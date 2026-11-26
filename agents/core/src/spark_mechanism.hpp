@@ -800,6 +800,17 @@ struct RegistryMechanismTestControls {
     /// capture failure (status set, name empty), never a probe failure. State must be owned
     /// by value (the hook is captured into the job as a shared_ptr, like `probe_hook`). Like
     /// `probe_hook`, a call that leaves it null clears any installed hook.
+    ///
+    /// CALL ORDER for a result that can be COMMITTED (an establishment, a re-arm, a retry:
+    /// a probe that took no duplicate, whose fresh key is a Target): the fresh read
+    /// (`held == false`), then the CONFIRMING read (`held == false` again), which runs
+    /// BEFORE its second by-path open, so a parked test lands a change between the first read
+    /// and the second open. A value returned for the confirming read is its name and skips the
+    /// open (it confirms when its status is 0 and the name equals the first read); `nullopt`
+    /// runs the real open and query. A verification (duplicate present) makes the fresh read,
+    /// then the held read (`held == true`), and no confirming read. Because the first read
+    /// follows the probe's own open, parking the FIRST `held == false` call is how a test
+    /// lands a rename between the open and the read that a confirmed commit must survive.
     std::function<std::optional<std::pair<long, std::wstring>>(std::string_view subkey, bool held)>
         name_hook;
     /// The sweeper treats DuplicateHandle of the held key as failed for every verification
@@ -839,11 +850,15 @@ struct RegistryMechanismDebugCounters {
     std::uint64_t verify_lost{0};        ///< periodic path verifications that found the path lost
     std::uint64_t verify_undecided{0};   ///< periodic path verifications that could not decide
     /// Name verdicts (#7877 item 31, R1), all test-only like the rest. `verify_lost` and
-    /// `verify_undecided` keep their PATH-level meaning. `verify_name_lost` counts the
+    /// `verify_undecided` keep their PATH-level meaning: `verify_undecided` is counted for
+    /// every verification whose probe did not produce an `ok` result, BEFORE the name verdict,
+    /// so it is also counted when that verdict then faults. `verify_name_lost` counts the
     /// held-versus-commit-time verdict, the fresh-versus-held verdict and the hive-unloaded
     /// verdict. `verify_name_undecided` counts a verification where a name query (or the
-    /// duplicate it needs) was attempted and could not yield a comparable pair; equal names
-    /// and a root-key (empty subkey) watch increment nothing.
+    /// duplicate it needs) was attempted and could not yield a comparable pair; equal names,
+    /// a root-key (empty subkey) watch, and a held name that reads fine against an EMPTY
+    /// committed name (the held-versus-commit-time compare is disabled for that watch, and
+    /// `commit_name_missing` is its discriminator) increment nothing.
     std::uint64_t verify_name_lost{0};
     std::uint64_t verify_name_undecided{0};
     /// Commits that recorded a non-empty canonical name on the watch, and Target commits of a
@@ -853,6 +868,17 @@ struct RegistryMechanismDebugCounters {
     std::uint64_t commit_name_missing{0};
     /// DuplicateHandle of the held key failed (or `verify_fail_duplicate`) for a verification.
     std::uint64_t verify_dup_failed{0};
+    /// Commit-capture confirmations that failed (#7877 item 31, R1 governance fix): a probe
+    /// result whose second by-path name read did not agree with the first (or could not be
+    /// made) was NOT committed and the watch was retried on the admission schedule. Counts
+    /// retries, not watches.
+    std::uint64_t commit_capture_retry{0};
+    /// Per-watch warnings actually logged (test-only): the canonical name could not be
+    /// recorded at a commit (counted only while verification is on), a verification could not
+    /// decide (once per blind episode of a watch), a DuplicateHandle failed.
+    std::uint64_t warns_logged_name_missing{0};
+    std::uint64_t warns_logged_undecided{0};
+    std::uint64_t warns_logged_dup_failed{0};
     /// The effective verification interval in ms (0 = off). Production default 0.
     std::int64_t path_verify_ms{0};
     std::size_t probe_workers_active{0};
@@ -877,7 +903,9 @@ registry_debug_counters_for_test(const ISparkMechanism& mech);
 /// Windows Registry mechanism or holds no watch for the key; an EMPTY string if the watch
 /// exists but its last commit recorded no name (capture failed, or a root-key watch). Read
 /// under the mechanism's lock. Exists so a test can tell a dropped store from a compare that
-/// merely still faults through the other path.
+/// merely still faults through the other path. (An owning std::wstring crosses the DLL boundary
+/// here, which relies on the agent library and its caller sharing the dynamic CRT, as the other
+/// std:: types in this header do.)
 [[nodiscard]] YUZU_EXPORT std::optional<std::wstring>
 registry_committed_name_for_test(const ISparkMechanism& mech, const std::string& spark_key);
 
