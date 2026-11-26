@@ -152,4 +152,47 @@ if [[ -d "$registry_dir" && ! -d "$installed_dir" ]]; then
   rm -rf "$registry_dir"
 fi
 
+# --- defensive invariant: a tree the registry does not list is orphaned ---
+#
+# The inverse of the rule above. `vcpkg_installed/vcpkg/` is ONE registry
+# shared by EVERY triplet tree in the workspace, but the drift branch wipes
+# it when ONE triplet's key changes. Every OTHER triplet's tree survives
+# with its files on disk and no `info/<port>_<ver>_<triplet>.list` entry.
+# The next `vcpkg install` for that triplet then believes nothing is
+# installed, finds its files already present, and aborts on the first
+# symlink: `error: failed: .../tools/protobuf/protoc: File exists`. The
+# sanitizer legs then fail with a missing dependency (CLI11) instead of a
+# real test result.
+#
+# It bites when two jobs with different manifests alternate on one work
+# dir (a dev/PR job and the main nightly, whose vcpkg.json differ): each
+# flip of the shared host triplet's key wipes the registry and strands the
+# sanitizer trees. A tree with no registry entry is unusable, so wipe it
+# and let vcpkg rebuild it from the binary cache.
+#
+# Runs whether or not the key drifted, so it also heals a workspace that is
+# already in this state.
+if [[ -d "$sentinel_dir" ]]; then
+  for tree in "$sentinel_dir"/*/; do
+    [[ -d "$tree" ]] || continue
+    name=$(basename "$tree")
+    if [[ "$name" == "vcpkg" ]]; then
+      continue
+    fi
+    listed=0
+    for entry in "$registry_dir"/info/*_"${name}".list; do
+      if [[ -f "$entry" ]]; then
+        listed=1
+        break
+      fi
+    done
+    if [[ "$listed" -eq 0 ]]; then
+      echo "vcpkg sentinel: orphaned tree detected for triplet=${name}"
+      echo "  ${tree} has no entry in ${registry_dir}/info"
+      echo "  wiping ${tree} to recover"
+      rm -rf "$tree"
+    fi
+  done
+fi
+
 exit 0

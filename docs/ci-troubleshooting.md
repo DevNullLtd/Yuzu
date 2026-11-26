@@ -544,7 +544,7 @@ step with:
 read_lines("...vcpkg_installed/x64-windows/lib/pkgconfig/<pkg>.pc"): no such file or directory
 ```
 
-**Root cause — two distinct paths produce this same symptom:**
+**Root cause — three distinct paths produce this same symptom:**
 
 1. **`<workspace>/vcpkg_installed/vcpkg/info/<port>_<triplet>.list`
    desync** (#741, fixed 2026-05-03). The sentinel previously wiped
@@ -559,7 +559,22 @@ read_lines("...vcpkg_installed/x64-windows/lib/pkgconfig/<pkg>.pc"): no such fil
    symptom on an unpatched runner, manual recovery is
    `rm -rf <workspace>/vcpkg_installed/`.
 
-2. **`<workspace>/vcpkg/packages/<port>_<triplet>/` partial build**
+2. **A sibling triplet tree stranded by another triplet's registry wipe**
+   (the inverse of path 1). `vcpkg_installed/vcpkg/` is one registry shared
+   by every triplet tree in the workspace, but a key drift on ONE triplet
+   wipes all of it. The other triplets' trees survive with their files on
+   disk and no `info/*.list` entry, so the next `vcpkg install` for them
+   finds its own files already present and aborts on the first symlink:
+   `error: failed: .../vcpkg_installed/x64-linux-asan/tools/protobuf/protoc:
+   File exists`. The sanitizer leg then fails on a missing dependency
+   (`Dependency "CLI11" not found`) rather than a real test result. It
+   occurs when jobs with different manifests alternate on one self-hosted
+   work dir (a dev or PR job, then the main nightly, whose `vcpkg.json`
+   differ). The sentinel now wipes any `vcpkg_installed/<triplet>/` tree
+   that the registry does not list, on every run, drift or not (pinned by
+   Test 6 in `scripts/ci/test-vcpkg-sentinel.sh`).
+
+3. **`<workspace>/vcpkg/packages/<port>_<triplet>/` partial build**
    (separate failure mode, predates #741). A build killed mid-port leaves
    a partial `vcpkg/packages/abseil_x64-windows/` (no `.pc` files yet)
    in the vcpkg tool root. vcpkg's manifest install trusts that dir's

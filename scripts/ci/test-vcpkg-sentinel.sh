@@ -223,6 +223,81 @@ assert_msg "[[ -d '$WS4/vcpkg_installed/vcpkg' ]]" \
 rm -rf "$TMPROOT"
 
 # -----------------------------------------------------------------------
+# Test 6 — a sibling triplet tree stranded by a registry wipe (main nightly
+# "protoc: File exists")
+# -----------------------------------------------------------------------
+# The registry is shared by every triplet in the workspace but a drift on one
+# triplet wipes all of it. The other triplets' trees survive with no registry
+# entry, and the next `vcpkg install` for them dies on the first symlink.
+echo "Test 6: sibling tree stranded by another triplet's drift"
+TMPROOT="$(mktemp -d)"
+WS6="$TMPROOT/t6"
+mk_workspace "$WS6"
+SIB="x64-linux-asan"
+
+seed_two_triplets() {
+  local ws="$1"
+  seed_desync_state "$ws"
+  mkdir -p "$ws/vcpkg_installed/$SIB/tools/protobuf"
+  echo "fake protoc" > "$ws/vcpkg_installed/$SIB/tools/protobuf/protoc-33.4.0"
+  ln -sf protoc-33.4.0 "$ws/vcpkg_installed/$SIB/tools/protobuf/protoc"
+  cat > "$ws/vcpkg_installed/vcpkg/info/protobuf_6.33.4_${SIB}.list" <<EOF
+${SIB}/
+${SIB}/tools/protobuf/protoc
+EOF
+}
+
+# 6a: drift on the host triplet. The sibling's tree must not outlive the
+# registry that described it.
+OUT6_BOOT=""; RC6_BOOT=0
+run_sentinel "$WS6" "baseline-one" OUT6_BOOT RC6_BOOT
+seed_two_triplets "$WS6"
+OUT6A=""; RC6A=0
+run_sentinel "$WS6" "baseline-two" OUT6A RC6A
+
+assert_msg "[[ $RC6A -eq 0 ]]" "6a: exit code is 0 (got $RC6A)"
+assert_msg "[[ ! -d '$WS6/vcpkg_installed/vcpkg' ]]" "6a: shared registry wiped on drift"
+assert_msg "[[ ! -d '$WS6/vcpkg_installed/$SIB' ]]" \
+  "6a: sibling tree wiped with the registry that listed it"
+assert_msg "echo \"\$OUT6A\" | grep -q 'orphaned tree detected for triplet=$SIB'" \
+  "6a: orphaned-tree log line names the sibling"
+
+# 6b: no drift, but the workspace is already in the stranded state (the
+# registry was wiped by an earlier job). The sibling tree must still be healed.
+mkdir -p "$WS6/vcpkg_installed/$SIB/tools/protobuf"
+echo "fake protoc" > "$WS6/vcpkg_installed/$SIB/tools/protobuf/protoc-33.4.0"
+ln -sf protoc-33.4.0 "$WS6/vcpkg_installed/$SIB/tools/protobuf/protoc"
+mkdir -p "$WS6/vcpkg_installed/$TRIPLET/lib" "$WS6/vcpkg_installed/vcpkg/info"
+echo "x" > "$WS6/vcpkg_installed/vcpkg/info/abseil_20260107.1_${TRIPLET}.list"
+OUT6B=""; RC6B=0
+run_sentinel "$WS6" "baseline-two" OUT6B RC6B
+
+assert_msg "[[ $RC6B -eq 0 ]]" "6b: exit code is 0 (got $RC6B)"
+assert_msg "echo \"\$OUT6B\" | grep -q 'sentinel unchanged'" "6b: key did not drift"
+assert_msg "[[ ! -d '$WS6/vcpkg_installed/$SIB' ]]" \
+  "6b: stranded sibling tree is healed without a drift"
+assert_msg "[[ -d '$WS6/vcpkg_installed/$TRIPLET' ]]" \
+  "6b: the listed triplet tree is preserved"
+
+# 6c: a sibling the registry DOES list is left alone, and a name that merely
+# prefixes another ('x64-linux' vs 'x64-linux-asan') does not borrow its entry.
+mkdir -p "$WS6/vcpkg_installed/$SIB/lib"
+echo "x" > "$WS6/vcpkg_installed/vcpkg/info/protobuf_6.33.4_${SIB}.list"
+OUT6C=""; RC6C=0
+run_sentinel "$WS6" "baseline-two" OUT6C RC6C
+assert_msg "[[ -d '$WS6/vcpkg_installed/$SIB' ]]" "6c: a registered sibling tree is preserved"
+assert_msg "[[ -d '$WS6/vcpkg_installed/$TRIPLET' ]]" "6c: the host tree is preserved"
+rm -f "$WS6/vcpkg_installed/vcpkg/info/abseil_20260107.1_${TRIPLET}.list"
+OUT6D=""; RC6D=0
+run_sentinel "$WS6" "baseline-two" OUT6D RC6D
+assert_msg "[[ ! -d '$WS6/vcpkg_installed/$TRIPLET' ]]" \
+  "6c: the host tree is orphaned once only the -asan entry remains"
+assert_msg "[[ -d '$WS6/vcpkg_installed/$SIB' ]]" \
+  "6c: the -asan tree keeps its own entry"
+
+rm -rf "$TMPROOT"
+
+# -----------------------------------------------------------------------
 # Test 5 — error on missing manifest
 # -----------------------------------------------------------------------
 echo "Test 5: missing vcpkg.json must fail"
