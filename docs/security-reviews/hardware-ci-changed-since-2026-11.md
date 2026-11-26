@@ -9,8 +9,7 @@ one respect: the watermark is returned on the first response of a walk only (own
 below). Migration v6 was added on 2026-11-26 to mitigate HWCI-DELTA-PLAN-FLIP and the runtime index check now
 covers `device_ci_changed_at_idx` too (HWCI-DELTA-INDEX-NO-WARN, closed); see "Migration v6" under "Measured query
 plans". Residuals that need an explicit owner ruling BEFORE this merges: HWCI-DELTA-PLAN-FLIP (what remains of it after
-v6),
-HWCI-DELTA-MARGIN-ESTIMATE (including the clock-step and long-commit cases added below),
+v6), HWCI-DELTA-MARGIN-ESTIMATE (including the clock-step and long-commit cases added below),
 HWCI-DELTA-MIXED-BUILDS, HWCI-DELTA-NO-REMOVALS, HWCI-DELTA-REPARSE, HWCI-DELTA-HOT-LOSS and
 HWCI-DELTA-AUDIT-NO-MARKER (the last two are not mitigated and no owner acceptance is recorded for either; the
 plan-flip `retry_after_ms` hint also needs the waived-A5 ledger entry described under "Unchanged contract"). Residuals recorded as design
@@ -84,7 +83,7 @@ A real change marker and a delta filter close that.
    time). The v5 `ALTER` takes `ACCESS EXCLUSIVE`, held through the index build, so reads and writes of
    `device_ci` are blocked for the migration (about 0.2 to 0.7 s per million rows on 18.4); it waits up to 30 s
    for the lock and then fails, and a failed v5 migration refuses to start the server on every restart until
-   the lock holder is gone (`docs/user-manual/upgrading.md`). v5 is forward-only: there is no rollback. A development or UAT
+   the lock holder is gone (`docs/user-manual/upgrading.md`). v5 and v6 are forward-only: there is no rollback. A development or UAT
    database that applied the unreleased pre-guard v5 text records a different hash for v5 and refuses to start; the
    recovery recipe in `docs/user-manual/upgrading.md` deletes that one recorded row and is pinned to the SHA-256 of the
    pre-guard text (`c2c3ca704946929d0d0d1bba87840cc2f67a30e967d9738580091f50c9cdce6b`), so a database that recorded any other v5 text deletes nothing (`DELETE 0`) and
@@ -126,7 +125,7 @@ default (`clock_timestamp()`) did change it, so the check does detect a rewrite.
 through the store (ALTER, index build, projection probes) took 107 ms at 300k and 684 ms at 1M rows. The
 index is about 7 MB at 1M rows.
 
-| Case at 1M rows | Plan | Execution |
+| Case at 1M rows (before v6: the v4 index plus the v5 index) | Plan | Execution |
 |---|---|---|
 | Sparse, 0.1% scattered, first page | `device_ci_changed_at_idx` + top-N sort | 6.1 ms |
 | Sparse, 0.1% scattered, mid-walk page | `device_ci_changed_at_idx` + top-N sort | 0.9 ms |
@@ -149,9 +148,10 @@ more on its first page, on its final page, or after a gap in the middle of a wal
 performance review took these figures on PostgreSQL 18.4 at 1M rows; like the rest of this section, the raw logs
 were not retained, so the numbers are a record of that review, not reproducible from the repository.) The worst case measured is a
 5% delta clustered at the head of `agent_id` order, whose terminal page took 3.6 to 3.8 s at 1M rows in that review's
-measurement (NOT reproduced: the re-measure under "Migration v6" below took 262 to 268 ms for the same shape, and which
-figure describes a real fleet is unresolved). On the review's figure that breaches the 5 s statement limit at about
-1.3M rows on a warm cache, and earlier on a cold one; on the re-measure, by linear extrapolation, at about 19M rows. A page that
+measurement (the first re-measure under "Migration v6" below took 262 to 268 ms for the same shape; a later one traced the gap
+to heap order and reproduced both figures: about 0.3 s on a table whose heap order follows `agent_id` order and 2.5 s on a
+random heap, which is the realistic one). On the random-heap figure that breaches the 5 s statement limit at about
+1.3M to 2M rows on a warm cache, and earlier on a cold one; on the ordered-heap figure at about 16M to 19M rows. A page that
 exceeds the limit answers `503` with `retry_after_ms` 5000, but the same `changed_since` reaches the same page
 again, so the answer is deterministic: a retry gets the same `503` and the walk wedges. The `5000` hint is wrong
 advice for it, because nothing about the retry changes. The mitigation for a client is conditional and capped: fall back only when the same delta page has
@@ -169,12 +169,14 @@ gave the runtime check's exact-key test as the reason; that check cannot influen
 with both indexes present was recorded.) The earlier claim in this record that a composite `(changed_at, agent_id)` index does not change the plan
 choice was about a different key order and does not describe the built index.
 
-**Migration v6 (2026-11-26): the composite keyset index.** v6, in one transaction, drops any index named
+**Migration v6 (2026-11-26): the composite keyset index.** v6, in one transaction, takes `ACCESS EXCLUSIVE` on `device_ci` first, drops any index named
 `device_ci_agent_id_c_changed_idx`, builds it on `device_ci (agent_id COLLATE "C", changed_at)` and then drops v4's
 `device_ci_agent_id_c_idx`. The drop-first order is deliberate (a 2026-11-26 external opinion): a bare `IF NOT
 EXISTS` build would be skipped over a same-named index left invalid or differently defined by a cancelled hand
 build, and the drop of v4's index would then leave no usable keyset index; a test runs v6 over such leftovers
-(a separate migration, not an edit of v5, so a database that already ran v5 needs no hash-drift recipe). The
+(the lock comes first because a build that took `SHARE` and upgraded at the drop deadlocked against a read-then-write
+session, reproduced on PostgreSQL 18.4; the drops are schema-qualified because the runner's `search_path` falls
+through to `public`; a separate migration, not an edit of v5, so a database that already ran v5 needs no hash-drift recipe). The
 planner can then test `changed_at` INSIDE the index (an `Index Cond:` line) where it used to test it on each heap row
 (a `Filter:` line). A unit test pins that plan shape (`a clustered delta's terminal page tests changed_at inside the
 keyset index, not row by row`).
@@ -202,24 +204,39 @@ kept), `device_ci_changed_at_idx` 6.8 MB. The v6 swap (build the composite, drop
 
 The first table above and this one come from different rigs, and the gap is systematic, not confined to the worst
 case: the same pre-v6 shapes cost 92 ms (2% clustered at the tail), 91 ms (5% scattered), 7.5 ms (all rows) and
-2.7 ms (no filter) in the first table against 11 ms, 7.8 ms, 1.0 ms and 1.0 ms here. A plan that makes one heap fetch per
-non-matching row, as the pre-v6 plan does, is very sensitive to the heap order against `agent_id` order and to the cache
-state (a likely cause, not tested), and the new plan is not. So the first table's absolute figures and this one's must
-not be mixed, and the "11 ms to 23 ms regression" below holds on this faster rig only.
+2.7 ms (no filter) in the first table against 11 ms, 7.8 ms, 1.0 ms and 1.0 ms here. The gate-3 performance review
+(2026-11-26) found the cause: the correlation between the heap (insertion) order and the `agent_id` order. This
+table's heap ended up correlated with `agent_id` order (a likely, untested mechanism: the `UPDATE` that assigned its
+rank column rewrote every row in an `agent_id`-sorted join order), so the old plan's one heap fetch per non-matching
+row hit neighbouring pages; a table whose rows are in registration order with random `agent_id`s (the real case: ids
+are random identifiers) costs far more. On a 1M-row, 601 MB table in a
+default-`shared_buffers` container, the 5%-at-the-head terminal page took 2,513 ms before v6 on a random heap and 321
+ms on an ordered one, against 23 and 24 ms for the composite index; the 5% scattered first page took 79 ms against 3.3
+ms (random) and 10.8 ms against 2.1 ms (ordered). So the realistic speed-up is about 100 times, not 12, the review's
+3.6 to 3.8 s was most likely a random-heap measurement (2.5 s was reproduced on a random heap; the residual gap is
+unexplained), and the 262 to 268 ms of this table's figures was most likely an ordered-heap one.
+The composite index is insensitive to the heap layout (about 23 ms in both). The "11 ms to 23 ms regression" for the
+2% clustered tail below appeared on this rig only; on the random-heap rig both layouts chose the `changed_at` index
+and cost the same, so the planner's choice at the 2 to 3% boundary is unstable and the regression is not a stable
+effect. None of the raw logs of any of these runs is retained (the figures above are the record, as for the review's).
 
 After v6 the terminal page of a clustered delta is still a linear walk of the keyset index: the composite removes the
-heap fetches, not the index walk. At about 22 ms per million entries (this rig), the 5 s statement limit is roughly
-200 million rows away by linear extrapolation, which was not measured beyond 1M.
+heap fetches, not the index walk. The performance review measured buffers touched growing with the table (about 8k at
+1M, 17k at 2M, 37k at 4M entries) and the time at 22.5 ms at 1M, 98 ms at 2M and 178 ms at 4M, because the index no
+longer fits in `shared_buffers` from about 2M rows. So 22 ms per million holds only in cache; beyond it, about 44 ms
+per million on a warm operating-system cache and worse on cold disk, which puts the 5 s statement limit at about 100
+million rows or fewer, still far beyond any plausible fleet. A delta that matches nothing uses
+`device_ci_changed_at_idx` and takes 0.06 ms, so the steady-state poll is unaffected. The swap itself (timed on the earlier SHARE-first text, before the lock-first change; the idle figure is unaffected), measured under
+eight concurrent writers (about 14k transactions a second), took about 1.9 s per million rows end to end, with the worst
+writer stall 1.9 s; the idle figure is 0.58 s. Content-update cost against the pre-v6 indexes: about +4% WAL and
+unchanged time for an update, +5 to 6% WAL and +5% time for an upsert that changes the hash, no HOT loss attributable to
+v6 (`changed_at` was already indexed), and hash-skip and `last_seen`-only updates keep HOT eligibility.
 
-What this re-measure does NOT reproduce: the governance review's 3.6 to 3.8 s for A's worst page. This synthetic
-table gave 262 to 268 ms for the same shape (a 5% delta at the head, the page after it), and the difference is
-unexplained (row width, data distribution, cache state or load on the review's machine are candidates). The
-shape of the plan is the same in both (A tests `changed_at` per heap row; B tests it in the index), and B is about
-12 times faster than A on this table and was about 85 times faster in the review's own run, but the absolute
-figures for A should be read as "between 0.26 s and 3.8 s depending on conditions nobody has pinned down". Two
-regressions are visible in the table and are small in absolute terms: the 2% clustered-tail first page moves from
-11 ms to 23 ms (the planner now takes the composite instead of the `changed_at` index plus a top-N sort), and C shows
-why `device_ci_changed_at_idx` stays (a sparse delta without it is 28 ms instead of 5 ms).
+What the first re-measure did not reproduce was the governance review's 3.6 to 3.8 s for the old plan's worst page: it
+gave 262 to 268 ms for the same shape, and the performance review above traced the gap to heap order. Two small
+differences are visible in the table and are small in absolute terms: the 2% clustered-tail first page moves from
+11 ms to 23 ms on the ordered-heap rig (not on the random one), and C shows why `device_ci_changed_at_idx` stays (a
+sparse delta without it is 28 ms instead of 5).
 
 ## Residuals
 
@@ -236,12 +253,12 @@ for every row (no issue numbers exist yet).
 | HWCI-DELTA-NO-REMOVALS | A delta has no removal signal: a decommissioned device simply stops appearing. Erasure: `changed_at` and its index live and die with the `device_ci` row, but a CMDB copy of the serial, MAC or UUID is NOT erased by a decommission, and until PR 2 a delta consumer gets no signal to erase it. | PR 2 (a removals feed of tombstones carrying `agent_id` and `removed_at`) is planned, no date. The tombstones will need a retention rule under the clock-guarded-retention row (`docs/clock-guarded-retention.md`) and a data classification. Until then: confirm absence with `?agent_id=` (without `changed_since`) and retire only through the client's own decommission process. | Ruling needed | to be filed at push |
 | HWCI-DELTA-REPARSE | If a server upgrade changes how stored records are interpreted without changing `content_hash`, `changed_at` does not move, and a CMDB holding the old reading is not told. No re-parse-on-upgrade code was found by the reviewers, so this is a conditional, not a present behaviour. | Run a full walk after every server upgrade (stated in the manual and the upgrade note). | Ruling needed | to be filed at push |
 | HWCI-DELTA-ENTER-SCOPE | The same mechanism as HWCI-DELTA-SCOPED-REFUSED seen from the data side: any consumer that filters by a scope it computes itself (a management group or a tag) and then uses a delta will miss a device that joined that scope without a content change. | Recompute the scope membership on a full walk, or filter after the pull. | Design consequence | to be filed at push |
-| HWCI-DELTA-PLAN-FLIP | See "The slow case" above. The planner flips at roughly 2 to 3% density; any clustered delta of 3% or more on its first page, final page or a mid-walk gap is slow; the worst case in the governance review's measurement (5% clustered at the head) took 3.6 to 3.8 s on its terminal page at 1M rows and breaches the 5 s statement limit at about 1.3M rows warm, earlier cold (a later re-measure of the same shape took 262 to 268 ms and did not reproduce it; see "Migration v6"). The `503` it produces is deterministic (the same `changed_since` hits the same page), carries `retry_after_ms` 5000, and wedges the walk. | Client: fall back only for the generic failure (REST `503` / MCP `-32603` with `retry_after_ms` 5000, no `Sec-Audit-Failed`, not the audit-subsystem message) when the same delta page has failed at least 3 times over at least 60 s while unfiltered pages succeed: ONE full walk, at most once per walk and not on every scheduled run; every other hint (2000, 60000, an audit failure) is honoured and never triggers it; if the fallback also fails, stop and alert; recurring fallbacks mean the delta plan is slow, to be raised with the operator. Server: mitigated by migration v6, the composite `(agent_id COLLATE "C", changed_at)` index that replaces v4's (see "Migration v6": the measured clustered cases drop to 12 to 24 ms; net +9 MB at 1M rows). What remains: a missing or invalid keyset index (the server now warns at start), and the fact that the walk is still linear in the table (the composite removes the heap fetches, not the index walk; about 22 ms per million entries on the re-measure rig, unmeasured beyond 1M). Not built: a retry-hint cause discriminator, so a deterministic `503` could stop advising a retry. | Mitigated for the measured shapes; ruling needed on the rest | to be filed at push |
-| HWCI-DELTA-MIXED-BUILDS | An older binary running against the new schema only warns, and writes device-CI rows without maintaining `changed_at`: a new row gets the column default (the insert time), but a content update of an existing row leaves the old value. The miss is PERMANENT for that row, not a transient one: every later delta skips it, because the stamp is already behind every watermark. | Procedural, not enforced: this is a fresh-deployment contract, not a rolling or mixed-version procedure (`docs/user-manual/upgrading.md`). After the LAST earlier-build replica is gone, do a full walk and take a fresh watermark. v5 is forward-only. | Ruling needed | to be filed at push |
+| HWCI-DELTA-PLAN-FLIP | See "The slow case" above. The planner flips at roughly 2 to 3% density; any clustered delta of 3% or more on its first page, final page or a mid-walk gap is slow; the worst case (5% clustered at the head) took 3.6 to 3.8 s on its terminal page at 1M rows in the governance review, 2.5 s on a random-heap table and 0.26 to 0.32 s on a heap-ordered one in the later re-measures (the gap is heap order against `agent_id` order; see "Migration v6"), and breaches the 5 s statement limit at about 1.3M to 2M rows warm on a random heap, earlier cold. The `503` it produces is deterministic (the same `changed_since` hits the same page), carries `retry_after_ms` 5000, and wedges the walk. | Client: fall back only for the generic failure (REST `503` / MCP `-32603` with `retry_after_ms` 5000, no `Sec-Audit-Failed`, not the audit-subsystem message) when the same delta page has failed at least 3 times over at least 60 s while unfiltered pages succeed: ONE full walk, at most once per walk and not on every scheduled run; every other hint (2000, 60000, an audit failure) is honoured and never triggers it; if the fallback also fails, stop and alert; recurring fallbacks mean the delta plan is slow, to be raised with the operator. Server: mitigated by migration v6, the composite `(agent_id COLLATE "C", changed_at)` index that replaces v4's (see "Migration v6": the measured clustered cases drop to 12 to 24 ms; net +9 MB at 1M rows). What remains: a missing or invalid keyset index (the server now warns at start), and the fact that the walk is still linear in the table (the composite removes the heap fetches, not the index walk; about 22 ms per million entries in cache on the re-measure rig and about 44 ms per million beyond the cache, so roughly 100 million rows to the limit). Not built: a retry-hint cause discriminator, so a deterministic `503` could stop advising a retry. | Mitigated for the measured shapes; ruling needed on the rest | to be filed at push |
+| HWCI-DELTA-MIXED-BUILDS | An older binary running against the new schema only warns, and writes device-CI rows without maintaining `changed_at`: a new row gets the column default (the insert time), but a content update of an existing row leaves the old value. The miss is PERMANENT for that row, not a transient one: every later delta skips it, because the stamp is already behind every watermark. | Procedural, not enforced: this is a fresh-deployment contract, not a rolling or mixed-version procedure (`docs/user-manual/upgrading.md`). After the LAST earlier-build replica is gone, do a full walk and take a fresh watermark. v5 and v6 are forward-only. | Ruling needed | to be filed at push |
 | HWCI-DELTA-PITR-RESTORE | A point-in-time restore or a restore from backup leaves `changed_at` stamps older than watermarks that clients already hold, so a delta will not show a row whose stored state the restore rolled back. | A full walk after any restore. | Residual | to be filed at push |
 | HWCI-DELTA-HASH-FLAPPING | An agent whose collector output changes nondeterministically (the content hash flaps) bumps `changed_at` on every full send, so that device is re-served on every delta. | Harmless to correctness (at-least-once), a cost only; fix the agent's nondeterminism. | Residual | to be filed at push |
-| HWCI-DELTA-HOT-LOSS | A content update now rewrites an indexed column, so it loses the heap-only-tuple (HOT) update path: about +29% cost per content update, a figure from the governance round's performance review on PostgreSQL 18.4 (raw logs not retained, so it is a recorded measurement, not a reproducible one). The hash-skip path is untouched. Migration v6 does not change the index count (the composite replaces v4's, and `changed_at` already forced the non-HOT path), but its entries are 8 bytes wider; that was not re-measured. | Not mitigated; no owner acceptance recorded. | Ruling needed | to be filed at push |
-| HWCI-DELTA-V5-LOCK | The v5 `ALTER` takes `ACCESS EXCLUSIVE` held through the index build and queues behind any long read or write on `device_ci` for up to 30 s, during which every new access queues behind it; then it fails and the server refuses to start on every restart until the holder is gone. v6 has the same 30 s bound and failure mode, with a `SHARE` lock for its build (writes wait) and `ACCESS EXCLUSIVE` locks for its two `DROP INDEX` statements. That is a lock upgrade inside one transaction (the first drop takes the strong lock up front when the composite pre-exists, otherwise the build's `SHARE` is upgraded), which can deadlock against a session that holds `ACCESS SHARE` and then writes; no such transaction was found in this store (ingest upserts the parent first, the hash-only read is autocommit) and the hard-cutover contract excludes other writers, so it is recorded and not changed. | Documented with the log line and recovery in `docs/user-manual/upgrading.md`; the migration is idempotent. | Residual | to be filed at push |
+| HWCI-DELTA-HOT-LOSS | A content update now rewrites an indexed column, so it loses the heap-only-tuple (HOT) update path: about +29% cost per content update, a figure from the governance round's performance review on PostgreSQL 18.4 (raw logs not retained, so it is a recorded measurement, not a reproducible one). The hash-skip path is untouched. Migration v6 does not change the index count (the composite replaces v4's, and `changed_at` already forced the non-HOT path), but its entries are 8 bytes wider: measured on 2026-11-26 as about +4% WAL and unchanged time for a content update and +5 to 6% WAL and +5% time for an upsert with a changed hash, with HOT eligibility unchanged for `last_seen`-only updates and unchanged-hash upserts. | Not mitigated; no owner acceptance recorded. | Ruling needed | to be filed at push |
+| HWCI-DELTA-V5-LOCK | The v5 `ALTER` takes `ACCESS EXCLUSIVE` held through the index build and queues behind any long read or write on `device_ci` for up to 30 s, during which every new access queues behind it; then it fails and the server refuses to start on every restart until the holder is gone. v6 takes `ACCESS EXCLUSIVE` first (no lock upgrade, so no upgrade deadlock; reads and writes wait for the whole swap, about 0.6 s per million rows idle and 1.9 s under eight writers), with the same 30 s bound and refuse-to-start failure; the pool's 10 s lock timeout also bounds a second replica waiting on the migration advisory lock (it fails if the first replica's migration takes longer, and retries on restart). A `pg_dump` or any long reader blocks the swap for up to 30 s per attempt; the recovery is in `upgrading.md` ("Migration v6"). | Documented with the log line and recovery in `docs/user-manual/upgrading.md`; the migration is idempotent (a re-run drops and rebuilds). | Residual | to be filed at push |
 | HWCI-DELTA-SCOPED-WALK-WATERMARK | A first page returns `next_changed_since` to any admitted caller, including a scope-confined one whose first page carries no `changed_since` (such a caller is refused only when it SENDS `changed_since`). A client that takes its first watermark from a scope-confined full walk holds a value that is correct as a clock reading but whose walk did not cover the whole fleet, so a later global delta started from it never delivers the devices that walk did not read. | Documented: run the first full walk under the SAME global credential that will run the deltas (the credential checklist in `rest-api.md`, the MCP tool description and `mcp.md`). Not built: refusing a watermark to a scope-confined caller (it would add a second scope branch to the first-page path). | Design consequence (LOW) | to be filed at push |
 | HWCI-DELTA-THROW-NO-AUDIT | An exception that escapes the watermark provider (a `bad_alloc`-class throw is the only realistic one: the provider returns `nullopt` for every database failure) is not converted to the `503`/`kInternalError` answer. It reaches httplib's default handler as a bare `500` with no audit row and no A4 body. The bulk-read slot is freed by unwinding (an RAII member of the page held in the failed read), so nothing leaks. | Informational: not mitigated, no change planned. | Informational | to be filed at push |
 | HWCI-DELTA-WATERMARK-OBSERVABILITY | A failed watermark read on a first page is indistinguishable from a failed page read in the audit row and in the `503` counters (both are a store failure with `retry_after_ms` 5000). | Not mitigated. The degrade is counted under `yuzu_inventory_read_degrade_total{source="device_ci"}` with the same `reason` labels a page read uses, so the counter does not tell the two apart either. | Residual | to be filed at push |
@@ -249,6 +266,41 @@ for every row (no issue numbers exist yet).
 | HWCI-DELTA-FIRST-PAGE-TIMING | A first page takes a second pool lease for the watermark read, so its worst-case bulk-read slot hold is longer than a cursor page's (REST about 80 s against about 62 s; MCP about 124 s against about 106 s), and the client timeout advice (at least about 90 s) covers the 80 s bound plus a typical authorization read but not a stalled authorization read. The figures are sums of source constants, not measurements, and exclude `BEGIN` and the `SET LOCAL` (uncapped by the 5 s statement cap, under the pool's 30 s default). | Documented in `rest-api.md` (client loop, step 5) and `server-admin.md` ("Slot hold time"). Not mitigated: no separate bound on `BEGIN`/`SET LOCAL`. | Residual | to be filed at push |
 | HWCI-DELTA-INDEX-NO-WARN | The runtime check at open used to WARN only for v4's `device_ci_agent_id_c_idx`; nothing warned when `device_ci_changed_at_idx` was missing. A delta stays correct without it. | Closed on 2026-11-26: one generic check now covers both read indexes (the v6 keyset index and `device_ci_changed_at_idx`), judging name, validity, readiness, predicate and the exact printed key list, and each WARN names its own cost and the statement to run (unit tests for each way an index can be wrong). | Closed | n/a |
 | HWCI-DELTA-CLOCK-DOMAINS | `changed_at` is stamped from the database clock, while `first_seen` and `last_seen` are stamped from the replica clock. The three are not comparable to better than the replica-to-database skew. | Documented; run NTP on every replica and the database host. | Residual | to be filed at push |
+
+## Push-time checklist (merge preconditions, nothing here is done yet)
+
+The residual rows above say "to be filed at push" by owner ruling (tracking issues are filed when the push is
+approved, not before). These are MERGE-BLOCKING when the push happens, in this order:
+
+1. Owner rulings on the "Ruling needed" rows (PLAN-FLIP after v6, MARGIN-ESTIMATE including the data-capped
+   watermark option, MIXED-BUILDS, NO-REMOVALS, REPARSE, HOT-LOSS, AUDIT-NO-MARKER).
+2. File the tracking issue and the follow-up issues (deduped, one outcome each, no closing keyword in the PR body),
+   then replace every "to be filed at push" cell above with its issue number and owner.
+3. Rename `changelog.d/NNNN-hardware-ci-changed-since.added.md` to the issue number and re-run
+   `python3 tools/plugin-doc-gen/plugin_doc_gen.py --all`.
+4. Add the waived-A5 row to `docs/agentic-first-principle.md` (surface `list_hardware_ci_records` and
+   `GET /api/v1/hardware-ci`; waived item: the honest `retry_after_ms` on a deterministic statement-timeout error of
+   the bulk read, whatever its cause; the issue number; a revisit-by date about three months out). A row without an
+   issue number would itself be an A5 finding, so the issue comes first.
+5. Commit the governance ledger fragment (`governance.d/*.jsonl` with its Resource Ledger) in the PR, with every
+   disposition filled in by superseding rows.
+6. Follow-up issues to file from the 2026-11-26 governance run (one outcome each; the `deferred-to-issue #?` rows of
+   `governance.d/0000-hwci-changed-since-v6.*.jsonl` are the register): a gauge or periodic re-check for a missing read
+   index; a server-side bound on an orphaned migration backend (`idle_in_transaction_session_timeout` in the runner's
+   `SET LOCAL`, for a connection cut after v6's last statement); the runner's 10 s advisory-lock wall for a second replica;
+   the WARN recognising v4's index so its consequence text is exact when only the composite is missing; a non-superuser way
+   to test the invalid-index replacement; and the chaos runs against the final v6 text (a real `pg_dump` against a
+   starting replica, a hand `CREATE INDEX CONCURRENTLY` in progress while v6 starts, a network cut after v6's last
+   statement, disk full at v6). Deliberately closed rather than filed: a `pg_dump` holding the lock (documented: start
+   outside the dump window), the `pg_get_indexdef` print format changing (stable on 18.4 across C, ICU and tuned indexes;
+   revisit on a PostgreSQL major upgrade), the WARN remedy being a plain build (the WARN says so), index bloat after a
+   mass content change (autovacuum), the upgrade deadlock (removed by lock-first), a restore without the composite (the
+   WARN covers it) and an older build against a v6 database (the rollback text covers it).
+   Also: no database outside this development branch applied an earlier text of v6 (it was never pushed). A rig that did
+   fails the hash-drift check at start; the generic reset in `upgrading.md` applies, and the v4 and v5 drift recipes do not
+   (the v4 recipe's by-hand index check queries an index that v6 drops).
+7. PR 2 (the removals feed) takes migration v7 (earlier plan notes say v6; four tests index the migration list by
+   position and use `size() >= 6`).
 
 ## Where to read more
 

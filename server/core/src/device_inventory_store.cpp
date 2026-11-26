@@ -247,10 +247,10 @@ constexpr const char* kMigrationV3Sql =
 // build and allows a lock wait of 30 s (ca_store's value) behind a long ingest transaction.
 // The btree key list of the index, exactly as `pg_get_indexdef` prints it after `USING btree`
 // (verified on PostgreSQL 18.4, where the parenthesised expression and a plain collated column
-// print the same). ONE spelling for the migration DDL, the operator's DDL in the WARN and the
-// runtime check, so the three cannot drift: the check compares the printed key list to this text
-// and nothing else, so a same-named index with another column, more columns, INCLUDE, a different
-// expression or an opclass does not pass.
+// print the same). These two constants and `agent_id_c_index_ddl` feed v4's FROZEN migration text (its
+// SHA-256 is recorded in every database that ran it and pinned in the tests) and v6's DROP, and
+// nothing else: the runtime check uses `kKeysetIndexKey` / `kChangedAtIndexKey` below. Changing the
+// spelling here changes v4's recorded hash, so a tidy-up of these constants needs a new migration.
 constexpr std::string_view kAgentIdCIndexKey = "(agent_id COLLATE \"C\")";
 constexpr const char* kAgentIdCIndexName = "device_ci_agent_id_c_idx";
 
@@ -314,23 +314,36 @@ const std::string kMigrationV5Sql =
 // in docs/security-reviews/hardware-ci-changed-since-2026-11.md. With `changed_at` as the second key
 // column the planner tests it inside the index, so the same walk reads only the matching heap rows.
 // It still serves a plain keyset (the leading column is the v4 expression), so v4's index is a strict
-// prefix of it and redundant (its size and its write cost buy nothing): it is dropped here, in the same
-// transaction (the build holds a SHARE lock, so writes wait; the drops take ACCESS EXCLUSIVE). The v5
-// `device_ci_changed_at_idx` stays: it keeps a sparse delta at a few milliseconds.
+// prefix of it and redundant (its size and its write cost buy nothing), and it is dropped here in the
+// same transaction. The v5 `device_ci_changed_at_idx` stays: it keeps a sparse delta at a few
+// milliseconds.
+// LOCKING, deliberately: the FIRST statement takes ACCESS EXCLUSIVE on device_ci. A build that took
+// SHARE and then upgraded to ACCESS EXCLUSIVE at the drop could deadlock against any session that
+// had read the table and then wrote it (reproduced on PostgreSQL 18.4, and the migration can be the
+// victim); taking the strongest mode first removes the upgrade and leaves ONE lock wait, bounded by
+// the 30 s lock_timeout below (the sibling gateway_route_store migration does the same for the same
+// reason). The price is that reads of device_ci block for the build too (about 0.6 s per million rows
+// on an idle database, measured; longer under write load), which v5 already costs.
 // The statement order is DETERMINISTIC on purpose: DROP the composite if it exists, CREATE it, then
 // DROP v4's. A bare `CREATE INDEX IF NOT EXISTS` would be skipped over a same-named index that is
 // INVALID or differently defined (an operator's cancelled hand build after a lock-timeout failure of
 // this very migration), and the unconditional drop of v4's index would then remove the only usable
 // keyset index. The composite's name has never shipped, so dropping a pre-existing one costs one
-// rebuild (about 0.6 s per million rows) and nothing else.
+// rebuild and nothing else.
+// The two DROPs are SCHEMA-QUALIFIED: the runner's search_path is `"<store>", public`, so an
+// unqualified `DROP INDEX IF EXISTS` falls through to `public` and would drop a same-named index
+// there (verified). That is a deliberate local exception to the unqualified-DDL convention of the
+// other migrations (the CREATE and the LOCK resolve through the store schema, which comes first).
 // A SEPARATE migration, not an edit of v5, so a database that already applied v5 (a development or
 // UAT rig on a branch build) needs no hash-drift recipe: it only runs v6. Idempotent (a re-run drops
 // and rebuilds), built under v4's transaction-local settings for the same reasons, and not
 // CONCURRENTLY (the runner's transaction refuses it).
-// ONE spelling for the migration DDL, the operator's DDL in the WARN and the runtime check: the check
-// compares the key list `pg_get_indexdef` prints after `USING btree` to this text and nothing else
-// (verified on PostgreSQL 18.4), so a same-named index with another column, an INCLUDE, a different
-// expression or a predicate does not pass.
+// THE CONSTANTS BELOW FEED v6's RECORDED HASH: changing the index name, the key spelling or
+// `index_ddl` changes v6's SHA-256 in every database that ran it (the tests pin it), so it needs a
+// new migration, not an edit. The check compares the key list `pg_get_indexdef` prints after
+// `USING btree` to `kKeysetIndexKey` / `kChangedAtIndexKey`, optionally followed by an operator's
+// ` WITH (...)` storage parameter (verified on PostgreSQL 18.4); a same-named index with another
+// column, an INCLUDE, a different expression or a predicate does not pass.
 constexpr std::string_view kKeysetIndexKey = "(agent_id COLLATE \"C\", changed_at)";
 constexpr const char* kKeysetIndexName = "device_ci_agent_id_c_changed_idx";
 // The v5 index, spelled as `pg_get_indexdef` prints it, for the runtime check only (the v5
@@ -350,10 +363,12 @@ std::string index_ddl(std::string_view name, std::string_view key, std::string_v
 
 const std::string kMigrationV6Sql = std::string("SET LOCAL lock_timeout = '30s'; "
                                                 "SET LOCAL statement_timeout = 0; "
-                                                "DROP INDEX IF EXISTS ") +
+                                                "LOCK TABLE device_ci IN ACCESS EXCLUSIVE MODE; "
+                                                "DROP INDEX IF EXISTS device_inventory_store.") +
                                     kKeysetIndexName + "; " +
                                     index_ddl(kKeysetIndexName, kKeysetIndexKey, "device_ci") +
-                                    "; DROP INDEX IF EXISTS " + kAgentIdCIndexName + ";";
+                                    "; DROP INDEX IF EXISTS device_inventory_store." +
+                                    kAgentIdCIndexName + ";";
 
 // The indexes as the runtime check (and an operator by hand) creates them: schema-qualified, because
 // no search_path is set outside the migration runner.
@@ -468,6 +483,8 @@ int fill_record(PGresult* res, int row, DeviceCiRecord& out) {
 
 /// What the runtime check needs to know about one index: its name, the key list `pg_get_indexdef`
 /// prints after `USING btree`, the operator's DDL, and what a miss costs (said in the WARN).
+/// CALL-SCOPED: `create_sql` is a reference to a namespace-scope constant, so build one only as an
+/// argument of `warn_if_index_unusable`; never store it.
 struct IndexCheck {
     const char* name;
     std::string_view key;
@@ -476,7 +493,7 @@ struct IndexCheck {
 };
 
 /// After migrations: is the index really there, valid and defined as the read needs it?
-/// `schema_meta` saying v6 is not proof (a restore, a hand `DROP INDEX`, or a same-named index of
+/// The recorded schema version being v6 is not proof (a restore, a hand `DROP INDEX`, or a same-named index of
 /// another definition that `IF NOT EXISTS` accepted). The read stays CORRECT without it (the
 /// `COLLATE "C"` spelling and the `changed_at` comparison in the query carry correctness), so a miss
 /// or a failed check is a WARN and the store still opens, but the plan degrades, which a loaded
@@ -521,18 +538,27 @@ void warn_if_index_unusable(PGconn* conn, const IndexCheck& chk) {
             key == chk.key || (key.substr(0, chk.key.size()) == chk.key &&
                                key.substr(chk.key.size(), kWith.size()) == kWith);
         if (valid != "t" || ready != "t")
-            problem = "is invalid (an interrupted build)";
+            problem = "is invalid (an interrupted build, or a concurrent build still running)";
         else if (partial == "t" || !same_key)
             problem = "is defined differently from the migration";
     }
     if (problem.empty())
         return;
+    // A missing index has nothing to drop; an invalid or differently defined one must be dropped
+    // first (`CREATE INDEX IF NOT EXISTS` would be skipped over it). Say which, and print both
+    // statements, each terminated, so the tail of the line can be pasted into a session as written.
+    const std::string statements =
+        problem == "is missing"
+            ? chk.create_sql + ";"
+            : std::string("DROP INDEX device_inventory_store.") + chk.name + "; " + chk.create_sql + ";";
     spdlog::warn("DeviceInventoryStore: index {} {}. GET /api/v1/hardware-ci and list_hardware_ci_"
                  "records stay correct but {} Create it as the table owner, in a session that first "
-                 "ran SET lock_timeout = '30s' (a plain build queues behind any session holding a lock "
-                 "on device_ci, and every writer queues behind it); DROP INDEX "
-                 "device_inventory_store.{} first if it exists but is invalid or differs: {};",
-                 chk.name, problem, chk.consequence, chk.name, chk.create_sql);
+                 "ran SET lock_timeout = '30s' (a plain build blocks writers to device_ci and queues "
+                 "behind any session holding a lock on it), then run{}: {} See "
+                 "docs/user-manual/upgrading.md, \"Migration v6\".",
+                 chk.name, problem, chk.consequence,
+                 problem == "is missing" ? "" : " both statements (the existing index must be dropped first)",
+                 statements);
 }
 
 void warn_if_read_indexes_unusable(PGconn* conn) {
@@ -540,8 +566,10 @@ void warn_if_read_indexes_unusable(PGconn* conn) {
     warn_if_index_unusable(
         conn, {kKeysetIndexName, kKeysetIndexKey, kKeysetIndexCreateSql,
                "every page becomes a scan plus a sort of device_ci (about 317 ms a page at 1M "
-               "devices), which can exhaust the database pool under load, and a delta of a few "
-               "percent of the table that is clustered in agent_id order reads most of it."});
+               "devices in one measurement, growing with the table), which can exhaust the database "
+               "pool under load, and a delta of a few percent of the table that is clustered in "
+               "agent_id order reads most of it. (If v4's device_ci_agent_id_c_idx still exists, plain "
+               "pages are served from it and only such a delta is slow.)"});
     // The changed_at index serves a sparse delta; without it a delta page falls back to the keyset
     // index with the changed_at test inside it, so a delta is still correct and bounded.
     warn_if_index_unusable(
