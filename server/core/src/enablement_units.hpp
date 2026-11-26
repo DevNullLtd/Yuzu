@@ -139,17 +139,11 @@ inline constexpr std::array<RequirementEdge, 2> kRequirements{{
     {"app_usage.last_used", "echo"},
 }};
 
-// matrix: docs/os-capability-matrix.md generated block (2026-10-06; shares.list,
-// pkg_inventory.store_packages, msi_packages.list_inventory and remote_access_audit.list added
-// 2026-10-17/19; registry set_user_value, delete_user_value and apply added in registry 2.1.0;
-// hardware chassis/baseboard/swap/machine_id and disk_actions partitions/topology added as planned;
-// middleware ibm_mq added by SAM.2; runtimes python added 2026-10-28; hardware drivers_inventory
-// added by SAM-32; virtualization host added by PR12.1-a, virtualization wsl added 2026-11-08,
-// virtualization runtime_posture added by PR12.1-b2; firewall quarantine, release, quarantine_status
-// and quarantine_allow added by PRQ.1; PRQ.2 removed the old containment plugin's four rows; component_inventory scan added by SAM-16, native by SAM-22 and python and node
-// by SAM-49 (POSIX legs supported, Windows leg planned for python and node; the scan and native Windows leg added by SAM-49 Windows); process_introspect inspect added by PR13.1-a (macOS leg by PR13.1-c, Windows leg planned), applicable on all three;
-// file_search search added with the file_search plugin, applicable on all three; msi_packages installer_records added by SAM-46), 255 rows.
-inline constexpr std::array<UnitOsRow, 255> kUnitOs{{
+// matrix: docs/os-capability-matrix.md generated block. No row count or change
+// history here: every PR adding a row edited both, so they conflicted. Add a row
+// next to its plugin's other rows (a new plugin: near its alphabetical
+// neighbours). Two PRs adding at the same spot, such as the end, still conflict.
+inline constexpr auto kUnitOs = std::to_array<UnitOsRow>({
     {"agent_actions", "set_log_level", kWin | kLin | kMac},
     {"agent_actions", "info", kWin | kLin | kMac},
     {"agent_logging", "get_log", kWin | kLin | kMac},
@@ -412,7 +406,7 @@ inline constexpr std::array<UnitOsRow, 255> kUnitOs{{
     {"wmi", "get_instance", kWin},
     {"wol", "wake", kWin | kLin | kMac},
     {"wol", "check", kWin | kLin | kMac},
-}};
+});
 
 /// The derived overlay: units + recorded non-units (sorted by name) and the
 /// validated requirement edges as (unit, required) name pairs.
