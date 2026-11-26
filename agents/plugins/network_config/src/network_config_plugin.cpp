@@ -103,6 +103,7 @@
 #include <netioapi.h> // GetIpNetTable2 / MIB_IPNET_ROW2 / ConvertInterfaceLuidToAlias (arp)
 #include <winhttp.h>
 #include <vector>
+#include <yuzu/agent/win_adapter_list.hpp> // read_adapters (bounded, in agent-core)
 #pragma comment(lib, "iphlpapi.lib")
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "winhttp.lib")
@@ -356,29 +357,24 @@ std::vector<std::string> extract_server_addresses(CFDictionaryRef dict) {
 #endif // __APPLE__
 
 #ifdef _WIN32
-// Format a MAC address from a byte array
-std::string format_mac(const BYTE* addr, DWORD len) {
-    if (len < 6)
-        return "-";
-    return std::format("{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}", addr[0], addr[1], addr[2],
-                       addr[3], addr[4], addr[5]);
-}
-
 // wide->UTF-8 conversion now via the shared win_str.hpp (#1681); from_wide is
 // behaviour-identical to the old NUL-terminated wide_to_utf8 for valid input.
 using yuzu::win::from_wide;
 
-// Convert a SOCKADDR to a string
-std::string sockaddr_to_string(LPSOCKADDR sa) {
-    char buf[128]{};
-    if (sa->sa_family == AF_INET) {
-        auto* v4 = reinterpret_cast<sockaddr_in*>(sa);
-        inet_ntop(AF_INET, &v4->sin_addr, buf, sizeof(buf));
-    } else if (sa->sa_family == AF_INET6) {
-        auto* v6 = reinterpret_cast<sockaddr_in6*>(sa);
-        inet_ntop(AF_INET6, &v6->sin6_addr, buf, sizeof(buf));
-    }
-    return buf;
+static_assert(yuzu::network_config::kIfTypeSoftwareLoopback == IF_TYPE_SOFTWARE_LOOPBACK);
+static_assert(yuzu::network_config::kIfTypeTunnel == IF_TYPE_TUNNEL);
+static_assert(yuzu::network_config::kIfOperStatusUp == static_cast<std::uint32_t>(IfOperStatusUp));
+
+// One bounded adapter-list read in agent-core, written through the pure row builder of the action.
+int write_adapter_list_rows(yuzu::CommandContext& ctx,
+                            yuzu::network_config::WindowsRows (*build)(
+                                const yuzu::agent::win::AdapterList&)) {
+    const auto list = yuzu::agent::win::read_adapters(yuzu::agent::win::kAdapterListDeadline);
+    yuzu::agent::forward_bounded_failure(ctx, list.status, "network_config:adapter_list");
+    const auto out = build(list);
+    for (const auto& row : out.rows)
+        ctx.write_output(row);
+    return out.rc;
 }
 #endif
 
@@ -736,35 +732,7 @@ RouteDumpResult fetch_default_route_dump() {
 
 int do_adapters(yuzu::CommandContext& ctx) {
 #ifdef _WIN32
-    ULONG buf_size = 0;
-    GetAdaptersAddresses(AF_UNSPEC, GAA_FLAG_INCLUDE_PREFIX, nullptr, nullptr, &buf_size);
-    if (buf_size == 0) {
-        ctx.write_output("adapter|No adapters found|-|0|unknown");
-        return 0;
-    }
-
-    std::vector<BYTE> buffer(buf_size);
-    auto* adapters = reinterpret_cast<PIP_ADAPTER_ADDRESSES>(buffer.data());
-    if (GetAdaptersAddresses(AF_UNSPEC, GAA_FLAG_INCLUDE_PREFIX, nullptr, adapters, &buf_size) !=
-        NO_ERROR) {
-        ctx.write_output("adapter|Error enumerating adapters|-|0|unknown");
-        return 1;
-    }
-
-    for (auto* a = adapters; a; a = a->Next) {
-        // Skip loopback and tunnel adapters
-        if (a->IfType == IF_TYPE_SOFTWARE_LOOPBACK)
-            continue;
-        if (a->IfType == IF_TYPE_TUNNEL)
-            continue;
-
-        auto name = from_wide(a->FriendlyName);
-        auto mac = format_mac(a->PhysicalAddress, a->PhysicalAddressLength);
-        auto speed_mbps = a->TransmitLinkSpeed / 1'000'000;
-        const char* status = (a->OperStatus == IfOperStatusUp) ? "up" : "down";
-
-        ctx.write_output(std::format("adapter|{}|{}|{}|{}", name, mac, speed_mbps, status));
-    }
+    return write_adapter_list_rows(ctx, yuzu::network_config::windows_adapter_rows);
 
 #elif defined(__linux__)
     auto links = fetch_link_dump();
@@ -872,45 +840,7 @@ int do_adapters(yuzu::CommandContext& ctx) {
 
 int do_ip_addresses(yuzu::CommandContext& ctx) {
 #ifdef _WIN32
-    ULONG buf_size = 0;
-    GetAdaptersAddresses(AF_UNSPEC, GAA_FLAG_INCLUDE_GATEWAYS, nullptr, nullptr, &buf_size);
-    if (buf_size == 0)
-        return 0;
-
-    std::vector<BYTE> buffer(buf_size);
-    auto* adapters = reinterpret_cast<PIP_ADAPTER_ADDRESSES>(buffer.data());
-    if (GetAdaptersAddresses(AF_UNSPEC, GAA_FLAG_INCLUDE_GATEWAYS, nullptr, adapters, &buf_size) !=
-        NO_ERROR) {
-        return 1;
-    }
-
-    for (auto* a = adapters; a; a = a->Next) {
-        if (a->IfType == IF_TYPE_SOFTWARE_LOOPBACK)
-            continue;
-        if (a->IfType == IF_TYPE_TUNNEL)
-            continue;
-
-        auto adapter_name = from_wide(a->FriendlyName);
-
-        // Collect first gateway
-        std::string gateway = "-";
-        for (auto* gw = a->FirstGatewayAddress; gw; gw = gw->Next) {
-            auto addr = sockaddr_to_string(gw->Address.lpSockaddr);
-            if (!addr.empty()) {
-                gateway = addr;
-                break;
-            }
-        }
-
-        // List unicast addresses
-        for (auto* ua = a->FirstUnicastAddress; ua; ua = ua->Next) {
-            auto addr = sockaddr_to_string(ua->Address.lpSockaddr);
-            if (addr.empty())
-                continue;
-            ctx.write_output(
-                std::format("ip|{}|{}|{}|{}", adapter_name, addr, ua->OnLinkPrefixLength, gateway));
-        }
-    }
+    return write_adapter_list_rows(ctx, yuzu::network_config::windows_ip_rows);
 
 #elif defined(__linux__)
     auto links = fetch_link_dump();
@@ -1057,35 +987,7 @@ int do_ip_addresses(yuzu::CommandContext& ctx) {
 
 int do_dns_servers(yuzu::CommandContext& ctx) {
 #ifdef _WIN32
-    ULONG buf_size = 0;
-    GetAdaptersAddresses(AF_UNSPEC, GAA_FLAG_INCLUDE_PREFIX, nullptr, nullptr, &buf_size);
-    if (buf_size == 0)
-        return 0;
-
-    std::vector<BYTE> buffer(buf_size);
-    auto* adapters = reinterpret_cast<PIP_ADAPTER_ADDRESSES>(buffer.data());
-    if (GetAdaptersAddresses(AF_UNSPEC, GAA_FLAG_INCLUDE_PREFIX, nullptr, adapters, &buf_size) !=
-        NO_ERROR) {
-        return 1;
-    }
-
-    for (auto* a = adapters; a; a = a->Next) {
-        if (a->IfType == IF_TYPE_SOFTWARE_LOOPBACK)
-            continue;
-        if (a->IfType == IF_TYPE_TUNNEL)
-            continue;
-
-        auto adapter_name = from_wide(a->FriendlyName);
-
-        for (auto* dns = a->FirstDnsServerAddress; dns; dns = dns->Next) {
-            auto addr = sockaddr_to_string(dns->Address.lpSockaddr);
-            if (addr.empty())
-                continue;
-            auto family = dns->Address.lpSockaddr->sa_family;
-            const char* type = (family == AF_INET6) ? "IPv6" : "IPv4";
-            ctx.write_output(std::format("dns|{}|{}|{}", adapter_name, addr, type));
-        }
-    }
+    return write_adapter_list_rows(ctx, yuzu::network_config::windows_dns_rows);
 
 #elif defined(__linux__)
     std::ifstream resolv("/etc/resolv.conf");

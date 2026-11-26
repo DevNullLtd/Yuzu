@@ -20,8 +20,10 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <cstdint>
 #include <string>
 #include <string_view>
+#include <vector>
 
 using namespace yuzu::network_config;
 
@@ -1229,3 +1231,129 @@ TEST_CASE("parse_default_route_dump reports truncation honestly on malformed inp
 }
 
 #endif // __APPLE__
+
+// ── Windows adapters / ip_addresses / dns_servers rows ───────────────────
+//
+// Pure builders over agent-core's adapter list, so they run on every host.
+
+namespace {
+
+yuzu::agent::win::AdapterList windows_adapter_fixture() {
+    using yuzu::agent::win::Adapter;
+    yuzu::agent::win::AdapterList list;
+    list.status = yuzu::agent::BoundedStatus::Completed;
+
+    Adapter loopback;
+    loopback.friendly_name = "Loopback Pseudo-Interface 1";
+    loopback.if_type = 24;
+    loopback.oper_status = 1;
+    loopback.unicast = {{"127.0.0.1", 4, 8}};
+    loopback.gateways = {"127.0.0.1"};
+    loopback.dns_servers = {{"127.0.0.1", 4, 0}};
+
+    Adapter tunnel = loopback;
+    tunnel.friendly_name = "Teredo Tunneling Pseudo-Interface";
+    tunnel.if_type = 131;
+
+    Adapter ethernet;
+    ethernet.friendly_name = "Ethernet";
+    ethernet.if_type = 6;
+    ethernet.oper_status = 1;
+    ethernet.transmit_link_speed = 1'000'000'000;
+    ethernet.physical_address = {0x00, 0x00, 0x5e, 0x00, 0x53, 0xab};
+    ethernet.unicast = {{"fe80::1", 6, 64}, {"", 4, 24}, {"192.0.2.10", 4, 24}};
+    ethernet.gateways = {"", "192.0.2.1", "192.0.2.2"};
+    ethernet.dns_servers = {{"192.0.2.53", 4, 0}, {"", 4, 0}, {"2001:db8::53", 6, 0}};
+
+    Adapter wifi; // down, unknown speed, an address longer than six bytes, no gateway
+    wifi.friendly_name = "Wi-Fi";
+    wifi.if_type = 71;
+    wifi.oper_status = 2;
+    wifi.transmit_link_speed = UINT64_MAX;
+    wifi.physical_address = {0x0a, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x11, 0x22};
+    wifi.unicast = {{"169.254.1.1", 4, 16}};
+    wifi.dns_servers = {{"fec0:0:0:ffff::1", 6, 0}};
+
+    Adapter short_mac;
+    short_mac.friendly_name = "Short";
+    short_mac.if_type = 23;
+    short_mac.oper_status = 1;
+    short_mac.physical_address = {0xaa, 0xbb, 0xcc, 0xdd, 0xee};
+
+    list.adapters = {loopback, tunnel, ethernet, wifi, short_mac};
+    return list;
+}
+
+} // namespace
+
+TEST_CASE("windows adapter, ip and dns rows from one adapter list", "[network_config][windows]") {
+    const auto list = windows_adapter_fixture();
+
+    const auto adapters = windows_adapter_rows(list);
+    CHECK(adapters.rc == 0);
+    CHECK(adapters.rows == std::vector<std::string>{
+                               "adapter|Ethernet|00:00:5E:00:53:AB|1000|up",
+                               "adapter|Wi-Fi|0A:BB:CC:DD:EE:FF|18446744073709|down",
+                               "adapter|Short|-|0|up",
+                           });
+
+    const auto ips = windows_ip_rows(list);
+    CHECK(ips.rc == 0);
+    CHECK(ips.rows == std::vector<std::string>{
+                          "ip|Ethernet|fe80::1|64|192.0.2.1",
+                          "ip|Ethernet|192.0.2.10|24|192.0.2.1",
+                          "ip|Wi-Fi|169.254.1.1|16|-",
+                      });
+
+    const auto dns = windows_dns_rows(list);
+    CHECK(dns.rc == 0);
+    CHECK(dns.rows == std::vector<std::string>{
+                          "dns|Ethernet|192.0.2.53|IPv4",
+                          "dns|Ethernet|2001:db8::53|IPv6",
+                          "dns|Wi-Fi|fec0:0:0:ffff::1|IPv6",
+                      });
+}
+
+TEST_CASE("windows row builders on an empty table and on a failed read",
+          "[network_config][windows]") {
+    using yuzu::agent::BoundedStatus;
+    yuzu::agent::win::AdapterList list;
+    list.status = BoundedStatus::Completed;
+
+    SECTION("empty table") {
+        list.empty_table = true;
+        const auto adapters = windows_adapter_rows(list);
+        CHECK(adapters.rc == 0);
+        CHECK(adapters.rows ==
+              std::vector<std::string>{"adapter|No adapters found|-|0|unknown"});
+        CHECK(windows_ip_rows(list).rc == 0);
+        CHECK(windows_ip_rows(list).rows.empty());
+        CHECK(windows_dns_rows(list).rc == 0);
+        CHECK(windows_dns_rows(list).rows.empty());
+    }
+
+    const std::vector<std::string> error_row{"adapter|Error enumerating adapters|-|0|unknown"};
+
+    SECTION("OS error") {
+        list.win_error = 87;
+        CHECK(windows_adapter_rows(list).rc == 1);
+        CHECK(windows_adapter_rows(list).rows == error_row);
+        CHECK(windows_ip_rows(list).rc == 1);
+        CHECK(windows_ip_rows(list).rows.empty());
+        CHECK(windows_dns_rows(list).rc == 1);
+        CHECK(windows_dns_rows(list).rows.empty());
+    }
+
+    SECTION("the read did not complete") {
+        for (const auto status : {BoundedStatus::TimedOut, BoundedStatus::Busy,
+                                  BoundedStatus::Abandoned, BoundedStatus::Rejected}) {
+            list.status = status;
+            CHECK(windows_adapter_rows(list).rc == 1);
+            CHECK(windows_adapter_rows(list).rows == error_row);
+            CHECK(windows_ip_rows(list).rc == 1);
+            CHECK(windows_ip_rows(list).rows.empty());
+            CHECK(windows_dns_rows(list).rc == 1);
+            CHECK(windows_dns_rows(list).rows.empty());
+        }
+    }
+}
