@@ -106,6 +106,93 @@ Run each component under its own system user:
 - `yuzu-agent` — agent process
 - `yuzu-gw` — gateway process
 
+### Firewall snapshot broker (Linux packages)
+
+The packaged agent unit keeps `NoNewPrivileges=true` and a bounding set of one capability, so it
+cannot read the nftables ruleset or the legacy iptables tables itself. The `.deb` and `.rpm` ship a
+root-owned socket unit for that, and the agent unit pulls it in (`Wants=yuzu-fw-snapshot.socket`).
+The units need systemd 239 or later; on a host with the legacy cgroup hierarchy `IPAddressDeny` is
+parsed and not enforced (measured on Rocky 8.10, systemd 239) and the address-family list is the
+bound.
+
+- `yuzu-fw-snapshot.socket` listens on `/run/yuzu-fw-snapshot.sock`, owned by root with group
+  `yuzu-agent` and mode `0660`, so only that group can connect.
+- Each connection starts `yuzu-fw-snapshot@.service`, which runs one fixed script as root with no
+  input and a read-only file system, `/run` included. The script runs `nft -a list ruleset` and
+  each address family's legacy save tool under its own name (`iptables-legacy-save` and
+  `ip6tables-legacy-save`, which list every instantiated table) with those literal arguments and
+  nothing else; a family with no save tool reads the kernel's own table list instead. The reply is
+  cut at 4 MiB. The agent sends nothing, checks that root created the socket and treats the reply as
+  untrusted text. The script changes no ruleset and writes no file. For the tables the kernel lists,
+  the legacy reads load no module and take no lock. Two reads can make the kernel load a module,
+  both measured (ADR-3007 clause 3): an nft read on a host where nf_tables is not loaded makes the
+  kernel load nf_tables (an empty ruleset, no table and no rule), and a legacy save tool that asks
+  for a table whose module is not loaded makes the kernel load that module (an empty table), which
+  the broker's reads reach only when a table is removed while a read is under way.
+- **What the agent account can now read:** the host's full nftables ruleset, rule handles and rule
+  comments included, and every instantiated legacy `iptables` and `ip6tables` table. Through the
+  broker it can change no ruleset and write no file, and the agent unit's own sandbox is unchanged.
+  Anyone who can run code as the agent can read those listings; treat the ruleset as readable by
+  that account. A host with no `nft` command cannot have nf_tables read through the broker: the
+  plugin then reports `error|nftables:snapshot:absent` and never `inactive` for it.
+- The service unit has its own sandbox (its own two capabilities, a system call filter, address
+  families, a read-only file system). It does not set `NoNewPrivileges`: with SELinux enforcing
+  (measured on Rocky 9.9, systemd 252) the exec of `nft` was a denied `nnp_transition` under
+  `NoNewPrivileges` and `nft` ran outside its own confined domain; the bounding set and the
+  filters, which systemd applies to every process the script starts, are what bound it. On Ubuntu
+  26.04 the broker's processes ran unconfined by AppArmor (measured). One thing changes without the
+  flag: an exec of a setuid or setgid program that belongs to another user or group changes the
+  process to that identity. That adds no capability beyond the two in the bounding set, the
+  filters still apply, and the script runs only `nft`, the two legacy save tools and `head`, with
+  no input. The service unit's IP egress filter takes effect only on hosts with the unified cgroup
+  hierarchy; its address-family list is what bounds its sockets. The agent unit keeps
+  `NoNewPrivileges=true`.
+- A packaged host with no socket file answers as a host without the broker does: after the error
+  row of the refused netlink read (`error|nftables:table:eperm`), firewalld's own rows on a
+  firewalld host (`backend|firewalld`, `state|running`, `ruleset|unknown`) and `unknown` elsewhere,
+  with no row that names the snapshot. If a read answers so, look at the socket: its file is gone
+  when the socket was stopped, was masked before it ever started, or has failed (below). A read
+  whose first snapshot was `inactive` and whose second found the socket gone answers `unknown` with
+  `error|snapshot:gone`, for the same reason. The socket fails when systemd's activation limit is
+  passed: `TriggerLimitBurst=200` in `TriggerLimitIntervalUSec=2s` (the `systemctl show` values),
+  with connections refused at `MaxConnections` counted. Measured on Rocky 9.9 (systemd 252): 150
+  connections made at once left the socket active, and after 250 `systemctl show -p Result
+  yuzu-fw-snapshot.socket` printed `trigger-limit-hit` and the socket file was removed; on Ubuntu
+  26.04 (systemd 259) 150, 250 and 600 connections did not fail it. A `state` or `rules` read makes
+  at most two connections, so the agent's own reads pass that limit only above 100 reads of one host
+  inside 2 seconds. The socket also fails at the first connection when `yuzu-fw-snapshot@.service`
+  is masked (`Result=resources`): that read answers `error|snapshot:empty` and the reads after it
+  find no socket (measured on Ubuntu 26.04 and Rocky 9.9); unmask the template first. Run `systemctl
+  status yuzu-fw-snapshot.socket`; then `systemctl reset-failed yuzu-fw-snapshot.socket` and
+  `systemctl start yuzu-fw-snapshot.socket`, once the connections that failed it have stopped: on
+  Rocky 9.9 a reset and start made 3 seconds after them held, one made straight after them failed
+  again at the next connection, and `systemctl restart yuzu-agent` alone also recovered the socket.
+  `journalctl -u 'yuzu-fw-snapshot@*'` shows each instance.
+- If a read answers `error|snapshot:empty` or `error|snapshot:timeout`, the broker was reached and
+  did not reply in full: either four reads were already in flight (`MaxConnections=4`; a connection
+  over the limit is accepted and closed at once, the read is not retried and the next read answers)
+  or the instance could not start or finish, or, on a host whose first snapshot read `inactive`, the
+  two snapshots did not fit the one 5 second deadline they share.
+  `journalctl -u yuzu-fw-snapshot.socket` shows a connection dropped at the limit (on Ubuntu 26.04,
+  systemd 259: "Too many incoming connections (4), dropping connection."),
+  `systemctl list-units 'yuzu-fw-snapshot@*'` shows the instances that are running, and
+  `journalctl -u 'yuzu-fw-snapshot@*'` shows one that failed. A host that reads `inactive` makes two
+  connections per read.
+- To opt out, run `systemctl stop yuzu-fw-snapshot.socket` and then `systemctl mask
+  yuzu-fw-snapshot.socket`; to keep the broker from ever starting, run `systemctl mask
+  yuzu-fw-snapshot.socket` before the package is installed, and the agent starts without it. The
+  order matters on a running host: on Rocky 9.9 (systemd 252) `systemctl mask --now` alone left the
+  socket file, and the agent then reported `error|snapshot:connect:refused`; stop first and then
+  mask, or remove `/run/yuzu-fw-snapshot.sock`. The firewall plugin then answers as a host without
+  the broker does: on a firewalld host firewalld's own rows (`backend|firewalld`, `state|running`,
+  `ruleset|unknown`), elsewhere `state|unknown` and `ruleset|unknown`, in both cases after the one
+  error row of the refused netlink read (`error|nftables:table:eperm`). On a host without firewalld
+  the rows that follow are the answer of `iptables` itself (`backend|iptables`, `state|unknown`,
+  `ruleset|unknown`, or `backend|none` when neither `ufw` nor `iptables` ran); a refused `ufw`
+  writes no row. It is not silent.
+
+The design and its limits are in `docs/adr/3007-os-activated-read-helpers.md`.
+
 ## Gateway TLS (if you deploy the Erlang gateway)
 
 > **⚠ The gateway agent listener (`:50051`) is plaintext in every shipped compose except the reference gateway compose.**
@@ -624,6 +711,79 @@ whitelist leaves IPv6 fully contained.
 - A device that cannot reach the server needs out-of-band recovery. When in doubt, whitelist both
   families for the management server.
 
+### A device that is its own server refuses new containment
+
+A `firewall.quarantine` apply to a device whose server or gateway address is one of its own
+addresses, loopback included, is refused and changes nothing. A device that held no containment
+therefore stays uncontained and its record never confirms; one that was already contained stays
+contained (the agent's repair and its boot re-apply keep the stored containment, and the server's
+re-apply is refused there). The token alone does not say which: `firewall.quarantine_status` does. A
+containment stored earlier is still re-applied (see "Which applies are checked"). Every `firewall.quarantine` apply that is not
+`repair=1` is checked, whoever sent it (an operator's dispatch, the server's reconciler or an MCP
+re-apply) and an apply to an already-contained device included: the agent compares the control
+addresses (the address it is connected through, plus every address the configured server name
+resolved to at agent start) with every address the host answers to, and answers `refused|self_host`
+when one matches, or when a control address is loopback or unspecified. Containing such a host would
+cut the agent off from the very server that has to release it. A read of the host's own addresses
+that fails is refused too (`refused|own_addresses_unreadable`): an unknown is not "not this host".
+That read fails for good where the agent cannot read its interfaces, for example a unit or seccomp
+profile that denies `AF_NETLINK`: every checked apply is refused there until the agent is allowed
+`AF_NETLINK` (the agent log names the errno). Either answer changes nothing: no rules are built, no
+record is stored, and an existing record and its containment are left as they were; there is no
+override. The refusal is visible in the
+`status|refused|<token>` row of the command's stored reply (the `command_id` is in the device's
+`quarantine.reapply` audit row) and in the agent log (`firewall: quarantine -> refused:self_host`).
+
+- **A single-host stack cannot apply a containment.** An agent that talks to a server on the
+  same machine, such as a one-machine evaluation stack or a loopback test rig, answers
+  `refused|self_host` to every quarantine apply. A containment round trip needs the server on
+  a separate host. The check runs before the privilege check, so a packaged Linux unit whose server
+  is the host itself (the unit's default) answers `self_host`, not `privilege_unavailable`. Each
+  refused apply counts as a failed command, so `YuzuHighCommandFailureRate` can fire on an otherwise
+  idle server while the record stands.
+- **Which applies are checked.** Every `firewall.quarantine` apply that is not `repair=1` is
+  checked, whoever sent it, an apply to a device that is already contained included. Not checked: the
+  agent's 60-second repair, its boot-time re-apply, `firewall.release` and
+  `firewall.quarantine_allow`. A containment that is already stored is therefore still re-applied, and
+  is released wherever the agent can elevate; on the packaged Linux unit a release is refused too
+  (`privilege_unavailable`), so only a forced end ends the record. `firewall.release` and the console
+  steps (in "Known limit: addresses only") still lift a containment on a device that refuses.
+- **The record of a refused device that held no containment stays unconfirmed.** The server keeps
+  re-dispatching to a device that refuses, so a record for a device that held no containment never
+  confirms and `YuzuQuarantineEndpointUnconfirmed` fires after 15 minutes. Operator commands to the
+  device stay refused while the record exists. End it with `DELETE /api/v1/quarantine/{agent_id}`,
+  with `?force=true` where the device refuses the release (the packaged Linux unit).
+- **A contained device that became its own server stays contained.** A refusal changes nothing, so a
+  device that was contained and has since come to share its server's address (the server moved onto
+  the host, or, after an agent restart, the server name resolves to one of the host's own addresses)
+  answers every new apply `refused|self_host` and keeps the containment and its record as they were;
+  the agent's repair and its boot re-apply keep the stored containment too.
+  `firewall.quarantine_status` says what is in force, because the refusal token does not.
+  `firewall.release`, and the console steps in "Known limit: addresses only" below, still lift it. A
+  time limit set on the device (by a `firewall.quarantine` dispatch outside the quarantine routes; a
+  server apply carries none) still ends that containment, and the server cannot then contain it
+  again. Do not release and quarantine again to change the whitelist on such a device: the release
+  lifts the containment and the new quarantine is refused, so the device ends uncontained; use
+  `firewall.quarantine_allow`.
+- **Known limit: addresses only.** The check compares addresses. A server that runs in a container
+  or a VM on the same host and is reached at a bridge address (for example `172.17.0.2` behind
+  `docker0`) is not one of the host's own addresses, so that host can still be contained. NAT,
+  floating and port-forwarded addresses (a cloud elastic IP, a Linux `local` route) are not seen on
+  any OS either, and a host that holds one of the addresses its server name resolves to is refused
+  (never newly contained): the resolved set is read once at agent start, so restart the agent after
+  the server's address changes. A host contained this way has `forward` at policy drop with no
+  rules, so forwarded traffic is dropped and the server's published ports vanish for the whole fleet
+  while the containment stands; a server apply carries no time limit (`ttl_seconds`), and the
+  60-second repair puts back a table removed by hand. A host that runs the server while its agent
+  reaches a remote gateway or VIP passes the check the same way, and its new inbound connections are
+  dropped. The exits are `DELETE /api/v1/quarantine/{agent_id}` while the API is reachable,
+  otherwise console recovery: stop the agent service first, then remove the containment by hand
+  (Linux: `sudo nft delete table inet yuzu_quarantine`, or without nft delete the `yuzu-fwq-*`
+  chains and the jumps to them, in iptables and ip6tables; macOS:
+  `sudo pfctl -a com.apple/000.yuzu_quarantine -F rules -F nat`). Keep the agent stopped until the
+  record is ended with `?force=true`: a restarted agent re-applies a stored containment, and the
+  release the server then owes lifts it. Put the server on a separate host when containment matters.
+
 ### Reading the result honestly
 
 The plugin reports on two channels: the `status|<token>[|<reason>]` row in the output, and the ABI
@@ -642,7 +802,8 @@ unenforced or unreadable.
 
 Linux on the **packaged systemd unit** (`NoNewPrivileges`, no sudoers grant) refuses every mutating
 action `refused|privilege_unavailable`: `sudo` cannot elevate there, so a record on such a host stays
-unconfirmed and cannot be released from the server except by a forced end (below).
+unconfirmed and cannot be released from the server except by a forced end (below). A `quarantine`
+whose server is the host itself answers `refused|self_host` first.
 
 A result is a claim about firewall rules, not proof that traffic is blocked. For a device you
 believe is actively hostile, confirm with an independent probe.
@@ -669,18 +830,29 @@ verified proof confirms). Confirmed means **the device reports its rules in forc
   `firewall.quarantine_allow` sent outside the quarantine routes changes the device and not the record,
   and the record still reads confirmed;
 - the one difference the device itself reports is on a **new record for a device that is already
-  contained**. `firewall.quarantine` to a contained device keeps the exceptions already in force, and
-  when the request's exceptions differ from them (as a set, order aside) the reply carries
+  contained**. `firewall.quarantine` to a contained device keeps the exceptions already in force,
+  and when the request's exceptions differ from them (as a set, order aside) the reply carries
   `note|allow_set_unchanged_use_quarantine_allow=1`. For a record that has never been confirmed the
-  server then does **not** confirm it and does not read status: the device is contained, but not under
-  this record's whitelist. The record stays unconfirmed, one `quarantine.reapply` failure row
-  (`allow_set_not_applied record_id=<id> command_id=<id>`, one per record, and one more after a server
-  restart) is written, and
-  `YuzuQuarantineEndpointUnconfirmed` fires after its usual delay. **The new whitelist is still not on
-  the device.** To get it there, release the device and quarantine it again (the release ends the record
-  once the device confirms, and the new quarantine then applies the whitelist to a device that holds no
-  earlier exceptions). A record that was confirmed once keeps the behaviour above: later allow-list
-  drift is not detected.
+  server then does **not** confirm it and does not read status: the device is contained, but not
+  under this record's whitelist. The record stays unconfirmed, one `quarantine.reapply` failure row
+  (`allow_set_not_applied record_id=<id> command_id=<id>`, one per record, and one more after a
+  server restart) is written, and `YuzuQuarantineEndpointUnconfirmed` fires after its usual delay.
+  **The new whitelist is still not on the device.** To get it there, release the device and
+  quarantine it again (the release ends the record once the device confirms, and the new quarantine
+  then applies the whitelist to a device that holds no earlier exceptions). Not where the apply was
+  refused (the reply stored under the row's `command_id` reads `status|refused|self_host` or
+  `status|refused|own_addresses_unreadable`): there the release lifts the containment and a new
+  quarantine cannot put it back, so change the device's exceptions with `firewall.quarantine_allow`
+  until they equal the record's whitelist (the next apply then carries no note and the status read
+  confirms). The note rides a refusal too: on a device whose own record (the one the plugin keeps on
+  the device) is active, a refusal (`refused|self_host` or `refused|own_addresses_unreadable`)
+  carries it when the request's exceptions differ from those in force (as a set, same rule and text
+  as a retry that is not refused), and a never-confirmed record then stays unconfirmed the same way
+  (`allow_set_not_applied`). With equal exceptions there is no note and the status read confirms. Do
+  not release and quarantine again to change the whitelist on a device that refuses: the release
+  lifts the containment and the new quarantine is refused, so the device ends uncontained; use
+  `firewall.quarantine_allow`. A record that was confirmed once keeps the behaviour above: later
+  allow-list drift is not detected.
 
 ### Releasing a device
 
@@ -854,8 +1026,11 @@ refuses it), but its own firewall cannot be touched until a dispatch reaches it.
   fresh apply. A confirm is checked against the session that was live when the verifying status was
   sent. A restarted server applies first (its in-memory state starts empty), then reads status.
 - **A new record on a contained device.** See "What confirmed means": when the device says it kept
-  other exceptions, a record that was never confirmed is left unconfirmed, audited and alerted, and the
-  remedy is a release followed by a new quarantine.
+  other exceptions, a record that was never confirmed is left unconfirmed, audited and alerted, and
+  the remedy is a release followed by a new quarantine, except where the apply was refused
+  (`status|refused|self_host` or `status|refused|own_addresses_unreadable`): there the release lifts
+  the containment and a new quarantine cannot put it back, so change the device's exceptions with
+  `firewall.quarantine_allow` until they equal the record's whitelist.
 - **Release driving.** See "Releasing a device" above.
 - **The owed release.** A record ended by force before the device confirmed stays on a list until the
   device does. Per agent session the reconciler reads status (`inactive` clears it, audited

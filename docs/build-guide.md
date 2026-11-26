@@ -196,11 +196,10 @@ encoding.
   Inbound requests do not reach the decoder. The pre-routing body-cap gate refuses any
   non-identity `Content-Encoding` with 415 before the body is read (`evaluate_body_cap` in
   `body_cap_policy.hpp`).
-- **Agent.** The agent core is not compiled with Brotli support. Three plugins decode `br`:
-  - `http_client` and `content_dist`, which fetch operator-supplied URLs;
-  - `printing`, which talks to the local CUPS daemon.
-
-  The `virtualization` plugin links Brotli but calls `set_decompress(false)`, so it never decodes.
+- **Agent.** The agent core is not compiled with Brotli support. The four plugins that build an
+  HTTP client (`http_client`, `content_dist`, `printing` and `virtualization`) link Brotli but call
+  `set_decompress(false)` right after each client is constructed, so no agent client decodes `br`;
+  `tests/test_agent_http_no_decompress_lexical.py` pins that for every client under `agents/`.
 
 **SQLite.** The agent's SQLite is in `libyuzu_agent_core` (`.so`, `.dll` or `.dylib`). The server
 also links it.

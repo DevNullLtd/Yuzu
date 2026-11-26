@@ -2225,6 +2225,8 @@ of reading as NOT TESTED.
   crypto NIF needs OpenSSL SM4 symbols that Red Hat's OpenSSL lacks. The
   same defect is waiting behind #5143 on rockylinux:9.
 
+**Known nondeterministic test.** `tests/unit/test_echo_local_dispatcher.cpp`'s byte-budget rollup case (the `[budget]` test, `budget_evicted_raw_rows_total`) fails on one Linux workstation while CI passes; it is tracked as #7039 and is not a regression of the change under test. It is not in `tests/known-flaky.json`, so a red on it is not retried.
+
 **Gateway-upstream peer authorization and the rigs.** The server refuses to start with
 `--gateway-upstream` unless gateway peer authorization is configured or acknowledged as disabled
 (`--insecure-gateway-peer`, or `YUZU_INSECURE_GATEWAY_PEER=1`). The rigs that run the server from
@@ -4436,7 +4438,7 @@ yet establish a complete per-case execution inventory.
 
 The Instructions gate requires terminal SUCCESS from every agent counted in an
 untargeted dispatch's `agents_reached`, reads response pages, validates command
-and agent identities, and rejects any failure or malformed/incomplete evidence.
+and agent identities, and rejects any failure or malformed/incomplete evidence. Rows the runner skips by name (`agent.http_client.get`/`head`, `crossplatform.echo.configure` and `windows.rdp.set_state` always; `network_actions.ping`/`flush_dns` when `YUZU_INSTRUCTIONS_SKIP_PRIVILEGED=1`) are never dispatched by this gate: they are skips, not passes, and the reasons are printed at the start and kept in each row's note.
 Earlier RUNNING chunks are allowed when that agent has terminal success. The
 opt-in destructive/forensic path retains its separate stricter grading. These
 checks establish reported execution success, not action-specific postconditions.
