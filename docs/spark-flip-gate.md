@@ -1849,7 +1849,7 @@ flip, with a red-first test each:
       the next verification sample, by comparing the held handle's name with the one recorded at commit and the fresh
       open's name with the held one; a rename away and back inside one interval stays an ACCEPTED residual, Dave, no
       independent adjudicator; the name reported through HKCR, a per-user key appearing over a held machine key and a
-      link re-point were measured on the 2026-11-25 rig, the last two with scratch cases that are not committed) and two more accepted residuals found by the #7836 governance
+      link re-point were measured on the 2026-11-25 rig, the last two now pinned by committed cases) and two more accepted residuals found by the #7836 governance
       review: item 32 (an undecided verification keeps the old handle and so misses a rename it saw until the next
       verification that decides) and item 33 (an Ancestor-mode watch is never verified, so a later rename of its
       shelter ancestor, including one re-committed in Ancestor mode after a verdict, is missed); item 34 (a Fired
@@ -2029,8 +2029,8 @@ flip, with a red-first test each:
     catches both (measured, below). `NtQueryKey(KeyNameInformation)` on a handle opened through HKCR was MEASURED on the
     2026-11-25 rig to report the underlying key's canonical name (`\REGISTRY\USER\<SID>_Classes\...` for `.txt`,
     `Directory`, `CLSID`, `*`, `AppID`, `Interface`, `TypeLib`, `Installer` and `MIME`; `\REGISTRY\MACHINE\SOFTWARE\Classes\Licenses`
-    for `Licenses`), not an HKCR spelling. Also measured on the rig on 2026-11-25 (build 26100, probe plus scratch
-    Catch2 cases that are NOT committed, so no committed test pins these two): with a watch holding a machine class
+    for `Licenses`), not an HKCR spelling. Also measured on the rig on 2026-11-25 (build 26100, probe plus Catch2
+    cases, committed afterwards as the HKCR and link cases of the 2026-11-26 paragraph below): with a watch holding a machine class
     key, a per-user class key appearing over it leaves the held name and the held notify unchanged (the notify does not
     fire) while a fresh open names the per-user `_Classes` key; a registry link re-pointed from one target to another
     does the same (held handle on the old target, fresh open on the new one, no notify). Through the real mechanism each
@@ -2511,10 +2511,11 @@ flip, with a red-first test each:
     measured to report different names when a per-user class key appears over a held machine key (held machine, fresh
     per-user `_Classes`, the held notify not signalled) and when a registry link is re-pointed (held old target,
     fresh new target, not signalled); through the real mechanism each gave one `registry watch path re-pointed to
-    another key` fault, recovery onto the new key and no flap, using scratch Catch2 cases that are NOT committed. A
+    another key` fault, recovery onto the new key and no flap, using scratch Catch2 cases (committed afterwards, see the
+    2026-11-26 paragraph below). A
     per-user key deleted while held answered `0xC000017C` and fired the notify, so the watch settled with no fault.
-    The delete race was then driven through the real mechanism with parked-worker scratch cases (not committed; 20 of 20
-    runs, no flake). When the delete's own fire is consumed before the verification result is judged, which is the
+    The delete race was then driven through the real mechanism with parked-worker scratch cases (20 of 20
+    runs, no flake; committed afterwards as the four delete-race cases of the 2026-11-26 paragraph below). When the delete's own fire is consumed before the verification result is judged, which is the
     natural order, the real `0xC000017C` is returned but the result is committed as the re-arm and the name verdict is
     never reached, so `verify_name_undecided` stays 0 and the watch converges; the undecided-by-name row is reached only
     when the sweeper judges the result first (forced with a sweep hook: counter 0 to 1, no fault, converges). An
@@ -2530,6 +2531,34 @@ flip, with a red-first test each:
     genuine UAC-filtered token could not be started, the rig has no CI runner so the runner's own token was not
     observed, and no non-administrator account was created. Not measured: a real non-administrator account, the
     runner token, and the profile unload cycle.
+    **2026-11-26, R1: the HKCR, link and delete-race cases are committed; author-reported, weecolin rig, build 26100, not a CI
+    run, raw logs not in the tree.** The scratch cases of the two paragraphs above are now committed, as seven Windows
+    cases (22 `[7877]` cases in all, 650 assertions): a per-user HKCR class key appearing over a held machine key (with a
+    negative control first) and one deleted while held, a registry link re-pointed (titles end `(#7877 item 31, HKCR)` and
+    `(#7877 item 31, link)`), and the delete race, driven with the verification worker parked before its held-name query,
+    in the natural and in the sweeper-first order, each with a plain delete and with a delete and re-create (titles end
+    `(#7877 item 31, delete race)`). The measured results above stand and are asserted: one `registry watch path
+    re-pointed to another key` fault, recovery onto the new key (per-user `_Classes` name, or the link's second target),
+    a write there fires, no flap; a deleted per-user key settles with no fault and the committed name goes back to the
+    machine key; the real `0xC000017C` is read on the worker (a test-held handle on the same key object), the natural order
+    leaves `verify_name_undecided` at 0 and the sweeper-first order takes it from 0 to 1, neither faults, both converge.
+    The sweeper-first window is 4 ms inside the sweeper's 5 ms pass, so the driver repeats the whole scenario up to five
+    times if a slow box loses it; in the 21 runs below it was reached at the first attempt every time. NOT committed, on
+    purpose: the plain delete with the worker parked before its open (it faults `registry watch key renamed or replaced`,
+    the item 37 class in #8188) and the unforced delete-and-recreate loop. The HKCR cases need a machine class key, so they
+    probe `HKLM\SOFTWARE\Classes` once and SKIP with the reason when the token cannot write it; the link and delete-race
+    cases use HKCU only and every case removes its salted `yuzu_test_name_*` keys on a failure too (the link by handle first).
+    Rig runs (tests commit `fa246079f9`; plain build, `-j4`, below-normal priority, one process at a time, cross-session
+    lock held): elevated token, all 22 pass, none skipped, 650 assertions, and 20 further sequential runs 20 of 20 (25 to 26
+    s a run, 551 s wall with 2 s between runs); `[spark][mechanism][windows]` 166 of 166 (3096 assertions); under `runas
+    /trustlevel:0x20000` (Administrators deny-only, High integrity, `SeChangeNotifyPrivilege` only) 20 pass, 598
+    assertions, and the two HKCR cases SKIP with the stated reason while the link and the four delete-race cases pass. Red
+    proof (a temporary edit on the rig, reverted, tree clean, rebuilt): with the fresh-versus-held compare neutralised
+    (row 4 never returns) 4 of the 22 go red, the HKCR-appears case, the link case and the two older cases that pin that
+    compare (the injected name, and the watch that recorded no name); the other 18 stay green. No `yuzu_test_*` key
+    remained under `HKCU\Software`, `HKCU\Software\Classes` or `HKLM\SOFTWARE\Classes` afterwards. Still not measured: a
+    real non-administrator account and the CI runner's own token (the second run above is a deny-only-Administrators
+    token), and ASan on the new cases.
     **Governance review and the fixes after it (#7836).** A scoped `/governance` run (range `da67bf0371..5731eb0632`, ten
     governance agents; happy-path, compliance-officer and enterprise-readiness were omitted by the caller, and the chaos
     plan was written, not executed) was NOT a pass: it raised 43 findings (REG-01 to REG-43), four of them blocking-provisional
@@ -4215,7 +4244,8 @@ stay deaf after a rename; review ids REG-04, REG-01, REG-02)
   another key` (the fresh open names another key than the held one) or `registry watch hive unloaded`; the new name
   counters are test-only too (#7658). The residual for item 31 is a parent renamed away and back inside one interval
   (not noticed). The sub-cases of a per-user key appearing over a held machine key and a link re-point were driven
-  on a rig (2026-11-25) and are detected by the fresh-versus-held compare, with scratch cases that are not committed.
+  on a rig (2026-11-25) and are detected by the fresh-versus-held compare; committed cases pin both (titles ending
+  `(#7877 item 31, HKCR)` and `(#7877 item 31, link)`).
 - Operator action: none exists beyond restarting the agent or `--spark-disable`. Not confirmed as a documented
   runbook step.
 - Compensating control: Spark File and Registry are not live (`prefer_spark_` is false in production), so only

@@ -88,10 +88,11 @@
  *     A per-user key appearing over a machine one while a watch holds the machine key
  *     leaves the held name and the held notify unchanged (no signal) while a fresh open
  *     names the per-user key; a link re-pointed from one target to another does the
- *     same. Both were driven through the real mechanism with scratch cases (not
- *     committed): one "re-pointed" fault, recovery onto the new key. A per-user key
+ *     same. Both are pinned through the real mechanism by committed cases in
+ *     test_spark_mechanism.cpp (titles ending "(#7877 item 31, HKCR)" and "(#7877 item
+ *     31, link)"): one "re-pointed" fault, recovery onto the new key. A per-user key
  *     deleted while held answers 0xC000017C on the held name and fires the notify, so
- *     it settles without a fault;
+ *     it settles without a fault (also a committed HKCR case);
  *     every watch commits at about the same time at startup, so a large fleet of
  *     watches launches its verifications together (probe lane cap, refusals
  *     defer without demoting coverage); a registry open that hangs pins one slot
@@ -1735,8 +1736,9 @@ private:
     ///      fresh-name query, which the next sample catches. Measured on a rig
     ///      (2026-11-25): NtQueryKey through HKCR reports the underlying key's name (per-user
     ///      `_Classes` or machine `SOFTWARE\Classes`); a per-user key appearing over a held
-    ///      machine key and a link re-pointed were each driven through the real mechanism
-    ///      with scratch cases (not committed) and gave one fault with this reason.
+    ///      machine key and a link re-pointed are each pinned through the real mechanism
+    ///      by a committed case (test_spark_mechanism.cpp, "(#7877 item 31, HKCR)" and
+    ///      "(#7877 item 31, link)") and give one fault with this reason.
     ///      Fault: re-pointed.
     ///   5. Otherwise, not ok (open or notify refused, hook or probe threw): undecided.
     ///      The watch keeps its handle and is NOT faulted (an unreadable path is not
