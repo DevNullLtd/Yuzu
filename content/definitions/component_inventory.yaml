@@ -185,11 +185,12 @@ status:
 ##   Windows: the Program Files and Program Files (x86) directories, on fixed local drives. The
 ##            WindowsApps directory under each (the Store packages) is not entered; it is counted
 ##            and reported as `package_tree_skipped`.
-##   All:     the same root, link and network-mount rules as scan: a root reached through a link or
-##            on a network mount (on Windows: a drive that is not a fixed local disk) is dropped and
-##            reported, and no link (on Windows: no reparse point) is followed at any path
-##            component. A missing root is not an error on Linux and macOS; on Windows it answers
-##            constrained (`dir_unreadable`).
+##   All:     the same root, link and network-mount rules as scan. Linux and macOS: a missing root
+##            is not an error, and a root reached through a link or on a network mount is dropped
+##            and reported. Windows: a missing root, or one that is a reparse point, answers
+##            constrained (`dir_unreadable`), and a root on a drive that is not a fixed local disk
+##            is dropped and reported. No link (on Windows: no reparse point) is followed at any
+##            path component.
 ## Candidates are files named <stem>.so or <stem>.so.<digits and dots> (Linux), <stem>.dylib
 ## (macOS) and <stem>.dll (Windows, the extension compared without regard to case; `.dll.mui` is not
 ## a candidate). Each candidate is opened once and its header is read in-process by the shared bounded

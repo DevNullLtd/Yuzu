@@ -577,7 +577,7 @@ unpacked (the archive's directory and, when needed, two small entries are read).
   and a row with no readable version (`version_unreadable`) ride the status row as information. On
   Windows a file the OS stores behind a reparse point (a cloud placeholder, a file compressed with the
   Windows Overlay Filter) is counted in `link_skipped` and not read. A `constrained` answer names its one cause only. A missing root is
-  skipped silently.
+  skipped silently on Linux and macOS; on Windows it answers `constrained` (`dir_unreadable`).
 - **What to do about a token.** Terminal (a repeat gives the same answer): `budget_entries`,
   `section_rows`, `anchor_rows`, `depth`, `dir_truncated`, and `archive_unenumerated` for that
   archive. Retryable: `budget_time` (run again off-peak), `archive_changed`,

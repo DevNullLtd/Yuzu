@@ -316,7 +316,8 @@ using DriveClassTest = std::function<DriveClass(char drive)>;
 /// planning, because a drive letter can be re-pointed (SUBST, a disk swap, hot-plug) inside the scan
 /// window (the `runtimes` plugin re-checks DRIVE_FIXED on every read for the same reason). Anything
 /// but a fixed answer, `unknown` included, refuses the open. The check and the open are two calls:
-/// only a privileged actor could re-point the drive between them (`runtimes` has the same residual).
+/// re-pointing the drive in that gap takes privilege or physical access (`runtimes` has the same
+/// residual).
 [[nodiscard]] inline bool volume_is_fixed(std::string_view walk_path, const DriveClassTest& drive_class) {
     const auto drive = drive_of_walk_path(walk_path);
     return drive && drive_class(*drive) == DriveClass::fixed;
