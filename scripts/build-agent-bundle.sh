@@ -592,6 +592,7 @@ EOF
 
 # Stage the self-extract entrypoint alongside yuzu-agents/ in the build context.
 cp deploy/docker/agent-bundle-extract.sh "$STAGING/extract.sh"
+cp deploy/docker/chisel-emit-status.py "$STAGING/chisel-emit-status.py"
 
 ok "Bundle tree staged at $BUNDLE_ROOT"
 du -sh "$BUNDLE_ROOT" 2>/dev/null | awk '{print "     payload size: "$1}'

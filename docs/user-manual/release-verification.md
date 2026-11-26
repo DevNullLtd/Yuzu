@@ -67,7 +67,7 @@ certificate at build time and cannot be restamped.
 | CycloneDX SBOMs | One per binary archive, package and installer (the Compose Wizard zip, first-party HTML and JavaScript, has none), named after the file without its extension (`yuzu-linux-x64.cdx.json`, `yuzu-agent_X.Y.Z_amd64.cdx.json`, `YuzuAgentSetup-X.Y.Z.cdx.json`, ...), and one per image: `yuzu-{server,gateway,postgres}-image.cdx.json` and `yuzu-{server,gateway,agent}-chisel-image.cdx.json` | `cyclonedx validate` |
 | SPDX SBOMs | `*.spdx.json`, the same set | `spdx-tools validate` |
 | SLSA provenance | `<artifact>.intoto.jsonl` where present: the platform archives and native installers of v0.11.0-rc2 and later (the Docker images' provenance is in GitHub's attestation registry only; which releases the registry holds is in section 4) | `gh attestation verify` |
-| Docker images | `ghcr.io/${OWNER}/yuzu-{server,gateway,postgres}:<tag>` and `ghcr.io/${OWNER}/yuzu-{server,gateway,agent}-chisel:<tag>` (the `-chisel` variants' operating-system packages are not vulnerability-scanned: [below](#image-vulnerability-scan-before-publishing)) | `cosign verify` |
+| Docker images | `ghcr.io/${OWNER}/yuzu-{server,gateway,postgres}:<tag>` and `ghcr.io/${OWNER}/yuzu-{server,gateway,agent}-chisel:<tag>` (the `-chisel` variants record their operating-system packages as dpkg `status.d` files, one per package: [below](#image-vulnerability-scan-before-publishing)) | `cosign verify` |
 | Image vulnerability scan reports | `trivy-yuzu-{server,gateway,postgres}.attempt-<N>.{json,txt,gate.txt}` and `trivy-yuzu-{server,gateway,agent}-chisel.attempt-<N>.{json,txt,gate.txt}`, and the same names with `grype-` for the second scanner, `<N>` being the workflow run attempt, and each passing attempt's publish journal `publish-<image>.attempt-<N>.txt` (none on v0.15.0 or any earlier release: the scan postdates them) | `sha256sum -c SHA256SUMS`; see [below](#image-vulnerability-scan-before-publishing) |
 | Agent-bundle image scan report | `trivy-yuzu-agent-bundle-chisel.attempt-<N>.{json,txt,gate.txt}`, `grype-yuzu-agent-bundle-chisel.attempt-<N>.{json,txt,gate.txt}` and `publish-yuzu-agent-bundle-chisel.attempt-<N>.txt`, attached after the release with its own checksum list `yuzu-agent-bundle-chisel-image-vuln-gate.attempt-<N>.SHA256SUMS` and `.sigstore` (none on v0.15.0 or any earlier release) | `cosign verify-blob` with the same identity as `SHA256SUMS`, then `sha256sum -c` that list ([commands below](#image-vulnerability-scan-before-publishing)) |
 
@@ -213,16 +213,22 @@ What this does **not** gate:
 
 - HIGH and lower findings, and CRITICAL findings with no fix released: they are in the report, not
   refused.
-- The operating-system packages of the chiselled images (`yuzu-*-chisel` and the agent-bundle delivery
-  image) are not covered by this scan. They are built from Ubuntu package slices and carry no package
-  database either scanner reads, so Trivy scans none of their OS packages. grype identifies only the few
-  packages whose binaries name their own package (busybox and openssl on the image we checked), and the
-  scan does not check that even those were matched against current advisories. Each Trivy `.gate.txt`
-  says `coverage: not-covered`. A passing scan of a chisel image is not evidence about its OS packages.
-  Use the non-chisel image if you need them covered. The four not-covered listings expire 2027-02-15 and
-  are not to be renewed; the planned fix is a scanner-readable package manifest emitted at build time
-  (#8415), a plan and not something shipped; until it ships, these images stop passing the release
-  gate after that date.
+- Unfixed findings in the operating-system packages of the chiselled images (`yuzu-*-chisel` and the
+  agent-bundle delivery image). They are built from Ubuntu package slices and carry no package
+  database of their own; the build writes one dpkg `status.d` record per cut package, so Trivy and
+  grype read those packages and the gate refuses a fixable CRITICAL in them like in any other
+  image. The records are per package: a slice is recorded as its whole package, so a finding in a
+  file the slice does not ship can be reported. An image on the not-covered list that Trivy sees
+  OS packages in is treated as covered, and the gate prints a warning that its listing is stale;
+  the listing applies only if Trivy sees no OS package, and then the `.gate.txt` says
+  `coverage: not-covered` and a passing scan is not evidence about the image's OS packages. The
+  four listings are removed by #8415 and expire 2027-02-15; their expiry is not consulted while
+  Trivy sees packages. Scanning a chisel image with your own Trivy or grype lists those packages
+  and their unfixed MEDIUM and lower findings; the gate does not refuse those. If a release
+  refuses a chisel image for a fixable CRITICAL, rebuild so the chisel archive resolves the fixed
+  package version, or accept the finding in `.trivyignore.yaml` or `.grypeignore.yaml` scoped to
+  that package and its exact version (a record covers a whole package, so scope it to the version
+  and say in the statement which shipped file is affected).
 - PostgreSQL itself in `yuzu-postgres`: its packages come from the PostgreSQL project's repository,
   which publishes no advisories the scanner matches, and the image holds them at the pinned minor.
 - Anything statically linked into the server and agent binaries. The gateway's bundled Erlang/OTP
@@ -810,7 +816,8 @@ assets: `yuzu-server`, `yuzu-gateway` and `yuzu-postgres`
 same version as the file SBOMs) of the image by its digest
 (`ghcr.io/<owner>/<image>@sha256:...`), the digest the release signs and
 attests, so the SBOM describes that exact image, not whatever a tag points at
-later. It lists the operating-system packages and what syft recognises in the
+later. It lists the operating-system packages (for a chiselled image, the cut packages from
+its `status.d` records, at package granularity) and what syft recognises in the
 image's files, so it does not list the C++ libraries linked statically into
 `yuzu-server` or `yuzu-agent` (the `yuzu-linux-x64` archive and the
 `yuzu-server` and `yuzu-agent` package SBOMs list those), nor what the gateway
