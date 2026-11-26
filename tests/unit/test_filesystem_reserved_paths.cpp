@@ -280,7 +280,7 @@ TEST_CASE("filesystem plugin: read/search/file_hash/get_acl refuse the agent's o
         return d.run(handle->descriptor(), action, params);
     };
 
-    for (const char* action : {"read", "search", "file_hash"}) {
+    for (const char* action : {"read", "search", "file_hash", "get_acl"}) {
         INFO(action);
         auto r1 = dispatch(action, key);
         CHECK(r1.rc != 0);
@@ -308,6 +308,11 @@ TEST_CASE("filesystem plugin: read/search/file_hash/get_acl refuse the agent's o
     auto good = dispatch("read", ok_file);
     CHECK(good.rc == 0);
     CHECK(good.captured.find("SECRET-SENTINEL") != std::string::npos);
+#ifndef _WIN32
+    // Negative control for the get_acl leg of the loop above: an unreserved path is answered, so
+    // the refusals there are the reserved-path guard and not the action failing for every path.
+    CHECK(dispatch("get_acl", ok_file).rc == 0);
+#endif
 
     handle->descriptor()->shutdown(ctx.get());
 }

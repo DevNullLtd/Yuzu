@@ -1278,6 +1278,24 @@ template <typename Req>
     return remote_addr == "127.0.0.1" || remote_addr == "::1";
 }
 
+/// The answer an UNAUTHENTICATED request gets from server.cpp's pre-routing handler (one copy;
+/// extend, never fork). Machine clients (`/api/*`, `/events`, `/mcp/*`, and the Prometheus
+/// scrape of `/metrics`) get a 401 JSON body: a scraper that is sent a 302 to the HTML sign-in
+/// page follows it and parses HTML. An htmx panel request gets a 401 with `HX-Redirect`, and
+/// everything else is redirected to the sign-in page. The 401 branch is tested BEFORE the htmx
+/// branch, so a request that carries `HX-Request` to a machine path still reads as a 401 JSON.
+enum class UnauthenticatedAnswer { Json401, HtmxRedirect401, SignInRedirect };
+
+[[nodiscard]] inline UnauthenticatedAnswer
+unauthenticated_answer(std::string_view path, bool has_hx_request) noexcept {
+    if (path.starts_with("/api/") || path == "/events" || path.starts_with("/mcp/") ||
+        path == "/metrics")
+        return UnauthenticatedAnswer::Json401;
+    if (has_hx_request)
+        return UnauthenticatedAnswer::HtmxRedirect401;
+    return UnauthenticatedAnswer::SignInRedirect;
+}
+
 /// Header names whose presence on a request means it passed through a proxy (WP06 F57).
 inline constexpr std::string_view kForwardingEvidenceHeaders[] = {
     "X-Forwarded-For", "Forwarded", "X-Real-IP", "Via", "X-Forwarded-Host", "X-Forwarded-Proto"};

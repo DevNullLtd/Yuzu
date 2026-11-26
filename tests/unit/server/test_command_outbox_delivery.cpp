@@ -20,6 +20,7 @@
 #include "pg/pg_exec.hpp"
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
+#include "schedule_arming_check.hpp"
 
 #include <yuzu/metrics.hpp>
 
@@ -31,12 +32,14 @@
 
 #include <cstdint>
 #include <cstdlib>
+#include <expected>
 #include <functional>
 #include <limits>
 #include <memory>
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 using namespace yuzu::server;
@@ -278,6 +281,89 @@ TEST_CASE("CommandOutboxDelivery[pg]: arming denied at delivery fails the occurr
 
     CHECK(probe.calls == 0); // re-authorization denied before any send
     CHECK(fx.raw_state("occ-deny") == "failed");
+}
+
+TEST_CASE("CommandOutboxDelivery[pg]: an unavailable arming answer reschedules, never fails the "
+          "occurrence and never dispatches",
+          "[command_outbox][pg][delivery]") {
+    DeliveryPg fx;
+    REQUIRE(fx.store().claim_and_enqueue(fx.req("occ-arm-unavail", "cmd-au"), fx.lock(),
+                                         fx.epoch()) == OutboxEnqueueOutcome::Enqueued);
+
+    yuzu::MetricsRegistry metrics;
+    const auto unavailable = [&] {
+        return metrics.counter("yuzu_server_command_outbox_deliver_arming_unavailable_total").value();
+    };
+    const auto denied = [&] {
+        return metrics.counter("yuzu_server_command_outbox_deliver_denied_total").value();
+    };
+
+    int asked = 0;
+    DispatchProbe probe;
+    auto loop = fx.make_delivery(
+        probe, /*arming_allow=*/true, &metrics, yuzu::kMaxOutboxRedeliveryHorizonCommands, nullptr,
+        [&asked](const std::string&, const std::string&, const std::string&,
+                 const std::unordered_map<std::string, std::string>&)
+            -> std::expected<bool, std::string> {
+            ++asked;
+            return std::unexpected(std::string("auth store unreadable"));
+        });
+    loop.tick();
+
+    CHECK(asked == 1);
+    CHECK(probe.calls == 0);                              // nothing sent on an unknown answer
+    CHECK(fx.raw_state("occ-arm-unavail") == "pending");   // owed, NOT failed as authority_denied
+    CHECK(unavailable() == 1.0);
+    CHECK(denied() == 0.0);                               // an unknown answer is not a denial
+
+    // Backed off: a same-second re-tick does not ask again.
+    loop.tick();
+    CHECK(asked == 1);
+}
+
+TEST_CASE("CommandOutboxDelivery[pg]: repeated unavailable arming answers hold the rest of the "
+          "tick at kMaxArmingUnavailablePerTick, and the next tick asks afresh",
+          "[command_outbox][pg][delivery]") {
+    DeliveryPg fx;
+    constexpr int kRows = yuzu::server::kMaxArmingUnavailablePerTick + 2;
+    for (int i = 0; i < kRows; ++i) {
+        const std::string occ = "occ-cap-" + std::to_string(i);
+        REQUIRE(fx.store().claim_and_enqueue(fx.req(occ, "cmd-cap-" + std::to_string(i)),
+                                             fx.lock(), fx.epoch()) ==
+                OutboxEnqueueOutcome::Enqueued);
+    }
+
+    int asked = 0;
+    bool available = false;
+    DispatchProbe probe;
+    probe.next.sent = 1;
+    auto loop = fx.make_delivery(
+        probe, /*arming_allow=*/true, nullptr, yuzu::kMaxOutboxRedeliveryHorizonCommands, nullptr,
+        [&asked, &available](const std::string&, const std::string&, const std::string&,
+                             const std::unordered_map<std::string, std::string>&)
+            -> std::expected<bool, std::string> {
+            ++asked;
+            if (!available)
+                return std::unexpected(std::string("auth store unreadable"));
+            return true;
+        });
+    loop.tick();
+
+    // The read is asked exactly the cap number of times; the remaining rows are not asked at all.
+    CHECK(asked == yuzu::server::kMaxArmingUnavailablePerTick);
+    CHECK(probe.calls == 0);
+    for (int i = 0; i < kRows; ++i)
+        CHECK(fx.raw_state("occ-cap-" + std::to_string(i)) == "pending");
+
+    // The hold is per tick: once the read recovers and the back-off has passed, every row is
+    // asked again and delivered.
+    available = true;
+    for (int i = 0; i < kRows; ++i)
+        fx.make_due("occ-cap-" + std::to_string(i));
+    asked = 0;
+    loop.tick();
+    CHECK(asked == kRows);
+    CHECK(probe.calls == kRows);
 }
 
 TEST_CASE("CommandOutboxDelivery[pg]: containment_unreadable reschedules, never marks sent",
