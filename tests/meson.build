@@ -4544,7 +4544,8 @@ if _bash_test.found()
   )
   # #4262: -Dbuild_examples=false must keep configuring a real build.
   # Configure-only smoke test (no compile) so it stays cheap on every leg;
-  # SKIPs cleanly when vcpkg_installed/<triplet> isn't populated yet.
+  # SKIPs cleanly when vcpkg_installed/<triplet> isn't populated yet, or holds only
+  # host tools with no CLI11 (e.g. a sanitizer-triplet install, #6719).
   # platform: OS-contract test, runs on every leg (docs is OS-independent and Linux-only since 2026-10-21);
   # it selects the per-OS vcpkg triplet (`uname -s`).
   test('build_examples=false gating smoke test',
