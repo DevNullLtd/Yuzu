@@ -53,9 +53,9 @@ def parse_manifest(text):
             name, version, arch = row["name"], row["version"], row["arch"]
         except KeyError as e:
             raise ValueError("a manifest package row has no %s field" % e)
-        if not (isinstance(name, str) and NAME_RE.match(name)
-                and isinstance(version, str) and VERSION_RE.match(version)
-                and isinstance(arch, str) and ARCH_RE.match(arch)):
+        if not (isinstance(name, str) and NAME_RE.fullmatch(name)
+                and isinstance(version, str) and VERSION_RE.fullmatch(version)
+                and isinstance(arch, str) and ARCH_RE.fullmatch(arch)):
             raise ValueError("manifest package row has a malformed name, version or arch: %r"
                              % (row,))
         if name in pkgs:
@@ -88,7 +88,7 @@ def source_from_show(text, name, version):
             fields.setdefault(k, v.strip())
         if fields.get("Package") == name and fields.get("Version") == version:
             source = fields.get("Source", "")
-            if source and not SOURCE_RE.match(source):
+            if source and not SOURCE_RE.fullmatch(source):
                 raise ValueError("archive record for %s=%s has a malformed Source: %r"
                                  % (name, version, source))
             return source

@@ -5,10 +5,11 @@
 # here passes that check anyway, and the gate prints NOT COVERED with the reason
 # for it on every run (and records it in the report). Listing an image is a
 # reviewed decision that its OS packages ship UNSCANNED by Trivy; it is not an
-# acceptance of any vulnerability in them. (The gate's second scanner, grype,
-# identifies only a few of these images' OS packages (busybox and openssl on the image checked) and refuses a fixable CRITICAL it
-# reports there, but nothing proves that coverage: docs/ci-architecture.md
-# "What it does not see". Each listing's reason describes Trivy's view.)
+# acceptance of any vulnerability in them. A listing applies only while Trivy
+# sees no OS package in the image. (The gate's second scanner, grype, refuses a
+# fixable CRITICAL it reports too, but nothing proves what it matched:
+# docs/ci-architecture.md "What it does not see". Each listing's reason
+# describes Trivy's view when it was approved.)
 #
 # Format, one image per line (validated by image-vuln-gate-checks.py; a
 # malformed line refuses the whole list):
@@ -38,8 +39,7 @@
 # which writes the manifest as status.d stanzas, so Trivy reads the packages and
 # the gate treats a listed image that shows packages as covered (it prints a
 # warning that the listing is stale and does not consult the expiry). The reason=
-# text below describes the state before the records existed and is kept as the
-# approved record. A listing applies only while Trivy sees no OS package. The
+# text below records the image as approved in #8315 and is kept unchanged. A listing applies only while Trivy sees no OS package. The
 # listings stay until a change removes them together with the test that pins
 # each Dockerfile's SLICES to what the scanner reads (#8415); until then a
 # regression to zero packages would pass as not covered. These four listings are

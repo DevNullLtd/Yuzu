@@ -224,7 +224,11 @@ What this does **not** gate:
   `coverage: not-covered` and a passing scan is not evidence about the image's OS packages. The
   four listings are removed by #8415 and expire 2027-02-15; their expiry is not consulted while
   Trivy sees packages. Scanning a chisel image with your own Trivy or grype lists those packages
-  and their unfixed MEDIUM and lower findings; the gate does not refuse those.
+  and their unfixed MEDIUM and lower findings; the gate does not refuse those. If a release
+  refuses a chisel image for a fixable CRITICAL, rebuild so the chisel archive resolves the fixed
+  package version, or accept the finding in `.trivyignore.yaml` or `.grypeignore.yaml` scoped to
+  that package and its exact version (a record covers a whole package, so scope it to the version
+  and say in the statement which shipped file is affected).
 - PostgreSQL itself in `yuzu-postgres`: its packages come from the PostgreSQL project's repository,
   which publishes no advisories the scanner matches, and the image holds them at the pinned minor.
 - Anything statically linked into the server and agent binaries. The gateway's bundled Erlang/OTP

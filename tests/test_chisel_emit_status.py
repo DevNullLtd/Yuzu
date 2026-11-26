@@ -41,6 +41,11 @@ MANIFEST = "\n".join([
 ])
 
 SHOW = """Package: libssl3t64
+Source: openssl-near
+Version: 3.5.1-1ubuntu3.1
+Architecture: amd64
+
+Package: libssl3t64
 Source: openssl-old
 Version: 3.5.1-1ubuntu2
 Architecture: amd64
@@ -94,7 +99,7 @@ class Behaviour(unittest.TestCase):
             d = {"kind": "package", "name": "a", "version": "1", "arch": "amd64"}
             d.update(kw)
             return json.dumps(d)
-        for bad in (row(name="../x"), row(name="a/b"), row(name="A"), row(version="1\nSource: x"),
+        for bad in (row(name="ab\n"), row(version="1.0\n"), row(arch="amd64\n"), row(name="../x"), row(name="a/b"), row(name="A"), row(version="1\nSource: x"),
                     row(version=""), row(arch="amd 64"), row(name=5),
                     '{"kind":"package","name":"a","version":"1"}'):
             with self.subTest(row=bad):
@@ -130,7 +135,7 @@ class Main(unittest.TestCase):
         ces.read_manifest = lambda root: manifest
         ces.archive_source = source
         try:
-            with tempfile.TemporaryDirectory() as root:
+            with tempfile.TemporaryDirectory(prefix="yuzu_test_chisel_") as root:
                 err, out = io.StringIO(), io.StringIO()
                 with redirect_stderr(err), redirect_stdout(out):
                     rc = ces.main(["--root", root, "--slices", slices])
@@ -163,7 +168,7 @@ class Main(unittest.TestCase):
         self.assertIn("no archive record", err)
 
     def test_a_missing_manifest_fails(self):
-        with tempfile.TemporaryDirectory() as root:
+        with tempfile.TemporaryDirectory(prefix="yuzu_test_chisel_") as root:
             err = io.StringIO()
             with redirect_stderr(err):
                 rc = ces.main(["--root", root, "--slices", "a_libs"])
@@ -195,6 +200,8 @@ class Subprocesses(unittest.TestCase):
         import shutil
         import subprocess
         if shutil.which("zstd") is None:
+            if os.environ.get("CI"):
+                self.fail("zstd is not installed: the manifest wrapper tests cannot run")
             self.skipTest("zstd is not installed")
         path = os.path.join(self.root, "var/lib/chisel/manifest.wall")
         subprocess.run(["zstd", "-q", "-o", path], input=raw, check=True)
