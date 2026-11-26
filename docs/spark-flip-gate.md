@@ -2569,7 +2569,7 @@ flip, with a red-first test each:
     mechanism, and the real (narrower) SACLs of a fleet.
     **2026-11-25 (later), R1 (#7877 item 31): first Windows rig run of the item 31 code and tests, which was RED, and the
     green runs after the test-side fixes; every rig figure here is author-reported, one box (weecolin, build 26100), not a
-    CI run, raw logs local only (evidence directory `/home/dgr/.claude/plans/spark-7877-evidence/`: `r1-rig`,
+    CI run, raw logs local only (evidence directory `~/.claude/plans/spark-7877-evidence/`: `r1-rig`,
     `r1-rig-asan`, `r1-rig-probes`, `r1-rig-race`, `r1-rig-committed`, `r1-rig-gate7`).** The item 31 code compiles on MSVC.
     The FIRST run, at `c36e78a6b3`, was red: `[7877]` 12 of 15 cases passed and 3 failed in all 20 repeat runs (430 of 433
     assertions; `[spark][mechanism][windows]` 156 of 159), because of three test-side defects, fixed in `141aee7bd6` (no
