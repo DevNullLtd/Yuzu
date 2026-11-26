@@ -2008,9 +2008,11 @@ jobs:
             export GITHUB_STEP_SUMMARY="$LOGS/ci-half-nonpg.summary.md"
             export YUZU_TEST_PROGRESS=1
             export YUZU_TEST_PROGRESS_FILE="$GITHUB_WORKSPACE/$LOGS/progress.log"
-            # Print a backtrace, the running case and MALLOC_PERTURB_ when a test
-            # binary dies on a fatal signal (#7872/#7503/#3507). Observe-only: the
-            # process still dies from the same signal. Linux glibc, non-sanitizer.
+            # Print a backtrace, the running case and MALLOC_PERTURB_ when
+            # yuzu_agent_tests (the only binary that links the listener) dies on a
+            # fatal signal (#7872). Observe-only: the process still dies from the
+            # same signal. Linux glibc, non-sanitizer. Exit-42 failures are not signals
+            # and are not captured. Remove once #7872 is root-caused.
             export YUZU_TEST_CRASH_BACKTRACE=1
             rm -f "$YUZU_TEST_PROGRESS_FILE"
             # docs suite is OS-independent and runs on the Linux leg only; OS-contract
@@ -2190,6 +2192,13 @@ jobs:
           if [[ "${rc[nonpg]:-1}" -ne 0 || "${rc[pg]:-1}" -ne 0 ]]; then
             exit 1
           fi
+
+      # Resolve the `<path>(+0xOFFSET)` frames the crash handler prints (the test
+      # binary hides its symbols). failure() leads the guard: an `if:` with no status
+      # function is implicitly success() and could never fire here.
+      - name: Symbolise test crash frames
+        if: failure()
+        run: scripts/ci/symbolise-crash-frames.sh "$BUILDDIR/meson-logs"
 
       # Run every registered migration pilot on the full Linux debug leg.
       # Keep the native reports and source identity even when a contract fails;

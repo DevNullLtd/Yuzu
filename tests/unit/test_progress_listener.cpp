@@ -66,6 +66,7 @@
 #include <cstring>
 #include <execinfo.h>
 #include <signal.h>
+#include <sys/wait.h>
 #endif
 #endif
 
@@ -88,8 +89,8 @@ std::string format_progress_line(long pid, std::string_view body) {
 
 #ifdef YUZU_CRASH_CAPTURE
 // Crash capture for the intermittent agent-shard SIGSEGV deaths (#7872). #7503 and
-// #3507 are the exit-42 siblings: exit 42 is a deliberate hard_exit, NOT a signal, so
-// this does not capture it.
+// #3507 are exit-42 siblings: exit 42 is NOT a signal, so this does not capture it
+// (and hard_exit is only called on Windows and macOS, so it is not Linux's source).
 //
 // Those runs end `killed by signal 11 SIGSEGV` with a different victim test each time
 // and nothing in the log but the last `[progress] START` line. meson sets a random
@@ -98,9 +99,11 @@ std::string format_progress_line(long pid, std::string_view body) {
 // can be replayed (`MALLOC_PERTURB_=<n> yuzu_agent_tests <case>`).
 //
 // Opt-in and silent otherwise, so every other leg is byte-identical. After printing, the
-// handler returns with the default disposition restored (SA_RESETHAND), so the process
-// still dies from the SAME signal and meson, flake-retry.py and the junit classifier see
-// exactly what they saw before. It only observes; it does not retry, mask or exit.
+// handler re-raises the signal with the default disposition restored (SA_RESETHAND), so
+// the process dies from the SAME signal and meson, flake-retry.py and the junit
+// classifier see exactly what they saw before. Returning instead would swallow a signal
+// sent by raise()/kill(), which does not re-fault, and could turn a crash green. It only
+// observes; it does not retry, mask or exit.
 //
 // Async-signal discipline: write(2) only, plus backtrace_symbols_fd (not formally
 // async-signal-safe; the risk is a second fault inside the handler, which then takes the
@@ -115,11 +118,16 @@ std::string format_progress_line(long pid, std::string_view body) {
 //    "previous" handler, prints its fatal report, restores ours and re-raises; ours then
 //    prints, so the [crash] block follows Catch2's report. During a case Catch2's own
 //    sigaltstack is the active one.
-//  - g_case is cleared at testCaseEnded; a crash with case "<none>" happened between
+//  - g_case is cleared at testCaseEnded, EXCEPT after Catch2 reports a fatal error (it
+//    calls testCaseEnded before re-raising into this handler), so "<none>" means between
 //    cases or in teardown. g_case is written on the test thread and read in the handler
 //    without synchronisation (diagnostic only, TSan excluded).
 //  - If stderr is a blocked pipe the write would hang the dying process, so the handler
 //    arms alarm(5) first; SIGALRM's default action then ends it (as SIGALRM, not SIGSEGV).
+//  - If Catch2's own fatal report faults, no [crash] block appears.
+//  - A stall inside the handler is ended by alarm(5), as SIGALRM, not the original signal.
+//  - Frames print as `<path>(+0xOFFSET)` (hidden visibility, no export_dynamic): ci.yml's
+//    "Symbolise test crash frames" step resolves them with addr2line.
 //  - SIGABRT also covers deliberate abort()/std::terminate, so a banner is not always a bug.
 //  - The handler, the altstack and the backtrace() warm-up shift heap and loader state a
 //    little: a crash that DISAPPEARS with this on is inconclusive, not fixed.
@@ -157,6 +165,9 @@ void handler(int sig) {
     const int depth = ::backtrace(frames, 64);
     ::backtrace_symbols_fd(frames, depth, STDERR_FILENO);
     write_str("[crash] end of backtrace\n");
+    // SA_RESETHAND has restored the default; re-deliver so the process dies from `sig`
+    // even when it came from raise()/kill() and returning would resume execution.
+    (void)::raise(sig);
 }
 
 void clear_case() {
@@ -225,9 +236,13 @@ public:
         emit(format_progress_line(pid_, std::format("START {}", info.name)));
     }
 
+    // Catch2 calls this just before it ends the case and re-raises into our handler; the
+    // case name must survive until then.
+    void fatalErrorEncountered(Catch::StringRef) override { fatal_ = true; }
+
     void testCaseEnded(Catch::TestCaseStats const& stats) override {
 #ifdef YUZU_CRASH_CAPTURE
-        if (crash_enabled_)
+        if (crash_enabled_ && !fatal_)
             crash_capture::clear_case();
 #endif
         if (!enabled_)
@@ -280,6 +295,7 @@ private:
 
     bool enabled_;
     bool crash_enabled_;
+    bool fatal_ = false;
     long pid_ = current_pid();
     clock::time_point start_{};
 };
@@ -298,3 +314,24 @@ TEST_CASE("progress listener: every line carries a pid column (#5073)", "[progre
     // The live process id is positive.
     REQUIRE(current_pid() > 0);
 }
+
+#ifdef YUZU_CRASH_CAPTURE
+// The handler must re-deliver the signal: a raise() that returned would let the case
+// carry on and the run pass. Forked so the dying process is not the test runner.
+TEST_CASE("crash capture: a raised fatal signal still kills the process by that signal",
+          "[progress_listener]") {
+    const pid_t pid = ::fork();
+    REQUIRE(pid >= 0);
+    if (pid == 0) {
+        // Child: async-signal-safe calls only until _exit.
+        (void)std::freopen("/dev/null", "w", stderr);
+        crash_capture::install();
+        (void)::raise(SIGBUS);
+        ::_exit(0); // reached only if the handler swallowed the signal
+    }
+    int status = 0;
+    REQUIRE(::waitpid(pid, &status, 0) == pid);
+    REQUIRE(WIFSIGNALED(status));
+    REQUIRE(WTERMSIG(status) == SIGBUS);
+}
+#endif
