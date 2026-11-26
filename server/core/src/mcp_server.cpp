@@ -2801,7 +2801,7 @@ static const ToolDef kTools[] = {
      "'truncated' set when either cut applies; count 0 with truncated true means the size "
      "cap cut everything (the first row alone exceeds it) and a retry returns the same. "
      "Rows left after a cut are the start of what was read (already the newest stored "
-     "output when the store read left the oldest out), not a prefix of the full answer. "
+     "output when the store read left the oldest out), so they may not be a prefix of the full answer. "
      "Errors: most errors carry a 'reason' (a cap, a permission or session withdrawn after "
      "the request was audited, an unreadable gate, a dispatch denial token such as "
      "forbidden or approval_required, an offline or withheld device, a poll outcome, or "

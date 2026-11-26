@@ -2165,7 +2165,7 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        deadline and a bounded store read; the MCP answer is capped at 1000
        rows and 1 MiB with a `truncated` flag (an answer already over the cap is
        cut and flagged at once, and the surviving rows are the start of what
-       was read, not a prefix of the full answer), the REST answer refuses over 4 MiB, 20000 rows or 64 stored
+       was read and may not be a prefix of the full answer), the REST answer refuses over 4 MiB, 20000 rows or 64 stored
        rows (`output_too_large`). A response-store ingest property remains and
        is not fixed here: if one middle chunk of a multi-chunk device answer
        is not stored, the read cannot detect the hole and may return the

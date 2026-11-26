@@ -11934,7 +11934,13 @@ TEST_CASE("MCP get_device_live: strict arguments (object, agent_id 1..256 and ne
     for (const auto& args : bad) {
         INFO(args);
         auto res = ts.call(live_req(args));
-        CHECK(live_error(res)["code"] == yuzu::server::mcp::kInvalidParams);
+        const auto err = live_error(res);
+        CHECK(err["code"] == yuzu::server::mcp::kInvalidParams);
+        // A4 envelope: the one correlation id of the call (the response header), no retry hint.
+        REQUIRE(res);
+        CHECK_FALSE(res->get_header_value("X-Correlation-Id").empty());
+        CHECK(err["data"]["correlation_id"] == res->get_header_value("X-Correlation-Id"));
+        CHECK(err["data"]["retry_after_ms"].is_null());
     }
     // No `arguments` key at all.
     auto none = ts.call(
@@ -12012,7 +12018,7 @@ TEST_CASE("MCP get_device_live: the served description states the lease limits t
     CHECK(description.find("a retry returns the same") != std::string::npos);
     CHECK(description.find("are the start of what was read") != std::string::npos);
     CHECK(description.find("already the newest stored output") != std::string::npos);
-    CHECK(description.find("not a prefix of the full answer") != std::string::npos);
+    CHECK(description.find("may not be a prefix of the full answer") != std::string::npos);
     CHECK(description.find("they come from the newest stored output") == std::string::npos); // the old wording
     CHECK(description.find("they are the newest ones") == std::string::npos); // the ambiguous wording
     CHECK(description.size() < 4096);
@@ -12045,7 +12051,12 @@ TEST_CASE("MCP get_device_live: a kind outside the REST pair (a dashboard-only k
     for (const char* kind : {"services", "hw_memory", "process_tree", "bogus", "Uptime", "uptime ", ""}) {
         INFO(kind);
         auto res = ts.call(live_req(live_args("WS-1", kind)));
-        CHECK(live_error(res)["code"] == yuzu::server::mcp::kInvalidParams);
+        const auto err = live_error(res);
+        CHECK(err["code"] == yuzu::server::mcp::kInvalidParams);
+        REQUIRE(res);
+        CHECK_FALSE(res->get_header_value("X-Correlation-Id").empty());
+        CHECK(err["data"]["correlation_id"] == res->get_header_value("X-Correlation-Id"));
+        CHECK(err["data"]["retry_after_ms"].is_null());
     }
     CHECK(probe.calls == 0);
     CHECK(ts.audit_log.empty());
@@ -12233,6 +12244,12 @@ TEST_CASE("MCP get_device_live: the two scoped gates are decided per device; a w
         CHECK(err["code"] == yuzu::server::mcp::kInternalError);
         CHECK(err["message"].get<std::string>().find("scope gate not configured") !=
               std::string::npos);
+        // One correlation id for the whole call: the body's equals the header's (it used to mint a
+        // second one), and a permanent refusal carries no retry hint.
+        REQUIRE(res);
+        CHECK_FALSE(res->get_header_value("X-Correlation-Id").empty());
+        CHECK(err["data"]["correlation_id"] == res->get_header_value("X-Correlation-Id"));
+        CHECK(err["data"]["retry_after_ms"].is_null());
         CHECK(probe.calls == 0);
         CHECK(unwired.audit_log.empty());
     }
