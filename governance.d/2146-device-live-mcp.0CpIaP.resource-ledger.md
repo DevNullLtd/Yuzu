@@ -120,3 +120,12 @@ HANDLE, SOCKET, `FILE*`, `sqlite3*`, OpenSSL or BCrypt object, allocated C strin
 callback context or thread, and no cast, `new`, `delete` or `malloc`. `openapi_spec()` still initialises one function-local
 `static const std::string` through `expand_ecosystem_tokens`, so its magic-static initialisation and its returned
 `const&` lifetime are unchanged. Reviewed by cpp-safety at Gate 3: no findings.
+
+## Fix round: PR #8791 review fixes (53dbf3d379, 743708d2cf and the docs commit)
+
+New resources: none. `mcp::live_read_store_degraded_retry_ms(std::string_view)` is a `constexpr noexcept` function over a
+borrowed view that it consumes within the call and returns an `int64_t` from (no allocation, no stored view). The three
+refusals in `get_device_live` now call the existing `a4_error` lambda with `{}`, `-1` and the call's `cid`; the lambda copies
+`cid_override` into a local `std::string` before use and escapes `remediation`, so no view outlives the call, and `cid` is the
+server-minted `ensure_correlation_id(res)` declared before every lambda that uses it. Tests add Catch2 locals and a `SqlFault`
+(repaired by explicit call and by destructor). Reviewed by cpp-safety and cpp-expert at Gate 3: no findings.
