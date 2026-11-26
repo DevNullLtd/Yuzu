@@ -568,11 +568,18 @@ read_lines("...vcpkg_installed/x64-windows/lib/pkgconfig/<pkg>.pc"): no such fil
    `error: failed: .../vcpkg_installed/x64-linux-asan/tools/protobuf/protoc:
    File exists`. The sanitizer leg then fails on a missing dependency
    (`Dependency "CLI11" not found`) rather than a real test result. It
-   occurs when jobs with different manifests alternate on one self-hosted
-   work dir (a dev or PR job, then the main nightly, whose `vcpkg.json`
-   differ). The sentinel now wipes any `vcpkg_installed/<triplet>/` tree
-   that the registry does not list, on every run, drift or not (pinned by
-   Test 6 in `scripts/ci/test-vcpkg-sentinel.sh`).
+   occurs when jobs whose key inputs differ (`vcpkg.json`, the baseline
+   commit or a triplet overlay; for example a dev or PR job and the main
+   nightly while a manifest change is on dev but not yet on main) alternate
+   on one self-hosted work dir. The sentinel now wipes any
+   `vcpkg_installed/<triplet>/` tree that the registry does not list, on
+   every run, drift or not (pinned by Test 6 in
+   `scripts/ci/test-vcpkg-sentinel.sh`). It skips symlinks, and skips the
+   check with a `::warning::` if `vcpkg_installed/vcpkg/info` is unreadable.
+   A repeated "orphaned tree detected" line means jobs with different keys
+   are sharing a work dir, and each flip costs one rebuild per sibling
+   triplet from the binary cache. If a wipe fails (a `::warning::` says so),
+   recover with `rm -rf <workspace>/vcpkg_installed/`.
 
 3. **`<workspace>/vcpkg/packages/<port>_<triplet>/` partial build**
    (separate failure mode, predates #741). A build killed mid-port leaves
@@ -585,10 +592,10 @@ read_lines("...vcpkg_installed/x64-windows/lib/pkgconfig/<pkg>.pc"): no such fil
 
 Full set of candidate corruption paths under `clean: false`:
 
-- `<workspace>/vcpkg/packages/` — pre-stage zips (path 2)
+- `<workspace>/vcpkg/packages/` — pre-stage zips (path 3)
 - `<workspace>/vcpkg/buildtrees/` — port build state
 - `<workspace>/vcpkg/installed/` — vcpkg classic-mode install (rare in manifest mode)
-- `<workspace>/vcpkg_installed/<triplet>/` — project install root (sentinel-managed)
+- `<workspace>/vcpkg_installed/<triplet>/` — project install root (sentinel-managed; an unlisted sibling tree is also wiped, path 2)
 - `<workspace>/vcpkg_installed/vcpkg/` — per-workspace registry (sentinel-managed since #741)
 - `<workspace>/vcpkg_installed/.<triplet>-cachekey.sha256` — the sentinel hash file
 - `${runner.tool_cache}/yuzu-vcpkg-binary-cache-windows` — runner-local binary cache

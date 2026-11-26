@@ -259,7 +259,7 @@ assert_msg "[[ $RC6A -eq 0 ]]" "6a: exit code is 0 (got $RC6A)"
 assert_msg "[[ ! -d '$WS6/vcpkg_installed/vcpkg' ]]" "6a: shared registry wiped on drift"
 assert_msg "[[ ! -d '$WS6/vcpkg_installed/$SIB' ]]" \
   "6a: sibling tree wiped with the registry that listed it"
-assert_msg "echo \"\$OUT6A\" | grep -q 'orphaned tree detected for triplet=$SIB'" \
+assert_msg "echo \"\$OUT6A\" | grep -q 'orphan triplet=$SIB'" \
   "6a: orphaned-tree log line names the sibling"
 
 # 6b: no drift, but the workspace is already in the stranded state (the
@@ -294,6 +294,45 @@ assert_msg "[[ ! -d '$WS6/vcpkg_installed/$TRIPLET' ]]" \
   "6c: the host tree is orphaned once only the -asan entry remains"
 assert_msg "[[ -d '$WS6/vcpkg_installed/$SIB' ]]" \
   "6c: the -asan tree keeps its own entry"
+
+# 6f: the shared registry dir is never treated as a triplet tree (checked
+# before 6e, whose host-less state legitimately trips the orphaned-registry rule)
+assert_msg "[[ -d '$WS6/vcpkg_installed/vcpkg/info' ]]" "6f: registry survives the orphan loop"
+
+# 6e: a symlink under vcpkg_installed is never followed, so its TARGET survives
+EXT="$TMPROOT/ext6"; mkdir -p "$EXT"; echo keep > "$EXT/keep"
+ln -s "$EXT" "$WS6/vcpkg_installed/linkdir"
+OUT6E=""; RC6E=0
+run_sentinel "$WS6" "baseline-two" OUT6E RC6E
+assert_msg "[[ $RC6E -eq 0 ]]" "6e: exit code is 0 (got $RC6E)"
+assert_msg "[[ -f '$EXT/keep' ]]" "6e: symlink target contents survive"
+rm -f "$WS6/vcpkg_installed/linkdir"
+
+# 6g: an UNREADABLE info/ must not wipe healthy trees (skipped with a warning).
+# chmod is a no-op for root, so this case only runs as a non-root user.
+if [[ "$(id -u)" -ne 0 ]]; then
+  WS6G="$TMPROOT/t6g"; mk_workspace "$WS6G"
+  OUT6G_PRIME=""; RC6G_PRIME=0
+  run_sentinel "$WS6G" "baseline-two" OUT6G_PRIME RC6G_PRIME   # prime the key
+  mkdir -p "$WS6G/vcpkg_installed/$TRIPLET/lib" "$WS6G/vcpkg_installed/vcpkg/info"
+  echo "x" > "$WS6G/vcpkg_installed/vcpkg/info/abseil_1_${TRIPLET}.list"
+  mkdir -p "$WS6G/vcpkg_installed/$SIB/lib"
+  chmod 000 "$WS6G/vcpkg_installed/vcpkg/info"
+  OUT6G=""; RC6G=0
+  run_sentinel "$WS6G" "baseline-two" OUT6G RC6G
+  chmod 755 "$WS6G/vcpkg_installed/vcpkg/info"
+  assert_msg "[[ $RC6G -eq 0 ]]" "6g: exit code is 0 (got $RC6G)"
+  assert_msg "[[ -d '$WS6G/vcpkg_installed/$SIB' && -d '$WS6G/vcpkg_installed/$TRIPLET' ]]" \
+    "6g: unreadable registry wipes nothing"
+  assert_msg "echo \"\$OUT6G\" | grep -q 'not readable'" "6g: a warning is emitted"
+fi
+
+# 6h: a workspace with no trees at all is a no-op
+WS6H="$TMPROOT/t6h"; mk_workspace "$WS6H"
+OUT6H=""; RC6H=0
+run_sentinel "$WS6H" "baseline-two" OUT6H RC6H
+assert_msg "[[ $RC6H -eq 0 ]]" "6h: fresh workspace exits 0 (got $RC6H)"
+assert_msg "! echo \"\$OUT6H\" | grep -q 'orphaned tree'" "6h: fresh workspace wipes nothing"
 
 rm -rf "$TMPROOT"
 
