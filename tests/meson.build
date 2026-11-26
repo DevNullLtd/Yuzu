@@ -4786,6 +4786,16 @@ test('agent httplib clients disable response decompression lexical gate (WP14-A)
   timeout: 30,
 )
 
+# ADR-3008: plugin code makes no direct call to the Windows APIs agent-core bounds, never includes
+# the single-flight driver or names a win_*.hpp test seam, and its bounded_call sites are frozen
+# file by file. Lexical; carries its own mutation self-test.
+test('plugin bounded OS call lexical gate (ADR-3008)',
+  _python3_test,
+  args: [files('test_bounded_os_call_lexical.py')],
+  suite: 'agent',
+  timeout: 30,
+)
+
 # #7035: static lexical gate over the Windows callers of the checked HKEY_USERS listing -- each
 # call tests `hku.error.empty()` before it reads `hku.names` and reports `hku_list_incomplete`, and
 # a new caller must be listed. Source text only (the callers cannot run in the unit suites).

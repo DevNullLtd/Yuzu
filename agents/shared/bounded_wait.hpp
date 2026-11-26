@@ -26,6 +26,12 @@
  * leaving the detached thread to complete (or not) on its own — harmless
  * once abandoned, since nothing observes its result after the deadline.
  *
+ * NEW PLUGIN CODE MUST NOT CALL bounded_call() OR bounded_call_ex() (ADR-3008):
+ * a plugin can be unloaded under the detached thread. A blocking OS call is
+ * bounded by an exported agent-core function instead. The remaining plugin sites
+ * are frozen by tests/test_bounded_os_call_lexical.py; agent-core and test
+ * binaries remain valid callers.
+ *
  * Two hardenings added by governance Gate 5 (chaos-injector), both closing
  * a real gap in the first cut of this primitive:
  *
