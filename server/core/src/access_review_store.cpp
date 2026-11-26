@@ -272,7 +272,8 @@ CREATE CONSTRAINT TRIGGER access_review_history_consistent AFTER INSERT
         // function, so none is re-created, and access_review_history_keep is untouched. Locks and
         // bounds as v3: ACCESS EXCLUSIVE on both tables for the whole transaction, the 30 s lock wait
         // and 300 s statement bound set below. The runner's per-store advisory lock is taken before
-        // this SQL and is bounded by the pool's 10 s, so start one replica first.
+        // this SQL and is bounded by the pool's 10 s lock_timeout (set by the pool only when the
+        // DSN carries no options=; pg_pool.cpp), so start one replica first.
         //
         // The raw strings are split below the 15,000-byte segment ceiling (MSVC refuses a single
         // string token near 16,380 bytes; tests/test_openapi_literal_segments.py states the

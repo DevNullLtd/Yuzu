@@ -4748,8 +4748,8 @@ the database and the reconciliation are the independent comparison. And the API 
 full text of a superseded decision at all: only this database read does.
 
 **Scope.** An attestation request must name the scope of the grant: `scope` is `fleet` or `management_group`, and
-`scope_group_id` is `""` (or absent) for `fleet` and a nonempty string of at most 256 bytes without a NUL byte (the management-group id limit) for
-`management_group`. A missing, mistyped or contradictory scope is a `400` / invalid-params before the gate. Every
+`scope_group_id` is `""` (or absent) for `fleet` and a nonempty string of at most 256 bytes without a NUL byte
+(the management-group id limit) for `management_group`. A missing, mistyped or contradictory scope is a `400` / invalid-params before the gate. Every
 grant frozen by this build is fleet-wide.
 
 **Bounds.** `principal_type`, `principal_id` and `role_name` are 1 to 1024 bytes without a NUL byte (the

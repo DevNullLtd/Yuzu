@@ -3312,6 +3312,12 @@ TEST_CASE("access review store errors: every string the store returns maps to on
     using yuzu::server::mcp::kPermissionDenied;
     // A named string: the table holds const char*, so a temporary's c_str() would dangle.
     const std::string kFrozenOwnerErr{yuzu::server::kStoreForbiddenEngineOwner};
+    // The two scope refusals the store builds from shared constants (a variable, not a literal
+    // after unexpected(, so the Python lexical gate does not see them): both are client refusals.
+    const std::string kScopeErr =
+        "bad_request: " + std::string(yuzu::server::kScopeGroupIdInvalidMessage);
+    const std::string kGrantFieldErr =
+        "bad_request: " + std::string(yuzu::server::kGrantFieldInvalidMessage);
     const Row rows[] = {
         {"not_found: no frozen grant matches (campaign_id, principal_type, principal_id, "
          "role_name, scope_group_id) in an open campaign",
@@ -3329,6 +3335,8 @@ TEST_CASE("access review store errors: every string the store returns maps to on
         {"bad_request: justification contains a NUL byte", 400, kInvalidParams},
         {"bad_request: justification exceeds 4096 bytes", 400, kInvalidParams},
         {"bad_request: closed_by contains a NUL byte", 400, kInvalidParams},
+        {kScopeErr.c_str(), 400, kInvalidParams},
+        {kGrantFieldErr.c_str(), 400, kInvalidParams},
         {"forbidden: reviewer is the subject of this grant", 403, kPermissionDenied},
         {kFrozenOwnerErr.c_str(), 403, kPermissionDenied},
         {"database not open", 503, kInternalError},

@@ -90,10 +90,6 @@
 /// DOES propagate — the pointer being present makes it part of the read set
 /// this call promised to read completely.
 
-#include "access_review_store.hpp" // GrantRef, the element type freeze_population builds
-
-#include <nlohmann/json_fwd.hpp>
-
 #include <cstddef>
 #include <cstdint>
 #include <expected>
@@ -101,6 +97,10 @@
 #include <string>
 #include <string_view>
 #include <vector>
+
+#include <nlohmann/json_fwd.hpp>
+
+#include "access_review_store.hpp" // GrantRef, the element type freeze_population builds
 
 namespace yuzu::server {
 

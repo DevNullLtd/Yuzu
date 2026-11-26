@@ -3033,12 +3033,22 @@ TEST_CASE("schema v4: the same grant attested under fleet and under a group scop
                 failures.fetch_add(1);
         }
     };
-    std::thread fleet_thread{attest, std::string(), std::string("attested"), std::string("carol")};
-    std::thread group_thread{attest, std::string("g-1"), std::string("flagged_revoke"),
-                             std::string("dave")};
-    go.store(true, std::memory_order_release);
-    fleet_thread.join();
-    group_thread.join();
+    {
+        // The guard is declared AFTER the threads, so it is destroyed FIRST: it opens the gate, then
+        // each jthread joins. A throwing second constructor therefore cannot leave the first worker
+        // spinning on a closed gate, or leave a joinable std::thread to std::terminate.
+        std::jthread fleet_thread;
+        std::jthread group_thread;
+        struct OpenGate {
+            std::atomic<bool>& gate;
+            ~OpenGate() { gate.store(true, std::memory_order_release); }
+        } open_gate{go};
+        fleet_thread = std::jthread{attest, std::string(), std::string("attested"),
+                                    std::string("carol")};
+        group_thread = std::jthread{attest, std::string("g-1"), std::string("flagged_revoke"),
+                                    std::string("dave")};
+        go.store(true, std::memory_order_release);
+    }
     CHECK(failures.load() == 0);
 
     auto view = store.get_campaign(cid, true);

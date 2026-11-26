@@ -478,6 +478,29 @@ TEST_CASE("access-review campaign fragment: a Scope column, and data-scope and d
     CHECK_THAT(list->body, ContainsSubstring("'\" (' + scopeText + ') for revocation? '"));
 }
 
+TEST_CASE("access-review campaign fragment: an empty campaign's placeholder row spans every "
+          "column of the table, Scope included",
+          "[pg][settings][access_review][6969]") {
+    YUZU_REQUIRE_PG_DB_TPL(db_, ar_engine_tpl);
+    Rig r{db_.dsn(), /*rbac_enabled=*/false}; // the default: the admin viewer can attest
+    auto id = r.reviews.open_campaign("Empty", "root", {}, "disabled");
+    REQUIRE(id.has_value());
+    const auto root = r.cookie("root", auth::Role::admin);
+
+    const auto res = r.cookie_get(std::string(kGetFragment) + "?id=" + *id, root);
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    const auto& b = res->body;
+    // Eight header cells for an attesting viewer: Principal, Role, Scope, Decision, Reviewer,
+    // Decided, Justification and the button column.
+    std::size_t headers = 0;
+    for (auto at = b.find("<th>"); at != std::string::npos; at = b.find("<th>", at + 1))
+        ++headers;
+    CHECK(headers == 8);
+    CHECK_THAT(b, ContainsSubstring("<td colspan=\"8\" class=\"muted\">No frozen grants in this "
+                                    "campaign</td>"));
+}
+
 TEST_CASE("access-review campaign fragment: a malformed or unknown id shows a plain notice, never "
           "the store's classification prefix",
           "[pg][settings][access_review][4752]") {
