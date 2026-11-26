@@ -9,11 +9,12 @@
  * Wire rows (middleware_parsers.hpp): a `status|<action>|...` row first, then
  * `<action>|<title>|<name>|<version or ->|<install_path>|<edition or ->` data rows.
  *
- * ZERO SUBPROCESS. Every fact is an installer-metadata file name or content read (rung 1); no
- * product binary (`dspmqver`, `dspmqinst`) is ever started.
+ * ZERO SUBPROCESS. Every fact is an installer-metadata read (rung 1): a file name or content on
+ * Linux, a registry value under HKLM on Windows; no product binary (`dspmqver`, `dspmqinst`) is ever started.
  *
- * SHIPPED LEGS. Linux. The Windows and macOS legs are declared PLANNED from the table; until they
- * ship they report `status|<action>|unsupported|<windows|macos>:planned`.
+ * SHIPPED LEGS. Linux and Windows (the Windows leg is declared SUPPORTED: its registry value names were
+ * confirmed on one real IBM MQ 9.4.5.0 install). The macOS leg is declared PLANNED
+ * through one shared constant and reports `status|<action>|unsupported|macos:planned`.
  *
  * This TU is portable except for its single dispatch #if, which selects the one host leg to call --
  * so a single-OS build never links the other legs' symbols. The action list and the descriptors are
@@ -41,7 +42,7 @@ constexpr const char* kMacosMechanism =
     "installer-metadata read, not yet wired on macOS (every product)";
 
 /// One descriptor per product: Linux and Windows straight from the table, macOS the shared PLANNED
-/// leg. Rung 1 on every leg (installer-metadata file reads).
+/// leg. Rung 1 on every leg (installer-metadata file or registry reads).
 constexpr auto kActionDescriptors = [] {
     std::array<YuzuActionDescriptor, kProducts.size()> d{};
     for (std::size_t i = 0; i < kProducts.size(); ++i) {
