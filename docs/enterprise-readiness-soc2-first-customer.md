@@ -220,11 +220,10 @@ approver-assurance addendum below (residual risk (e)), not a four-eyes guarantee
 and the same compensating controls apply (narrowing the identity sources in use, an
 identity-to-HR-record check at the review, sampling). A decision is committed before its audit row
 is written and a failed audit write never undoes it, so the decision history, not the audit row, is
-the primary record. A deployment that carries forward a database holding a `user` grant decided by
-the account it names is refused at start (a hard cutover; fresh database only, see
-`docs/user-manual/upgrading.md`); decisions on engine or group grants made by earlier builds are not
-checked and read as "previous: not recorded", and a database carried forward is unsupported either
-way. **More limits an assessor should know.** A "reviewer" is an account, not proof of a person: engine
+the primary record. The server is deployed on a fresh database only (see
+`docs/user-manual/upgrading.md`), and a database holding a `user` grant decided by the account it
+names is refused at start. A decision on an engine or group grant is not checked for that, and a
+decision row with no recorded previous state reads as "previous: not recorded". **More limits an assessor should know.** A "reviewer" is an account, not proof of a person: engine
 principal sessions, service-scoped tokens (403) and the MCP read-only and operator tiers are refused, but an
 API-token caller (acting as its owning user) and a supervised-tier MCP token can still attest; the three
 write routes are step-up exempt (`kEvidenceCapture`), so no fresh MFA proof is required (the exemption
