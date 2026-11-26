@@ -3674,6 +3674,15 @@ test('image vulnerability gate',
   priority: 10,
 )
 
+# WP15: deploy/docker/chisel-emit-status.py records a chiselled image's packages
+# where the image scanners read them; its refusals and its four call sites.
+test('chisel status.d emission',
+  _python3_test,
+  args: [files('test_chisel_emit_status.py')],
+  suite: 'docs',
+  timeout: 120,
+)
+
 # WP15/S9: the publish journal (scripts/ci/image-publish.sh). A table of gate
 # outcomes x stop points x publish shapes runs release.yml's publish steps in
 # the workflow's order against a stub registry and checks the journal never
