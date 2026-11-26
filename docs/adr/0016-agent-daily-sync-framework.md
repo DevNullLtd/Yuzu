@@ -2005,8 +2005,10 @@ change, migration or parser change.
   and the row then hashes exactly as if the slot were empty. The `msi_packages.list_inventory`
   adapter accepts a row of five or six
   tokens; a sixth token that is a braced GUID in either case becomes `upgrade_code={UPPER}`, and any other
-  sixth token is ignored and the row is kept. No producer sends a sixth token yet: until the
-  `msi_packages` producer change lands, nothing on the wire changes.
+  sixth token is ignored and the row is kept. This change added no producer: until the
+  `msi_packages` producer change lands, nothing on the wire changes. That change is the
+  installer-records one: the Windows `msi_packages.list_inventory` collector then sends the sixth
+  token for a product named under exactly one upgrade code.
 - **Server.** The parser keeps field 14 and refuses a section whose `+` record carries a value that is
   not canonical, with the new refusal `bad_attributes` (the `bad_version_source` precedent: that section
   only, its rows cleared, the other sections of the call apply). A refused section is resent in full,

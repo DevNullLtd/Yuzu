@@ -731,7 +731,7 @@ database.
   for every version of that product, written as a braced GUID in upper-case hex, for example
   `upgrade_code={12345678-90AB-CDEF-1234-567890ABCDEF}`. The server stores it only from the v3 blob
   (the v2 blob's slot is ignored), keeps it in the row's section hash, and does not return it from
-  any read route, dashboard page or MCP tool yet. No collector reports an `upgrade_code` yet. A
+  any read route, dashboard page or MCP tool yet. The Windows `msi_packages.list_inventory` collector reports an `upgrade_code` for a product named under exactly one upgrade code; no other collector reports one yet. A
   value the server cannot read as a valid attribute field refuses that one section (reason
   `bad_attributes`, below). Two rows that differ only in `attributes` are two rows, and an
   attribute-only change at the same version writes no change-feed entry.
