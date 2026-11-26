@@ -43,6 +43,18 @@
 #include <unistd.h> // getpid
 #endif
 
+// Crash backtrace (opt-in, YUZU_TEST_CRASH_BACKTRACE=1). Linux/glibc, non-sanitizer
+// builds only: ASan/TSan install their own fatal-signal reporting, and execinfo.h is
+// glibc's. See the block comment above crash_capture below.
+#if defined(__linux__) && defined(__GLIBC__) && !defined(__SANITIZE_ADDRESS__) && \
+    !defined(__SANITIZE_THREAD__)
+#define YUZU_CRASH_CAPTURE 1
+#include <algorithm>
+#include <cstring>
+#include <execinfo.h>
+#include <signal.h>
+#endif
+
 namespace {
 
 long current_pid() {
@@ -60,10 +72,102 @@ std::string format_progress_line(long pid, std::string_view body) {
     return std::format("[progress] pid={} {}\n", pid, body);
 }
 
+#ifdef YUZU_CRASH_CAPTURE
+// Crash capture for the intermittent agent-shard deaths (#7872, #7503, #3507).
+//
+// Those runs end `killed by signal 11 SIGSEGV` with a different victim test each time
+// and nothing in the log but the last `[progress] START` line. meson sets a random
+// MALLOC_PERTURB_ per run, so a use-after-free or uninitialised read crashes only for
+// some values; this prints the stack, the running test case and that value so a failure
+// can be replayed (`MALLOC_PERTURB_=<n> yuzu_agent_tests <case>`).
+//
+// Opt-in and silent otherwise, so every other leg is byte-identical. After printing, the
+// handler returns with the default disposition restored (SA_RESETHAND), so the process
+// still dies from the SAME signal and meson, flake-retry.py and the junit classifier see
+// exactly what they saw before. It only observes; it does not retry, mask or exit.
+//
+// Async-signal discipline: write(2) only, plus backtrace_symbols_fd (not formally
+// async-signal-safe; the risk is a second fault inside the handler, which then takes the
+// default action because of SA_RESETHAND, i.e. no worse than today). backtrace() is
+// called once at install so libgcc is already loaded. The handler runs on an alternate
+// stack so a stack-overflow SEGV is reported too. The test-case name and perturb value
+// live in fixed static buffers, never std::string.
+namespace crash_capture {
+
+char g_case[256] = "<none>";
+char g_perturb[32] = "unset";
+
+void write_str(const char* s) {
+    const ssize_t r = ::write(STDERR_FILENO, s, std::strlen(s));
+    (void)r; // best effort: nothing useful to do if stderr is closed
+}
+
+void handler(int sig) {
+    char num[8];
+    int n = 0;
+    char rev[8];
+    int v = sig;
+    do {
+        rev[n++] = static_cast<char>('0' + v % 10);
+        v /= 10;
+    } while (v > 0 && n < 7);
+    for (int i = 0; i < n; ++i)
+        num[i] = rev[n - 1 - i];
+    num[n] = '\0';
+    write_str("\n[crash] fatal signal ");
+    write_str(num);
+    write_str(" in test case: ");
+    write_str(g_case);
+    write_str("\n[crash] MALLOC_PERTURB_=");
+    write_str(g_perturb);
+    write_str("\n");
+    void* frames[64];
+    const int depth = ::backtrace(frames, 64);
+    ::backtrace_symbols_fd(frames, depth, STDERR_FILENO);
+    write_str("[crash] end of backtrace\n");
+}
+
+void note_case(const std::string& name) {
+    const std::size_t k = std::min(name.size(), sizeof(g_case) - 1);
+    std::memcpy(g_case, name.data(), k);
+    g_case[k] = '\0';
+}
+
+void install() {
+    static bool done_once = false;
+    if (!done_once) {
+        done_once = true;
+        if (const char* p = std::getenv("MALLOC_PERTURB_")) {
+            std::strncpy(g_perturb, p, sizeof(g_perturb) - 1);
+            g_perturb[sizeof(g_perturb) - 1] = '\0';
+        }
+        void* warm[4];
+        (void)::backtrace(warm, 4); // load libgcc now, not inside a handler
+        static char alt_stack[64 * 1024];
+        stack_t ss{};
+        ss.ss_sp = alt_stack;
+        ss.ss_size = sizeof(alt_stack);
+        (void)::sigaltstack(&ss, nullptr);
+    }
+    // Re-armed per test case: Catch2's own fatal-condition guard may be enabled around
+    // each case and restores whatever handler was current when it was enabled, so
+    // installing here keeps ours on top in either order.
+    struct sigaction sa{};
+    sa.sa_handler = &handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = SA_ONSTACK | SA_RESETHAND | SA_NODEFER;
+    for (const int sig : {SIGSEGV, SIGBUS, SIGABRT, SIGILL, SIGFPE})
+        (void)::sigaction(sig, &sa, nullptr);
+}
+
+} // namespace crash_capture
+#endif // YUZU_CRASH_CAPTURE
+
 class ProgressListener : public Catch::EventListenerBase {
 public:
     explicit ProgressListener(Catch::IConfig const* config)
-        : Catch::EventListenerBase(config), enabled_(read_enabled()) {}
+        : Catch::EventListenerBase(config), enabled_(read_enabled()),
+          crash_enabled_(read_crash_enabled()) {}
 
     void testRunStarting(Catch::TestRunInfo const& info) override {
         if (!enabled_)
@@ -74,6 +178,12 @@ public:
     }
 
     void testCaseStarting(Catch::TestCaseInfo const& info) override {
+#ifdef YUZU_CRASH_CAPTURE
+        if (crash_enabled_) {
+            crash_capture::note_case(std::string(info.name));
+            crash_capture::install();
+        }
+#endif
         if (!enabled_)
             return;
         start_ = clock::now();
@@ -96,6 +206,11 @@ private:
     static bool read_enabled() {
         const char* v = std::getenv("YUZU_TEST_PROGRESS");
         return v != nullptr && std::atoi(v) != 0; // atoi(nullptr) is UB - guarded above
+    }
+
+    static bool read_crash_enabled() {
+        const char* v = std::getenv("YUZU_TEST_CRASH_BACKTRACE");
+        return v != nullptr && std::atoi(v) != 0;
     }
 
     // decltype(&std::fclose) as a unique_ptr deleter template argument triggers
@@ -125,6 +240,7 @@ private:
     }
 
     bool enabled_;
+    bool crash_enabled_;
     long pid_ = current_pid();
     clock::time_point start_{};
 };

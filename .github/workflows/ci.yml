@@ -2008,6 +2008,10 @@ jobs:
             export GITHUB_STEP_SUMMARY="$LOGS/ci-half-nonpg.summary.md"
             export YUZU_TEST_PROGRESS=1
             export YUZU_TEST_PROGRESS_FILE="$GITHUB_WORKSPACE/$LOGS/progress.log"
+            # Print a backtrace, the running case and MALLOC_PERTURB_ when a test
+            # binary dies on a fatal signal (#7872/#7503/#3507). Observe-only: the
+            # process still dies from the same signal. Linux glibc, non-sanitizer.
+            export YUZU_TEST_CRASH_BACKTRACE=1
             rm -f "$YUZU_TEST_PROGRESS_FILE"
             # docs suite is OS-independent and runs on the Linux leg only; OS-contract
             # entries carry suite platform (tests/meson.build) and run on every leg.
