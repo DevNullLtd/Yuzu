@@ -2700,8 +2700,8 @@ flip, with a red-first test each:
     sweeper-first delete-race window of 4 ms was measured only on an idle box, so a loaded runner can lose it more
     often than the rig did (the driver repeats the scenario up to five times and asserts nothing on a lost one); this
     stays unmeasured on a loaded runner (the final run's contention test below used 8 spinners on one box and did not
-    measure the window); (2) the shard B budget, which the final rig run below measured once, standalone (and which
-    is an OPEN item).
+    measure the window); (2) the shard B budget, which the final rig run below measured once, standalone (resolved
+    there by moving the cases to shard A).
     **2026-11-26, R1 FINAL RIG RUN at tip `187a56bc75`, the bytes of every governance fix round above; author-reported,
     one box (the weecolin rig, Windows build 26100, MSVC 19.44), raw logs local only (evidence directory
     `r1-rig-final`), not a CI run.** Build: clean on MSVC 19.44 (rc 0, no errors). Warnings, attributed to the files:
@@ -2731,8 +2731,21 @@ flip, with a red-first test each:
     89222 assertions, 159 s wall against its 240 s timeout (66%). `[7877]` is 39 cases and 40.5 s of that, so shard B
     without it is about 118 s. `[7877]` therefore pushes shard B past the 50% (120 s) budget stated in
     `tests/meson.build` and `docs/testing/unit-test-conventions.md`. This is a standalone figure; CI runs the shards
-    3-wide, so a CI wall time may differ and is not measured. OPEN: Shard B budget: decision pending with the owner.
-    NOT run, or unmeasured: the meson-level concurrent 3-shard run; the full agent suite on this tip; Windows builds
+    3-wide, so a CI wall time may differ and is not measured. Shard B budget, RESOLVED 2026-11-26 (Dave, governance Gate 7): the `[7877]` cases move to shard A (commit
+    `689215c1bd`, tag `7877` added to `agent_shard_a_tags` in `tests/meson.build`). Post-move rig run at that commit
+    (author-reported, one box: the weecolin rig, Windows build 26100, elevated, raw logs local only, not a CI run).
+    The partition checker passes: 3 agent shards, 7429 cases, an exact partition (A 1015, B 855, C 5559), all 39
+    `[7877]` cases in A and none in B or C. Each shard run alone: A 140 s (1015 cases; 58% of its 240 s timeout; over
+    the 50% half-budget of 120 s; `[7877]` is 40.5 s of A's 139.7 s case sum, so A was about 99 s before), B 122 s
+    (855 cases; 51% of 240 s, on the 120 s line; 118.5 s case sum, against 159 s with `[7877]`), C 353 s (5559
+    cases; 74% of its 480 s timeout; over its 240 s half-budget as the known deliberate #7135 / #7177 exception, and
+    longer than the roughly 222 s recorded in the `tests/meson.build` comments, which was not investigated). Run
+    3-wide with `meson test --suite agent-shard`, twice: B 118.5 s, A 140.0 s, C 351.0 s (total wall 352 s) and B
+    118.5 s, A 139.5 s, C 346.7 s (total wall 347 s), all passing, with no measurable slowdown from running 3-wide
+    on this 16-thread box. So shard A is now over the half-budget and shard B is on the line; both are under
+    `flake-retry.py`'s 80% mark (192 s). A dedicated shard for the `[7877]` cases is the follow-up (an issue is filed
+    when the item 31 PR opens). The 3-wide figures are one box, not a CI runner pool.
+    NOT run, or unmeasured at this tip (the meson-level concurrent 3-shard run was done later, at `689215c1bd`, above): the full agent suite on this tip; Windows builds
     before 26100 (X1); a real non-administrator account; the CI runner's own token; a profile unload against the
     mechanism. Two further records from the final delta reviews. (1) A CI runner that ran as LocalSystem would skip the
     two HKCR cases even with `YUZU_REQUIRE_WINDOWS_REGISTRY_TESTS=1` (a premise mismatch, deliberately not routed
