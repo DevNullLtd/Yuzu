@@ -1,22 +1,26 @@
 /**
  * component_inventory_plugin.cpp -- installed software components found by reading application
  * trees: Java archives (.jar/.war/.ear) and the libraries nested inside them, the versioned
- * shared libraries (ELF .so, Mach-O .dylib) shipped inside applications, and the Python distributions
- * and Node packages installed outside a package manager. A software-inventory fact read from the files
- * themselves, so it sees components no package manager owns.
+ * shared libraries (ELF .so, Mach-O .dylib, PE .dll) shipped inside applications, and the Python
+ * distributions and Node packages installed outside a package manager. A software-inventory fact read
+ * from the files themselves, so it sees components no package manager owns.
  *
  * Actions (none takes a parameter; the roots come from the OS leg and from nothing a request can
  * supply):
- *   "scan"   -- Java archives. Roots: scan_targets().
- *   "native" -- shared libraries, capped at 5,000 rows. Roots: scan_native_targets(); package-owned
- *               trees are excluded and counted. The server refuses it until an operator switches it
- *               on (an action-level kill-switch row seeded off at boot). Publishes no heartbeat keys:
- *               scan already uses 6 of the 8 a plugin may publish.
+ *   "scan"   -- Java archives. Roots: scan_targets(); on Windows the WindowsApps tree under each root is
+ *               excluded and counted.
+ *   "native" -- shared libraries (ELF .so, Mach-O .dylib, PE .dll), capped at 5,000 rows. Roots:
+ *               scan_native_targets(); package-owned trees are excluded and counted. The server
+ *               refuses it until an operator switches it on (an action-level kill-switch row seeded
+ *               off at boot). Publishes no heartbeat keys: scan already uses 6 of the 8 a plugin may
+ *               publish.
  *   "python" -- Python distributions: the METADATA of a `.dist-info`, the PKG-INFO of an `.egg-info`,
  *               first 16 KiB only. Roots: scan_python_targets(). Package source trees are pruned by
- *               design (component_pkg_scan.hpp); the count is logged, never a status token.
+ *               design (component_pkg_scan.hpp); the count is logged, never a status token. Not on
+ *               Windows: planned there.
  *   "node"   -- Node packages: the package.json of each package under node_modules, 64 KiB cap. Roots:
- *               scan_node_targets(). Pruned the same way. Neither publishes heartbeat keys.
+ *               scan_node_targets(). Pruned the same way. Neither publishes heartbeat keys. Not on
+ *               Windows: planned there.
  *
  * Wire rows (component_scan.hpp): exactly one leading `status|<action>|<level>|<tokens or ->` row,
  * then `comp|<java|native|python|node>|name|version|version_source|path|size|mtime|anchor_app` rows.
@@ -28,9 +32,14 @@
  * archive that changed while read answers constrained and CONSTRAINED/PARTIAL with the cause as a
  * `<os>:component_inventory:<cause>` token. The rows that were reachable are written at both levels.
  *
- * SHIPPED LEGS. Linux and macOS (machine roots only). The Windows leg of all four actions is a later
- * change and answers through the shared planned-leg reporter. All three descriptor legs are declared unconditionally so
- * the capability-matrix generator sees a complete, stable shape.
+ * SHIPPED LEGS. Linux and macOS (machine roots only), and Windows for `scan` and `native` (the two
+ * Program Files trees on fixed drives, through a filesystem binding that follows no reparse point;
+ * component_fs_win.cpp). The Windows leg is declared SUPPORTED on the measured scope (one host,
+ * Windows 11 build 26200, elevated administrator session; docs/samples/windows.txt) and answers
+ * constrained when a directory is refused or a bound is reached; the Windows leg of `python` and
+ * `node` is a later change and answers through the shared planned-leg reporter. All three
+ * descriptor legs are declared unconditionally so the capability-matrix generator sees a complete,
+ * stable shape.
  *
  * ZERO SUBPROCESS, READ-ONLY. Nothing here mutates the host; the only write is the plugin's own
  * heartbeat KV keys (the cost of the last `scan`).
@@ -46,13 +55,16 @@
 #include "component_pkg_scan.hpp"    // portable: the python and node answers
 #include "component_scan.hpp"        // portable: the answer, its emission and the catch-all's answer
 
-#if !defined(_WIN32)
+#if defined(_WIN32)
+#include "component_legs_win.hpp"
+#else
 #include "component_legs.hpp"
 #endif
 
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
+#include <functional>
 #include <string>
 #include <string_view>
 
@@ -96,8 +108,17 @@ const YuzuActionDescriptor kActionDescriptors[] = {
          "Java archives only; machine roots only (per-user installs are not read); any budget, "
          "unreadable directory or unenumerable archive answers constrained"},
         /* .windows_leg = */
-        {YUZU_SUPPORT_PLANNED, 1, "bounded Program Files walk with the same archive reads",
-         "not read yet: one unsupported status row, windows:planned"},
+        {YUZU_SUPPORT_SUPPORTED, 1,
+         "bounded read-only walk of the Program Files and Program Files (x86) directories (the shell's "
+         "known-folder paths, fixed drives only); every directory and file opened relative to its volume "
+         "root with no reparse point followed at any path component (NtCreateFile, OBJ_DONT_REPARSE); "
+         "archive central directory, pom.properties and MANIFEST.MF read in-process; WindowsApps under "
+         "each root excluded and counted",
+         "measured on one host (Windows 11 build 26200, elevated administrator session), where a "
+         "system directory whose access list excludes Administrators was refused and the action "
+         "answered constrained (dir_unreadable); Java archives only; machine roots only (per-user "
+         "installs are not read); a reparse point is counted and never read; any budget, unreadable "
+         "directory or unenumerable archive answers constrained"},
     },
     {
         /* .action      = */ "native",
@@ -120,8 +141,16 @@ const YuzuActionDescriptor kActionDescriptors[] = {
          "are not read; machine roots only; the server refuses it until an operator switches it on; "
          "any budget, unreadable directory or changed file answers constrained"},
         /* .windows_leg = */
-        {YUZU_SUPPORT_PLANNED, 1, "bounded Program Files walk with the same library reads",
-         "not read yet: one unsupported status row, windows:planned"},
+        {YUZU_SUPPORT_SUPPORTED, 1,
+         "bounded read-only walk of the Program Files and Program Files (x86) directories for .dll files, "
+         "at most 5,000 rows; every directory and file opened relative to its volume root with no reparse "
+         "point followed at any path component (NtCreateFile, OBJ_DONT_REPARSE); the PE fixed file "
+         "version read in-process within fixed bounds; WindowsApps under each root excluded and counted",
+         "measured on one host (Windows 11 build 26200, elevated administrator session), where a "
+         "system directory whose access list excludes Administrators was refused and the walk returned "
+         "exactly 5,000 rows, the row limit, so the action answered constrained; libraries inside applications only; machine "
+         "roots only; the server refuses it until an operator switches it on; a reparse point is counted "
+         "and never read; any budget, unreadable directory or changed file answers constrained"},
     },
     {
         /* .action      = */ "python",
@@ -174,10 +203,12 @@ const YuzuActionDescriptor kActionDescriptors[] = {
     },
 };
 
-#if !defined(_WIN32)
 // The native action's per-OS parts: which names are candidates, how a file is read, which trees are
 // the package manager's. Chosen at compile time, like kOs.
-#if defined(__APPLE__)
+#if defined(_WIN32)
+constexpr auto kNativeCandidate = &yuzu::component_inventory::is_windows_native_candidate;
+const yuzu::component_inventory::NativeParse kNativeParse = yuzu::component_inventory::describe_windows_file;
+#elif defined(__APPLE__)
 constexpr auto kNativeCandidate = &yuzu::component_inventory::is_macos_native_candidate;
 const yuzu::component_inventory::NativeParse kNativeParse = yuzu::component_inventory::describe_macos_file;
 #else
@@ -185,15 +216,28 @@ constexpr auto kNativeCandidate = &yuzu::component_inventory::is_linux_native_ca
 const yuzu::component_inventory::NativeParse kNativeParse = yuzu::component_inventory::describe_linux_file;
 #endif
 
-yuzu::component_inventory::WalkPolicy native_policy() {
+// The scan's walk reads Java archives (the default candidate test). Only the Windows scan excludes a
+// tree today; the Linux and macOS scan walk excludes nothing, as before.
+yuzu::component_inventory::WalkPolicy scan_policy([[maybe_unused]] const yuzu::component_inventory::Targets& t) {
     yuzu::component_inventory::WalkPolicy p;
-    p.is_candidate = kNativeCandidate;
+#if defined(_WIN32)
+    p = yuzu::component_inventory::windows_walk_policy(t); // WindowsApps kept out and counted
+#endif
+    return p;
+}
+
+yuzu::component_inventory::WalkPolicy native_policy([[maybe_unused]] const yuzu::component_inventory::Targets& t) {
+#if defined(_WIN32)
+    yuzu::component_inventory::WalkPolicy p = yuzu::component_inventory::windows_walk_policy(t);
+#else
+    yuzu::component_inventory::WalkPolicy p;
     p.skip_dir = [excluded = yuzu::component_inventory::native_excluded_dirs()](const std::string& dir) {
         return std::ranges::find(excluded, dir) != excluded.end();
     };
+#endif
+    p.is_candidate = kNativeCandidate;
     return p;
 }
-#endif
 
 } // namespace
 
@@ -243,10 +287,12 @@ public:
                 ctx.write_output(std::string{"unknown action: "} + yuzu::util::safe_output_field(action));
                 return 1;
             }
-#if defined(_WIN32)
-            return yuzu::shared::report_planned(ctx, answered);
-#else
             const auto make_fs = [](const ci::Targets& x) { return ci::make_fs_ops(x); };
+#if defined(_WIN32)
+            // The Windows leg of python and node is a later change (#8440): the planned row, never a walk.
+            if (action == ci::kPythonAction || action == ci::kNodeAction)
+                return yuzu::shared::report_planned(ctx, answered);
+#else
             // Pruning package source trees is the design of python and node, not a gap: the count is
             // logged once per dispatch and never reaches the status row.
             const auto log_pruned = [](std::string_view act, std::size_t pruned) {
@@ -260,20 +306,21 @@ public:
                 ci::emit_answer(ctx, static_cast<yuzu::PluginContext*>(nullptr), a, wrote);
                 return 0;
             }
+#endif
             if (action == ci::kNativeAction) {
                 // No heartbeat keys: scan already uses 6 of the 8 a plugin may publish.
-                const ci::Answer a = ci::answer_native(kOs, ci::scan_native_targets(), make_fs, ci::native_limits(),
-                                                       native_policy(), kNativeParse);
+                const ci::Targets nt = ci::scan_native_targets();
+                const ci::Answer a = ci::answer_native(kOs, nt, make_fs, ci::native_limits(), native_policy(nt),
+                                                       kNativeParse);
                 ci::emit_answer(ctx, static_cast<yuzu::PluginContext*>(nullptr), a, wrote);
                 return 0;
             }
             const ci::Targets t = ci::scan_targets();
-            const ci::Answer a = ci::answer_scan(kOs, t, make_fs, ci::WalkLimits{});
+            const ci::Answer a = ci::answer_scan(kOs, t, make_fs, ci::WalkLimits{}, scan_policy(t));
             // The cost of this scan, published by the agent as yuzu.plugin.component_inventory.* tags.
             yuzu::PluginContext pctx{plugin_ctx_};
             ci::emit_answer(ctx, plugin_ctx_ != nullptr ? &pctx : nullptr, a, wrote);
             return 0; // a degraded read is never a failed command
-#endif
         } catch (...) {
             ci::answer_internal_error(ctx, kInternalError, wrote, answered);
             return 1; // a genuine internal failure is a failed command

@@ -327,6 +327,26 @@ TEST_CASE("resolve_kill_switch: base layer ANDed with the per-OS layer",
     CHECK(resolve("a", {{"b", "", false}, {"b", "linux", false}}) == Set{});
 }
 
+TEST_CASE("resolve_kill_switch: the documented file_search stop command beats an action-level ON row",
+          "[plugin_config][parsers][killswitch]") {
+    using Rows = std::vector<KillSwitchRowView>;
+    using Set = std::unordered_set<std::string>;
+    // An operator-set action ON row: a plugin-level OFF alone leaves the search running,
+    // which is why the README, upgrading.md and the changelog name the action-level row.
+    CHECK(resolve_kill_switch("search", Rows{{"search", "", true}, {"", "", false}}) == Set{});
+    // PUT ...?action=search {"enabled":false} writes the same (search, "") key, so it
+    // replaces the ON row and the search is off on every OS whatever else is stored.
+    CHECK_FALSE(resolve_kill_switch("search", Rows{{"search", "", false}, {"", "", true},
+                                                   {"search", "windows", true}})
+                    .has_value());
+    // The Windows leg: search@windows ON overrides plugin@windows OFF ...
+    CHECK(resolve_kill_switch("search", Rows{{"search", "windows", true}, {"", "windows", false}}) ==
+          Set{});
+    // ... and ?action=search&os=windows OFF withholds Windows only.
+    CHECK(resolve_kill_switch("search", Rows{{"search", "windows", false}, {"", "windows", true}}) ==
+          Set{"windows"});
+}
+
 // ── kill_switch_set_detail: the reason reaches the audit evidence ────────────
 
 TEST_CASE("kill_switch_set_detail without a reason is the unchanged evidence format",

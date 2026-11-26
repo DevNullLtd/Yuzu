@@ -1,0 +1,12 @@
+captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-11-23 · interactive user (elevated) · leg-hash d2997fe1071a
+== action=search root=C:\yuzu-dev\snr-fs-pr4-win\fixture pattern=yuzu-fs-control-* kinds=both
+match|/C:/yuzu-dev/snr-fs-pr4-win/fixture/level01/level02/level03/level04/level05/level06/level07/level08/level09/level10/level11/yuzu-fs-control-depth12.dat|file|342805ea2805abc4:0036000000077a85|262144|1795471224|system
+extents|342805ea2805abc4:0036000000077a85|ok|1|0:259646955520:262144:-
+match|/C:/yuzu-dev/snr-fs-pr4-win/fixture/yuzu-fs-control-depth1.dat|file|342805ea2805abc4:00b1000000077a76|262144|1795471224|system
+extents|342805ea2805abc4:00b1000000077a76|ok|1|0:61662572544:262144:-
+match|/C:/yuzu-dev/snr-fs-pr4-win/fixture/yuzu-fs-control-dir|directory|342805ea2805abc4:0038000000077a86|-|-|system
+volume|/C:|NTFS|complete|none|extents=collected|entries=16
+coverage|complete|slices=1|prior_gaps=0|consistency=single_pass
+search|ok|none|windows_upcase_v1|seq=0|q=284eb238|links_skipped=1
+[result_status] OK / FULL / 
+

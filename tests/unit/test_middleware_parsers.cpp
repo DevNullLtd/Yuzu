@@ -1,15 +1,17 @@
 /**
  * test_middleware_parsers.cpp -- tests for the middleware plugin's pure layer: the product table
  * (agents/shared/middleware_products.hpp), the key=value / file-name parsers and the token and row
- * formatters (middleware_parsers.hpp), and the generic runner (middleware_runner.hpp) driven end to
- * end over an in-memory FakeFs. Builds and runs on every OS, unguarded: nothing here touches a real
+ * formatters (middleware_parsers.hpp), and the generic runners (middleware_runner.hpp) driven end to
+ * end over an in-memory FakeFs (files, run_leg) and FakeRegFs (registry, run_reg_leg). Builds and runs on every OS, unguarded: nothing here touches a real
  * filesystem beyond reading the committed fixtures.
  *
  * Fixtures: tests/unit/fixtures/middleware/linux/ -- swidtag.listing is a REAL CAPTURE of
  * `ls -ln /opt/mqm/swidtag` from IBM MQ developer images and from a registered 9.4.5.0 install;
  * mqinst.ini is the REAL byte-exact file of that registered install (one stanza, 64 trailing spaces
  * in Description, no Primary key; provenance.txt has the sha256 and cites IBM's documentation).
- * The only synthetic input is kTwoInstallationsInline below, a clearly labelled inline string.
+ * The only synthetic input is kTwoInstallationsInline below, a clearly labelled inline string, and
+ * every registry case: FakeRegFs scripts SYNTHETIC installations
+ * (the cases are synthetic; the key and value names in them are the ones captured on a real 9.4.5.0 install).
  * Fixtures are read via YUZU_TEST_FIXTURE_DIR and REQUIREd to exist -- a missing fixture fails,
  * never skips.
  *
@@ -28,6 +30,20 @@
  *    fails the "every stanza dropped" case (an empty `supported` for a file that held stanzas).
  *  - plain enumerator path: reverting enumerator_well_formed to a leading-'/' check fails the
  *    kBadTrailingSlash / kBadDotComponent / kBadEmptyComponent rows.
+ *  - registry shapes: dropping the per-leg kind check (a registry probe on the Linux leg, a file
+ *    probe on the Windows leg) fails the kBadRegOnLinux / kBadFileOnWindows rows; dropping
+ *    is_plain_reg_path fails kBadRegLeadingBackslash and the is_plain_reg_path section.
+ *  - registry failure never reads as absent: mapping a denied or failed key to an empty `supported`
+ *    fails the registry enumerator-outcome case; dropping the every-subkey-dropped token fails the
+ *    "no usable FilePath" case.
+ *  - a refused or failed view keeps its sibling's rows: returning at the token even when the Fs
+ *    holds names fails the "names beside a refused / failed view" cases.
+ *  - a FilePath that failed to read is a fault, not a drop: treating every non-denied non-ok path
+ *    answer as a data-shape drop (the old rule) fails the "failed in any other way" cases (a
+ *    healthy sibling would answer `supported` without that installation).
+ *  - a wrong version value name is loud: dropping the every-row-versionless token fails the "no
+ *    VRMF anywhere" cases; counting a refused / failed / empty value as absent fails the "only
+ *    blanks its row" case.
  */
 #include <catch2/catch_test_macros.hpp>
 
@@ -258,6 +274,56 @@ struct FakeFs {
 };
 static_assert(mw::MiddlewareFs<FakeFs>);
 
+// -- FakeRegFs (SYNTHETIC cases; the names are the captured ones) ------------------------------------------------
+
+constexpr const char* kRegKey = "SOFTWARE\\IBM\\WebSphere MQ\\Installation";
+
+struct FakeRegFs {
+    std::map<std::string, mw::RegKeys> keys;  // hklm key -> scripted enumeration
+    std::map<std::string, mw::Read> values;   // "<key>|<subkey>|<value>" -> scripted read
+    bool exhausted_after_listing = false;     // exhausted() from the first call on
+    std::size_t exhaust_after_reads = SIZE_MAX; // exhausted() once this many values were read
+    std::vector<std::string> read_calls;      // "<key>|<subkey>|<value>"
+
+    /// `o` other than ok scripts a refused / failed view beside one that answered with `names`.
+    void put_keys(std::vector<std::string> names, mw::Read::Outcome o = mw::Read::Outcome::ok) {
+        keys[kRegKey] = mw::RegKeys{std::move(names), o};
+    }
+    void put_keys_outcome(mw::Read::Outcome o) { keys[kRegKey] = mw::RegKeys{{}, o}; }
+    void put_value(const std::string& sub, const std::string& value, std::string text) {
+        values[std::string{kRegKey} + "|" + sub + "|" + value] =
+            mw::Read{mw::Read::Outcome::ok, std::move(text)};
+    }
+    void put_value_outcome(const std::string& sub, const std::string& value, mw::Read::Outcome o) {
+        values[std::string{kRegKey} + "|" + sub + "|" + value] = mw::Read{o, {}};
+    }
+    /// One synthetic installation: a subkey with its FilePath and (when non-empty) VRMF.
+    void put_install(const std::string& sub, const std::string& path, const std::string& vrmf) {
+        put_value(sub, "FilePath", path);
+        if (!vrmf.empty())
+            put_value(sub, "VRMF", vrmf);
+    }
+
+    mw::RegKeys reg_subkeys(std::string_view key) {
+        const auto it = keys.find(std::string{key});
+        if (it == keys.end())
+            return mw::RegKeys{{}, mw::Read::Outcome::absent};
+        return it->second;
+    }
+    mw::Read reg_value(std::string_view key, std::string_view sub, std::string_view value,
+                       std::size_t /*cap*/) {
+        const std::string k = std::string{key} + "|" + std::string{sub} + "|" + std::string{value};
+        read_calls.push_back(k);
+        const auto it = values.find(k);
+        return it == values.end() ? mw::Read{mw::Read::Outcome::absent, {}} : it->second;
+    }
+    bool exhausted() const { return exhausted_after_listing || read_calls.size() >= exhaust_after_reads; }
+    std::string_view os() const { return "windows"; }
+};
+static_assert(mw::MiddlewareRegFs<FakeRegFs>);
+static_assert(!mw::MiddlewareFs<FakeRegFs>);
+static_assert(!mw::MiddlewareRegFs<FakeFs>);
+
 constexpr const char* kIni = "/etc/opt/mqm/mqinst.ini";
 
 struct LogEvent {
@@ -288,6 +354,42 @@ LegRun run(FakeFs& fs, yuzu::shared::RowByteBudget budget = mw::make_row_budget(
     REQUIRE_FALSE(r.rows.empty());
     status_tokens(r.status(), acc.any_failure() ? "constrained" : "supported");
     return r;
+}
+
+
+/// Runs the ibm_mq Windows leg over `fs` and checks the wire rules of its status row: every token is
+/// `windows:middleware:<installation_key|vrmf|walk>:<cause>` and never a per-item spelling.
+LegRun run_reg(FakeRegFs& fs, yuzu::shared::RowByteBudget budget = mw::make_row_budget()) {
+    const mw::Product& p = *mw::find_product("ibm_mq");
+    yuzu::shared::ConstraintAccumulator acc;
+    LegRun r;
+    const auto data = mw::run_reg_leg(
+        p, p.windows, fs, acc, budget,
+        [&](std::string_view prod, std::string_view probe, mw::ItemReason why, std::string_view cand) {
+            r.events.push_back({std::string{prod}, std::string{probe}, why, std::string{cand}});
+        });
+    r.rows = mw::compose_output(p.id, data, acc);
+    REQUIRE_FALSE(r.rows.empty());
+    const auto f = split_fields(r.status());
+    REQUIRE(f.size() == 4);
+    REQUIRE(f[2] == (acc.any_failure() ? "constrained" : "supported"));
+    if (f[3] != "-") {
+        for (const auto& t : split_on(f[3], ',')) {
+            CAPTURE(t);
+            REQUIRE(is_wire_token(t));
+            const auto parts = split_on(t, ':');
+            CHECK(parts[0] == "windows");
+            CHECK((parts[2] == "installation_key" || parts[2] == "vrmf" || parts[2] == "walk"));
+            CHECK(parts[3] != "missing");
+            CHECK(parts[3] != "path_refused");
+        }
+    }
+    return r;
+}
+
+std::string reg_status(const LegRun& r) {
+    const auto f = split_fields(r.status());
+    return f[2] + "|" + f[3];
 }
 
 std::string ini_of(std::initializer_list<std::pair<const char*, const char*>> installs) {
@@ -366,6 +468,36 @@ constexpr std::array<Probe, 2> kProbesBadId = [] {
     return a;
 }();
 
+/// The Windows leg's probes with one change each, for the registry well-formedness rows. One row
+/// proves enumerator_well_formed calls is_plain_reg_path; the path rule itself is pinned directly.
+constexpr std::array<Probe, 2> kRegLeadingBackslash = [] {
+    std::array<Probe, 2> a{{mw::kIbmMqWindowsProbes[0], mw::kIbmMqWindowsProbes[1]}};
+    a[0].path = "\\SOFTWARE\\IBM";
+    return a;
+}();
+constexpr std::array<Probe, 2> kRegNoPathKey = [] {
+    std::array<Probe, 2> a{{mw::kIbmMqWindowsProbes[0], mw::kIbmMqWindowsProbes[1]}};
+    a[0].path_key = nullptr;
+    return a;
+}();
+constexpr std::array<Probe, 2> kRegValueFirst{{mw::kIbmMqWindowsProbes[1], mw::kIbmMqWindowsProbes[1]}};
+constexpr std::array<Probe, 2> kRegSubkeysSecond{{mw::kIbmMqWindowsProbes[0], mw::kIbmMqWindowsProbes[0]}};
+constexpr std::array<Probe, 2> kRegDirNameSecond{{mw::kIbmMqWindowsProbes[0], mw::kIbmMqLinuxProbes[1]}};
+constexpr std::array<Probe, 2> kRegValueNoName = [] {
+    std::array<Probe, 2> a{{mw::kIbmMqWindowsProbes[0], mw::kIbmMqWindowsProbes[1]}};
+    a[1].name_key = nullptr;
+    return a;
+}();
+constexpr std::array<Probe, 2> kRegDupId = [] {
+    std::array<Probe, 2> a{{mw::kIbmMqWindowsProbes[0], mw::kIbmMqWindowsProbes[1]}};
+    a[1].id = "installation_key";
+    return a;
+}();
+/// A registry probe on the Linux leg (run_leg would read the registry path as a file).
+constexpr std::array<Probe, 2> kRegOnLinux{{mw::kIbmMqWindowsProbes[0], mw::kIbmMqWindowsProbes[1]}};
+/// File probes on the Windows leg (run_reg_leg reads no file).
+constexpr std::array<Probe, 2> kFileOnWindows{{mw::kIbmMqLinuxProbes[0], mw::kIbmMqLinuxProbes[1]}};
+
 constexpr std::array<Product, 1> kGoodControl{
     {mutated([](Product& p) { p.linux.support = YUZU_SUPPORT_CONSTRAINED; })}};
 constexpr std::array<Product, 1> kBadSupportedNoProbes{
@@ -416,6 +548,23 @@ constexpr std::array<Product, 1> kBadRootOnly{
 constexpr std::array<Product, 1> kBadDupId{{mutated([](Product& p) { p.linux.probes = kProbesDupId; })}};
 constexpr std::array<Product, 1> kBadProbeId{{mutated([](Product& p) { p.linux.probes = kProbesBadId; })}};
 
+constexpr std::array<Product, 1> kBadRegLeadingBackslash{
+    {mutated([](Product& p) { p.windows.probes = kRegLeadingBackslash; })}};
+constexpr std::array<Product, 1> kBadRegNoPathKey{
+    {mutated([](Product& p) { p.windows.probes = kRegNoPathKey; })}};
+constexpr std::array<Product, 1> kBadRegValueFirst{
+    {mutated([](Product& p) { p.windows.probes = kRegValueFirst; })}};
+constexpr std::array<Product, 1> kBadRegSubkeysSecond{
+    {mutated([](Product& p) { p.windows.probes = kRegSubkeysSecond; })}};
+constexpr std::array<Product, 1> kBadRegDirNameSecond{
+    {mutated([](Product& p) { p.windows.probes = kRegDirNameSecond; })}};
+constexpr std::array<Product, 1> kBadRegValueNoName{
+    {mutated([](Product& p) { p.windows.probes = kRegValueNoName; })}};
+constexpr std::array<Product, 1> kBadRegDupId{{mutated([](Product& p) { p.windows.probes = kRegDupId; })}};
+constexpr std::array<Product, 1> kBadRegOnLinux{{mutated([](Product& p) { p.linux.probes = kRegOnLinux; })}};
+constexpr std::array<Product, 1> kBadFileOnWindows{
+    {mutated([](Product& p) { p.windows.probes = kFileOnWindows; })}};
+
 // -- a second, test-only table: its own stanza header, keys, sub-directory and tag name ------------
 
 constexpr std::array<Probe, 2> kAcmeProbes{{
@@ -429,6 +578,7 @@ constexpr std::array<Product, 1> kAcme{{mutated([](Product& p) {
     p.title = "Acme";
     p.ecosystem = "acme";
     p.linux.probes = kAcmeProbes;
+    p.windows = {YUZU_SUPPORT_PLANNED, "not read on Windows", mw::kPlannedNote, {}};
 })}};
 static_assert(mw::products_well_formed(std::span<const Product>{kAcme}));
 
@@ -449,9 +599,9 @@ TEST_CASE("middleware products: the table is well-formed and find_product reads 
     CHECK(std::string_view{p->kind} == "app");
     CHECK(p->linux.support == YUZU_SUPPORT_SUPPORTED);
     CHECK(p->linux.probes.size() == 3);
-    CHECK(p->windows.support == YUZU_SUPPORT_PLANNED);
-    CHECK(p->windows.probes.empty());
-    CHECK(p->windows.note != nullptr);
+    CHECK(p->windows.support == YUZU_SUPPORT_SUPPORTED); // names confirmed on a real 9.4.5.0 install
+    CHECK(p->windows.probes.size() == 2);
+    CHECK(p->windows.note == nullptr);
     CHECK(mw::find_product("nope") == nullptr);
     CHECK(mw::find_product("") == nullptr);
 
@@ -462,6 +612,15 @@ TEST_CASE("middleware products: the table is well-formed and find_product reads 
     CHECK(std::string_view{probes[1].id} == "swidtag");
     CHECK(std::string_view{probes[2].id} == "mqtag");
     CHECK(probes[2].name_form == mw::NameForm::exact);
+
+    const auto reg = p->windows.probes;
+    CHECK(std::string_view{reg[0].id} == "installation_key");
+    CHECK(reg[0].kind == mw::ProbeKind::reg_subkeys);
+    CHECK(std::string_view{reg[0].path} == "SOFTWARE\\IBM\\WebSphere MQ\\Installation");
+    CHECK(std::string_view{reg[0].path_key} == "FilePath");
+    CHECK(std::string_view{reg[1].id} == "vrmf");
+    CHECK(reg[1].kind == mw::ProbeKind::reg_value);
+    CHECK(std::string_view{reg[1].name_key} == "VRMF");
 }
 
 TEST_CASE("middleware products: the same consteval check refuses a broken table", "[middleware]") {
@@ -515,6 +674,33 @@ TEST_CASE("middleware products: the same consteval check refuses a broken table"
     SECTION("probe ids are [a-z0-9_]+ and unique within the leg") {
         STATIC_REQUIRE_FALSE(mw::products_well_formed(std::span<const Product>{kBadDupId}));
         STATIC_REQUIRE_FALSE(mw::products_well_formed(std::span<const Product>{kBadProbeId}));
+        STATIC_REQUIRE_FALSE(mw::products_well_formed(std::span<const Product>{kBadRegDupId}));
+    }
+    SECTION("a registry key path is plain backslash-separated components") {
+        STATIC_REQUIRE_FALSE(mw::products_well_formed(std::span<const Product>{kBadRegLeadingBackslash}));
+    }
+    SECTION("a registry leg is reg_subkeys then reg_value probes, each with its field") {
+        STATIC_REQUIRE_FALSE(mw::products_well_formed(std::span<const Product>{kBadRegNoPathKey}));
+        STATIC_REQUIRE_FALSE(mw::products_well_formed(std::span<const Product>{kBadRegValueFirst}));
+        STATIC_REQUIRE_FALSE(mw::products_well_formed(std::span<const Product>{kBadRegSubkeysSecond}));
+        STATIC_REQUIRE_FALSE(mw::products_well_formed(std::span<const Product>{kBadRegDirNameSecond}));
+        STATIC_REQUIRE_FALSE(mw::products_well_formed(std::span<const Product>{kBadRegValueNoName}));
+    }
+    SECTION("the Linux leg holds no registry kind and the Windows leg no file kind") {
+        STATIC_REQUIRE_FALSE(mw::products_well_formed(std::span<const Product>{kBadRegOnLinux}));
+        STATIC_REQUIRE_FALSE(mw::products_well_formed(std::span<const Product>{kBadFileOnWindows}));
+    }
+    SECTION("is_plain_reg_path accepts a plain path and refuses the rest") {
+        STATIC_REQUIRE(mw::detail::is_plain_reg_path("A"));
+        STATIC_REQUIRE(mw::detail::is_plain_reg_path("SOFTWARE\\IBM\\WebSphere MQ"));
+        STATIC_REQUIRE_FALSE(mw::detail::is_plain_reg_path(""));
+        STATIC_REQUIRE_FALSE(mw::detail::is_plain_reg_path("\\"));
+        STATIC_REQUIRE_FALSE(mw::detail::is_plain_reg_path("A\\"));
+        STATIC_REQUIRE_FALSE(mw::detail::is_plain_reg_path("A/B"));
+        STATIC_REQUIRE_FALSE(mw::detail::is_plain_reg_path("\\A"));
+        STATIC_REQUIRE_FALSE(mw::detail::is_plain_reg_path("A\\\\B"));
+        STATIC_REQUIRE_FALSE(mw::detail::is_plain_reg_path("A\\.\\B"));
+        STATIC_REQUIRE_FALSE(mw::detail::is_plain_reg_path("A\\..\\B"));
     }
 }
 
@@ -1336,6 +1522,310 @@ TEST_CASE("middleware runner: a second product's table drives the same runner", 
     }
     SECTION("a PLANNED leg reads nothing") {
         const auto rows = mw::run_leg(acme, acme.windows, fs, acc, budget, log);
+        CHECK(rows.empty());
+        CHECK(fs.read_calls.empty());
+        CHECK_FALSE(acc.any_failure());
+    }
+}
+
+// =================================================================================================
+// the registry runner (run_reg_leg), over SYNTHETIC installations
+// =================================================================================================
+
+TEST_CASE("middleware registry runner: two installations give two rows with name version and path",
+          "[middleware]") {
+    FakeRegFs fs;
+    fs.put_keys({"Installation2", "Installation1"}); // unsorted on purpose: rows come sorted by name
+    fs.put_install("Installation1", "C:\\Program Files\\IBM\\MQ", "9.3.5.1");
+    fs.put_install("Installation2", "D:\\mq2", "9.4.0.0");
+    const LegRun r = run_reg(fs);
+    CHECK(reg_status(r) == "supported|-");
+    CHECK(r.data() == std::vector<std::string>{
+                          "ibm_mq|IBM MQ|Installation1|9.3.5.1|C:/Program Files/IBM/MQ|-",
+                          "ibm_mq|IBM MQ|Installation2|9.4.0.0|D:/mq2|-"});
+    CHECK(r.events.empty());
+    // the key is read once per candidate for each value: FilePath then VRMF
+    CHECK(fs.read_calls.size() == 4);
+    CHECK(fs.read_calls[0] == std::string{kRegKey} + "|Installation1|FilePath");
+    CHECK(fs.read_calls[1] == std::string{kRegKey} + "|Installation1|VRMF");
+}
+
+TEST_CASE("middleware registry runner: every enumerator outcome yields exactly its token", "[middleware]") {
+    FakeRegFs fs;
+    SECTION("the key absent in both views is none found and not a failure") {
+        const LegRun r = run_reg(fs);
+        CHECK(reg_status(r) == "supported|-");
+        CHECK(r.data().empty());
+        CHECK(fs.read_calls.empty());
+    }
+    SECTION("an empty key is none found") {
+        fs.put_keys({});
+        const LegRun r = run_reg(fs);
+        CHECK(reg_status(r) == "supported|-");
+        CHECK(r.data().empty());
+    }
+    SECTION("denied") {
+        fs.put_keys_outcome(mw::Read::Outcome::denied);
+        const LegRun r = run_reg(fs);
+        CHECK(reg_status(r) == "constrained|windows:middleware:installation_key:permission_denied");
+        CHECK(r.data().empty());
+    }
+    SECTION("any other failure is unreadable") {
+        for (const auto o : {mw::Read::Outcome::failed, mw::Read::Outcome::refused,
+                             mw::Read::Outcome::oversized}) {
+            FakeRegFs f2;
+            f2.put_keys_outcome(o);
+            const LegRun r = run_reg(f2);
+            CHECK(reg_status(r) == "constrained|windows:middleware:installation_key:unreadable");
+            CHECK(r.data().empty());
+        }
+    }
+    SECTION("names beside a refused view: permission_denied, and the answering view's rows are kept") {
+        fs.put_keys({"A", "B"}, mw::Read::Outcome::denied);
+        fs.put_install("A", "C:\\a", "1.0.0.0");
+        fs.put_install("B", "C:\\b", "2.0.0.0");
+        const LegRun r = run_reg(fs);
+        CHECK(reg_status(r) == "constrained|windows:middleware:installation_key:permission_denied");
+        CHECK(r.data() == std::vector<std::string>{"ibm_mq|IBM MQ|A|1.0.0.0|C:/a|-",
+                                                   "ibm_mq|IBM MQ|B|2.0.0.0|C:/b|-"});
+    }
+    SECTION("names beside a failed view: unreadable, and the answering view's rows are kept") {
+        fs.put_keys({"A"}, mw::Read::Outcome::failed);
+        fs.put_install("A", "C:\\a", "1.0.0.0");
+        const LegRun r = run_reg(fs);
+        CHECK(reg_status(r) == "constrained|windows:middleware:installation_key:unreadable");
+        CHECK(r.data() == std::vector<std::string>{"ibm_mq|IBM MQ|A|1.0.0.0|C:/a|-"});
+    }
+}
+
+TEST_CASE("middleware registry runner: a subkey without FilePath is dropped and logged", "[middleware]") {
+    FakeRegFs fs;
+    SECTION("beside a usable sibling: the sibling is kept and the answer stays supported") {
+        fs.put_keys({"Bad", "Good"});
+        fs.put_install("Good", "C:\\mq", "9.3.0.0");
+        const LegRun r = run_reg(fs);
+        CHECK(reg_status(r) == "supported|-");
+        CHECK(r.data() == std::vector<std::string>{"ibm_mq|IBM MQ|Good|9.3.0.0|C:/mq|-"});
+        CHECK(r.events == std::vector<LogEvent>{ev("installation_key", mw::ItemReason::malformed, "Bad")});
+    }
+    SECTION("every subkey dropped is an incomplete answer, never an empty supported") {
+        fs.put_keys({"A", "B"}); // neither has a FilePath value: absent, a data-shape fault
+        const LegRun r = run_reg(fs);
+        CHECK(reg_status(r) == "constrained|windows:middleware:installation_key:malformed");
+        CHECK(r.data().empty());
+        CHECK(r.events.size() == 2);
+    }
+    SECTION("an empty FilePath is dropped too") {
+        fs.put_keys({"A"});
+        fs.put_value("A", "FilePath", "");
+        const LegRun r = run_reg(fs);
+        CHECK(reg_status(r) == "constrained|windows:middleware:installation_key:malformed");
+    }
+    SECTION("a wrong-type or oversized FilePath is a data-shape drop, not a constraint") {
+        fs.put_keys({"Bin", "Big", "Good"});
+        fs.put_value_outcome("Bin", "FilePath", mw::Read::Outcome::not_text);
+        fs.put_value_outcome("Big", "FilePath", mw::Read::Outcome::oversized);
+        fs.put_install("Good", "C:\\mq", "9.3.0.0");
+        const LegRun r = run_reg(fs);
+        CHECK(reg_status(r) == "supported|-");
+        CHECK(r.data() == std::vector<std::string>{"ibm_mq|IBM MQ|Good|9.3.0.0|C:/mq|-"});
+        CHECK(r.events.size() == 2);
+    }
+}
+
+TEST_CASE("middleware registry runner: a refused or failed FilePath constrains, never reads absent",
+          "[middleware]") {
+    FakeRegFs fs;
+    SECTION("beside a usable sibling: permission_denied, the sibling's row is kept") {
+        fs.put_keys({"Denied", "Good"});
+        fs.put_value_outcome("Denied", "FilePath", mw::Read::Outcome::denied);
+        fs.put_install("Good", "C:\\mq", "9.3.0.0");
+        const LegRun r = run_reg(fs);
+        CHECK(reg_status(r) == "constrained|windows:middleware:installation_key:permission_denied");
+        CHECK(r.data() == std::vector<std::string>{"ibm_mq|IBM MQ|Good|9.3.0.0|C:/mq|-"});
+        CHECK(r.events ==
+              std::vector<LogEvent>{ev("installation_key", mw::ItemReason::unreadable, "Denied")});
+        // the refused installation's version is never asked for
+        CHECK(std::none_of(fs.read_calls.begin(), fs.read_calls.end(), [](const std::string& c) {
+            return c == std::string{kRegKey} + "|Denied|VRMF";
+        }));
+    }
+    SECTION("alone: permission_denied, not malformed") {
+        fs.put_keys({"Denied"});
+        fs.put_value_outcome("Denied", "FilePath", mw::Read::Outcome::denied);
+        const LegRun r = run_reg(fs);
+        CHECK(reg_status(r) == "constrained|windows:middleware:installation_key:permission_denied");
+        CHECK(r.data().empty());
+    }
+    SECTION("beside a data-shape drop: permission_denied alone, no malformed token") {
+        fs.put_keys({"Denied", "NoPath"});
+        fs.put_value_outcome("Denied", "FilePath", mw::Read::Outcome::denied);
+        const LegRun r = run_reg(fs);
+        CHECK(reg_status(r) == "constrained|windows:middleware:installation_key:permission_denied");
+        CHECK(r.data().empty());
+    }
+    SECTION("failed in any other way, beside a usable sibling: unreadable, the sibling is kept") {
+        for (const auto o : {mw::Read::Outcome::failed, mw::Read::Outcome::refused,
+                             mw::Read::Outcome::network, mw::Read::Outcome::symlink}) {
+            FakeRegFs f2;
+            f2.put_keys({"Broken", "Good"});
+            f2.put_value_outcome("Broken", "FilePath", o);
+            f2.put_install("Good", "C:\\mq", "9.3.0.0");
+            const LegRun r = run_reg(f2);
+            CHECK(reg_status(r) == "constrained|windows:middleware:installation_key:unreadable");
+            CHECK(r.data() == std::vector<std::string>{"ibm_mq|IBM MQ|Good|9.3.0.0|C:/mq|-"});
+            CHECK(r.events == std::vector<LogEvent>{
+                                  ev("installation_key", mw::ItemReason::unreadable, "Broken")});
+            // the failed installation's version is never asked for
+            CHECK(std::none_of(f2.read_calls.begin(), f2.read_calls.end(),
+                               [](const std::string& c) {
+                                   return c == std::string{kRegKey} + "|Broken|VRMF";
+                               }));
+        }
+    }
+    SECTION("failed, alone: unreadable, not malformed") {
+        fs.put_keys({"Broken"});
+        fs.put_value_outcome("Broken", "FilePath", mw::Read::Outcome::failed);
+        const LegRun r = run_reg(fs);
+        CHECK(reg_status(r) == "constrained|windows:middleware:installation_key:unreadable");
+        CHECK(r.data().empty());
+    }
+    SECTION("failed, beside a data-shape drop: unreadable alone, no malformed token") {
+        fs.put_keys({"Broken", "NoPath"});
+        fs.put_value_outcome("Broken", "FilePath", mw::Read::Outcome::failed);
+        const LegRun r = run_reg(fs);
+        CHECK(reg_status(r) == "constrained|windows:middleware:installation_key:unreadable");
+        CHECK(r.data().empty());
+    }
+}
+
+TEST_CASE("middleware registry runner: no VRMF anywhere is loud, one beside a sibling is not",
+          "[middleware]") {
+    FakeRegFs fs;
+    SECTION("absent on the only installation: vrmf malformed, the row is kept with version dash") {
+        fs.put_keys({"A"});
+        fs.put_install("A", "C:\\mq", "");
+        const LegRun r = run_reg(fs);
+        CHECK(reg_status(r) == "constrained|windows:middleware:vrmf:malformed");
+        CHECK(r.data() == std::vector<std::string>{"ibm_mq|IBM MQ|A|-|C:/mq|-"});
+        CHECK(r.events == std::vector<LogEvent>{ev("vrmf", mw::ItemReason::missing, "A")});
+    }
+    SECTION("absent on every one of two installations: the token once, both rows kept") {
+        fs.put_keys({"A", "B"});
+        fs.put_install("A", "C:\\a", "");
+        fs.put_install("B", "C:\\b", "");
+        const LegRun r = run_reg(fs);
+        CHECK(reg_status(r) == "constrained|windows:middleware:vrmf:malformed");
+        CHECK(r.data() == std::vector<std::string>{"ibm_mq|IBM MQ|A|-|C:/a|-",
+                                                   "ibm_mq|IBM MQ|B|-|C:/b|-"});
+    }
+    SECTION("absent on one beside a sibling that has it: supported, that row's version is dash") {
+        fs.put_keys({"A", "B"});
+        fs.put_install("A", "C:\\a", "");
+        fs.put_install("B", "C:\\b", "9.3.0.0");
+        const LegRun r = run_reg(fs);
+        CHECK(reg_status(r) == "supported|-");
+        CHECK(r.data() == std::vector<std::string>{"ibm_mq|IBM MQ|A|-|C:/a|-",
+                                                   "ibm_mq|IBM MQ|B|9.3.0.0|C:/b|-"});
+        CHECK(r.events == std::vector<LogEvent>{ev("vrmf", mw::ItemReason::missing, "A")});
+    }
+    SECTION("a refused, failed, oversized, empty or non-text value only blanks its row") {
+        struct Case {
+            mw::Read::Outcome out;
+            const char* text;
+            mw::ItemReason reason;
+        };
+        for (const Case& c :
+             {Case{mw::Read::Outcome::denied, "", mw::ItemReason::unreadable},
+              Case{mw::Read::Outcome::failed, "", mw::ItemReason::unreadable},
+              Case{mw::Read::Outcome::oversized, "", mw::ItemReason::unreadable},
+              Case{mw::Read::Outcome::not_text, "", mw::ItemReason::unreadable},
+              Case{mw::Read::Outcome::ok, "", mw::ItemReason::missing}}) {
+            FakeRegFs f2;
+            f2.put_keys({"A"});
+            f2.put_install("A", "C:\\mq", "");
+            f2.put_value_outcome("A", "VRMF", c.out);
+            const LegRun r = run_reg(f2);
+            CHECK(reg_status(r) == "supported|-");
+            CHECK(r.data() == std::vector<std::string>{"ibm_mq|IBM MQ|A|-|C:/mq|-"});
+            CHECK(r.events == std::vector<LogEvent>{ev("vrmf", c.reason, "A")});
+        }
+    }
+}
+
+TEST_CASE("middleware registry runner: the row cap keeps the first rows in sorted order", "[middleware]") {
+    FakeRegFs fs;
+    std::vector<std::string> names;
+    for (std::size_t i = 0; i < mw::kMaxRows + 1; ++i) {
+        std::string n = "I" + std::string(i < 10 ? "00" : (i < 100 ? "0" : "")) + std::to_string(i);
+        fs.put_install(n, "C:\\mq", "9.0.0.0");
+        names.push_back(std::move(n));
+    }
+    SECTION("more than kMaxRows subkeys") {
+        std::reverse(names.begin(), names.end());
+        fs.put_keys(names);
+        const LegRun r = run_reg(fs);
+        CHECK(reg_status(r) == "constrained|windows:middleware:installation_key:row_cap");
+        REQUIRE(r.data().size() == mw::kMaxRows);
+        CHECK(r.data().front().rfind("ibm_mq|IBM MQ|I000|", 0) == 0);
+        CHECK(r.data().back().rfind("ibm_mq|IBM MQ|I255|", 0) == 0);
+    }
+    SECTION("exactly kMaxRows subkeys complete") {
+        names.pop_back();
+        fs.put_keys(names);
+        const LegRun r = run_reg(fs);
+        CHECK(reg_status(r) == "supported|-");
+        CHECK(r.data().size() == mw::kMaxRows);
+    }
+}
+
+TEST_CASE("middleware registry runner: the Fs budget and the row budget end in walk row_cap",
+          "[middleware]") {
+    FakeRegFs fs;
+    fs.put_keys({"A", "B"});
+    fs.put_install("A", "C:\\a", "1.0.0.0");
+    fs.put_install("B", "C:\\b", "2.0.0.0");
+    SECTION("exhausted() after the listing gives no row") {
+        fs.exhausted_after_listing = true;
+        const LegRun r = run_reg(fs);
+        CHECK(reg_status(r) == "constrained|windows:middleware:walk:row_cap");
+        CHECK(r.data().empty());
+        CHECK(fs.read_calls.empty());
+    }
+    SECTION("exhausted() mid-walk: the candidate being resolved gets no row") {
+        fs.exhaust_after_reads = 3; // A: FilePath + VRMF (2 reads, fine), B: FilePath (3rd read)
+        const LegRun r = run_reg(fs);
+        CHECK(reg_status(r) == "constrained|windows:middleware:walk:row_cap");
+        CHECK(r.data() == std::vector<std::string>{"ibm_mq|IBM MQ|A|1.0.0.0|C:/a|-"});
+    }
+    SECTION("the caller's row budget") {
+        const LegRun r = run_reg(fs, mw::make_row_budget(1));
+        CHECK(reg_status(r) == "constrained|windows:middleware:walk:row_cap");
+        CHECK(r.data().size() == 1);
+    }
+}
+
+TEST_CASE("middleware registry runner: registry text is escaped and a planned leg reads nothing",
+          "[middleware]") {
+    SECTION("a pipe in a subkey name or value cannot shift the field count") {
+        FakeRegFs fs;
+        fs.put_keys({"A|B"});
+        fs.put_install("A|B", "C:\\m|q", "9.0|0.0");
+        const LegRun r = run_reg(fs);
+        REQUIRE(r.data().size() == 1);
+        const auto f = split_fields(r.data()[0]);
+        REQUIRE(f.size() == 6);
+        CHECK(f[2] == "A|B");
+        CHECK(f[4] == "C:/m|q");
+    }
+    SECTION("a leg with no probes yields nothing and asks the Fs nothing") {
+        FakeRegFs fs;
+        const mw::Product& acme = kAcme[0];
+        yuzu::shared::ConstraintAccumulator acc;
+        auto budget = mw::make_row_budget();
+        const auto rows = mw::run_reg_leg(acme, acme.windows, fs, acc, budget,
+                                          [](std::string_view, std::string_view, mw::ItemReason,
+                                             std::string_view) {});
         CHECK(rows.empty());
         CHECK(fs.read_calls.empty());
         CHECK_FALSE(acc.any_failure());

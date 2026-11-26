@@ -18,6 +18,7 @@
 // no I/O: the zero-dependency leaf-helper convention of this directory.
 #pragma once
 
+#include "file_search_position.hpp"
 #include "sha256.hpp"
 #include "wire_utf8.hpp"
 
@@ -41,7 +42,16 @@ inline constexpr std::size_t kMaxStars = 4;
 inline constexpr std::size_t kMinLiteralBytes = 3;
 // A canonical pattern or name longer than this cannot be matched (bounds the matcher's work).
 inline constexpr std::size_t kMaxCanonicalPatternBytes = 4 * kMaxPatternBytes;
+// The assert below proves one thing only: a RAW name at the position bound (kMaxNameBytes, 765)
+// fits the matcher before it is canonicalised. It does not prove the canonical form fits, on any
+// OS: the macOS canonicaliser (normalisation and case folding) can expand a name, and the Windows
+// upper-casing sizes its result separately, with nothing checking that it keeps the length. A name
+// either one pushes past this cap is not_evaluated, which the walk records as a `name_too_long` gap
+// (agents/plugins/file_search/src/file_search_driver.hpp), never as a non-match. That gap is the
+// intended honest answer, pinned in test_file_search_query.cpp ("A canonicaliser that expands a
+// short name past the cap"); raising the cap only moves where the gap starts.
 inline constexpr std::size_t kMaxCanonicalNameBytes = 4 * 255;
+static_assert(kMaxCanonicalNameBytes >= kMaxNameBytes, "a raw name a Position can hold must fit the matcher");
 
 enum class PatternError { empty, too_long, too_many_stars, too_few_literals, forbidden_byte };
 

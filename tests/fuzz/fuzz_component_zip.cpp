@@ -1,4 +1,4 @@
-// libFuzzer harness for agents/plugins/component_inventory/src/zip_directory.hpp
+// libFuzzer harness for agents/shared/zip_directory.hpp
 // - the pure, bounded ZIP central-directory reader. Every byte of an archive
 // is attacker-chosen (any file under a scanned root), so all three entry
 // points must be total: no crash, no out-of-bounds read, no unbounded work.
@@ -6,7 +6,7 @@
 // Registered in tests/fuzz/meson.build AND .clusterfuzzlite/build.sh - keep
 // the two in sync when adding sources.
 
-#include "../../agents/plugins/component_inventory/src/zip_directory.hpp"
+#include "../../agents/shared/zip_directory.hpp"
 
 #include <algorithm>
 #include <cstddef>

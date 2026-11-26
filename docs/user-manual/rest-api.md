@@ -11952,7 +11952,7 @@ rule delivery, disable or remove the rules instead. The response returns the row
 not the effective state, in the same shape as the `GET` above.
 
 **Plugins that start off.** `execution_artifacts`, `browser_inventory`, `privacy_permissions`,
-`remote_access_audit`, `process_introspect` and `file_search` are seeded as switched off when the server
+`remote_access_audit` and `process_introspect` are seeded as switched off when the server
 starts, and a restart does not overwrite a choice an operator has made. Turn one on with this `PUT` and
 `enabled` set to `true`.
 

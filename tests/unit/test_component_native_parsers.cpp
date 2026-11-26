@@ -11,12 +11,21 @@
  *
  * The reader every case uses (Rd) CHECKS each request against the buffer: a request not wholly
  * inside it sets `bad`, and every case asserts `bad` stayed false.
+ *
+ * WINDOWS (SAM-49). The PE cases use the REAL capture tests/unit/fixtures/binary_headers/pe_version.bin
+ * (an x64 DLL built on Windows 11 with MSVC, file version 1.2.3.4; provenance.txt there) and values
+ * derived from it by truncation or by zeroing the fixed file version. The one image built here, a PE
+ * with no resource directory, is SYNTHETIC: a hand-laid MZ and PE header with a PE32+ optional header
+ * that declares no data directories, the shape the reader answers `has_version == false` for.
  */
 #include <catch2/catch_test_macros.hpp>
+
+#include "binary_header_test_util.hpp" // bhtest::load_fixture: the real PE capture
 
 #include "component_native_parsers.hpp"
 
 #include <cstdint>
+#include <cstring>
 #include <stdexcept>
 #include <functional>
 #include <optional>
@@ -617,6 +626,215 @@ TEST_CASE("describe_*_file: not a library gives no row; an unreadable library is
     const std::string junk = "garbage";
     Rd rd4(junk);
     CHECK_FALSE(describe_macos_file("libfoo.dylib", rd4.fn(), junk.size()).has_value());
+}
+
+// ---- Windows: PE candidates, names and the fixed file version ----
+
+TEST_CASE("candidate predicate: .DLL and .dll are both candidates, .dll.mui and near misses are not",
+          "[component_native][component_inventory]") {
+    for (const char* ok : {"a.dll", "kernel32.dll", "KERNEL32.DLL", "Lib.Dll", "lib.dLL", "a.b.dll", "x y.dll"})
+        CHECK(is_windows_native_candidate(ok));
+    for (const char* no : {".dll", "dll", "a.dll.mui", "a.dll.bak", "a.dl", "adll", "a.dll ", "a.dll.", "a.dlls",
+                           "a.so", "a.dylib", "a.exe", "a.DLL.MUI", ""})
+        CHECK_FALSE(is_windows_native_candidate(no));
+}
+
+TEST_CASE("describe_windows: the file name without its extension, the fixed file version when one is declared",
+          "[component_native][component_inventory]") {
+    {
+        const auto d = describe_windows("libfoo.dll", std::optional<std::string>{"1.2.3.4"});
+        CHECK(d.name == "libfoo");
+        CHECK(d.version == "1.2.3.4");
+        CHECK(d.version_source == NativeVersionSource::pe);
+    }
+    { // the extension is cut whatever its case; an inner dot stays
+        CHECK(describe_windows("Lib.Core.DLL", std::nullopt).name == "Lib.Core");
+        CHECK(describe_windows("a.dll", std::nullopt).name == "a");
+    }
+    { // no version declared: named, version unreadable (the row is still listed)
+        const auto d = describe_windows("libfoo.dll", std::nullopt);
+        CHECK(d.name == "libfoo");
+        CHECK(d.version.empty());
+        CHECK(d.version_source == NativeVersionSource::unreadable);
+    }
+    { // hostile bytes in a file name never reach a name as anything but '?'
+        const auto d = describe_windows(std::string("lib\x01\xff|x.dll"), std::nullopt);
+        CHECK(d.name == "lib??|x");
+    }
+    { // the name is capped like every other leg's
+        const auto d = describe_windows(std::string(400, 'a') + ".dll", std::nullopt);
+        CHECK(d.name.size() == kMaxNativeNameBytes);
+    }
+    CHECK(to_token(NativeVersionSource::pe) == "pe");
+}
+
+TEST_CASE("native_pe: the real capture gives the fixed file version", "[component_native][component_inventory]") {
+    const std::string capture = bhtest::load_fixture("pe_version.bin");
+    Rd rd(capture);
+    const auto r = native_pe(rd.fn(), capture.size());
+    REQUIRE(r.has_value());
+    REQUIRE(r->has_value());
+    CHECK(**r == "1.2.3.4"); // pe_version.bin's VERSIONINFO file version (provenance.txt)
+    CHECK_FALSE(rd.bad);
+
+    Rd rd2(capture);
+    const auto d = describe_windows_file("yuzu_fixture.dll", rd2.fn(), capture.size());
+    REQUIRE(d.has_value());
+    CHECK(d->name == "yuzu_fixture");
+    CHECK(d->version == "1.2.3.4");
+    CHECK(d->version_source == NativeVersionSource::pe);
+    CHECK_FALSE(rd2.bad);
+}
+
+namespace {
+
+/// SYNTHETIC. A PE32+ image with a valid MZ and PE header and an optional header that declares no data
+/// directories: the reader answers it as a value with has_version == false.
+std::string pe_without_resources() {
+    std::string b(64 + 24 + 112, '\0');
+    b[0] = 'M';
+    b[1] = 'Z';
+    put(b, 0x3C, 64, 4, false);          // e_lfanew
+    b.replace(64, 4, std::string("PE\0\0", 4));
+    put(b, 64 + 4, 0x8664, 2, false);    // machine: x64
+    put(b, 64 + 6, 0, 2, false);         // no sections
+    put(b, 64 + 20, 112, 2, false);      // SizeOfOptionalHeader
+    put(b, 64 + 24, 0x20b, 2, false);    // optional header magic: PE32+
+    return b;                            // NumberOfRvaAndSizes (offset 108) stays 0
+}
+
+} // namespace
+
+TEST_CASE("native_pe: a PE with no version resource, or a 0.0.0.0 one, is a library that declares no version",
+          "[component_native][component_inventory]") {
+    {
+        const auto img = pe_without_resources();
+        Rd rd(img);
+        const auto r = native_pe(rd.fn(), img.size());
+        REQUIRE(r.has_value());
+        CHECK_FALSE(r->has_value());
+        CHECK_FALSE(rd.bad);
+
+        Rd rd2(img);
+        const auto d = describe_windows_file("nover.dll", rd2.fn(), img.size());
+        REQUIRE(d.has_value()); // a row, not a skip
+        CHECK(d->name == "nover");
+        CHECK(d->version.empty());
+        CHECK(d->version_source == NativeVersionSource::unreadable);
+    }
+    { // the real capture with its fixed file version zeroed (VS_FIXEDFILEINFO: signature, struct version,
+      // then dwFileVersionMS and dwFileVersionLS)
+        std::string capture = bhtest::load_fixture("pe_version.bin");
+        const auto sig = capture.find(std::string("\xBD\x04\xEF\xFE", 4));
+        REQUIRE(sig != std::string::npos);
+        for (std::size_t i = 8; i < 16; ++i)
+            capture[sig + i] = '\0';
+        Rd rd(capture);
+        const auto r = native_pe(rd.fn(), capture.size());
+        REQUIRE(r.has_value());
+        CHECK_FALSE(r->has_value());
+        Rd rd2(capture);
+        const auto d = describe_windows_file("zero.dll", rd2.fn(), capture.size());
+        REQUIRE(d.has_value());
+        CHECK(d->version_source == NativeVersionSource::unreadable);
+    }
+}
+
+TEST_CASE("native_pe: not a PE is not a library; a truncated or malformed PE is unreadable and never throws",
+          "[component_native][component_inventory]") {
+    const std::string capture = bhtest::load_fixture("pe_version.bin");
+
+    // No MZ, no PE signature, or under two bytes: not a library, no row.
+    const std::string script = "#!/bin/sh\necho not a pe\n";
+    Rd a(script);
+    CHECK_FALSE(describe_windows_file("x.dll", a.fn(), script.size()).has_value());
+    const std::string one = "M";
+    Rd b(one);
+    CHECK_FALSE(describe_windows_file("x.dll", b.fn(), one.size()).has_value());
+    const std::string empty;
+    Rd c(empty);
+    CHECK_FALSE(describe_windows_file("x.dll", c.fn(), 0).has_value());
+    auto no_pe_sig = capture;
+    std::uint32_t e_lfanew = 0;
+    std::memcpy(&e_lfanew, capture.data() + 0x3C, sizeof(e_lfanew)); // little-endian host, as the format is
+    REQUIRE(e_lfanew < capture.size());
+    no_pe_sig[e_lfanew] = 'X'; // e_lfanew now names a place that is not "PE\0\0"
+    Rd d(no_pe_sig);
+    CHECK_FALSE(describe_windows_file("x.dll", d.fn(), no_pe_sig.size()).has_value());
+    for (const auto& r : {&a, &b, &c, &d})
+        CHECK_FALSE(r->bad);
+
+    // MZ and then a cut: a library that cannot be read, named by its file, version unreadable.
+    for (const std::size_t keep : {std::size_t{2}, std::size_t{64}, std::size_t{100}, std::size_t{200}, std::size_t{512},
+                                   std::size_t{1500}, std::size_t{2048}}) {
+        const auto cut = capture.substr(0, keep);
+        Rd rd(cut);
+        const auto desc = describe_windows_file("cut.dll", rd.fn(), cut.size());
+        INFO("kept " << keep << " bytes");
+        REQUIRE(desc.has_value());
+        CHECK(desc->name == "cut");
+        CHECK(desc->version_source == NativeVersionSource::unreadable);
+        CHECK_FALSE(rd.bad);
+    }
+
+    // A fault in a read, at any call, is never a value; an exception out of a read never escapes.
+    Rd clean(capture);
+    REQUIRE(native_pe(clean.fn(), capture.size()).has_value());
+    REQUIRE(clean.calls >= 2);
+    for (std::size_t k = 0; k < clean.calls; ++k) {
+        Rd failing(capture);
+        failing.fail_call = k;
+        CHECK_FALSE(native_pe(failing.fn(), capture.size()).has_value());
+        Rd shorting(capture);
+        shorting.short_call = k;
+        CHECK_FALSE(native_pe(shorting.fn(), capture.size()).has_value());
+        CHECK_FALSE(failing.bad);
+        CHECK_FALSE(shorting.bad);
+    }
+    Rd inner_rd(capture);
+    auto inner = inner_rd.fn();
+    const ReadAt throwing = [inner, n = std::size_t{0}](std::uint64_t off, std::size_t len) mutable
+        -> std::optional<std::string> {
+        if (n++ == 1)
+            throw std::runtime_error("boom");
+        return inner(off, len);
+    };
+    const auto thrown = native_pe(throwing, capture.size());
+    REQUIRE_FALSE(thrown.has_value());
+    CHECK(thrown.error() == NativeError::unreadable);
+    const ReadAt throwing_again = [inner, n = std::size_t{0}](std::uint64_t off, std::size_t len) mutable
+        -> std::optional<std::string> {
+        if (n++ == 1)
+            throw std::runtime_error("boom");
+        return inner(off, len);
+    };
+    REQUIRE(describe_windows_file("boom.dll", throwing_again, capture.size()).has_value()); // a file-name row
+}
+
+TEST_CASE("sweep: every truncation and damaged header byte of a PE is an outcome, never an outside read",
+          "[component_native][component_inventory][sweep]") {
+    const std::vector<std::pair<const char*, std::string>> fixtures = {
+        {"real", bhtest::load_fixture("pe_version.bin")},
+        {"no_resources", pe_without_resources()},
+    };
+    for (const auto& [what, bytes] : fixtures) {
+        INFO(what);
+        bool clean = true;
+        const auto run = [&clean](const std::string& image) {
+            Rd rd(image);
+            (void)native_pe(rd.fn(), image.size());
+            clean = clean && !rd.bad;
+        };
+        for (std::size_t len = 0; len <= bytes.size(); ++len)
+            run(bytes.substr(0, len));
+        for (std::size_t i = 0; i < std::min<std::size_t>(512, bytes.size()); ++i)
+            for (const unsigned char v : {0x00, 0x7f, 0x80, 0xff}) {
+                auto m = bytes;
+                m[i] = static_cast<char>(v);
+                run(m);
+            }
+        CHECK(clean);
+    }
 }
 
 // ---- fuzz-style sweep over the adapter ----

@@ -10,20 +10,21 @@
  * `search` trailer last. Names, types, sizes, times and extents only: a matched file is opened for its
  * facts and never read, and no file content is read or hashed.
  *
- * SHIPPED LEGS. Linux and macOS. The Windows leg is a later change and answers through the shared
- * planned-leg reporter. All three descriptor legs are declared unconditionally so the capability-matrix
- * generator sees a complete, stable shape.
+ * SHIPPED LEGS. Linux, macOS and Windows. All three descriptor legs are declared unconditionally so the
+ * capability-matrix generator sees a complete, stable shape. The plugin is ON by default on every OS (the
+ * per-plugin kill switch still turns it off).
  *
  * THIS TU holds the descriptors, init (the module pin and the context the heartbeat keys are written
  * through), shutdown (stop and a bounded quiesce) and the two hooks a finished slice triggers: the heartbeat
  * counters and the log line. The execute body and its one try/catch are in file_search_execute.hpp, the
- * state machine in file_search_driver.hpp and the operating system in file_search_posix.cpp.
+ * state machine in file_search_driver.hpp, the process-wide slot and the worker runner in
+ * file_search_shell.cpp and the operating system in file_search_posix.cpp and file_search_win.cpp.
  *
  * THE MODULE PIN. A slice that times out leaves its worker thread running, and that worker runs this
  * plugin's own code (the walk is compiled into it). Unloading the module under it would unmap code that is
- * still executing, so init takes one extra reference on the module, with RTLD_NODELETE, and never releases
- * it: the module stays mapped for the life of the process, and the worker can finish on its own time. Init
- * fails if the pin cannot be taken.
+ * still executing, so init takes one extra reference on the module and never releases it (POSIX: dlopen with
+ * RTLD_NODELETE; Windows: GetModuleHandleExW with the pin flag): the module stays mapped for the life of the
+ * process, and the worker can finish on its own time. Init fails if the pin cannot be taken.
  *
  * SHUTDOWN. shutdown() clears the context pointer the heartbeat writes through, sets the stop flag (a
  * running walk ends at its next entry) and waits a short bounded quiesce for a call in flight. On the
@@ -34,8 +35,6 @@
  */
 
 #include <yuzu/plugin.hpp>
-
-#include <planned_leg.hpp> // yuzu::shared::report_planned (agents/shared)
 
 #include "file_search_execute.hpp"
 
@@ -48,9 +47,17 @@
 #include <string_view>
 #include <thread>
 
-#if !defined(_WIN32)
 #include <spdlog/spdlog.h>
 
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
 #include <dlfcn.h>
 #endif
 
@@ -83,8 +90,19 @@ const YuzuActionDescriptor kActionDescriptors[] = {
          "firmlinks and reads partial; the verdict reads partial when any mount, directory or name was not "
          "searched"},
         /* .windows_leg = */
-        {YUZU_SUPPORT_PLANNED, 1, "NTFS volume search and a directory walk with the same rows",
-         "not read yet: one unsupported status row, windows:planned"},
+        {YUZU_SUPPORT_CONSTRAINED, 1,
+         "resumable sorted depth-first search of one fixed volume through parent-handle-relative no-reparse "
+         "opens; the volume type and the drive type decide whether it is searched; the extents of every "
+         "matched file from FSCTL_GET_RETRIEVAL_POINTERS on an attribute-only handle, after "
+         "FSCTL_GET_EXTERNAL_BACKING rules out an externally backed file; matched files are opened for "
+         "their attributes and never read",
+         "constrained: fixed NTFS, ReFS, FAT, FAT32 and exFAT volumes only; names compare upper-cased; links, "
+         "junctions and mount points are skipped and counted; a populated cloud-synced folder is searched; "
+         "placeholder and offline files and folders are never opened, except that each folder of the "
+         "operator-named root's own path is opened (never listed) before any listing decision (tracked in "
+         "#8755); file ids are reported on NTFS only; a folder the agent's token is refused is a gap; the "
+         "search takes no extra privilege; the verdict reads partial when any volume, directory or name was "
+         "not searched"},
     },
 };
 
@@ -102,16 +120,6 @@ struct InFlight {
 /// How long shutdown() waits for a call that is running to return. Bounded: a walk blocked in a system call
 /// is not waited for; its worker finishes on its own time inside the pinned module.
 constexpr std::chrono::milliseconds kShutdownQuiesce{3'000};
-
-#if !defined(_WIN32)
-
-// The exception provenance is a literal per OS: the catch-all must answer without allocating outside its own
-// guarded calls. (The Windows leg answers `planned` and never reads one.)
-#if defined(__APPLE__)
-constexpr std::string_view kExceptionProvenance = "macos:file_search:exception";
-#else
-constexpr std::string_view kExceptionProvenance = "linux:file_search:exception";
-#endif
 
 // ---- the heartbeat counters and the log line ----
 
@@ -156,11 +164,23 @@ void after_slice(const fs_plugin::SliceResult& r) {
     log_slice(r);
 }
 
-void pin_anchor() noexcept {} // an address inside this module, for dladdr
+void pin_anchor() noexcept {} // an address inside this module
 
-/// Takes one extra reference on this module, with RTLD_NODELETE, once; never released. False if it cannot be
-/// taken, in which case init fails and the plugin never runs.
+/// Takes one extra reference on this module, once; never released. False if it cannot be taken, in which
+/// case init fails and the plugin never runs.
 [[nodiscard]] bool pin_module() noexcept {
+#if defined(_WIN32)
+    static bool pinned = false;
+    if (pinned)
+        return true;
+    HMODULE module = nullptr;
+    // With FROM_ADDRESS the "name" argument is an address inside the module, not a string; the pointer is
+    // never read as wchar_t. The pin flag makes FreeLibrary unable to unmap the module for the life of the
+    // process (the echo plugin's pin, echo_mapdrive_collector.cpp).
+    pinned = ::GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
+                                  reinterpret_cast<LPCWSTR>(&pin_anchor), &module) != 0;
+    return pinned;
+#else
     static void* handle = nullptr;
     if (handle != nullptr)
         return true;
@@ -171,9 +191,8 @@ void pin_anchor() noexcept {} // an address inside this module, for dladdr
         return false;
     handle = ::dlopen(info.dli_fname, RTLD_NOW | RTLD_NOLOAD | RTLD_NODELETE);
     return handle != nullptr;
+#endif
 }
-
-#endif // !_WIN32
 
 } // namespace
 
@@ -197,12 +216,11 @@ public:
     }
 
     yuzu::Result<void> init(yuzu::PluginContext& ctx) override {
-#if !defined(_WIN32)
         if (!pin_module())
             return std::unexpected(yuzu::PluginError{1, "file_search: the plugin module could not be pinned"});
-        if (!fs_plugin::posix_init_cursor_key())
+        if (!fs_plugin::init_cursor_key())
             return std::unexpected(yuzu::PluginError{1, "file_search: the cursor key could not be drawn"});
-        fs_plugin::posix_clear_stop();
+        fs_plugin::clear_stop();
         const std::lock_guard<std::mutex> lock(g_heartbeat_mutex);
         g_plugin_ctx = ctx.raw();
         // "Since the agent started": the KV is a file that outlives the process and the totals restart at
@@ -213,20 +231,15 @@ public:
         g_totals.fill(0);
         for (const char* key : kHeartbeatKeys)
             (void)yuzu_ctx_storage_delete(g_plugin_ctx, key);
-#else
-        (void)ctx;
-#endif
         return {};
     }
 
     void shutdown(yuzu::PluginContext& /*ctx*/) noexcept override {
-#if !defined(_WIN32)
         {
             const std::lock_guard<std::mutex> lock(g_heartbeat_mutex);
             g_plugin_ctx = nullptr; // nothing below writes through a context again
         }
-        fs_plugin::posix_request_stop(); // a running walk ends at its next entry
-#endif
+        fs_plugin::request_stop(); // a running walk ends at its next entry
         const auto give_up = std::chrono::steady_clock::now() + kShutdownQuiesce;
         while (g_in_flight.load(std::memory_order_acquire) != 0 && std::chrono::steady_clock::now() < give_up)
             std::this_thread::sleep_for(std::chrono::milliseconds{10});
@@ -234,24 +247,10 @@ public:
 
     int execute(yuzu::CommandContext& ctx, std::string_view action, yuzu::Params params) override {
         const InFlight in_flight;
-#if defined(_WIN32)
-        // The Windows leg is a later change. Nothing here can throw but the row text, so the one catch
-        // answers with the status 1 rather than unwind through the SDK's extern "C" export.
-        (void)params;
-        try {
-            if (action != fs_plugin::kSearchAction) {
-                ctx.write_output(std::string{"unknown action: "} + yuzu::util::safe_output_field(action));
-                return 1;
-            }
-            return yuzu::shared::report_planned(ctx, fs_plugin::kSearchAction);
-        } catch (...) {
-            return 1;
-        }
-#else
         return fs_plugin::execute_search(ctx, action, params.get("root"), params.get("pattern"),
-                                         params.get("kinds"), params.get("cursor"), &fs_plugin::posix_name_semantics,
-                                         &fs_plugin::run_posix_slice, &after_slice, kExceptionProvenance);
-#endif
+                                         params.get("kinds"), params.get("cursor"), &fs_plugin::os_name_semantics,
+                                         &fs_plugin::run_live_slice, &after_slice, fs_plugin::kExceptionProvenance,
+                                         &fs_plugin::os_normalise_root);
     }
 };
 

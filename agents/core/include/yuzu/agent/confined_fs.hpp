@@ -256,6 +256,13 @@ struct OpenDirResult {
 #endif
     Reason reason;
     int os_error;
+#ifdef _WIN32
+    /// The directory's FILE_ATTRIBUTE_* bits and, only when the reparse-point attribute is set, its
+    /// reparse tag (else 0), read from the handle itself. Filled on success AND on a ReparseRejected
+    /// refusal (with no handle), so a caller can name the cause without a second open.
+    std::uint32_t attributes{0};
+    std::uint32_t reparse_tag{0};
+#endif
 };
 
 /// Open and pin `path` as a confinement root. Refuses (via `reason`) a
@@ -288,8 +295,44 @@ struct OpenDirResult {
 /// Open `name` inside `parent` as a new confined directory handle. `root_id`
 /// re-verifies the opened directory is still within the pinned root's
 /// volume.
+///
+/// `reparse` is the REPARSE POLICY, an opt-in that widens nothing by default. Under
+/// `ReparseDirs::refuse` (the default, and what every existing caller gets) a directory that carries a
+/// reparse tag is refused with ReparseRejected. Under `ReparseDirs::allow_populated_cloud` exactly ONE
+/// family is admitted: a directory whose tag is in the cloud family and whose attributes carry no recall
+/// or offline bit (`reparse_dir_open_allowed`, confined_fs_rules.hpp). A symlink, a junction or mount
+/// point, a WSL symlink, any unknown tag and a cloud directory marked recall or offline are refused under
+/// BOTH policies. The decision is taken on the OPENED handle, inside this function, before the caller can
+/// enumerate it. The open itself is the same for every directory and never carries FILE_OPEN_NO_RECALL
+/// (an open flag is not a recall barrier; see open_file_attributes_at).
 [[nodiscard]] YUZU_EXPORT OpenDirResult open_dir_at(HANDLE parent, const std::string& name,
-                                                     const FileIdentity& root_id);
+                                                     const FileIdentity& root_id,
+                                                     ReparseDirs reparse = ReparseDirs::refuse);
+
+/// Result of `open_file_attributes_at`. `h` is valid only on success; `attributes`, `reparse_tag`
+/// (when the reparse attribute is set), `size` and `mtime` are read from that handle.
+struct OpenFileResult {
+    WinHandle h;
+    Reason reason{Reason::None};
+    int os_error{0};
+    std::uint32_t attributes{0};
+    std::uint32_t reparse_tag{0};
+    std::uint64_t size{0};
+    std::optional<std::int64_t> mtime;
+};
+
+/// Open the non-directory `name` inside `parent` for its ATTRIBUTES ONLY and never for its data
+/// (FILE_READ_ATTRIBUTES | SYNCHRONIZE). Parent-handle-relative like open_dir_at; a reparse point is
+/// opened as itself (FILE_OPEN_REPARSE_POINT) and is NOT rejected here: the caller decides from
+/// `attributes` and `reparse_tag`.
+///
+/// What protects a placeholder or any other file: the handle has no data right, so it can neither read
+/// nor hydrate the file. Measured: an open of this form on an unhydrated cloud placeholder caused no
+/// provider callback of any kind. FILE_OPEN_NO_RECALL is deliberately never sent and is NOT a barrier (a
+/// read on a handle opened with it hydrated the file); it is unmeasured on ReFS, so sending it could
+/// only add a refusal.
+[[nodiscard]] YUZU_EXPORT OpenFileResult open_file_attributes_at(HANDLE parent, const std::string& name,
+                                                                  const FileIdentity& root_id);
 
 namespace detail {
 

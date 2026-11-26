@@ -111,7 +111,7 @@ ARG CHISEL_VERSION=v1.4.2
 ARG CHISEL_RELEASE=ubuntu-26.04
 
 # ca-certificates: chisel fetches the release definitions + .debs over HTTPS.
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates python3 zstd \
     && rm -rf /var/lib/apt/lists/*
 
 ADD https://github.com/canonical/chisel/releases/download/${CHISEL_VERSION}/chisel_${CHISEL_VERSION}_linux_${TARGETARCH}.tar.gz /tmp/chisel.tgz
@@ -156,18 +156,24 @@ RUN set -eux; \
 # pockets) instead of being served from the runner's persistent build cache.
 # Local builds leave it empty and cache as usual.
 ARG YUZU_PACKAGE_REFRESH=
+# Records the cut packages where Trivy and grype read them (see the script's header).
+COPY deploy/docker/chisel-emit-status.py /usr/local/bin/chisel-emit-status.py
 RUN set -eux; mkdir -p /rootfs; \
     : "package refresh: ${YUZU_PACKAGE_REFRESH}"; \
     SLICES="base-files_base base-files_etc base-files_var base-files_tmp \
-      base-files_release-info base-passwd_data netbase_config \
+      base-files_release-info base-files_chisel base-passwd_data netbase_config \
       ca-certificates_data openssl_config libc6_libs libgcc-s1_libs \
       libstdc++6_libs libssl3t64_libs libsqlite3-0_libs libsystemd0_libs libblkid1_libs zlib1g_libs \
       busybox-static_bins"; \
     ok=0; for i in 1 2 3 4 5; do \
-      if chisel cut --release "${CHISEL_RELEASE}" --root /rootfs ${SLICES}; then ok=1; break; fi; \
-      echo "chisel cut attempt $i failed; retrying in 5s"; sleep 5; \
+      rm -rf /rootfs; mkdir -p /rootfs; \
+      if chisel cut --release "${CHISEL_RELEASE}" --root /rootfs ${SLICES} \
+         && apt-get update -qq \
+         && python3 /usr/local/bin/chisel-emit-status.py --root /rootfs --slices "${SLICES}"; then ok=1; break; fi; \
+      echo "chisel cut or status.d attempt $i failed; retrying in 5s"; sleep 5; \
     done; \
-    [ "$ok" = 1 ]
+    [ "$ok" = 1 ]; \
+    rm -rf /var/lib/apt/lists/*
 
 # Agent artifacts: binary, the core DSO, and the plugin directory.
 COPY --from=builder /src/builddir/agents/core/yuzu-agent           /rootfs/usr/local/bin/yuzu-agent
