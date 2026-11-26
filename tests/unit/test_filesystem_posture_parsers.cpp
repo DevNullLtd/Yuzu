@@ -538,6 +538,7 @@ TEST_CASE("filesystem_posture: plan_vss_rows -- an empty incomplete read never c
         REQUIRE(plan.marks.size() == 1);
         CHECK_FALSE(plan.marks[0].denied);
         CHECK(plan.marks[0].detail == c.mark);
+        CHECK(plan.marks[0].cause.empty());
     }
 }
 
@@ -552,8 +553,10 @@ TEST_CASE("filesystem_posture: plan_vss_rows -- marks run skipped, narrowed, tru
     CHECK(plan.marks[0].detail == kSkippedMark);
     CHECK(plan.marks[1].detail == kNarrowedMark);
     CHECK(plan.marks[2].detail == kTruncatedMark);
-    for (const auto& mark : plan.marks)
+    for (const auto& mark : plan.marks) {
         CHECK_FALSE(mark.denied);
+        CHECK(mark.cause.empty());
+    }
 }
 
 TEST_CASE("filesystem_posture: plan_vss_rows -- each failed step, denied and otherwise",
@@ -591,6 +594,7 @@ TEST_CASE("filesystem_posture: plan_vss_rows -- each failed step, denied and oth
             REQUIRE(plan.marks.size() == 1);
             CHECK(plan.marks[0].denied == denied);
             CHECK(plan.marks[0].detail == detail);
+            CHECK(plan.marks[0].cause.empty());
         }
     }
 }
@@ -608,6 +612,7 @@ TEST_CASE("filesystem_posture: plan_vss_rows -- a mid-walk failure keeps the row
     REQUIRE(plan.marks.size() == 1);
     CHECK_FALSE(plan.marks[0].denied);
     CHECK(plan.marks[0].detail == "IVssEnumObject::Next failed: 0x80042306");
+    CHECK(plan.marks[0].cause.empty());
 }
 
 TEST_CASE("filesystem_posture: plan_vss_rows -- an unanswered read names its cause",
@@ -643,4 +648,5 @@ TEST_CASE("filesystem_posture: plan_vss_rows -- a build without the VSS API says
     REQUIRE(plan.marks.size() == 1);
     CHECK_FALSE(plan.marks[0].denied);
     CHECK(plan.marks[0].detail == "SDK header vsbackup.h not present at build time");
+    CHECK(plan.marks[0].cause.empty());
 }

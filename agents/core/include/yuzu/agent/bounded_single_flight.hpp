@@ -24,10 +24,6 @@
  * template taking the slot by reference: production binds agent-core's slots, tests bind their own.
  */
 
-#include <yuzu/agent/bounded_status.hpp>
-
-#include <bounded_wait.hpp> // yuzu::shared::bounded_call_ex (agents/shared)
-
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -35,6 +31,9 @@
 #include <optional>
 #include <type_traits>
 #include <utility>
+
+#include <yuzu/agent/bounded_status.hpp>
+#include <bounded_wait.hpp> // yuzu::shared::bounded_call_ex (agents/shared)
 
 namespace yuzu::agent {
 

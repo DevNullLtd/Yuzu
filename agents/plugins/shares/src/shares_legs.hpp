@@ -31,6 +31,7 @@
 #include <constraint_accumulator.hpp>
 #include <yuzu/agent/runner_status.hpp>
 #include <yuzu/agent/subprocess_runner.hpp>
+#include <yuzu/agent/win_share_enum.hpp> // ShareRec (portable)
 #include <yuzu/plugin.hpp>
 #include <yuzu/string_utils.hpp>
 
@@ -428,13 +429,9 @@ inline Listing list_linux(const LinuxFs& fs) {
 // Windows decision logic (OS-free; the shell in shares_win.cpp injects NetShareEnum)
 // ---------------------------------------------------------------------------
 
-/// One NetShareEnum entry, already converted to UTF-8 by the shell. No `remark` (free text
-/// that can name people) and no ACL: names, paths and the type word only.
-struct WinShareRec {
-    std::string name;
-    std::string path; ///< empty at level 1 (SHARE_INFO_1 carries none) and for IPC$
-    std::uint32_t type = 0; ///< SHARE_INFO_*.shi*_type
-};
+/// One NetShareEnum entry: agent-core's record, already UTF-8. No `remark` (free text that can
+/// name people) and no ACL: names, paths and the type word only.
+using WinShareRec = yuzu::agent::win::ShareRec;
 
 /// One NetShareEnum call: its NET_API_STATUS, the entries of THAT page only, and the API's
 /// `totalentries` for that call.

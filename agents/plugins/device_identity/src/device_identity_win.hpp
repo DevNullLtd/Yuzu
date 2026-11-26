@@ -5,11 +5,11 @@
  * read is agent-core's (yuzu/agent/win_join_info.hpp).
  */
 
-#include <yuzu/agent/win_join_info.hpp>
-
 #include <cstdint>
 #include <string>
 #include <vector>
+
+#include <yuzu/agent/win_join_info.hpp>
 
 namespace yuzu::device_identity::win {
 

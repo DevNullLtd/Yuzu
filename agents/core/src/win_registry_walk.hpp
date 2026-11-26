@@ -14,11 +14,6 @@
  *                                         otherwise `size` is the capacity in and the length out
  */
 
-#include <yuzu/agent/win_registry_read.hpp>
-
-#include "binary_header_pe.hpp"   // yuzu::shared::binary_header::utf16_to_utf8 (agents/shared)
-#include "user_profile_model.hpp" // yuzu::profiles::multi_sz_records, kReg* (agents/shared)
-
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
@@ -27,6 +22,10 @@
 #include <string_view>
 #include <utility>
 #include <vector>
+
+#include <yuzu/agent/win_registry_read.hpp>
+#include "binary_header_pe.hpp"   // yuzu::shared::binary_header::utf16_to_utf8 (agents/shared)
+#include "user_profile_model.hpp" // yuzu::profiles::multi_sz_records, kReg* (agents/shared)
 
 namespace yuzu::agent::win::detail {
 

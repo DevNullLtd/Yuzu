@@ -6,16 +6,16 @@
  * agent-core. Portable, with no Windows type, so both are tested on every OS.
  */
 
-#include <yuzu/agent/bounded_single_flight.hpp>
-
-#include <spdlog/spdlog.h>
-
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <string_view>
 #include <utility>
 #include <vector>
+
+#include <spdlog/spdlog.h>
+
+#include <yuzu/agent/bounded_single_flight.hpp>
 
 namespace yuzu::agent::win::detail {
 

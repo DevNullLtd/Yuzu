@@ -54,6 +54,9 @@ SmbSessionsRead drain(DWORD level, std::size_t max_entries, LPWSTR Info::*client
         page.status = static_cast<std::uint32_t>(status);
         page.raw_count = static_cast<std::uint32_t>(read);
         if ((status == NERR_Success || status == ERROR_MORE_DATA) && buf) {
+            // The API allocated and aligned buf as an array of `read` Info entries; the strings
+            // they point at live in the same buffer, which `buf` owns to the end of this page,
+            // and every string is copied out first.
             const auto* entries = reinterpret_cast<const Info*>(buf.get());
             for (DWORD i = 0; i < read; ++i) {
                 SmbSession s{yuzu::win::from_wide(entries[i].*client),

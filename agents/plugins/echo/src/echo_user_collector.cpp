@@ -30,24 +30,10 @@
 #include <utmpx.h>
 #endif
 
-#ifdef _WIN32
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <windows.h>
-#include <wtsapi32.h> // WTS_CONNECTSTATE_CLASS, for the static_asserts below
-#endif
-
 namespace yuzu::echo {
 
 // -- Windows implementation ---------------------------------------------------
 #ifdef _WIN32
-
-static_assert(kWtsStateActive == static_cast<std::uint32_t>(WTSActive));
-static_assert(kWtsStateDisconnected == static_cast<std::uint32_t>(WTSDisconnected));
 
 std::vector<UserSession> enumerate_users() {
     return user_sessions_from_wts(

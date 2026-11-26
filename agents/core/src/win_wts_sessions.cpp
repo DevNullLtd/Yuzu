@@ -32,6 +32,13 @@ SingleFlightSlot& g_wts_slot = detail::new_slot();
 
 #ifdef _WIN32
 
+// The header names these as plain numbers: a value that disagrees with the SDK fails this build.
+static_assert(kWtsActive == static_cast<std::uint32_t>(WTSActive));
+static_assert(kWtsConnected == static_cast<std::uint32_t>(WTSConnected));
+static_assert(kWtsDisconnected == static_cast<std::uint32_t>(WTSDisconnected));
+static_assert(kWtsIdle == static_cast<std::uint32_t>(WTSIdle));
+static_assert(kWtsListen == static_cast<std::uint32_t>(WTSListen));
+
 /// RAII owner of a buffer the WTS API allocated.
 struct WtsFree {
     void operator()(void* p) const noexcept { ::WTSFreeMemory(p); }

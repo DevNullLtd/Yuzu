@@ -1475,7 +1475,6 @@ if host_machine.system() == 'windows'
   echo_test_deps += cxx.find_library('wevtapi')  # echo_netconn_win.cpp EvtQuery/EvtRender
   echo_test_deps += cxx.find_library('ws2_32')   # winsock2 symbols the iphlpapi/netioapi headers in echo_netqual_boot.cpp pull in
   echo_test_deps += cxx.find_library('mpr')      # echo_mapdrive_collector.cpp WNet outbound
-  echo_test_deps += cxx.find_library('netapi32') # echo_mapdrive_collector.cpp NetSessionEnum inbound
   echo_test_deps += cxx.find_library('powrprof') # echo_power_collector.cpp PowerRegisterSuspendResumeNotification
 elif host_machine.system() == 'linux'
   # echo_power_collector.cpp is compiled DIRECTLY into this exe, and its Linux

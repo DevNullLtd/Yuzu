@@ -1,13 +1,15 @@
 /**
- * test_users_win_rows.cpp -- the pure Windows row builders of the users plugin
- * (agents/plugins/users/src/users_win_rows.hpp). Canned reads in, exact pipe rows out; runs on
- * every OS.
+ * test_users_win_rows.cpp -- the pure Windows row builders of the users plugin and its
+ * declare_partial status write (agents/plugins/users/src/users_win_rows.hpp). Canned reads in,
+ * exact pipe rows and result status out; runs on every OS.
  */
 
 #include <catch2/catch_test_macros.hpp>
 
+#include "local_dispatcher.hpp"
 #include "users_win_rows.hpp"
 
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -66,6 +68,16 @@ std::string stamp(std::uint32_t seconds) {
     return "T" + std::to_string(seconds);
 }
 
+// The fake plugin behind the declare_partial case: the Windows session legs' declaration, run on
+// the test's thread.
+WtsSessionsRead g_declared_read;
+
+int declare_execute(YuzuCommandContext* raw, const char*, const YuzuParam*, std::size_t) {
+    yuzu::CommandContext ctx{raw};
+    declare_partial(ctx, wts_degraded_provenance(g_declared_read));
+    return 0;
+}
+
 } // namespace
 
 TEST_CASE("logged_on rows: active and disconnected sessions with a user",
@@ -104,6 +116,33 @@ TEST_CASE("a failed session listing is declared; an empty one is not",
     cut.truncated = true;
     CHECK(wts_degraded_provenance(cut) == "windows:users:wts_sessions:row_cap");
     CHECK_FALSE(logged_on_rows(cut).empty());
+}
+
+TEST_CASE("declare_partial reports a failed or cut read as CONSTRAINED and PARTIAL",
+          "[users][win_rows][bounded_os_call]") {
+    YuzuPluginDescriptor descriptor{};
+    descriptor.execute = &declare_execute;
+    yuzu::agent::LocalDispatcher dispatcher;
+
+    g_declared_read = {};
+    g_declared_read.status = BoundedStatus::Completed;
+    g_declared_read.win_error = 259; // not enumerated: the listing failed
+    auto r = dispatcher.run(&descriptor, "probe");
+    CHECK(r.result_status == YUZU_RESULT_STATUS_CONSTRAINED);
+    CHECK(r.result_completeness == YUZU_RESULT_COMPLETENESS_PARTIAL);
+    CHECK(r.result_provenance == "windows:users:wts_sessions:enum_failed:259");
+
+    g_declared_read = canned_sessions();
+    g_declared_read.truncated = true;
+    r = dispatcher.run(&descriptor, "probe");
+    CHECK(r.result_status == YUZU_RESULT_STATUS_CONSTRAINED);
+    CHECK(r.result_completeness == YUZU_RESULT_COMPLETENESS_PARTIAL);
+    CHECK(r.result_provenance == "windows:users:wts_sessions:row_cap");
+
+    g_declared_read = canned_sessions(); // the whole list: nothing to declare
+    r = dispatcher.run(&descriptor, "probe");
+    CHECK(r.result_status == YUZU_RESULT_STATUS_UNDECLARED);
+    CHECK(r.result_provenance.empty());
 }
 
 TEST_CASE("local_user rows: flags, comment and last logon", "[users][win_rows][bounded_os_call]") {

@@ -22,9 +22,6 @@
  * consumer.
  */
 
-#include <yuzu/agent/bounded_status.hpp>
-#include <yuzu/plugin.h> // YUZU_EXPORT
-
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -32,7 +29,18 @@
 #include <string>
 #include <vector>
 
+#include <yuzu/agent/bounded_status.hpp>
+#include <yuzu/plugin.h> // YUZU_EXPORT
+
 namespace yuzu::agent::win {
+
+// The WTS_CONNECTSTATE_CLASS values consumers decide on (static_asserted against the SDK in
+// win_wts_sessions.cpp).
+inline constexpr std::uint32_t kWtsActive = 0;
+inline constexpr std::uint32_t kWtsConnected = 1;
+inline constexpr std::uint32_t kWtsDisconnected = 4;
+inline constexpr std::uint32_t kWtsIdle = 5;
+inline constexpr std::uint32_t kWtsListen = 6;
 
 /// One session. Text is UTF-8 and empty when its query failed or the session has no value.
 struct WtsSession {

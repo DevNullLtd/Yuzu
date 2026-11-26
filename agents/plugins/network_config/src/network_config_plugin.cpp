@@ -731,8 +731,9 @@ RouteDumpResult fetch_default_route_dump() {
 // ── adapters action ───────────────────────────────────────────────────────
 
 int do_adapters(yuzu::CommandContext& ctx) {
+    int rc = 0;
 #ifdef _WIN32
-    return write_adapter_list_rows(ctx, yuzu::network_config::windows_adapter_rows);
+    rc = write_adapter_list_rows(ctx, yuzu::network_config::windows_adapter_rows);
 
 #elif defined(__linux__)
     auto links = fetch_link_dump();
@@ -833,14 +834,15 @@ int do_adapters(yuzu::CommandContext& ctx) {
                                      up_by_name[name] ? "up" : "down"));
     }
 #endif
-    return 0;
+    return rc;
 }
 
 // ── ip_addresses action ───────────────────────────────────────────────────
 
 int do_ip_addresses(yuzu::CommandContext& ctx) {
+    int rc = 0;
 #ifdef _WIN32
-    return write_adapter_list_rows(ctx, yuzu::network_config::windows_ip_rows);
+    rc = write_adapter_list_rows(ctx, yuzu::network_config::windows_ip_rows);
 
 #elif defined(__linux__)
     auto links = fetch_link_dump();
@@ -980,14 +982,15 @@ int do_ip_addresses(yuzu::CommandContext& ctx) {
         }
     }
 #endif
-    return 0;
+    return rc;
 }
 
 // ── dns_servers action ────────────────────────────────────────────────────
 
 int do_dns_servers(yuzu::CommandContext& ctx) {
+    int rc = 0;
 #ifdef _WIN32
-    return write_adapter_list_rows(ctx, yuzu::network_config::windows_dns_rows);
+    rc = write_adapter_list_rows(ctx, yuzu::network_config::windows_dns_rows);
 
 #elif defined(__linux__)
     std::ifstream resolv("/etc/resolv.conf");
@@ -1075,7 +1078,7 @@ int do_dns_servers(yuzu::CommandContext& ctx) {
                           "network_config:no_systemconfiguration");
 #endif
 #endif
-    return 0;
+    return rc;
 }
 
 // ── proxy action ──────────────────────────────────────────────────────────

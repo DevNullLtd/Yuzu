@@ -14,13 +14,13 @@
  * Every other field of the result is meaningful only when status == Completed.
  */
 
-#include <yuzu/agent/bounded_status.hpp>
-#include <yuzu/plugin.h> // YUZU_EXPORT
-
 #include <chrono>
 #include <cstdint>
 #include <functional>
 #include <string>
+
+#include <yuzu/agent/bounded_status.hpp>
+#include <yuzu/plugin.h> // YUZU_EXPORT
 
 namespace yuzu::agent::win {
 

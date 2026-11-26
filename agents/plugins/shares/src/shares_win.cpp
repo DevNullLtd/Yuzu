@@ -59,9 +59,7 @@ int run_windows(yuzu::CommandContext& ctx) {
         page.status = read.nerr;
         page.total = read.total;
         page.unanswered = yuzu::agent::bounded_cause(read.status);
-        page.shares.reserve(read.shares.size());
-        for (auto& s : read.shares)
-            page.shares.push_back({std::move(s.name), std::move(s.path), s.type});
+        page.shares = std::move(read.shares);
         return page;
     };
     report_list(ctx, list_windows(pager));

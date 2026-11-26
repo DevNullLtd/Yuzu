@@ -6,10 +6,10 @@
  * it. The driver that produces these (bounded_single_flight.hpp) is for agent-core.
  */
 
-#include <yuzu/plugin.hpp>
-
 #include <string>
 #include <string_view>
+
+#include <yuzu/plugin.hpp>
 
 namespace yuzu::agent {
 

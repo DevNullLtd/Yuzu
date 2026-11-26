@@ -67,12 +67,9 @@
 #include <win_str.hpp>  // shared yuzu::win wide<->UTF-8 helpers (#1681)
 #include <winevt.h>     // EvtQuery / EvtNext / EvtRender / EvtClose
 #include <lm.h>
-#include <wtsapi32.h>
 #include <user_profile_model.hpp> // yuzu::profiles::profile_name_from_path (PR1.7)
 #include <win_profiles.hpp>       // yuzu::win::enumerate_profile_records (PR1.7)
 #include "users_win_events.hpp"   // pure Security-channel XML parsers (Wave-2 WP-A)
-#pragma comment(lib, "wtsapi32.lib")
-#pragma comment(lib, "netapi32.lib")
 #pragma comment(lib, "wevtapi.lib")
 #endif
 
@@ -165,21 +162,14 @@ ToolOutcome run_tool(std::vector<std::string> argv, std::size_t max_lines = 0,
     return ToolOutcome{std::move(output), std::move(res)};
 }
 
-/// One per-account tool of local_users, under a deadline from the tool budget. A tool that hits a
-/// deadline the budget shortened counts as skipped: `tool_skipped` is set, nothing is forwarded
-/// and its output is dropped, so its field stays unread. Every other runner failure is forwarded,
-/// the first one winning.
+/// One per-account tool of local_users, under a deadline from the tool budget. What its outcome
+/// reports is settle_account_tool's rule (users_tool_budget.hpp).
 ToolOutcome run_account_tool(yuzu::CommandContext& ctx, std::vector<std::string> argv,
                              std::chrono::milliseconds deadline, bool& status_forwarded,
                              bool& tool_skipped) {
     auto out = run_tool(std::move(argv), 0, deadline);
-    if (out.res.termination_reason == yuzu::agent::TerminationReason::deadline &&
-        yuzu::users::deadline_shortened(deadline, kUsersCmdDeadline)) {
-        tool_skipped = true;
-        out.output.clear();
-    } else if (!status_forwarded) {
-        status_forwarded = yuzu::agent::forward_runner_failure(ctx, out.res);
-    }
+    yuzu::users::settle_account_tool(ctx, out.res, deadline, kUsersCmdDeadline, out.output,
+                                     status_forwarded, tool_skipped);
     return out;
 }
 #endif // !_WIN32
@@ -187,28 +177,17 @@ ToolOutcome run_account_tool(yuzu::CommandContext& ctx, std::vector<std::string>
 #ifdef _WIN32
 // wide->UTF-8 conversion now via the shared win_str.hpp (#1681); from_wide is
 // behaviour-identical to the old NUL-terminated wide_to_utf8 for valid input.
+using yuzu::users_win::declare_partial;
 using yuzu::win::from_wide;
 
 // users_win_rows.hpp names these as plain numbers; pin them to the SDK here so a header that
 // disagrees fails the Windows build instead of misclassifying at runtime.
-static_assert(yuzu::users_win::kWtsActive == static_cast<std::uint32_t>(WTSActive));
-static_assert(yuzu::users_win::kWtsConnected == static_cast<std::uint32_t>(WTSConnected));
-static_assert(yuzu::users_win::kWtsDisconnected == static_cast<std::uint32_t>(WTSDisconnected));
-static_assert(yuzu::users_win::kWtsIdle == static_cast<std::uint32_t>(WTSIdle));
-static_assert(yuzu::users_win::kWtsListen == static_cast<std::uint32_t>(WTSListen));
 static_assert(yuzu::users_win::kUfAccountDisable == static_cast<std::uint32_t>(UF_ACCOUNTDISABLE));
 static_assert(yuzu::users_win::kSidTypeUser == static_cast<std::uint32_t>(SidTypeUser));
 static_assert(yuzu::users_win::kSidTypeGroup == static_cast<std::uint32_t>(SidTypeGroup));
 static_assert(yuzu::users_win::kSidTypeAlias == static_cast<std::uint32_t>(SidTypeAlias));
 static_assert(yuzu::users_win::kSidTypeWellKnownGroup ==
               static_cast<std::uint32_t>(SidTypeWellKnownGroup));
-
-/// Declares an answered read that is not the whole list. Empty provenance: nothing to declare.
-void declare_partial(yuzu::CommandContext& ctx, std::string_view provenance) {
-    if (!provenance.empty())
-        ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
-                              provenance);
-}
 
 // Format a Windows FILETIME as "YYYY-MM-DD HH:MM:SS" or "Never" if zero
 std::string format_filetime(DWORD low, DWORD high) {
@@ -576,9 +555,7 @@ int do_local_users(yuzu::CommandContext& ctx) {
         ctx.write_output(std::format("local_user|{}|{}|{}|{}", user, enabled ? "true" : "false",
                                      last_logon, desc.empty() ? "-" : desc));
     }
-    if (tool_skipped && !status_forwarded)
-        ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
-                              "linux:users:local_users:tool_budget_exhausted");
+    yuzu::users::declare_budget_exhausted(ctx, "linux", tool_skipped, status_forwarded);
 
 #elif defined(__APPLE__)
     // M7: macOS dscl output format assumption.
@@ -659,22 +636,7 @@ int do_local_users(yuzu::CommandContext& ctx) {
                     ctx,
                     {"/usr/bin/dscl", ".", "-read", std::format("/Users/{}", user), "UserShell"},
                     *deadline, status_forwarded, tool_skipped);
-                // Only an answered read decides: a killed or failed dscl leaves "unknown".
-                if (shell_res.res.termination_reason == yuzu::agent::TerminationReason::exited &&
-                    shell_res.res.exit_code == 0) {
-                    auto& shell = shell_res.output;
-                    // Extract second field (the shell path) without piping to awk
-                    bool enabled = true;
-                    auto sp = shell.find(' ');
-                    if (sp != std::string::npos) {
-                        auto shell_path = shell.substr(sp + 1);
-                        while (!shell_path.empty() && shell_path.front() == ' ')
-                            shell_path.erase(shell_path.begin());
-                        enabled = shell_path.find("false") == std::string::npos &&
-                                  shell_path.find("nologin") == std::string::npos;
-                    }
-                    enabled_state = enabled ? "true" : "false";
-                }
+                enabled_state = yuzu::users::user_shell_enabled(shell_res.res, shell_res.output);
             }
 
             std::string desc;
@@ -790,9 +752,7 @@ int do_local_users(yuzu::CommandContext& ctx) {
                 desc.empty() ? "-" : yuzu::util::safe_output_field(desc), console_state));
         }
     }
-    if (tool_skipped && !status_forwarded)
-        ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
-                              "macos:users:local_users:tool_budget_exhausted");
+    yuzu::users::declare_budget_exhausted(ctx, "macos", tool_skipped, status_forwarded);
 
 #elif defined(_WIN32)
     const auto read = yuzu::agent::win::read_local_users(yuzu::agent::win::kLocalUsersDeadline);

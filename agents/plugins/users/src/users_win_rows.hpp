@@ -2,14 +2,12 @@
 //
 // Windows-headers-free and I/O-free by design (same split as users_win_events.hpp): agent-core
 // owns the bounded WTS / NetAPI calls and hands back plain records; every row decision lives here,
-// unit-testable on every host (test_users_win_rows.cpp). The SDK constants named below are
-// static_asserted against the real headers in users_plugin.cpp.
+// with declare_partial (the one write, to the result status), unit-testable on every host
+// (test_users_win_rows.cpp). The SDK constants declared below are static_asserted against the real
+// headers in users_plugin.cpp; the session states are agent-core's (win_wts_sessions.hpp).
 //
 // A read whose status is not Completed carries no answer, so every builder returns no rows for it.
 #pragma once
-
-#include <yuzu/agent/win_account_enum.hpp>
-#include <yuzu/agent/win_wts_sessions.hpp>
 
 #include <cstdint>
 #include <format>
@@ -18,14 +16,17 @@
 #include <string_view>
 #include <vector>
 
+#include <yuzu/agent/win_account_enum.hpp>
+#include <yuzu/agent/win_wts_sessions.hpp>
+#include <yuzu/plugin.hpp>
+
 namespace yuzu::users_win {
 
-// WTS_CONNECTSTATE_CLASS
-inline constexpr std::uint32_t kWtsActive = 0;
-inline constexpr std::uint32_t kWtsConnected = 1;
-inline constexpr std::uint32_t kWtsDisconnected = 4;
-inline constexpr std::uint32_t kWtsIdle = 5;
-inline constexpr std::uint32_t kWtsListen = 6;
+using yuzu::agent::win::kWtsActive;
+using yuzu::agent::win::kWtsConnected;
+using yuzu::agent::win::kWtsDisconnected;
+using yuzu::agent::win::kWtsIdle;
+using yuzu::agent::win::kWtsListen;
 // USER_INFO_2 flags
 inline constexpr std::uint32_t kUfAccountDisable = 2;
 // SID_NAME_USE
@@ -125,6 +126,13 @@ inline std::string wts_degraded_provenance(const yuzu::agent::win::WtsSessionsRe
     if (!read.enumerated)
         return std::format("windows:users:wts_sessions:enum_failed:{}", read.win_error);
     return incomplete_provenance("windows:users:wts_sessions", read.truncated, false);
+}
+
+/// Declares an answered read that is not the whole list. Empty provenance: nothing to declare.
+inline void declare_partial(yuzu::CommandContext& ctx, std::string_view provenance) {
+    if (!provenance.empty())
+        ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                              provenance);
 }
 
 /// local_users: every account collected, whatever the final NetAPI status. `format_last_logon`

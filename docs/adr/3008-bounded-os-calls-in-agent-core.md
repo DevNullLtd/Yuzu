@@ -174,7 +174,7 @@ They are valid callers:
 | A recorded decision on bounding OS calls, covering COM, `DeviceIoControl`, `ioctl` and IOKit, and in-flight resources | D1 and D3. The `disk_actions` volume reads are not converted (D7, #3925). |
 | A shared primitive is safe against unload, and the `bounded_wait.hpp` limits are met or superseded | D1, D2 and D5. The worker runs agent-core code; at most one is abandoned per function; a refusal at the 64-call ceiling is `Rejected`, reported as `deadline_exceeded`; plugin use is superseded. |
 | The `filesystem_posture` VSS read adopts the outcome and its hazard banner is removed or narrowed | It calls `read_vss_snapshots`; the banner is gone and the plugin README states the 15 s bound. |
-| A test or documented manual procedure shows a wedged provider no longer exhausts the dispatch pool | Test: `tests/unit/test_win_vss_snapshots.cpp`, a never-returning reader times out, the next call is `Abandoned` without starting a reader, then the slot recovers. Manual procedure below. |
+| A test or documented manual procedure shows a wedged provider no longer exhausts the dispatch pool | Test: `tests/unit/test_bounded_single_flight.cpp`, `a stalled slot does not wedge the thread pool`: with the call still blocked, all twelve tasks on a four-thread pool finish (one `TimedOut`, the rest `Abandoned` or `Busy`) and a later plain task runs. Per reader, for example `tests/unit/test_win_vss_snapshots.cpp`: a never-returning reader times out, the next call is `Abandoned` without starting a reader, then the slot recovers. Manual procedure below. |
 
 Manual procedure, on a disposable Windows machine:
 

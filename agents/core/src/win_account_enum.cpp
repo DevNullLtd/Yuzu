@@ -45,6 +45,8 @@ LocalUsersRead read_users_raw() {
         DWORD got = 0;
         DWORD total = 0;
         detail::NetPage<LocalUser> page;
+        // The API takes LPBYTE* and writes a pointer to an array of the level-2 struct `raw` is
+        // typed for, owned by the unique_ptr right after the call.
         page.status =
             ::NetUserEnum(nullptr, 2, FILTER_NORMAL_ACCOUNT, reinterpret_cast<LPBYTE*>(&raw),
                           MAX_PREFERRED_LENGTH, &got, &total, &resume);
@@ -74,6 +76,8 @@ GroupMembersRead read_members_raw(const std::string& group_utf8) {
         DWORD got = 0;
         DWORD total = 0;
         detail::NetPage<GroupMember> page;
+        // The API takes LPBYTE* and writes a pointer to an array of the level-2 struct `raw` is
+        // typed for, owned by the unique_ptr right after the call.
         page.status =
             ::NetLocalGroupGetMembers(nullptr, group.c_str(), 2, reinterpret_cast<LPBYTE*>(&raw),
                                       MAX_PREFERRED_LENGTH, &got, &total, &resume);

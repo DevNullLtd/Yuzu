@@ -6,21 +6,15 @@
  * (tests/unit/test_echo_capture_status.cpp).
  */
 
+#include <string>
+#include <vector>
+
 #include "echo_capture_status.hpp" // IncompleteCaptureError
 #include "echo_collectors.hpp"     // UserSession
 
 #include <yuzu/agent/win_wts_sessions.hpp> // WtsSessionsRead and its completeness contract
 
-#include <cstdint>
-#include <string>
-#include <vector>
-
 namespace yuzu::echo {
-
-// The WTS_CONNECTSTATE_CLASS values of a logged-on session (static_asserted against the SDK in
-// echo_user_collector.cpp).
-inline constexpr std::uint32_t kWtsStateActive = 0;
-inline constexpr std::uint32_t kWtsStateDisconnected = 4;
 
 /// The logged-on sessions (active or disconnected, with a user name) of one session read. THROWS
 /// IncompleteCaptureError unless the list is complete: an unanswered, capped or failed read
@@ -36,9 +30,11 @@ user_sessions_from_wts(const yuzu::agent::win::WtsSessionsRead& read) {
         throw IncompleteCaptureError(
             "ECHO: user session read failed (rc=" + std::to_string(read.win_error) + ")");
 
+    using yuzu::agent::win::kWtsActive;
+    using yuzu::agent::win::kWtsDisconnected;
     std::vector<UserSession> sessions;
     for (const auto& s : read.sessions) {
-        if (s.state != kWtsStateActive && s.state != kWtsStateDisconnected)
+        if (s.state != kWtsActive && s.state != kWtsDisconnected)
             continue;
         if (s.user.empty())
             continue;
@@ -47,7 +43,7 @@ user_sessions_from_wts(const yuzu::agent::win::WtsSessionsRead& read) {
         us.user = s.user;
         us.domain = s.domain.empty() ? "local" : s.domain;
         us.session_id = std::to_string(s.session_id);
-        us.disconnected = s.state == kWtsStateDisconnected;
+        us.disconnected = s.state == kWtsDisconnected;
 
         // Determine logon type from session name
         if (s.station_name.find("RDP") != std::string::npos ||

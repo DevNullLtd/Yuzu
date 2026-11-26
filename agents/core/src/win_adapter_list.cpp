@@ -40,6 +40,8 @@ AdapterAddr to_addr(LPSOCKADDR sa) {
     if (!sa)
         return out;
     char buf[128]{};
+    // sa_family selects the concrete sockaddr type each cast names; the storage is the API's
+    // own, inside the buffer read_raw holds, and is only read.
     if (sa->sa_family == AF_INET) {
         auto* v4 = reinterpret_cast<sockaddr_in*>(sa);
         ::inet_ntop(AF_INET, &v4->sin_addr, buf, sizeof(buf));
@@ -96,6 +98,9 @@ AdapterList read_raw() {
         out.empty_table = true;
         return out;
     }
+    // Both casts of buf below: the vector's storage comes from operator new, so it is aligned for
+    // IP_ADAPTER_ADDRESSES; every Next pointer points inside buf, which outlives the walk, and
+    // flatten copies everything out.
     std::vector<unsigned char> buf;
     ULONG rc = ERROR_BUFFER_OVERFLOW;
     for (int attempt = 0; attempt < kMaxReads && rc == ERROR_BUFFER_OVERFLOW; ++attempt) {

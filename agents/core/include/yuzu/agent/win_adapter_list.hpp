@@ -15,14 +15,14 @@
  * of its data: nothing points into the OS buffer.
  */
 
-#include <yuzu/agent/bounded_status.hpp>
-#include <yuzu/plugin.h> // YUZU_EXPORT
-
 #include <chrono>
 #include <cstdint>
 #include <functional>
 #include <string>
 #include <vector>
+
+#include <yuzu/agent/bounded_status.hpp>
+#include <yuzu/plugin.h> // YUZU_EXPORT
 
 namespace yuzu::agent::win {
 

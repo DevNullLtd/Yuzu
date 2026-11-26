@@ -52,13 +52,8 @@ struct ProcSnapshot {
     std::uint64_t start_abstime = 0; ///< mach absolute time at process start (monotonic)
 };
 
-enum class ProcSnapshotStatus {
-    Completed, ///< the read returned within the deadline (snap.err may still be nonzero)
-    TimedOut,  ///< deadline hit (or the reader threw, or the budget was already spent): no answer
-    Busy,      ///< another read is in flight and healthy; none was started by this call
-    Abandoned, ///< an earlier call hit its deadline and its worker is still blocked; none started
-    Rejected,  ///< the outstanding-call ceiling refused, or setup failed: the worker never ran
-};
+/// The shared statuses (bounded_status.hpp). A Completed read may still carry a nonzero snap.err.
+using ProcSnapshotStatus = BoundedStatus;
 
 struct ProcSnapshotResult {
     ProcSnapshotStatus status = ProcSnapshotStatus::Rejected;
@@ -81,24 +76,9 @@ ProcSnapshotResult bounded_proc_snapshot(ProcSnapshotSlot& slot, int pid,
         slot, deadline, SlotWait::none,
         [pid, reader = std::move(reader)]() mutable -> ProcSnapshot { return reader(pid); });
     ProcSnapshotResult out;
-    switch (flight.status) {
-    case BoundedStatus::Completed:
-        out.status = ProcSnapshotStatus::Completed;
+    out.status = flight.status;
+    if (flight.value)
         out.snap = *flight.value;
-        break;
-    case BoundedStatus::TimedOut:
-        out.status = ProcSnapshotStatus::TimedOut;
-        break;
-    case BoundedStatus::Busy:
-        out.status = ProcSnapshotStatus::Busy;
-        break;
-    case BoundedStatus::Abandoned:
-        out.status = ProcSnapshotStatus::Abandoned;
-        break;
-    case BoundedStatus::Rejected:
-        out.status = ProcSnapshotStatus::Rejected;
-        break;
-    }
     return out;
 }
 

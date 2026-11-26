@@ -25,15 +25,15 @@
  * truncated nor no_progress is set.
  */
 
-#include <yuzu/agent/bounded_status.hpp>
-#include <yuzu/plugin.h> // YUZU_EXPORT
-
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <string>
 #include <vector>
+
+#include <yuzu/agent/bounded_status.hpp>
+#include <yuzu/plugin.h> // YUZU_EXPORT
 
 namespace yuzu::agent::win {
 

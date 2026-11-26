@@ -9,8 +9,9 @@ Over agents/plugins/**/*.{cpp,hpp,mm}, with comments and string/char literals bl
   (c) the per-file count of `bounded_call*(` sites equals GRANDFATHERED. A new file or a higher
       count fails; a lower count fails until the table is lowered, so the freeze only ratchets down;
   (d) each WIRED site keeps the text that handles a bounded answer, in shells no unit test reaches:
-      shares' unanswered page, users' "did not complete" returns, and the tool budget's deadline on
-      the per-account tools.
+      shares' unanswered page, users' "did not complete" returns and its declaration of a failed or
+      cut read, and the tool budget's deadline, settlement and end-of-run status on the
+      per-account tools.
 
 Stated limits: a wrapper whose name does not start with `bounded_call` is not seen, nor is a call
 with explicit template arguments (`bounded_call_ex<F>(`); (a) matches the listed spellings only;
@@ -52,6 +53,10 @@ GRANDFATHERED = {
     "windows_updates/src/windows_updates_plugin.cpp": 1,
 }
 
+# What may lie between a users read and its handling: anything but the next users read.
+BEFORE_NEXT_USERS_READ = (r"(?:(?!\bread_(?:wts_sessions|local_users|local_group_members)\s*\()"
+                          r"[\s\S])*?")
+
 # (d) (file, what starts a site, what must follow it, how many sites there are).
 WIRED = (
     ("shares/src/shares_win.cpp", r"\bread_share_page\s*\(",
@@ -67,6 +72,21 @@ WIRED = (
     # ... and every such `deadline` comes from the budget.
     ("users/src/users_plugin.cpp",
      r"\bdeadline\s*=\s*(?:tool_deadline\s*\(\s*\)|budget\.next_deadline\s*\()", "", 5),
+    # Each per-account tool's outcome is settled against that deadline and the full one,
+    ("users/src/users_plugin.cpp", r"\bToolOutcome\s+run_account_tool\s*\(",
+     r"[^{}]*\{[^{}]*\byuzu::users::settle_account_tool\s*\(\s*ctx\s*,\s*out\.res\s*,"
+     r"\s*deadline\s*,\s*kUsersCmdDeadline\s*,\s*out\.output\s*,", 1),
+    # ... and each run (Linux, macOS) ends by declaring a spent budget.
+    ("users/src/users_plugin.cpp", r"\byuzu::users::declare_budget_exhausted\s*\(",
+     r"\s*ctx\s*,\s*,\s*tool_skipped\s*,\s*status_forwarded\s*\)\s*;", 2),
+    # An answered read that is not the whole list is declared before the next read.
+    ("users/src/users_plugin.cpp", r"\bread_wts_sessions\s*\(",
+     BEFORE_NEXT_USERS_READ + r"\bdeclare_partial\s*\(\s*ctx\s*,\s*"
+     r"yuzu::users_win::wts_degraded_provenance\s*\(\s*read\s*\)\s*\)\s*;", 2),
+    ("users/src/users_plugin.cpp", r"\bread_(?:local_users|local_group_members)\s*\(",
+     BEFORE_NEXT_USERS_READ + r"\bdeclare_partial\s*\(\s*ctx\s*,\s*"
+     r"yuzu::users_win::incomplete_provenance\s*\(\s*,\s*read\.truncated\s*,"
+     r"\s*read\.no_progress\s*\)\s*\)\s*;", 3),
 )
 
 SITE = re.compile(r"\bbounded_call\w*\s*\(")
@@ -179,6 +199,12 @@ class BoundedOsCall(unittest.TestCase):
             (users, r"\*deadline,", "kUsersCmdDeadline,", 4),
             (users, r"std::move\(argv\), 0, deadline", "std::move(argv)", 1),
             (users, r"deadline =\s+(?:tool_deadline|budget\.next_deadline)\(", "deadline = f(", 5),
+            (users, r"yuzu::users::settle_account_tool\([^;]*;", "", 1),
+            (users, r"yuzu::users::declare_budget_exhausted\([^;]*;", "", 2),
+            (users, r"declare_partial\(ctx, yuzu::users_win::wts_degraded_provenance\(read\)\);",
+             "", 2),
+            (users, r"(?s)declare_partial\(ctx, yuzu::users_win::incomplete_provenance\(.*?\);",
+             "", 3),
         ):
             src = self.srcs[name]
             matches = list(re.finditer(pattern, src))
