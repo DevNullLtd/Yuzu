@@ -1229,19 +1229,27 @@ that could not mean anything:
   `approval_ref` is `pending` is not in force in a release (`--release`). A listed image is
   printed as `NOT COVERED` (and a step warning) on every run. Today four images are listed: the
   three chisel images and the agent bundle. They are assembled FROM scratch from chisel slices
-  (all four Dockerfiles cut `base-files_{base,etc,var,tmp,release-info}` and no
-  `base-files_chisel`, then `COPY --from=chisel /rootfs /`). The scanners read a dpkg package
-  database, including `/var/lib/dpkg/status.d` (the distroless format), and these images ship
-  none, so Trivy 0.70.0 reports "No OS package is detected". Cutting `base-files_chisel` would not
-  change that: it writes a chisel manifest, and a string check of the Trivy 0.70.0, grype 0.122.0
-  and syft 1.57.2 binaries found `dpkg/status.d` in all three and neither `manifest.wall` nor
-  `var/lib/chisel` in any (string evidence, not a scan, and on grype 0.122.0 rather than the
-  pinned 0.121.3). **Their libc6, libssl3t64, zlib1g and other slices ship unscanned by Trivy**
-  (grype identifies only a few packages, best effort: "What it does not see" below). These four
-  listings expire 2027-02-15 and are not to be renewed; the planned fix, not a shipped one, is a
-  scanner-readable package manifest (dpkg `status.d` stanzas emitted in the chisel stage, #8415).
-  Consequence: from 2027-02-15 the release gate refuses these four images unless #8415 has shipped
-  or a renewal is deliberately approved by the owner.
+  (all four Dockerfiles cut `base-files_{base,etc,var,tmp,release-info,chisel}`, then run
+  `deploy/docker/chisel-emit-status.py` on the same slice list, then `COPY --from=chisel /rootfs /`).
+  The scanners read a dpkg package database, including `/var/lib/dpkg/status.d` (the distroless
+  format), and chisel writes none; it writes a chisel manifest (`base-files_chisel`), and a string
+  check of the Trivy 0.70.0, grype 0.122.0 and syft 1.57.2 binaries found `dpkg/status.d` in all
+  three and neither `manifest.wall` nor `var/lib/chisel` in any (string evidence, not a scan, and on
+  grype 0.122.0 rather than the pinned 0.121.3). The script therefore converts the manifest into
+  one `status.d` stanza per package (`Package`, `Status`, `Architecture`, `Version`, and the archive's
+  `Source`, which the Ubuntu advisories are keyed on) and refuses to finish if a slice's package is
+  missing from the manifest, a package has no archive record at its version, or the written set
+  differs from the manifest. Measured by hand on the server chisel stage, Trivy 0.70.0 reads 35
+  packages and grype 0.122.0 matches them; on a deliberately downgraded `busybox-static` both
+  report the older version's findings, so the stanzas are matched, not just parsed. That is one
+  hand run, not a CI check, and the four listings stay in force until their removal change (#8415).
+  Until then the images are still printed as `NOT COVERED`, and the gate warns that a listed image
+  does have OS packages. Their libc6, libssl3t64, zlib1g and other slices are scanned by Trivy
+  only once the listings are removed (grype identifies only a few packages in the meantime, best
+  effort: "What it does not see" below). These four listings expire 2027-02-15 and are not to be
+  renewed.
+  Consequence: from 2027-02-15 the release gate refuses these four images unless their listings have
+  been removed (#8415) or a renewal is deliberately approved by the owner.
   The gate learns an image's name from
   `NAME=IMAGE` (release.yml) or the tag (pre-release.yml); a bare image ID can never match the list.
 - an ignore file that `scripts/ci/image-vuln-gate-checks.py` does not accept (below).

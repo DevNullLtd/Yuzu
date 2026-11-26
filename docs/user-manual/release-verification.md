@@ -214,15 +214,15 @@ What this does **not** gate:
 - HIGH and lower findings, and CRITICAL findings with no fix released: they are in the report, not
   refused.
 - The operating-system packages of the chiselled images (`yuzu-*-chisel` and the agent-bundle delivery
-  image) are not covered by this scan. They are built from Ubuntu package slices and carry no package
-  database either scanner reads, so Trivy scans none of their OS packages. grype identifies only the few
+  image) are not covered by this scan. They are built from Ubuntu package slices. The build now records each package where the scanners read them
+  (dpkg `status.d`), but the gate still lists these images as not covered until that listing is removed
+  (#8415), so the gate does not scan their OS packages. grype identifies only the few
   packages whose binaries name their own package (busybox and openssl on the image we checked), and the
   scan does not check that even those were matched against current advisories. Each Trivy `.gate.txt`
   says `coverage: not-covered`. A passing scan of a chisel image is not evidence about its OS packages.
   Use the non-chisel image if you need them covered. The four not-covered listings expire 2027-02-15 and
-  are not to be renewed; the planned fix is a scanner-readable package manifest emitted at build time
-  (#8415), a plan and not something shipped; until it ships, these images stop passing the release
-  gate after that date.
+  are not to be renewed; the removal of the listings (#8415) is not yet done, and until it is, these images stop
+  passing the release gate after that date.
 - PostgreSQL itself in `yuzu-postgres`: its packages come from the PostgreSQL project's repository,
   which publishes no advisories the scanner matches, and the image holds them at the pinned minor.
 - Anything statically linked into the server and agent binaries. The gateway's bundled Erlang/OTP

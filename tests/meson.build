@@ -3676,6 +3676,15 @@ test('image vulnerability gate',
 # step-reorder and script mutants must be killed. Cancels are delivered to the
 # step's PID only, as the Actions runner delivers them, and some rows wait out
 # a stall or a cancelled run, hence the timeout. Bash + PyYAML, no Docker.
+# WP15: deploy/docker/chisel-emit-status.py records a chiselled image's packages
+# where the image scanners read them; its refusals and its four call sites.
+test('chisel status.d emission',
+  _python3_test,
+  args: [files('test_chisel_emit_status.py')],
+  suite: 'docs',
+  timeout: 120,
+)
+
 test('image publish journal',
   _python3_test,
   args: [files('test_image_publish.py')],

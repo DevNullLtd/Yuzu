@@ -1188,7 +1188,7 @@ acceptance records; WP15/S9).** What exists, for a questionnaire or an auditor's
   `scripts/build-agent-bundle.sh --push` predate the gate and can push release tags with
   maintainer credentials, bypassing the gate and the journal; they are not used to publish a
   release (Limit 1 of the policy).
-- *Not covered (disclose with the control):* the OS packages of the chiselled images (no package database either scanner reads; a passing scan is no evidence; fix planned in #8415, not shipped), PostgreSQL
+- *Not covered (disclose with the control):* the OS packages of the chiselled images (the build records them for the scanners, but the gate still lists the images as not covered until #8415 removes the listings; a passing scan is no evidence), PostgreSQL
   in `yuzu-postgres`, the gateway's Erlang/OTP runtime, statically linked code, HIGH and unfixed
   findings (reported, not gated), and the integrity of the vulnerability DB (unsigned upstream).
   `pre-release.yml` rescans the published images afterwards; it is detective only.
