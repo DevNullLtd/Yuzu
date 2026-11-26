@@ -81,13 +81,17 @@
  *     leaves the watch unverified with no fault (counted as undecided); HKCR is a
  *     merged view, so a user-hive key appearing later changes what the path resolves
  *     to, and a registry link re-pointed to another target is the same class (the
- *     verification open follows links): the fresh-versus-held compare is built to
- *     catch both. Measured on the rig (2026-11-25): NtQueryKey on a key opened through
- *     HKCR reports the underlying key's canonical name (a per-user `_Classes` key where
+ *     verification open follows links): the fresh-versus-held compare catches both.
+ *     Measured on the rig (2026-11-25): NtQueryKey on a key opened through HKCR
+ *     reports the underlying key's canonical name (a per-user `_Classes` key where
  *     one exists, a machine `SOFTWARE\Classes` key otherwise), not an HKCR spelling.
- *     NOT observed: a per-user key appearing over a machine one while a watch is held,
- *     and a registry link re-pointed (the link case rests on the same reporting), so
- *     treat both as residual until a rig case drives them;
+ *     A per-user key appearing over a machine one while a watch holds the machine key
+ *     leaves the held name and the held notify unchanged (no signal) while a fresh open
+ *     names the per-user key; a link re-pointed from one target to another does the
+ *     same. Both were driven through the real mechanism with scratch cases (not
+ *     committed): one "re-pointed" fault, recovery onto the new key. A per-user key
+ *     deleted while held answers 0xC000017C on the held name and fires the notify, so
+ *     it settles without a fault;
  *     every watch commits at about the same time at startup, so a large fleet of
  *     watches launches its verifications together (probe lane cap, refusals
  *     defer without demoting coverage); a registry open that hangs pins one slot
@@ -1730,8 +1734,9 @@ private:
     ///      re-pointed). Its window is a shadowing landing between the fresh open and the
     ///      fresh-name query, which the next sample catches. Measured on a rig
     ///      (2026-11-25): NtQueryKey through HKCR reports the underlying key's name (per-user
-    ///      `_Classes` or machine `SOFTWARE\Classes`); the shadowing and link re-point
-    ///      themselves were not driven.
+    ///      `_Classes` or machine `SOFTWARE\Classes`); a per-user key appearing over a held
+    ///      machine key and a link re-pointed were each driven through the real mechanism
+    ///      with scratch cases (not committed) and gave one fault with this reason.
     ///      Fault: re-pointed.
     ///   5. Otherwise, not ok (open or notify refused, hook or probe threw): undecided.
     ///      The watch keeps its handle and is NOT faulted (an unreadable path is not
