@@ -278,10 +278,10 @@ struct SodRefusal {
 }
 
 /// ` principal_type=<tok> principal_id=<tok> role=<tok> scope=fleet` or
-/// ` ... scope=management_group scope_group_id=<tok>`: the grant tuple appended to every attestation
-/// audit detail (the target id is the campaign alone). The scope tokens come last, so a parser that
-/// reads the earlier tokens by prefix keeps working. CWE-117 via `audit_token`; the scope word is
-/// one of two fixed literals (`scope_kind`).
+/// ` ... scope=management_group scope_group_id=<tok>`: the grant tuple appended to every
+/// attestation audit detail (the target id is the campaign alone). The scope tokens come last, so a
+/// parser that reads the earlier tokens by prefix keeps working. CWE-117 via `audit_token`; the
+/// scope word is one of two fixed literals (`scope_kind`).
 [[nodiscard]] inline std::string attest_tuple_detail(std::string_view principal_type,
                                                      std::string_view principal_id,
                                                      std::string_view role_name,

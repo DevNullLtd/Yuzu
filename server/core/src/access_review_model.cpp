@@ -452,7 +452,8 @@ std::vector<GrantRef> freeze_population(const std::vector<AccessReviewRow>& rows
             continue;
         const std::string snapshot = freeze_snapshot(r);
         for (const auto& role : r.roles)
-            frozen.push_back(GrantRef{r.principal_type, r.principal_id, role, snapshot, r.scope_group_id});
+            frozen.push_back(
+                GrantRef{r.principal_type, r.principal_id, role, snapshot, r.scope_group_id});
     }
     return frozen;
 }
