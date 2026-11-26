@@ -142,20 +142,24 @@ TEST_CASE("read_keychain_bounded gives the caller its thread back when the read 
     // past its own scope would corrupt that test's saturation count.
     //
     // The baseline must be ZERO, not whatever the counter happens to read here
-    // (seen in the nightly ASan leg as `0 == 1`). The counter is shared with every
+    // (seen in the nightly ASan leg as `baseline 1, then 0`: the check read `0 == 1`
+    // with the counter at 0 and the baseline at 1). The counter is shared with every
     // bounded_call_ex consumer in this binary, and an earlier test case's abandoned
     // worker can still hold a guard when this one starts. Sampling that as the
     // baseline made the closing check wait for a value the counter would never
     // return to: the earlier worker retired (1 -> 0) and the loop below spun its
     // whole 5 s for 1. Settle to zero first, as the saturation test below does.
     // The deadline is a liveness bound only (spin_until scales it on a sanitizer
-    // leg); if something is genuinely leaked it is caught by the final REQUIRE.
-    (void)yuzu::test::spin_until(
+    // leg). A settle that times out means a guard from an earlier case is still held:
+    // that is CHECKed (non-fatal) so it is visible. Otherwise it would be absorbed into
+    // the baseline below, and the final REQUIRE would fail spuriously (counter under
+    // baseline) when that guard retired, with nothing pointing at the earlier case.
+    CHECK(yuzu::test::spin_until(
         [] {
             return yuzu::shared::detail::g_outstanding_bounded_calls.load(
                        std::memory_order_relaxed) == 0;
         },
-        10s);
+        10s));
     const auto baseline =
         yuzu::shared::detail::g_outstanding_bounded_calls.load(std::memory_order_relaxed);
 
