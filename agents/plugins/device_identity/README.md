@@ -166,9 +166,9 @@ ou|N/A
 ## Source and tests
 
 <!-- BEGIN GENERATED: plugin-doc-gen source -->
-- Plugin: `agents/plugins/device_identity/src/device_identity_macos.hpp` · `agents/plugins/device_identity/src/device_identity_plugin.cpp`
+- Plugin: `agents/plugins/device_identity/src/device_identity_macos.hpp` · `agents/plugins/device_identity/src/device_identity_plugin.cpp` · `agents/plugins/device_identity/src/device_identity_win.hpp`
 - Definitions: `content/definitions/device_identity.yaml`
 - Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_b.hpp`
-- Tests: `tests/unit/test_device_identity_macos.cpp`
+- Tests: `tests/unit/test_device_identity_macos.cpp` · `tests/unit/test_device_identity_win.cpp`
 - Privilege row: `docs/agent-privilege-model.md` (no row yet)
 <!-- END GENERATED -->

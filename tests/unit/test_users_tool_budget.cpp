@@ -14,7 +14,8 @@ using yuzu::users::deadline_shortened;
 using yuzu::users::kLocalUsersToolBudget;
 using yuzu::users::ToolBudget;
 
-TEST_CASE("ToolBudget cuts a tool deadline to what is left, then refuses", "[users][tool_budget]") {
+TEST_CASE("ToolBudget cuts a tool deadline to what is left, then refuses",
+          "[users][tool_budget][bounded_os_call]") {
     const std::chrono::steady_clock::time_point start{1000s};
     const ToolBudget budget{start, kLocalUsersToolBudget};
     static_assert(kLocalUsersToolBudget == 30s);

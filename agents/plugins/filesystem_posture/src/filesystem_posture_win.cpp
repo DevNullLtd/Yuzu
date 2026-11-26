@@ -584,10 +584,13 @@ int emit_snapshots(yuzu::CommandContext& ctx) {
     for (const auto& row : plan.rows)
         write_snapshot_row(ctx, row.mount_point, row.name, row.kind, row.detail);
     for (const auto& mark : plan.marks) {
+        std::string provenance{"windows:vss"};
+        if (!mark.cause.empty())
+            provenance.append(":").append(mark.cause);
         if (mark.denied)
-            mark_result_denied(ctx, "windows:vss", mark.detail);
+            mark_result_denied(ctx, provenance, mark.detail);
         else
-            mark_result_partial(ctx, "windows:vss", mark.detail);
+            mark_result_partial(ctx, provenance, mark.detail);
     }
     return 0;
 }

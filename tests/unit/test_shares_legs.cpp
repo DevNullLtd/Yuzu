@@ -610,7 +610,8 @@ TEST_CASE("shares windows: a failing later page discards every earlier row", "[s
     CHECK(l.rows == std::vector<std::string>{"source|netshareenum|failed|-"});
 }
 
-TEST_CASE("shares windows: an unanswered page names its cause and reports no rows", "[shares]") {
+TEST_CASE("shares windows: an unanswered page names its cause and reports no rows",
+          "[shares][bounded_os_call]") {
     for (const std::string cause :
          {"deadline_exceeded", "call_in_progress", "abandoned_call_pending"}) {
         CAPTURE(cause);

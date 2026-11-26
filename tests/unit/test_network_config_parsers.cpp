@@ -1286,7 +1286,8 @@ yuzu::agent::win::AdapterList windows_adapter_fixture() {
 
 } // namespace
 
-TEST_CASE("windows adapter, ip and dns rows from one adapter list", "[network_config][windows]") {
+TEST_CASE("windows adapter, ip and dns rows from one adapter list",
+          "[network_config][windows][bounded_os_call]") {
     const auto list = windows_adapter_fixture();
 
     const auto adapters = windows_adapter_rows(list);
@@ -1315,7 +1316,7 @@ TEST_CASE("windows adapter, ip and dns rows from one adapter list", "[network_co
 }
 
 TEST_CASE("windows row builders on an empty table and on a failed read",
-          "[network_config][windows]") {
+          "[network_config][windows][bounded_os_call]") {
     using yuzu::agent::BoundedStatus;
     yuzu::agent::win::AdapterList list;
     list.status = BoundedStatus::Completed;

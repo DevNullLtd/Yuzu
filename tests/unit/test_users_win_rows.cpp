@@ -68,12 +68,14 @@ std::string stamp(std::uint32_t seconds) {
 
 } // namespace
 
-TEST_CASE("logged_on rows: active and disconnected sessions with a user", "[users][win_rows]") {
+TEST_CASE("logged_on rows: active and disconnected sessions with a user",
+          "[users][win_rows][bounded_os_call]") {
     CHECK(logged_on_rows(canned_sessions()) ==
           Rows{"user|alice|HOST-A|console|1", "user|bob|local|RDP|2", "user|carol|CORP|RDP|3"});
 }
 
-TEST_CASE("session rows: every session with a user, with its state", "[users][win_rows]") {
+TEST_CASE("session rows: every session with a user, with its state",
+          "[users][win_rows][bounded_os_call]") {
     CHECK(session_rows(canned_sessions()) ==
           Rows{"session|1|alice|Active|-|0", "session|2|bob|Active|laptop-b|0",
                "session|3|carol|Disconnected|-|0", "session|4|dave|Connected|-|0",
@@ -81,7 +83,8 @@ TEST_CASE("session rows: every session with a user, with its state", "[users][wi
                "session|65536|grace|Other|-|0"});
 }
 
-TEST_CASE("a failed session listing is declared; an empty one is not", "[users][win_rows]") {
+TEST_CASE("a failed session listing is declared; an empty one is not",
+          "[users][win_rows][bounded_os_call]") {
     WtsSessionsRead empty;
     empty.status = BoundedStatus::Completed;
     empty.enumerated = true;
@@ -103,7 +106,7 @@ TEST_CASE("a failed session listing is declared; an empty one is not", "[users][
     CHECK_FALSE(logged_on_rows(cut).empty());
 }
 
-TEST_CASE("local_user rows: flags, comment and last logon", "[users][win_rows]") {
+TEST_CASE("local_user rows: flags, comment and last logon", "[users][win_rows][bounded_os_call]") {
     const Rows expected{"local_user|alice|true|T1700000000|Alice A",
                         "local_user|Guest|false|Never|-"};
     auto read = canned_users();
@@ -114,7 +117,7 @@ TEST_CASE("local_user rows: flags, comment and last logon", "[users][win_rows]")
     CHECK(local_user_rows(read, stamp) == expected);
 }
 
-TEST_CASE("admin rows: member type and domain split", "[users][win_rows]") {
+TEST_CASE("admin rows: member type and domain split", "[users][win_rows][bounded_os_call]") {
     CHECK(admin_rows(canned_members()) ==
           Rows{"admin|alice|user|HOST-A", "admin|Domain Admins|group|CORP",
                "admin|INTERACTIVE|well_known_group|NT AUTHORITY", "admin|Users|alias|BUILTIN",
@@ -122,7 +125,7 @@ TEST_CASE("admin rows: member type and domain split", "[users][win_rows]") {
 }
 
 TEST_CASE("group_member rows: member without its domain, only from a successful read",
-          "[users][win_rows]") {
+          "[users][win_rows][bounded_os_call]") {
     auto read = canned_members();
     CHECK(group_member_rows(read, "Administrators") ==
           Rows{"group_member|alice|Administrators|user",
@@ -134,7 +137,7 @@ TEST_CASE("group_member rows: member without its domain, only from a successful 
     CHECK(group_member_rows(read, "Administrators").empty());
 }
 
-TEST_CASE("every SidType has a member type", "[users][win_rows]") {
+TEST_CASE("every SidType has a member type", "[users][win_rows][bounded_os_call]") {
     // SID_NAME_USE 1..11: User, Group, Domain, Alias, WellKnownGroup, DeletedAccount, Invalid,
     // Unknown, Computer, Label, LogonSession.
     const char* const types[] = {"user",    "group",   "unknown", "alias",   "well_known_group",
@@ -150,7 +153,8 @@ TEST_CASE("every SidType has a member type", "[users][win_rows]") {
     }
 }
 
-TEST_CASE("a capped or stalled read keeps its rows and says why", "[users][win_rows]") {
+TEST_CASE("a capped or stalled read keeps its rows and says why",
+          "[users][win_rows][bounded_os_call]") {
     auto read = canned_members();
     read.members.resize(3);
     CHECK(incomplete_token(read.truncated, read.no_progress).empty());
@@ -174,7 +178,8 @@ TEST_CASE("a capped or stalled read keeps its rows and says why", "[users][win_r
     CHECK(session_rows(sessions) == session_rows(canned_sessions()));
 }
 
-TEST_CASE("a failure after earlier pages never reads as the member list", "[users][win_rows]") {
+TEST_CASE("a failure after earlier pages never reads as the member list",
+          "[users][win_rows][bounded_os_call]") {
     auto read = canned_members();
     read.members.resize(1);
     read.nerr = 5;
@@ -182,7 +187,7 @@ TEST_CASE("a failure after earlier pages never reads as the member list", "[user
     CHECK(group_member_rows(read, "Administrators").empty());
 }
 
-TEST_CASE("a read that did not complete yields no rows", "[users][win_rows]") {
+TEST_CASE("a read that did not complete yields no rows", "[users][win_rows][bounded_os_call]") {
     for (const auto status : kNotCompleted) {
         auto sessions = canned_sessions();
         sessions.status = status;

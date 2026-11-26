@@ -502,7 +502,7 @@ std::string none_wire_row(std::string_view detail) {
 } // namespace
 
 TEST_CASE("filesystem_posture: plan_vss_rows -- a complete read writes one row per snapshot",
-          "[filesystem_posture]") {
+          "[filesystem_posture][bounded_os_call]") {
     auto read = answered_read();
     read.snapshots = {{"{id-1}", "volume-1", "device-1"}, {"{id-2}", "", "-"}};
     const auto plan = plan_of(read);
@@ -514,7 +514,7 @@ TEST_CASE("filesystem_posture: plan_vss_rows -- a complete read writes one row p
 }
 
 TEST_CASE("filesystem_posture: plan_vss_rows -- an empty complete read says none are present",
-          "[filesystem_posture]") {
+          "[filesystem_posture][bounded_os_call]") {
     const auto plan = plan_of(answered_read());
     CHECK(wire_rows(plan) ==
           std::vector<std::string>{"snapshot|-|-|none|no shadow copies present on any volume"});
@@ -522,7 +522,7 @@ TEST_CASE("filesystem_posture: plan_vss_rows -- an empty complete read says none
 }
 
 TEST_CASE("filesystem_posture: plan_vss_rows -- an empty incomplete read never claims none",
-          "[filesystem_posture]") {
+          "[filesystem_posture][bounded_os_call]") {
     struct Case {
         bool VssSnapshotsRead::*flag;
         const char* mark;
@@ -542,7 +542,7 @@ TEST_CASE("filesystem_posture: plan_vss_rows -- an empty incomplete read never c
 }
 
 TEST_CASE("filesystem_posture: plan_vss_rows -- marks run skipped, narrowed, truncated",
-          "[filesystem_posture]") {
+          "[filesystem_posture][bounded_os_call]") {
     auto read = answered_read();
     read.snapshots = {{"{id-1}", "volume-1", "device-1"}};
     read.truncated = read.context_narrowed = read.skipped_wrong_type = true;
@@ -557,7 +557,7 @@ TEST_CASE("filesystem_posture: plan_vss_rows -- marks run skipped, narrowed, tru
 }
 
 TEST_CASE("filesystem_posture: plan_vss_rows -- each failed step, denied and otherwise",
-          "[filesystem_posture]") {
+          "[filesystem_posture][bounded_os_call]") {
     struct Case {
         VssStep step;
         std::string denied;
@@ -596,7 +596,7 @@ TEST_CASE("filesystem_posture: plan_vss_rows -- each failed step, denied and oth
 }
 
 TEST_CASE("filesystem_posture: plan_vss_rows -- a mid-walk failure keeps the rows already read",
-          "[filesystem_posture]") {
+          "[filesystem_posture][bounded_os_call]") {
     auto read = answered_read();
     read.snapshots = {{"{id-1}", "volume-1", "device-1"}};
     read.failed_step = VssStep::next;
@@ -611,7 +611,7 @@ TEST_CASE("filesystem_posture: plan_vss_rows -- a mid-walk failure keeps the row
 }
 
 TEST_CASE("filesystem_posture: plan_vss_rows -- an unanswered read names its cause",
-          "[filesystem_posture]") {
+          "[filesystem_posture][bounded_os_call]") {
     struct Case {
         BoundedStatus status;
         const char* cause;
@@ -629,11 +629,12 @@ TEST_CASE("filesystem_posture: plan_vss_rows -- an unanswered read names its cau
         REQUIRE(plan.marks.size() == 1);
         CHECK_FALSE(plan.marks[0].denied);
         CHECK(plan.marks[0].detail == detail);
+        CHECK(plan.marks[0].cause == c.cause);
     }
 }
 
 TEST_CASE("filesystem_posture: plan_vss_rows -- a build without the VSS API says so",
-          "[filesystem_posture]") {
+          "[filesystem_posture][bounded_os_call]") {
     auto read = answered_read();
     read.api_available = false;
     const auto plan = plan_of(read);

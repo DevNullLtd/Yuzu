@@ -151,6 +151,7 @@ struct SnapshotRow {
 struct SnapshotMark {
     bool denied = false;
     std::string detail;
+    std::string_view cause{}; ///< set only when the read did not complete: the provenance suffix
 };
 
 struct VssRowPlan {
@@ -215,10 +216,10 @@ plan_vss_rows(const yuzu::agent::win::VssSnapshotsRead& read,
     };
 
     if (read.status != yuzu::agent::BoundedStatus::Completed) {
-        const std::string why = std::format("VSS enumeration did not answer: {}",
-                                            yuzu::agent::bounded_cause(read.status));
+        const std::string_view cause = yuzu::agent::bounded_cause(read.status);
+        const std::string why = std::format("VSS enumeration did not answer: {}", cause);
         none_row(why);
-        plan.marks.push_back({false, why});
+        plan.marks.push_back({false, why, cause});
         return plan;
     }
     if (!read.api_available) {
