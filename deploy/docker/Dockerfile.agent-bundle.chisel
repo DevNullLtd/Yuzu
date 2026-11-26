@@ -34,7 +34,7 @@ ARG CHISEL_VERSION
 ARG CHISEL_RELEASE
 
 # ca-certificates: chisel fetches release definitions + .debs over HTTPS.
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates python3 zstd \
     && rm -rf /var/lib/apt/lists/*
 
 ADD https://github.com/canonical/chisel/releases/download/${CHISEL_VERSION}/chisel_${CHISEL_VERSION}_linux_${TARGETARCH}.tar.gz /tmp/chisel.tgz
@@ -58,14 +58,20 @@ RUN set -eux; \
 #   base-passwd_data    /etc/passwd + /etc/group base
 #   busybox-static_bins one static binary: sh, cp, tar, ls, find, sha256sum, …
 # Retry loop: the Ubuntu archive indices occasionally EOF mid-fetch.
+# Records the cut packages where Trivy and grype read them (see the script's header).
+COPY chisel-emit-status.py /usr/local/bin/chisel-emit-status.py
 RUN set -eux; mkdir -p /rootfs; \
     SLICES="base-files_base base-files_etc base-files_var base-files_tmp \
-      base-files_release-info base-passwd_data busybox-static_bins"; \
+      base-files_release-info base-files_chisel base-passwd_data busybox-static_bins"; \
     ok=0; for i in 1 2 3 4 5; do \
-      if chisel cut --release "${CHISEL_RELEASE}" --root /rootfs ${SLICES}; then ok=1; break; fi; \
-      echo "chisel cut attempt $i failed; retrying in 5s"; sleep 5; \
+      rm -rf /rootfs; mkdir -p /rootfs; \
+      if chisel cut --release "${CHISEL_RELEASE}" --root /rootfs ${SLICES} \
+         && apt-get update -qq \
+         && python3 /usr/local/bin/chisel-emit-status.py --root /rootfs --slices "${SLICES}"; then ok=1; break; fi; \
+      echo "chisel cut or status.d attempt $i failed; retrying in 5s"; sleep 5; \
     done; \
-    [ "$ok" = 1 ]
+    [ "$ok" = 1 ]; \
+    rm -rf /var/lib/apt/lists/*
 
 # The pre-staged bundle tree, assembled on the host by build-agent-bundle.sh
 # from the verified release archives. This is the only payload in the image.

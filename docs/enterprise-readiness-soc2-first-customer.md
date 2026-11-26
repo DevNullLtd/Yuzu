@@ -1154,7 +1154,7 @@ acceptance records; WP15/S9).** What exists, for a questionnaire or an auditor's
   Not kept: anything from an attempt whose runner was killed (SIGKILL, a lost runner) before the
   upload, or whose report upload and its one retry both failed, which leaves no record at all; and a refusal never followed by a release, which exists only
   as the 90-day artifact, shorter than a Type II window: export it if the period needs it.
-- *Acceptances:* `.trivyignore.yaml`, `.grypeignore.yaml` (its acceptances and provider waivers) and `scripts/ci/image-vuln-gate-not-covered.txt` entries
+- *Acceptances:* `.trivyignore.yaml`, `.grypeignore.yaml` (its acceptances and provider waivers) and `scripts/ci/image-vuln-gate-not-covered.txt` entries (the file holds none)
   carry an approver, a date and a pull-request reference, which the gate checks for FORMAT ONLY;
   the control is the pull-request review of changes to those files, the gate scripts and the
   workflows (`docs/ci-architecture.md` "What the approval fields are, and what the control is").
@@ -1188,7 +1188,7 @@ acceptance records; WP15/S9).** What exists, for a questionnaire or an auditor's
   `scripts/build-agent-bundle.sh --push` predate the gate and can push release tags with
   maintainer credentials, bypassing the gate and the journal; they are not used to publish a
   release (Limit 1 of the policy).
-- *Not covered (disclose with the control):* the OS packages of the chiselled images (no package database either scanner reads; a passing scan is no evidence; fix planned in #8415, not shipped), PostgreSQL
+- *Not covered (disclose with the control):* unfixed MEDIUM and lower findings in the OS packages of the chiselled images (the build records each cut package as a dpkg `status.d` file at package granularity, so Trivy and grype read them and the gate refuses a fixable CRITICAL; no image is on the not-covered list, so a regression to zero packages fails the gate, but the loss of only some records is not detected; Trivy reading the records was checked by hand on one image and the gate does not check what grype matched), PostgreSQL
   in `yuzu-postgres`, the gateway's Erlang/OTP runtime, statically linked code, HIGH and unfixed
   findings (reported, not gated), and the integrity of the vulnerability DB (unsigned upstream).
   `pre-release.yml` rescans the published images afterwards; it is detective only.

@@ -9,6 +9,7 @@
 #include "oidc_writer_gate.hpp"
 #include "test_oidc_mock_idp.hpp"
 
+#include "../test_helpers.hpp"
 #include "../test_log_capture.hpp"
 
 #include <catch2/catch_test_macros.hpp>
@@ -373,6 +374,14 @@ TEST_CASE("OIDC lease: concurrent acquire-under-a-shared-lock against swap-and-r
             std::atomic<bool>& stop;
             ~StopOnExit() { stop.store(true); }
         } stop_on_exit{stop};
+        // Do not start swapping until a reader has really run. Thread start is not ordered
+        // against this loop: on a loaded box (the nightly sanitizer legs share one machine
+        // with other jobs) all kSwaps can finish before any reader is scheduled, so the
+        // closing `acquired > 0` saw 0 and the case failed without ever exercising the race
+        // it exists for. Waiting here makes that check a precondition of the overlap, not a
+        // lucky outcome. The deadline (sanitizer-scaled by spin_until) is a liveness bound
+        // only; it does not change what is asserted.
+        REQUIRE(yuzu::test::spin_until([&] { return acquired.load() > 0; }, std::chrono::seconds{30}));
         for (int i = 0; i < kSwaps; ++i) {
             auto next = lease_test_provider();
             std::unique_ptr<OidcProvider> old;

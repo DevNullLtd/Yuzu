@@ -132,6 +132,9 @@ elif host_machine.system() == 'windows'
   # test_app_usage_local_dispatcher.cpp's foreign-owner case calls SetNamedSecurityInfoW and
   # AdjustTokenPrivileges directly, as echo_test_deps' Windows block does for its DACL cases.
   agent_test_native_deps += cxx.find_library('advapi32')
+  # component_fs_win.cpp is compiled into this exe (SAM-49): SHGetKnownFolderPath is shell32's; its
+  # CoTaskMemFree comes from ole32, above.
+  agent_test_native_deps += cxx.find_library('shell32')
 endif
 
 # ── Test fixture: FROZEN ABI3-layout plugin (PLAN-03 — real backward-compat) ──
@@ -716,7 +719,8 @@ agent_test_exe = executable(
     'unit/test_component_native_scan.cpp',       # component_inventory: native-library scan over an in-memory tree and a fake clock; one POSIX-only case through the real leg and parsers (SAM-22)
     'unit/test_component_pkg_scan.cpp',          # component_inventory: Python and Node scans over an in-memory tree and a fake clock (SAM-49)
     'unit/test_component_fs_posix.cpp',          # component_inventory: POSIX filesystem leg (body POSIX-only)
-    'unit/test_component_inventory_local_dispatcher.cpp',  # component_inventory: real plugin via LocalDispatcher, unguarded on every OS (dispatches scan on Windows only)
+    'unit/test_component_fs_win.cpp',            # SAM-49: Windows filesystem leg (reparse refusal, read_at, unchanged) over a salted real tree; root planning portable
+    'unit/test_component_inventory_local_dispatcher.cpp',  # component_inventory: real plugin via LocalDispatcher, unguarded on every OS (scan and native are dispatched on Windows only, as a hidden host-walk entry)
     'unit/test_runtimes_linux_parsers.cpp',      # Wave 10 PR10.1-b: Linux walk over materialized tree manifests (REAL CAPTURE structure plus labelled reconstructions; walk bodies POSIX-only)
     'unit/test_runtimes_local_dispatcher.cpp',   # Wave 10 PR10.1-b: real plugin via LocalDispatcher, unguarded on every OS
     'unit/test_runtimes_python_parsers.cpp',     # runtimes python: pure python layer + macOS framework walk over a materialized fixture tree (walk body POSIX-only)
@@ -736,6 +740,7 @@ agent_test_exe = executable(
     'unit/test_middleware_local_dispatcher.cpp',    # SAM.2: real middleware plugin via LocalDispatcher and the table-generated descriptors, unguarded on every OS
     '../agents/plugins/middleware/src/middleware_linux.cpp', # SAM.2: run_linux (self-gated to __linux__, empty elsewhere)
     '../agents/plugins/component_inventory/src/component_fs_posix.cpp',  # SAM-16: POSIX filesystem leg (self-gated to non-Windows, empty on Windows)
+    '../agents/plugins/component_inventory/src/component_fs_win.cpp',  # SAM-49: Windows filesystem leg (self-gated to _WIN32, empty elsewhere)
     '../agents/plugins/file_search/src/file_search_shell.cpp',          # file search plugin: the OS-neutral shell (slot, stop flag, search state, cursor key, worker runner, live slice)
     '../agents/plugins/file_search/src/file_search_posix.cpp',          # file search plugin: the POSIX shell (self-gated to non-Windows, empty on Windows)
     '../agents/plugins/file_search/src/file_search_win.cpp',            # file search plugin: the Windows shell (self-gated to Windows, empty elsewhere)
@@ -1305,6 +1310,24 @@ foreach shard, spec : agent_shard_specs
     depends: agent_shard_deps,
   )
 endforeach
+
+# The component_inventory dispatcher's Windows host walk (SAM-49). The case dispatches the real plugin's
+# `scan` and `native` over this host's own Program Files; each walk ends only at the plugin's own
+# budget (WalkLimits: 400,000 entries, 45 s), so two walks bound the case at about 90 s, under 50% of
+# this entry's 240 s (docs/testing/unit-test-conventions.md "Budget rule"). No shard has that room (A
+# measures 98-102 s on the Windows MSVC debug leg, above), so the case is hidden from every shard by
+# its [.] tag and runs here alone. Windows only: the case does not exist elsewhere. No
+# --allow-running-no-tests, so a renamed tag fails loudly, as on 'agent tsan-heavy checkpoints'.
+if host_machine.system() == 'windows'
+  test(
+    'component_inventory windows host walk',
+    agent_test_exe,
+    args: ['[component_inventory_host_walk]', '--durations=yes'],
+    suite: 'agent',
+    timeout: 240,
+    depends: agent_shard_deps,
+  )
+endif
 
 # Structural partition-invariant check for the agent shards (#5073): proves, against
 # the real compiled binary via --list-tests, that every case matched by
@@ -3674,6 +3697,15 @@ test('image vulnerability gate',
   priority: 10,
 )
 
+# WP15: deploy/docker/chisel-emit-status.py records a chiselled image's packages
+# where the image scanners read them; its refusals and its four call sites.
+test('chisel status.d emission',
+  _python3_test,
+  args: [files('test_chisel_emit_status.py')],
+  suite: 'docs',
+  timeout: 120,
+)
+
 # WP15/S9: the publish journal (scripts/ci/image-publish.sh). A table of gate
 # outcomes x stop points x publish shapes runs release.yml's publish steps in
 # the workflow's order against a stub registry and checks the journal never
@@ -4522,7 +4554,8 @@ if _bash_test.found()
   )
   # #4262: -Dbuild_examples=false must keep configuring a real build.
   # Configure-only smoke test (no compile) so it stays cheap on every leg;
-  # SKIPs cleanly when vcpkg_installed/<triplet> isn't populated yet.
+  # SKIPs cleanly when vcpkg_installed/<triplet> isn't populated yet, or holds only
+  # host tools with no CLI11 (e.g. a sanitizer-triplet install, #6719).
   # platform: OS-contract test, runs on every leg (docs is OS-independent and Linux-only since 2026-10-21);
   # it selects the per-OS vcpkg triplet (`uname -s`).
   test('build_examples=false gating smoke test',

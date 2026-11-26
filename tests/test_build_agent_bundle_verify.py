@@ -138,7 +138,7 @@ class VerifyTests(unittest.TestCase):
         (self.repo / "scripts").mkdir()
         shutil.copy(SCRIPT, self.repo / "scripts" / "build-agent-bundle.sh")
         (self.repo / "deploy" / "docker").mkdir(parents=True)
-        for f in ("Dockerfile.agent-bundle.chisel", "agent-bundle-extract.sh"):
+        for f in ("Dockerfile.agent-bundle.chisel", "agent-bundle-extract.sh", "chisel-emit-status.py"):
             shutil.copy(ROOT / "deploy" / "docker" / f, self.repo / "deploy" / "docker" / f)
         for t in TOOLS:
             real = shutil.which(t)
