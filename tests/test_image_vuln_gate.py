@@ -675,6 +675,11 @@ class GateBehaviour(unittest.TestCase):
         self.assertIn("coverage: not-covered",
                       (rep / "trivy-yuzu-server-chisel.gate.txt").read_text(encoding="utf-8"))
 
+    def test_grype_os_package_count_is_not_judged_on_a_not_covered_image(self):
+        r = self.run_gate("yuzu-server-chisel=img:1", os_pkgs="0", grype_mode="no-os-pkgs",
+                          gate=self.listed_gate("yuzu-server-chisel"))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+
     def test_listed_image_that_has_packages_warns_but_passes(self):
         r = self.run_gate("yuzu-server-chisel=img:1", os_pkgs="3", gate=self.listed_gate("yuzu-server-chisel"))
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
