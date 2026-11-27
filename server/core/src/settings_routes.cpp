@@ -1577,6 +1577,17 @@ std::string ar_fmt_epoch_ms(int64_t epoch_ms) {
     return enrolment::utc_stamp_epoch_secs(epoch_ms / 1000);
 }
 
+/// The Scope cell of a frozen grant (#6969): "Fleet-wide", "Group: <name>" with the id as the
+/// tooltip, or "Group: name unavailable (<id>)". Built from the attestation row alone (the name is
+/// read from the frozen snapshot); nothing here dereferences a live management group.
+std::string ar_scope_cell(const AccessReviewAttestationRow& a) {
+    const auto cell = scope_cell(a.scope_group_id, snapshot_scope_group_name(a.grant_snapshot));
+    std::string out = "<td";
+    if (!cell.title.empty())
+        out += " title=\"" + html_escape(cell.title) + "\"";
+    return out + ">" + html_escape(cell.text) + "</td>";
+}
+
 /// The self-contained JS helper block for the Access Reviews fragment's
 /// write actions. Emitted ONCE, inside the top-level fragment
 /// (render_access_review_fragment) — the campaign sub-fragment is always
@@ -1649,9 +1660,12 @@ function arOpenCampaign(form) {
 }
 function arAttest(btn) {
   var d = btn.dataset;
+  var scopeText = d.scope === 'management_group' ? 'on management group "' + d.scopeGroupId + '"'
+                                                 : 'fleet-wide';
   if (d.decision === 'flagged_revoke' &&
       !window.confirm('Flag ' + d.principalType + ' "' + d.principalId + '" role "' + d.roleName +
-                       '" for revocation? This records evidence only — it does NOT revoke the grant.')) {
+                       '" (' + scopeText + ') for revocation? ' +
+                       'This records evidence only. It does NOT revoke the grant.')) {
     return;
   }
   var row = btn.closest('tr');
@@ -1666,6 +1680,8 @@ function arAttest(btn) {
     principal_type: d.principalType,
     principal_id: d.principalId,
     role_name: d.roleName,
+    scope: d.scope,
+    scope_group_id: d.scopeGroupId,
     decision: d.decision,
     justification: justEl ? justEl.value : ''
   }, function (data) {
@@ -1889,13 +1905,13 @@ SettingsRoutes::render_access_review_campaign_fragment(const httplib::Request& r
     }
 
     html += "<table class=\"user-table\"><thead><tr><th>Principal</th><th>Role</th>"
-            "<th>Decision</th><th>Reviewer</th><th>Decided</th>";
+            "<th>Scope</th><th>Decision</th><th>Reviewer</th><th>Decided</th>";
     if (can_attest)
         html += "<th>Justification</th><th></th>";
     html += "</tr></thead><tbody>";
 
     if (view.attestations.empty()) {
-        html += "<tr><td colspan=\"" + std::to_string(can_attest ? 7 : 5) +
+        html += "<tr><td colspan=\"" + std::to_string(can_attest ? 8 : 6) +
                 "\" class=\"muted\">No frozen grants in this campaign</td></tr>";
     } else {
         for (const auto& a : view.attestations) {
@@ -1910,8 +1926,7 @@ SettingsRoutes::render_access_review_campaign_fragment(const httplib::Request& r
                     "</span> " + html_escape(a.principal_id) +
                     "</td>"
                     "<td>" +
-                    html_escape(a.role_name) +
-                    "</td>"
+                    html_escape(a.role_name) + "</td>" + ar_scope_cell(a) +
                     "<td><span class=\"role-badge " +
                     decision_cls + "\">" + html_escape(a.decision) +
                     "</span></td>"
@@ -1937,7 +1952,9 @@ SettingsRoutes::render_access_review_campaign_fragment(const httplib::Request& r
                             html_escape(campaign_id) + "\" data-principal-type=\"" +
                             html_escape(a.principal_type) + "\" data-principal-id=\"" +
                             html_escape(a.principal_id) + "\" data-role-name=\"" +
-                            html_escape(a.role_name) +
+                            html_escape(a.role_name) + "\" data-scope=\"" +
+                            html_escape(std::string(scope_kind(a.scope_group_id))) +
+                            "\" data-scope-group-id=\"" + html_escape(a.scope_group_id) +
                             "\" data-decision=\"attested\" "
                             "onclick=\"arAttest(this)\">Attest</button> "
                             "<button class=\"btn btn-danger\" "
@@ -1945,7 +1962,9 @@ SettingsRoutes::render_access_review_campaign_fragment(const httplib::Request& r
                             html_escape(campaign_id) + "\" data-principal-type=\"" +
                             html_escape(a.principal_type) + "\" data-principal-id=\"" +
                             html_escape(a.principal_id) + "\" data-role-name=\"" +
-                            html_escape(a.role_name) +
+                            html_escape(a.role_name) + "\" data-scope=\"" +
+                            html_escape(std::string(scope_kind(a.scope_group_id))) +
+                            "\" data-scope-group-id=\"" + html_escape(a.scope_group_id) +
                             "\" data-decision=\"flagged_revoke\" "
                             "onclick=\"arAttest(this)\">Flag for revocation (records evidence; "
                             "does not revoke)</button>";

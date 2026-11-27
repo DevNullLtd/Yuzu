@@ -3,6 +3,7 @@
 #include "access_reviews_render.hpp"
 
 #include "access_audit_render.hpp"
+#include "access_review_model.hpp" // scope_kind, scope_cell, snapshot_scope_group_name
 #include "web_utils.hpp"
 
 #include <algorithm>
@@ -174,6 +175,17 @@ std::string history_block(const AccessReviewAttestationRow& a) {
     return out + "</details>";
 }
 
+// The Scope cell of a frozen grant (#6969): "Fleet-wide", or "Group: <name>" with the id as the
+// tooltip, or "Group: name unavailable (<id>)". Built from the attestation row alone: the group
+// name is read from the frozen snapshot and nothing here dereferences a live group.
+std::string scope_cell_html(const AccessReviewAttestationRow& a) {
+    const auto cell = scope_cell(a.scope_group_id, snapshot_scope_group_name(a.grant_snapshot));
+    std::string out = "<td";
+    if (!cell.title.empty())
+        out += " title=\"" + esc(cell.title) + "\"";
+    return out + ">" + esc(cell.text) + "</td>";
+}
+
 // `viewer` is the signed-in reviewer. The server refuses a reviewer who is the subject of the
 // grant, so a user row naming the viewer shows no Attest or Flag; that is a courtesy, not the
 // control.
@@ -184,9 +196,11 @@ std::string attestation_row(const AccessReviewAttestationRow& a, bool controls,
     const bool edit = controls && pending && !own;
     std::string out = "<tr data-principal-type=\"" + esc(a.principal_type) +
                       "\" data-principal-id=\"" + esc(a.principal_id) + "\" data-role-name=\"" +
-                      esc(a.role_name) + "\"><td class=\"long\"><span class=\"pill idle\">" +
-                      esc(a.principal_type) + "</span> " + esc(a.principal_id) +
-                      "</td><td><span class=\"pill tag\">" + esc(a.role_name) + "</span></td><td>" +
+                      esc(a.role_name) + "\" data-scope=\"" + esc(std::string(scope_kind(a.scope_group_id))) +
+                      "\" data-scope-group-id=\"" + esc(a.scope_group_id) +
+                      "\"><td class=\"long\"><span class=\"pill idle\">" + esc(a.principal_type) +
+                      "</span> " + esc(a.principal_id) + "</td><td><span class=\"pill tag\">" +
+                      esc(a.role_name) + "</span></td>" + scope_cell_html(a) + "<td>" +
                       decision_pill(a.decision) + "</td><td class=\"long\">";
     if (a.reviewer.empty())
         out += "<span class=\"hint\">None</span>";
@@ -240,7 +254,7 @@ std::string campaign_panel(const CampaignView& v, bool can_attest, std::string_v
         out += "<div class=\"empty\"><b>No frozen grants</b>This campaign froze zero grants.</div>";
     } else {
         out += "<div class=\"tw\"><table class=\"dense\"><thead><tr><th>Principal</th><th>Role</th>"
-               "<th>Decision</th><th>Decided by</th><th>Justification</th><th></th></tr></thead>"
+               "<th>Scope</th><th>Decision</th><th>Decided by</th><th>Justification</th><th></th></tr></thead>"
                "<tbody>";
         const std::size_t shown = std::min(ordered.size(), kGrantRenderCap);
         for (std::size_t i = 0; i < shown; ++i)
