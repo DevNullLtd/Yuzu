@@ -2267,9 +2267,9 @@ deliberately: those change between cycles and would flip the content hash every
 sync, defeating the hash-skip protocol.
 
 - **Windows domain and adapter reads.** On Windows, if the domain-join read or the
-  network adapter read gets no answer within 5 seconds, the agent skips that
-  `device_ci` cycle; the stored record stays as it was, and a read that stays hung
-  keeps it from updating.
+  network adapter read gets no answer within 5 seconds, or the adapter read fails,
+  the agent skips that `device_ci` cycle; the stored record stays as it was, and a
+  read that stays hung or keeps failing keeps it from updating.
 - **Scope / privacy.** Machine-scope only (no per-user data), but serial/UUID/MAC
   are device-persistent identifiers — treat as potentially personal data where a
   device is person-assigned. The same **`--inventory-disable`** flag suppresses
