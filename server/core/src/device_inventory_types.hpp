@@ -105,6 +105,14 @@ struct DeviceCiRecord {
     /// by `get_device_ci_with_sections` (one snapshot with the scalars) and readable alone via
     /// `get_device_ci_sections`.
     std::vector<DeviceCiSection> sections;
+    /// Epoch SECONDS (the unit of `first_seen`/`last_seen`) at which this row's CONTENT last
+    /// changed, authored by the PostgreSQL clock (never a replica's `system_clock`): the insert time
+    /// on a first store, moved forward only when a full replace carries a DIFFERENT `content_hash`.
+    /// A hash-skip touch and a full re-send of unchanged content leave it alone, so unlike
+    /// `last_seen` it marks change. Filled by the keyset read and the single/keyed record reads;
+    /// 0 on a parsed (not yet stored) record. Appended last so existing designated initialisers
+    /// keep compiling.
+    std::int64_t changed_at{0};
 };
 
 /// Error type for the authoritative single-record read. The success type is
@@ -139,6 +147,10 @@ struct DeviceCiKeysetQuery {
     /// Only these agents' rows, when set. Present-and-empty means "none": the store answers
     /// an empty page without running SQL, which is how a deny-all scope reads.
     std::optional<std::vector<std::string>> agent_ids;
+    /// Only rows whose `changed_at >= *changed_since` (epoch seconds, inclusive: at-least-once
+    /// delivery), when set. Unset adds no clause: the statement text and parameters are the
+    /// unfiltered ones. Combines (AND) with every other narrowing and with `after`.
+    std::optional<std::int64_t> changed_since;
 };
 
 } // namespace yuzu::server

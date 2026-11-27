@@ -1404,6 +1404,19 @@ TEST_CASE("the plugins behind the frozen internal-consumer reads are not Forensi
     }
 }
 
+// The per-device live read (REST POST /api/v1/dex/devices/{id}/live and MCP get_device_live)
+// dispatches os_info/uptime and processes/list_hashed and reads them back under the fixed-plugin
+// tier filter, which excludes every Forensics-tier plugin. That is only sound while neither
+// plugin is Forensics-tier, so pin both against the catalogue-derived set.
+TEST_CASE("the plugins behind the live device read are not Forensics-tier",
+          "[server][forensics_tier][security][live]") {
+    const auto& set = test::forensics_plugin_set();
+    for (const char* plugin : {"os_info", "processes"}) {
+        INFO(plugin);
+        CHECK_FALSE(set.contains(plugin));
+    }
+}
+
 // An agent failure text containing an embedded NUL byte must still settle the agent's status row:
 // a NUL cannot be stored in a text column, so the ingest replaces it (U+FFFD) before any sink
 // binds the text, and the rest of the message is kept as sent.

@@ -1414,6 +1414,37 @@ def cmd_grype_components(path, names):
     return 1 if missing or wrong else 0
 
 
+_OS_DB_CATALOGERS = frozenset({"dpkg-db-cataloger", "apk-db-cataloger", "rpm-db-cataloger"})
+
+
+def cmd_grype_os_packages(path):
+    """Count the components grype read from an OS package database in its CycloneDX.
+
+A component counts when syft's `syft:package:foundBy` property names an OS package-database
+cataloger. A purl prefix is not enough: syft also emits `pkg:deb/` components from ELF
+`.note.package` sections (`elf-binary-package-cataloger`), which stay present when the database
+is no longer read."""
+    try:
+        d = _load_json_object(path, "grype CycloneDX output")
+        if d.get("bomFormat") != "CycloneDX":
+            raise ValueError(f"{path} is not CycloneDX output (no bomFormat)")
+        # CycloneDX omits the key when there are no components: that is a count of 0.
+        comps = d.get("components", [])
+        if not isinstance(comps, list):
+            raise ValueError(f"{path}: components is not a list")
+    except (OSError, ValueError, RecursionError) as e:
+        print(f"grype os packages: cannot read {e}", file=sys.stderr)
+        return 1
+    def from_db(c):
+        props = c.get("properties") if isinstance(c, dict) else None
+        return isinstance(props, list) and any(
+            isinstance(p, dict) and p.get("name") == "syft:package:foundBy"
+            and p.get("value") in _OS_DB_CATALOGERS for p in props)
+    n = sum(1 for c in comps if from_db(c))
+    print(f"os_packages={n}")
+    return 0
+
+
 def cmd_grype_report(path):
     try:
         d = _load_json_object(path, "grype report")
@@ -1503,6 +1534,8 @@ def main(argv):
                 return cmd_grype_db_providers(pos[0], pos[1:], f.get("--waivers"))
         elif len(argv) >= 3 and argv[0] == "grype-components":
             return cmd_grype_components(argv[1], argv[2:])
+        elif len(argv) == 2 and argv[0] == "grype-os-packages":
+            return cmd_grype_os_packages(argv[1])
         elif len(argv) == 2 and argv[0] == "grype-report":
             return cmd_grype_report(argv[1])
         elif argv and argv[0] == "db-age":

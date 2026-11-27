@@ -213,6 +213,9 @@ struct Rig {
 
     RestApiV1::AuthorizeDispatchFn authorize_dispatch;
     detail::KillSwitchFn kill_switch; // empty = unwired (legacy-open), as server.cpp without a store
+    // The held-open budget the DELETE route's reply wait leases from (`SseSurface::kLiveRead`),
+    // with the default global cap. Declared before the sink so it outlives the route handlers.
+    detail::StreamBudget live_budget{detail::StreamBudget::Config{}};
     yuzu::server::test::TestRouteSink sink;
     RestApiV1 api;
     std::unique_ptr<QuarantineContainmentReconciler> reconciler;
@@ -407,7 +410,7 @@ struct Rig {
                             /*software_inventory_store=*/nullptr, /*response_scope_fn=*/{},
                             /*engine_principal_store=*/nullptr, /*access_review_store=*/nullptr,
                             /*auth_db=*/nullptr, /*directory_sync=*/nullptr,
-                            /*stream_budget=*/nullptr, exec_visible,
+                            &live_budget, exec_visible,
                             /*list_read_fn=*/{}, /*fleet_read_fn=*/{},
                             /*agents_fn=*/{}, /*response_visible_set_fn=*/{},
                             /*verify_api=*/nullptr, /*device_api=*/nullptr,

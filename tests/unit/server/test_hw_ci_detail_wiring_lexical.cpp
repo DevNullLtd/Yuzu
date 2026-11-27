@@ -29,6 +29,7 @@
  * cannot tell that the branch is reachable or that the arguments are right.
  */
 
+#include "device_inventory_store.hpp"
 #include "source_scan.hpp"
 
 #include <catch2/catch_test_macros.hpp>
@@ -374,4 +375,81 @@ TEST_CASE("bulk read cap wiring (LEXICAL pin, not behaviour): both bulk-read con
     CHECK(count_occurrences(rest, "deps_.ci_collation_gate,deps_.ci_read_slots,") == 1);
     const std::string mcp = squeeze(comment_free_source("mcp_tools_hardware.cpp"));
     CHECK(count_occurrences(mcp, "deps->ci_collation_gate,deps->ci_read_slots,") == 1);
+}
+
+// The `changed_since` watermark (`next_changed_since`). An EMPTY provider fails every FIRST page
+// (no cursor, no agent_id) closed (`with_watermark`), so a deps field that silently stayed empty in
+// production would 503 every walk at its first page; a transport that stopped wrapping its `read_page` in `with_watermark` would serve pages
+// WITHOUT the watermark (a delta client would then keep a stale or zero value). This pins the
+// production wiring: both bulk-read consumers are handed the ONE `hw_ci_watermark_fn` closure, which
+// binds `DeviceInventoryStore::device_ci_watermark` and answers nullopt for an unwired store, and
+// each transport's one `read_page` call sits inside `with_watermark` with the request it answered
+// (the first-page-only rule reads it) and its deps' provider.
+TEST_CASE("changed_since watermark wiring (LEXICAL pin, not behaviour): both bulk-read consumers are handed the "
+          "one production provider and wrap read_page in with_watermark",
+          "[hardware][wiring][lexical][changed_since]") {
+    const std::string flat = squeeze(comment_free_source("server.cpp"));
+
+    REQUIRE(count_occurrences(flat, "autohw_ci_watermark_fn=") == 1);
+    CHECK(count_occurrences(flat, ".ci_watermark_fn=hw_ci_watermark_fn,") == 1);
+    CHECK(count_occurrences(flat, "tool_deps.ci_watermark_fn=hw_ci_watermark_fn;") == 1);
+    CHECK(count_occurrences(flat, ".ci_watermark_fn=") == 2); // the two assignments; the definition is `auto hw_ci_watermark_fn=`
+    CHECK(count_occurrences(flat, "ci_watermark_fn=nullptr") == 0);
+    CHECK(count_occurrences(flat, "ci_watermark_fn={}") == 0);
+    // The closure reads the store's database-clock watermark and degrades to nullopt, never a value
+    // of its own (no clock call in its body).
+    const std::string body = lambda_body(comment_free_source("server.cpp"), "hw_ci_watermark_fn",
+                                         "std::optional<std::int64_t>");
+    REQUIRE_FALSE(body.empty());
+    const std::string flat_body = squeeze(body);
+    CHECK(count_occurrences(flat_body, "device_inventory_store_->device_ci_watermark()") == 1);
+    CHECK(count_occurrences(flat_body, "returnstd::nullopt;") == 1);
+    CHECK(count_occurrences(flat_body, "chrono") == 0);
+    CHECK(count_occurrences(flat_body, "time(") == 0);
+
+    // Each transport's ONE read_page call is the argument of with_watermark, with its deps' provider.
+    const std::string rest = squeeze(comment_free_source("hardware_routes.cpp"));
+    CHECK(count_occurrences(rest, "hardware_ci_page::with_watermark(") == 1);
+    CHECK(count_occurrences(rest, "hardware_ci_page::with_watermark(hardware_ci_page::read_page(") == 1);
+    CHECK(count_occurrences(rest, "hardware_ci_page::kRestRowBudgetBytes),rq,deps_.ci_watermark_fn)") == 1);
+    const std::string mcp = squeeze(comment_free_source("mcp_tools_hardware.cpp"));
+    CHECK(count_occurrences(mcp, "hardware_ci_page::with_watermark(") == 1);
+    CHECK(count_occurrences(mcp, "hardware_ci_page::with_watermark(hardware_ci_page::read_page(") == 1);
+    CHECK(count_occurrences(mcp, "hardware_ci_page::kMcpRowBudgetBytes),*rq,deps->ci_watermark_fn)") == 1);
+}
+
+// The watermark statement cap (governance round 2): a first bulk page takes a SECOND lease for
+// `device_ci_watermark()`, and the pool's own statement_timeout is 30 s, so the read must run in
+// a transaction whose first statement is `SET LOCAL statement_timeout = '<kDeviceCiWatermark
+// StatementTimeout>'` (the keyset read's idiom). The statement reads no table, so its stall cannot
+// be provoked on a live database; this pins the source instead. Kills: dropping the SET LOCAL (a
+// plain lease again), a non-local `SET`, a different constant, or the SELECT moving ahead of it.
+TEST_CASE("device_ci_watermark runs under a transaction-local statement_timeout (LEXICAL pin, not behaviour)",
+          "[device_ci][changed_since][watermark][wiring][lexical]") {
+    CHECK(std::string_view(yuzu::server::kDeviceCiWatermarkStatementTimeout) == "5s");
+    const std::string src = comment_free_source("device_inventory_store.cpp");
+    const std::size_t def = src.find("DeviceInventoryStore::device_ci_watermark()");
+    REQUIRE(def != std::string::npos);
+    const std::size_t open = src.find('{', def);
+    REQUIRE(open != std::string::npos);
+    int depth = 0;
+    std::size_t close = std::string::npos;
+    for (std::size_t i = open; i < src.size(); ++i) {
+        if (src[i] == '{')
+            ++depth;
+        else if (src[i] == '}' && --depth == 0) {
+            close = i;
+            break;
+        }
+    }
+    REQUIRE(close != std::string::npos);
+    const std::string body = squeeze(std::string_view(src).substr(open, close - open + 1));
+    CHECK(count_occurrences(body, "pool_.try_acquire_for(kQueryAcquireTimeout)") == 1); // bounded acquire
+    CHECK(count_occurrences(body, "pool_.with_txn_on(std::move(lease),") == 1);          // inside a transaction
+    CHECK(count_occurrences(body, "PQexec") == 0); // no statement outside the transaction
+    const std::size_t set_local = body.find("\"SETLOCALstatement_timeout='\")+kDeviceCiWatermarkStatementTimeout+\"'\"");
+    const std::size_t select = body.find("exec_params(c,sql.c_str(),");
+    REQUIRE(set_local != std::string::npos);
+    REQUIRE(select != std::string::npos);
+    CHECK(set_local < select);
 }

@@ -458,6 +458,18 @@ FAMILIES = {
             # (#2146); shared with the REST v1 live route.
             "server/core/src/live_model.cpp",
             "server/core/src/live_model.hpp",
+            # live_result_json.{hpp,cpp} + live_outcome.hpp: the shared REST+MCP `data` JSON
+            # builder and the closed live-read outcome vocabulary (both pure). live_read_poll is
+            # deliberately NOT enrolled: it reads the response store.
+            "server/core/src/live_result_json.cpp",
+            "server/core/src/live_result_json.hpp",
+            "server/core/src/live_outcome.hpp",
+            # live_admission.hpp + utf8_clamp.hpp + live_zero_reach_outcome.hpp: the shared
+            # held-open admission step, the UTF-8 boundary clamp and the zero-reach/gate to
+            # outcome mapping (all pure decision code; none reaches a store).
+            "server/core/src/live_admission.hpp",
+            "server/core/src/utf8_clamp.hpp",
+            "server/core/src/live_zero_reach_outcome.hpp",
         ],
     },
     "network": {
