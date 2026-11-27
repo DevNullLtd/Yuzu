@@ -158,6 +158,13 @@ struct Twin {
     std::vector<std::string> dex_calls_for;
     // The keyset store behind GET /api/v1/hardware-ci and list_hardware_ci_records.
     yuzu::server::test::FakeCiKeysetStore ci_store;
+    // The `changed_since` watermark provider both transports share (production binds
+    // DeviceInventoryStore::device_ci_watermark): the value it answers (nullopt = the read failed)
+    // and how often it was asked. Opts::wire_ci_watermark = false leaves it unwired (empty).
+    static constexpr std::int64_t kWatermark = 1'699'999'700;
+    std::optional<std::int64_t> ci_watermark{kWatermark};
+    int ci_watermark_calls = 0;
+    std::function<void()> on_watermark; // called inside every watermark read
     // The collation gate both transports hand to read_page (production wires &collation_gate_).
     // Trusted by default; Opts::wire_ci_gate = false leaves the deps pointer null (no gate).
     std::atomic<pg::CollationGate> ci_gate{pg::CollationGate::Trusted};
@@ -202,6 +209,7 @@ struct Twin {
         bool wire_audit = true;
         bool wire_ci_page = true;
         bool wire_ci_gate = true;
+        bool wire_ci_watermark = true;
         int ci_slot_cap = 0; // > 0 wires a BulkReadSlots of this cap (30 ms wait) into both transports
     };
 
@@ -292,6 +300,15 @@ struct Twin {
             deps.ci_collation_gate = &ci_gate;
         deps.ci_read_slots = ci_slots.get();
         deps.ci_read_busy_fn = busy_fn;
+        const hardware_ci_page::Watermark watermark_fn = [this]() {
+            if (on_watermark)
+                on_watermark(); // outside `mu`: a test probes the cap from in here
+            std::lock_guard lk(mu);
+            ++ci_watermark_calls;
+            return ci_watermark;
+        };
+        if (o.wire_ci_watermark)
+            deps.ci_watermark_fn = watermark_fn;
         deps.dex_score_fn = dex_fn;
         sink.default_headers = {{"Host", "yuzu.test"}, {"Origin", "https://yuzu.test"}};
         routes.register_routes(sink, deps);
@@ -312,6 +329,8 @@ struct Twin {
             td.ci_collation_gate = &ci_gate;
         td.ci_read_slots = ci_slots.get();
         td.ci_read_busy_fn = busy_fn;
+        if (o.wire_ci_watermark)
+            td.ci_watermark_fn = watermark_fn;
         if (o.wire_dex)
             td.dex_score_fn = dex_fn;
         server.set_tool_deps(std::move(td));
@@ -1741,6 +1760,7 @@ TEST_CASE("mcp list_hardware_ci_records: served as a confined Inventory:Read rea
     CHECK(tool["annotations"]["readOnlyHint"] == true);
     CHECK(tool["annotations"]["idempotentHint"] == true);
     CHECK(tool["outputSchema"]["type"] == "object");
+    // next_changed_since is NOT required: it is on the first response of a walk only
     CHECK(tool["outputSchema"]["required"] == json::array({"devices", "next_cursor"}));
     const auto& p = tool["inputSchema"]["properties"];
     CHECK(p["limit"]["minimum"] == 1);
@@ -2944,7 +2964,7 @@ TEST_CASE("byte bound: a page the budget does not touch carries no page_bytes_ca
     t.clear_audit();
     const json rest = t.rest_data("/api/v1/hardware-ci?limit=2");
     CHECK_FALSE(rest.contains("page_bytes_capped"));
-    CHECK(rest.size() == 2);
+    CHECK(rest.size() == 3); // devices, next_cursor, next_changed_since
     const json mcp = t.call("list_hardware_ci_records", {{"limit", 2}});
     CHECK_FALSE(mcp["result"]["structuredContent"].contains("page_bytes_capped"));
     REQUIRE(t.domain_details.size() == 2);
@@ -3288,4 +3308,328 @@ TEST_CASE("audit lock, real handlers: pool 1 / cap 1 is the documented residual,
         CHECK(r.served == 1);
         CHECK(r.rows_written == 1);
     }
+}
+
+// ───────────────────── list_hardware_ci_records: the changed_since delta pull ─────────────────────
+
+namespace {
+
+void seed_changed(Twin& t, const char* id, std::int64_t changed_at) {
+    auto r = yuzu::server::test::make_ci_record(id);
+    r.changed_at = changed_at;
+    t.ci_store.add(std::move(r));
+}
+
+std::int64_t mcp_delta_now() {
+    return std::chrono::duration_cast<std::chrono::seconds>(
+               std::chrono::system_clock::now().time_since_epoch())
+        .count();
+}
+
+} // namespace
+
+// The tool tells an agentic worker how to use the delta, and its schemas type the new fields.
+TEST_CASE("mcp list_hardware_ci_records: the changed_since input, the per-row changed_at and next_changed_since "
+          "are typed and the description teaches the delta recipe",
+          "[mcp][hardware][ci_page][changed_since][registry_seam]") {
+    Twin t;
+    auto res = t.post(R"({"jsonrpc":"2.0","method":"tools/list","id":1})");
+    REQUIRE(res);
+    const json listed = json::parse(res->body);
+    const json& tool = tool_entry(listed, "list_hardware_ci_records");
+    const auto& cs = tool["inputSchema"]["properties"]["changed_since"];
+    CHECK(cs["type"] == "integer");
+    CHECK(cs["minimum"] == 0);
+    CHECK(cs["maximum"].is_number_integer()); // bounded, not open-ended
+    // the cursor is bound to BOTH the agent_id and the changed_since it was issued with
+    CHECK(tool["inputSchema"]["properties"]["cursor"]["description"].get<std::string>().find(
+              "Valid only with the same agent_id and changed_since it was issued with") != std::string::npos);
+    CHECK(tool["annotations"]["readOnlyHint"] == true);
+    const auto& out = tool["outputSchema"];
+    CHECK(out["properties"]["next_changed_since"]["type"] == "integer");
+    CHECK(out["properties"]["next_changed_since"]["description"].get<std::string>().find("FIRST response") !=
+          std::string::npos);
+    CHECK(out["properties"]["devices"]["items"]["properties"]["changed_at"]["type"] == "integer");
+    CHECK(out["properties"]["devices"]["items"]["required"].dump().find("changed_at") != std::string::npos);
+    const std::string desc = tool["description"].get<std::string>();
+    for (const char* needle : {"changed_since", "next_changed_since", "at-least-once",
+                               "upsert by agent_id", "full walk", "backstop", "removal signal",
+                               "credential with global read", "terminal", "300 seconds",
+                               // the first-response-only rule and the client protocol (owner ruling 2026-11-24)
+                               "Only the FIRST response of a walk", "keep ONLY that value", "max(changed_at)",
+                               "your own clock", "restart a failed walk from page 1",
+                               "never resume a saved cursor across days", "Do NOT send changed_since on an agent_id confirm read",
+                               "does NOT mean no records exist",
+                               // the conditional, capped fallback (round 2): never an unconditional loop
+                               "If the same delta page returns the same error (-32603) with retry_after_ms 5000 at least 3 times over at least 60 s while unfiltered pages succeed, drop changed_since and run ONE full walk, at most once per walk and not on every scheduled run",
+                               "honour every other hint (2000, 60000, an audit failure) and do not fall back for them",
+                               // how to recognise the audit failure: the exact message of answer_audit_withheld
+                               "An audit failure is the internal error whose message is \"audit subsystem unavailable, request not served\"",
+                               "If that full walk's first page also fails (it reads the watermark too) or the fallback recurs, stop and alert: the delta plan is slow, raise it with the operator",
+                               "Run the first full walk under the SAME global credential that will run the deltas",
+                               "first-page next_changed_since is NOT valid for a later global delta",
+                               "a replica whose clock is behind the database", "fleet-wide Inventory:Read grant",
+                               "agent_id and changed_since it was issued with"})
+    {
+        INFO(needle);
+        CHECK(desc.find(needle) != std::string::npos);
+    }
+    CHECK(desc.find("last_seen") != std::string::npos);
+}
+
+// Kills: the delta filter not plumbed through MCP, the boundary dropped, and the new row and page
+// fields missing or different from REST's.
+TEST_CASE("mcp list_hardware_ci_records: changed_since returns exactly the rows at or after it and the page is "
+          "the REST data object byte for byte",
+          "[mcp][hardware][ci_page][changed_since]") {
+    Twin t;
+    const std::int64_t at = mcp_delta_now() - 1000;
+    seed_changed(t, "d-old", at - 1);
+    seed_changed(t, "d-edge", at);
+    seed_changed(t, "d-new", at + 500);
+    const json full = t.call("list_hardware_ci_records");
+    REQUIRE_FALSE(full.contains("error"));
+    CHECK(record_ids(full["result"]["structuredContent"]) == std::vector<std::string>{"d-edge", "d-new", "d-old"});
+    CHECK(full["result"]["structuredContent"]["next_changed_since"] == Twin::kWatermark);
+
+    const json r = t.call("list_hardware_ci_records", {{"changed_since", at}});
+    REQUIRE_FALSE(r.contains("error"));
+    const json page = r["result"]["structuredContent"];
+    CHECK(record_ids(page) == std::vector<std::string>{"d-edge", "d-new"});
+    CHECK(page["next_changed_since"] == Twin::kWatermark);
+    CHECK(page["devices"][0]["changed_at"] == at);
+    REQUIRE(t.ci_store.queries.back().changed_since.has_value());
+    CHECK(*t.ci_store.queries.back().changed_since == at);
+    // the audit grammar lists no filter, exactly as for a full page
+    CHECK(t.domain_details.back() == "hardware CI records (MCP): rows=2 scope=fleet");
+    CHECK(page == t.rest_data("/api/v1/hardware-ci?changed_since=" + std::to_string(at)));
+    // the text copy equals the structured copy (the page is serialised once)
+    CHECK(json::parse(r["result"]["content"][0]["text"].get<std::string>()) == page);
+}
+
+// Kills: a malformed, wrongly typed, negative or future-dated value coerced or ignored.
+TEST_CASE("mcp list_hardware_ci_records: a changed_since that is not a non-negative past integer is -32602",
+          "[mcp][hardware][ci_page][changed_since]") {
+    Twin t;
+    seed(t, {"a"});
+    const std::vector<json> bad = {
+        {{"changed_since", "5"}},   {{"changed_since", 1.5}},     {{"changed_since", -1}},
+        {{"changed_since", true}},  {{"changed_since", nullptr}}, {{"changed_since", json::array()}},
+        {{"changed_since", INT64_MIN}},
+        {{"changed_since", static_cast<std::uint64_t>(INT64_MAX) + 1}}, {{"changed_since", UINT64_MAX}},
+        {{"changed_since", mcp_delta_now() + 3600}},
+    };
+    for (const auto& args : bad) {
+        INFO(args.dump());
+        t.clear_audit();
+        const int reads = t.ci_store.reads;
+        const json r = t.call("list_hardware_ci_records", args);
+        REQUIRE(r.contains("error"));
+        CHECK(r["error"]["code"] == mcp::kInvalidParams);
+        CHECK(t.ci_store.reads == reads); // judged before the store is read
+        CHECK(has(t.generic_rows, "mcp.list_hardware_ci_records|denied"));
+        CHECK(t.domain_rows.empty());
+        CHECK(r.dump().find("3600") == std::string::npos);
+    }
+    CHECK_FALSE(t.call("list_hardware_ci_records", {{"changed_since", 0}}).contains("error"));
+    CHECK_FALSE(t.call("list_hardware_ci_records", {{"changed_since", mcp_delta_now()}}).contains("error"));
+    // the REST twin refuses what MCP refuses: the same two messages
+    const json future = t.call("list_hardware_ci_records", {{"changed_since", mcp_delta_now() + 3600}});
+    CHECK(future["error"]["message"] ==
+          "invalid changed_since (it is in the future, or this server's clock is behind the database clock)");
+    const json neg = t.call("list_hardware_ci_records", {{"changed_since", -1}});
+    CHECK(neg["error"]["message"] == "invalid changed_since (expected epoch seconds as a non-negative integer)");
+}
+
+TEST_CASE("mcp list_hardware_ci_records: a cursor is bound to the changed_since it was issued for",
+          "[mcp][hardware][ci_page][changed_since]") {
+    Twin t;
+    const std::int64_t at = mcp_delta_now() - 100;
+    for (const char* id : {"a", "b", "c"})
+        seed_changed(t, id, at);
+    const std::string plain =
+        t.call("list_hardware_ci_records", {{"limit", 1}})["result"]["structuredContent"]["next_cursor"];
+    const std::string delta = t.call("list_hardware_ci_records", {{"limit", 1}, {"changed_since", at}})
+                                  ["result"]["structuredContent"]["next_cursor"];
+    REQUIRE_FALSE(plain.empty());
+    REQUIRE_FALSE(delta.empty());
+    CHECK_FALSE(t.call("list_hardware_ci_records", {{"limit", 1}, {"cursor", plain}}).contains("error"));
+    CHECK_FALSE(t.call("list_hardware_ci_records", {{"limit", 1}, {"cursor", delta}, {"changed_since", at}})
+                    .contains("error"));
+    for (const json& args : {json{{"cursor", delta}}, json{{"cursor", plain}, {"changed_since", at}},
+                             json{{"cursor", delta}, {"changed_since", at + 1}}}) {
+        INFO(args.dump());
+        const json r = t.call("list_hardware_ci_records", args);
+        REQUIRE(r.contains("error"));
+        CHECK(r["error"]["code"] == mcp::kInvalidParams);
+        CHECK(r["error"]["message"] == "invalid cursor; restart from the first page");
+    }
+}
+
+// Kills: a scope-confined MCP caller getting a delta, a refusal that names a device or count, one
+// that is retryable, and one that varies with the cursor or a named device.
+TEST_CASE("mcp list_hardware_ci_records: changed_since from a scope-confined caller is a terminal -32602, no read",
+          "[mcp][hardware][ci_page][changed_since][security]") {
+    const std::int64_t at = mcp_delta_now() - 100;
+    struct Case {
+        const char* name;
+        authz::VisibleSet scope;
+    };
+    // Group-scoped and service-scoped tokens both reach the tool as an engaged scope (see the REST
+    // twin's comment): the tool cannot tell them apart and refuses both identically.
+    for (const Case& c : {Case{"group-scoped", authz::VisibleSet{std::unordered_set<std::string>{"in-a", "in-d"}}},
+                          Case{"service-scoped", authz::VisibleSet{std::unordered_set<std::string>{"in-a"}}},
+                          Case{"engaged-empty", authz::deny_all()},
+                          Case{"over the ceiling", mcp_scope_of_size({"in-a"}, 10001)}}) {
+        INFO(c.name);
+        Twin t;
+        seed_changed(t, "in-a", at);
+        seed_changed(t, "out-b", at);
+        t.scope = c.scope;
+        for (const json& extra : {json::object(), json{{"limit", 1}}, json{{"agent_id", "in-a"}},
+                                  json{{"agent_id", "out-b"}}, json{{"agent_id", "ghost"}},
+                                  json{{"cursor", "garbage"}}}) {
+            json args = extra;
+            args["changed_since"] = at;
+            INFO(args.dump());
+            t.clear_audit();
+            const json r = t.call("list_hardware_ci_records", args);
+            REQUIRE(r.contains("error"));
+            CHECK_FALSE(r.contains("result"));
+            CHECK(r["error"]["code"] == mcp::kInvalidParams);
+            CHECK(r["error"]["message"] ==
+                  "changed_since needs a credential with global read; a scope-confined credential cannot "
+                  "use a delta pull");
+            CHECK(r["error"]["data"]["remediation"] ==
+                  "use a credential holding a fleet-wide Inventory:Read grant (a management-group or "
+                  "service-scoped token cannot), or omit changed_since and walk the full set");
+            CHECK(r["error"]["data"]["retry_after_ms"].is_null()); // terminal
+            CHECK_FALSE(r["error"]["data"].contains("audit_persisted"));
+            for (const char* leak : {"in-a", "out-b", "ghost", "pad-", "10000", "authority_scoped"})
+                CHECK(r.dump().find(leak) == std::string::npos);
+            REQUIRE(t.domain_rows.size() == 1);
+            CHECK(t.domain_details[0] == "hardware CI records (MCP) state=changed_since needs global read");
+            REQUIRE(t.generic_rows.size() == 1);
+            CHECK(t.generic_rows[0] == "mcp.list_hardware_ci_records|denied");
+        }
+        CHECK(t.ci_store.reads == 0);
+        CHECK(t.ci_watermark_calls == 0);
+    }
+    // the same caller without the filter reads exactly as before
+    Twin t;
+    seed_changed(t, "in-a", at);
+    seed_changed(t, "out-b", at);
+    t.scope = std::unordered_set<std::string>{"in-a"};
+    const json r = t.call("list_hardware_ci_records");
+    REQUIRE_FALSE(r.contains("error"));
+    CHECK(record_ids(r["result"]["structuredContent"]) == std::vector<std::string>{"in-a"});
+    CHECK(r["result"]["structuredContent"]["scope_basis"] == "authority_scoped");
+}
+
+// Kills: serving a page without the watermark when its source fails or is unwired.
+TEST_CASE("mcp list_hardware_ci_records: a watermark that cannot be read is a retryable error, never a page without it",
+          "[mcp][hardware][ci_page][changed_since][security]") {
+    SECTION("the provider fails") {
+        Twin t;
+        seed(t, {"a"});
+        t.ci_watermark = std::nullopt;
+        t.clear_audit();
+        const json r = t.call("list_hardware_ci_records");
+        REQUIRE(r.contains("error"));
+        CHECK_FALSE(r.contains("result"));
+        CHECK(r["error"]["code"] == mcp::kInternalError);
+        CHECK(r["error"]["data"]["retry_after_ms"] == 5000);
+        CHECK(r.dump().find("next_changed_since") == std::string::npos);
+        REQUIRE(t.domain_rows.size() == 1);
+        CHECK(t.domain_rows[0] == "inventory.devices.ci|failure|Inventory|fleet");
+    }
+    SECTION("the provider is unwired") {
+        Twin::Opts o;
+        o.wire_ci_watermark = false;
+        Twin t(o);
+        seed(t, {"a"});
+        const json r = t.call("list_hardware_ci_records");
+        REQUIRE(r.contains("error"));
+        CHECK(r["error"]["code"] == mcp::kInternalError);
+        // a point read takes no watermark, so an unwired provider cannot fail it
+        const json named = t.call("list_hardware_ci_records", {{"agent_id", "a"}});
+        REQUIRE_FALSE(named.contains("error"));
+        CHECK_FALSE(named["result"]["structuredContent"].contains("next_changed_since"));
+    }
+    SECTION("a failed provider cannot fail a point read or a cursor page") {
+        Twin t;
+        seed(t, {"a", "b", "c"});
+        const std::string cursor =
+            t.call("list_hardware_ci_records", {{"limit", 1}})["result"]["structuredContent"]["next_cursor"];
+        REQUIRE_FALSE(cursor.empty());
+        t.ci_watermark = std::nullopt;
+        const int calls = t.ci_watermark_calls;
+        CHECK_FALSE(t.call("list_hardware_ci_records", {{"limit", 1}, {"cursor", cursor}}).contains("error"));
+        CHECK_FALSE(t.call("list_hardware_ci_records", {{"agent_id", "a"}}).contains("error"));
+        CHECK(t.ci_watermark_calls == calls);
+        CHECK(t.call("list_hardware_ci_records", {{"limit", 1}}).contains("error")); // the first page fails closed
+    }
+}
+
+// Kills (owner ruling 2026-11-24): a watermark on a cursor page or a point read, none on a first
+// page, and a second lease per page; and the MCP twin diverging from REST's bytes.
+TEST_CASE("mcp list_hardware_ci_records: next_changed_since is on the first response only, absent (not null or 0) "
+          "on cursor pages and agent_id reads, with zero extra watermark reads",
+          "[mcp][hardware][ci_page][changed_since][watermark]") {
+    Twin t;
+    seed(t, {"a", "b", "c"});
+    const json first = t.call("list_hardware_ci_records", {{"limit", 1}});
+    REQUIRE_FALSE(first.contains("error"));
+    const json fp = first["result"]["structuredContent"];
+    CHECK(t.ci_watermark_calls == 1);
+    REQUIRE(fp.contains("next_changed_since"));
+    CHECK(fp["next_changed_since"] == Twin::kWatermark);
+    std::string cursor = fp["next_cursor"];
+    int pages = 0;
+    while (!cursor.empty()) {
+        const json r = t.call("list_hardware_ci_records", {{"limit", 1}, {"cursor", cursor}});
+        REQUIRE_FALSE(r.contains("error"));
+        const json page = r["result"]["structuredContent"];
+        CHECK_FALSE(page.contains("next_changed_since"));
+        CHECK(r.dump().find("next_changed_since") == std::string::npos); // not in the text copy either
+        cursor = page["next_cursor"];
+        ++pages;
+    }
+    CHECK(pages == 2);
+    const json point = t.call("list_hardware_ci_records", {{"agent_id", "a"}});
+    REQUIRE_FALSE(point.contains("error"));
+    CHECK(point.dump().find("next_changed_since") == std::string::npos);
+    CHECK(t.ci_watermark_calls == 1);
+    // and the REST twin agrees page for page on both shapes
+    CHECK(fp == t.rest_data("/api/v1/hardware-ci?limit=1"));
+}
+
+// The bulk-read slot is held while the watermark is read (a bulk page's watermark read is inside the
+// cap), and a failed watermark frees it.
+TEST_CASE("mcp list_hardware_ci_records: the watermark is read while the bulk-read slot is held, and a failed one "
+          "frees it",
+          "[mcp][hardware][ci_page][changed_since][bulk_read_slots]") {
+    Twin::Opts o;
+    o.ci_slot_cap = 1;
+    Twin t(o);
+    seed(t, {"a"});
+    bool second_acquired = true;
+    t.on_watermark = [&] { second_acquired = t.ci_slots->try_acquire().has_value(); };
+    const json r = t.call("list_hardware_ci_records");
+    REQUIRE_FALSE(r.contains("error"));
+    CHECK(t.ci_watermark_calls == 1);
+    CHECK_FALSE(second_acquired); // the one slot was still held when the watermark was read
+    // a point read takes no slot, so its watermark read is outside the cap (documented residual)
+    // (and, as the watermark is first-response-only, makes no watermark read at all)
+    const int calls_before_point = t.ci_watermark_calls;
+    t.on_watermark = [&] { FAIL("a point read must not read the watermark"); };
+    REQUIRE_FALSE(t.call("list_hardware_ci_records", {{"agent_id", "a"}}).contains("error"));
+    CHECK(t.ci_watermark_calls == calls_before_point);
+    // a failed watermark releases the slot: the next call is served, not busy
+    t.on_watermark = nullptr;
+    t.ci_watermark = std::nullopt;
+    CHECK(t.call("list_hardware_ci_records").contains("error"));
+    t.ci_watermark = Twin::kWatermark;
+    CHECK_FALSE(t.call("list_hardware_ci_records").contains("error"));
+    CHECK(t.busy_seen.empty());
 }
