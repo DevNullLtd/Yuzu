@@ -30,9 +30,12 @@
 #include <chrono>
 #include <cstdint>
 #include <expected>
+#include <functional>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "dispatch_position.hpp"    // DispatchPosition (#3678)
@@ -80,6 +83,18 @@ struct Execution {
     /// server marks them `timed_out`; 0 means the default. Never below
     /// `kMinResponseWindowSecs`.
     int64_t response_window_s{0};
+    /// #2673: write-only on create. Set by a caller whose dispatch will record this run's
+    /// targets; until the whole list is recorded the run cannot finish `succeeded`.
+    bool expects_targets{false};
+    /// #2673: parts of a recorded run that are not device answers. Filled only by the software
+    /// sync status read; unset for every other read and for an unrecorded run.
+    struct Unanswered {
+        int64_t timed_out{0};
+        int64_t not_delivered{0};
+        int64_t unknown{0};
+        int64_t not_reached{0}; ///< offline, not sent or withheld
+    };
+    std::optional<Unanswered> unanswered;
 };
 
 /// #2673: the response window used when a run names none.
@@ -131,9 +146,9 @@ struct DispatchTarget {
 };
 
 /// #2673: per-run coverage counts. When `recorded` is false the counts are unknown, not zero.
-/// `intended = contacted + offline + not_sent + withheld` and
-/// `contacted = responded + failed + timed_out + pending`; `late` (an answer that arrived after
-/// the server's `timed_out`) is a subset of `timed_out`.
+/// `intended = contacted + offline + not_sent + withheld` and `contacted = responded + failed +
+/// timed_out + not_delivered + unknown + pending`; `late` (an answer that arrived after the
+/// server gave up) is a subset of `timed_out + unknown`.
 struct ExecutionCoverage {
     bool recorded{false};
     /// True when the target set came from a filter or broadcast, which see only connected agents.
@@ -142,7 +157,12 @@ struct ExecutionCoverage {
     int64_t contacted{0};
     int64_t responded{0}; ///< answered successfully
     int64_t failed{0};    ///< answered with failure, timeout or rejected
-    int64_t timed_out{0}; ///< no answer before the server's deadline
+    int64_t timed_out{0}; ///< the server recorded no result before its deadline
+    int64_t not_delivered{0}; ///< the server or gateway reported it could not deliver the command
+    int64_t unknown{0};       ///< delivery or the answer is not known
+    /// The part of `unknown` a gateway-made frame reported (it counts as a response, as such a
+    /// frame always has). Not served: only used to derive `agents_responded`.
+    int64_t undetermined{0};
     int64_t offline{0};
     int64_t not_sent{0};
     int64_t withheld{0}; ///< quarantine, plugin absent, per-OS switch, concurrency or gate
@@ -153,8 +173,18 @@ struct ExecutionCoverage {
 
 /// #2673: one `sweep_response_deadlines` pass.
 struct ResponseDeadlineSweepOutcome {
+    struct Run {
+        std::string execution_id;
+        int64_t timed_out{0};
+        int64_t unknown{0};
+        std::string finished_status; ///< empty when the run is still running
+    };
     int64_t timed_out_targets{0};
-    std::vector<std::string> execution_ids; ///< runs this pass marked or finished
+    int64_t unknown_targets{0};
+    std::vector<Run> runs; ///< runs this pass changed, in the order swept
+    std::vector<std::string> execution_ids; ///< the ids of `runs`
+    int64_t failed_runs{0};                 ///< runs whose transaction failed and rolled back
+    bool held{false}; ///< expiry held back after missed passes, a restart or a clock change
     bool skipped{false};       ///< another replica held the sweep lock
     bool clock_anomaly{false}; ///< declined on an implausible database clock reading
     bool capped{false};        ///< more runs were eligible than one pass handles
@@ -245,6 +275,10 @@ struct AgentExecStatus {
     /// status and STICKY: the stored value is the OR of every write, so no later write clears it.
     /// Not part of the event payload.
     bool response_dropped{false};
+    /// #2673: non-empty when the server or gateway made this status up: `not_delivered` (the
+    /// command certainly never arrived) or `undetermined` (it may have). It is not the device's
+    /// answer, a later answer from the device replaces it. Not part of the event payload.
+    std::string server_outcome;
 };
 
 // ── Execution statistics (capability 1.9) ────────────────────────────
@@ -608,14 +642,36 @@ public:
     bool update_agent_status(const std::string& execution_id, const AgentExecStatus& status);
     void refresh_counts(const std::string& execution_id);
 
+    /// #2673: say that a dispatch for this running run is about to send. Until
+    /// `record_dispatch_targets` completes, the run cannot finish `succeeded`, and it has a
+    /// deadline so the sweep can end it. False on a store failure.
+    [[nodiscard]] bool mark_targets_expected(const std::string& execution_id);
+
     /// #2673: record who one dispatch was meant for and what happened to each, and set the run's
     /// response deadline from the database clock. May be called more than once per run (batches,
-    /// redrive): a later call can raise a target to `contacted`, never lower it. A run with no
-    /// execution row (the side-channel correlation ids) is a successful no-op. Does NOT write
-    /// `agents_targeted`. False on a store failure, in which case nothing was recorded.
+    /// redrive): a later call can raise a target to `contacted`, never lower it. `complete`
+    /// false (the caller knows the list may be partial) leaves the run unable to read
+    /// `succeeded`. A run with no execution row (the side-channel correlation ids) is a
+    /// successful no-op. Does NOT write `agents_targeted`. False on a store failure, in which
+    /// case nothing was recorded.
     [[nodiscard]] bool record_dispatch_targets(const std::string& execution_id,
                                                const std::vector<DispatchTarget>& targets,
-                                               bool connected_only);
+                                               bool connected_only, bool complete = true);
+
+    /// #2673: a dispatch for this run could not store its command correlation record, so its
+    /// replies cannot be matched: targets still silent at the deadline read `unknown`.
+    void mark_correlation_lost(const std::string& execution_id);
+
+    /// #2673: for COUNTING only, add the outcomes the server decided itself (`timed_out`,
+    /// `unknown`) to the agent rows of the named runs: an existing row of that agent takes the
+    /// outcome's status (a late answer counts for nothing), and an agent with no row gains one.
+    /// A caller must decide visibility from the rows BEFORE this. False on a store failure.
+    [[nodiscard]] bool overlay_server_outcomes(
+        std::unordered_map<std::string, std::vector<AgentExecStatus>>& by_execution,
+        const std::vector<std::string>& execution_ids) const;
+    /// The one-run form.
+    [[nodiscard]] bool overlay_server_outcomes(const std::string& execution_id,
+                                               std::vector<AgentExecStatus>& statuses) const;
 
     /// #2673: coverage counts for one run. With `visible_agents` engaged, only those agents are
     /// counted (applied in SQL; engaged-empty counts nobody). `nullopt` on a store failure, which
@@ -624,11 +680,13 @@ public:
         const std::string& execution_id,
         const std::optional<std::vector<std::string>>& visible_agents = std::nullopt) const;
 
-    /// #2673: mark contacted targets that stayed silent past their run's deadline as
-    /// `timed_out`, then recount and finish those runs. Replica-safe (advisory try-lock),
-    /// database-clock driven and capped per pass; see docs/clock-guarded-retention.md.
+    /// #2673: give contacted targets that stayed silent past their run's deadline a final
+    /// outcome (`timed_out`, or `unknown`), then recount and finish those runs, one
+    /// transaction per run. Replica-safe (advisory try-lock), database-clock driven, capped per
+    /// pass, and held back after missed passes; see docs/clock-guarded-retention.md.
+    /// `should_stop` is asked between runs.
     [[nodiscard]] std::expected<ResponseDeadlineSweepOutcome, std::string>
-    sweep_response_deadlines();
+    sweep_response_deadlines(const std::function<bool()>& should_stop = {});
 
     /// PR 2: set agents_targeted post-creation. Used by the workflow execute
     /// handler which now creates the execution row BEFORE dispatch (to thread
@@ -1192,7 +1250,18 @@ private:
     /// (`pg_conn` is libpq's `PGconn`, named by its struct tag to keep libpq out of here.)
     bool refresh_counts_in_txn(pg_conn* conn, const std::string& execution_id,
                                RefreshEvents& events,
-                               const std::string* only_agent = nullptr);
+                               const std::string* only_agent = nullptr,
+                               bool force_incomplete = false);
+    /// A final status write failed twice: remembered so the sweep says `unknown`.
+    void note_lost_reply(const std::string& execution_id, const std::string& agent_id);
+    /// Targets of a recorded run whose outcome is final and not `success`; -1 when the run is
+    /// not recorded (count agent rows instead), nullopt on a store failure.
+    [[nodiscard]] std::optional<int>
+    count_unsuccessful_targets(const std::string& execution_id) const;
+    std::mutex lost_replies_mu_;
+    std::unordered_map<std::string, std::unordered_set<std::string>> lost_replies_;
+    /// The first sweep pass of this process holds expiry (agents are still reconnecting).
+    std::atomic<bool> first_deadline_pass_{true};
     void publish_refresh_events(const std::string& execution_id, const RefreshEvents& events);
 
     /// One attempt at `update_agent_status`'s upsert + agent-transition SSE

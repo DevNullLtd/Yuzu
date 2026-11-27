@@ -35,8 +35,9 @@
 //
 // `target_resolution_failed` and `no_targets` (#2673) separate "the target list could not be
 // read" from "the list was read and is empty" (an empty group, a scope or broadcast matching no
-// CONNECTED agent, or only ids outside the caller's visible set, which must read the same as ids
-// that do not exist). An unset `intended_count` is never "zero targets".
+// CONNECTED agent, or only ids outside the caller's visible set, which for a confined caller
+// reads the same as ids that do not exist; an unconfined caller naming a nonexistent id gets
+// `no_agents_reached`). An unset `intended_count` is never "zero targets".
 //
 // `dispatch_denied` ranks first: the chokepoint refused before targeting, so no
 // other outcome signal is set alongside it.
@@ -92,8 +93,8 @@
 
 namespace yuzu::server {
 
-/// The `no_targets` and `target_resolution_failed` wording, shared by every surface so the
-/// connected-agents limit is stated the same way everywhere (#2673).
+/// The `no_targets` and `target_resolution_failed` wording, used by the surfaces that share this
+/// classifier (the older routes word their own) so the connected-agents limit is stated the same way everywhere (#2673).
 inline constexpr std::string_view kNoTargetsMessage =
     "No targets: nothing you can dispatch to matched this request. Scope and broadcast targeting "
     "consider only connected agents.";

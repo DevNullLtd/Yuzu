@@ -1845,3 +1845,39 @@ TEST_CASE("resolve_and_dispatch_confined: an unreadable group is a failed resolu
     CHECK(empty.intended_count == 0u);
     CHECK(sink.reached.empty());
 }
+
+TEST_CASE("resolve_and_dispatch_confined: an id named twice is sent to and counted once",
+          "[server][dispatch][scope][coverage]") {
+    RecordingSink sink;
+    const auto out = resolve_and_dispatch_confined(
+        {"dev-A", "dev-A", "dev-B"}, "", unfiltered(), false, kNoContainment,
+        no_group_no_scope_resolvers(), sink.make(), nullptr, {}, {}, /*collect_targets=*/true);
+    CHECK(sink.reached.size() == 2);
+    CHECK(out.sent == 2);
+    CHECK(out.intended_count == 2u);
+    CHECK(out.intended.size() == 2);
+    CHECK(out.contacted.size() == 2);
+}
+
+TEST_CASE("resolve_and_dispatch_confined: a broadcast list that may be incomplete is never zero "
+          "targets",
+          "[server][dispatch][scope][coverage]") {
+    RecordingSink sink;
+    sink.fleet.clear();
+    auto raw = sink.make();
+    raw.membership_degraded = [] { return true; };
+    const auto none = resolve_and_dispatch_confined({}, "__all__", unfiltered(), false,
+                                                    kNoContainment, no_group_no_scope_resolvers(),
+                                                    raw);
+    CHECK(none.membership_partial);
+    CHECK(none.resolution_failed);
+    CHECK_FALSE(none.intended_count.has_value());
+
+    sink.fleet = {"dev-A"};
+    const auto some = resolve_and_dispatch_confined({}, "__all__", unfiltered(), false,
+                                                    kNoContainment, no_group_no_scope_resolvers(),
+                                                    raw);
+    CHECK(some.membership_partial);
+    CHECK_FALSE(some.resolution_failed);
+    CHECK(some.sent == 1);
+}

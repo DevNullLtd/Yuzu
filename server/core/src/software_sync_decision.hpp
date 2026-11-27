@@ -496,6 +496,8 @@ struct Counts {
 
 struct Plan {
     std::vector<std::string> targets; // the live, new-enough subset, in input order
+    std::vector<std::string> offline; // selected, no session here
+    std::vector<std::string> too_old; // selected, below the sync-now version floor
     Counts counts;
 };
 
@@ -536,11 +538,13 @@ template <class VersionFn, class SupportsFn>
     p.counts.requested = ids.size();
     for (const auto& id : ids) {
         const std::optional<std::string> version = version_of(id);
-        if (!version)
+        if (!version) {
             ++p.counts.skipped_offline;
-        else if (!supports(std::string_view(*version)))
+            p.offline.push_back(id);
+        } else if (!supports(std::string_view(*version))) {
             ++p.counts.skipped_version;
-        else
+            p.too_old.push_back(id);
+        } else
             p.targets.push_back(id);
     }
     p.counts.reached = p.targets.size();

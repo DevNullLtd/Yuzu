@@ -635,15 +635,19 @@ strictly safer than falsely cancelling it, since there is no repair path today t
 
 ### `ExecutionTracker::sweep_response_deadlines` (#2673)
 
-Not a delete: it marks silent dispatch targets `timed_out` and finishes their runs, a bulk change to authoritative state decided by a clock, so it takes the guarded shape. Recorded decisions:
+Not a delete: it marks silent dispatch targets `timed_out` or `unknown` and finishes their runs, a bulk change to authoritative state decided by a clock, so it takes the guarded shape. The first final outcome stands, so an early expiry is not undone by a later answer. Recorded decisions:
 
 - **Clock:** the database clock, which also authors every `deadline_at` and `last_signal_at`, so one clock domain decides.
-- **Anchor and repeat:** persisted anchor `target_deadline_anchor`; an implausible reading (backwards, or more than 15 minutes forward against a 30 s cadence) is declined once and recorded in `target_deadline_declined`; the same anomaly again is taken as elapsed time. A corrupt anchor is repaired and that pass declined.
-- **Missing anchor:** accepted. Every deadline was authored by the same clock a window earlier, and declining forever on a fresh database would leave runs unfinishable.
-- **Cap:** 100 runs per pass, unconditionally (two outbox events each, under the cross-replica poll's rows-per-transaction bound).
-- **Would-wipe ratio: DECLINED.** A real outage leaves every open run silent at once, which is exactly when this pass must act; a ratio gate would wedge it.
+- **Persisted state** (`reap_meta`): the anchor `target_deadline_anchor` (last accepted reading), the marker `target_deadline_declined` (`<direction>:<first seen>:<last seen>`) and `target_deadline_hold` (no expiry before this time).
+- **Implausible reading and persistence window:** backwards, or more than 900 s forward of the anchor against a 30 s cadence, is declined. It is accepted only after the same direction has persisted for 660 s (the minimum response window), each declined pass within 900 s of the last; another direction, or a further jump, starts over. A single repeat is not enough: the next pass is about 30 s later, before any agent has had a chance to signal. A corrupt anchor is repaired, that pass declined and a hold set.
+- **Outage and restart hold:** expiry is held for 360 s (one 300 s keepalive interval plus reconnect room) when more than 150 s have passed since the last accepted pass, on a server process's first pass, or when a persisted clock change is accepted. The hold is shared, so any replica's restart holds the sweep. After an outage longer than 900 s timeouts therefore resume about 1,020 s (17 minutes) after recovery. A stored hold further ahead than one hold can reach is clamped.
+- **Missing anchor:** accepted, with no hold. Every deadline was authored by the same clock a window earlier, and declining forever on a fresh database would leave runs unfinishable.
+- **Cap:** 100 runs per pass, and no new run is started after 10 s (each run's transaction appends at most two outbox events, within the cross-replica poll's rows-per-transaction bound). One transaction per run, so a failing run rolls back alone and replies do not wait on other runs. An overdue backlog drains over later passes (`capped`).
+- **Deliberately not capped by target count:** a run's silent targets are expired by one `UPDATE` and the run recounted in the same transaction, however many there are. The cap is on runs and time, not rows, because a per-target cap would leave a large run partly expired across passes, judged at different clock readings, and the rows touched are already bounded by that one run's size. The accepted cost: a very large run holds its row locks for the length of the transaction (replies to that run wait), the 10 s budget is checked only between runs, and a run whose statements exceed the database timeouts fails every pass (`run_failed`).
+- **Would-wipe ratio: DECLINED.** A real outage leaves every open run silent at once, which is exactly when this pass must eventually act; a ratio gate would wedge it. The hold is what protects agents that are reconnecting.
 - **Per-row second condition:** a target also has to be silent for its whole window, so a live agent's keepalive protects it even past the run deadline.
-- **Single writer:** `pg_try_advisory_xact_lock`; a losing replica skips.
+- **Single writer:** `pg_try_advisory_xact_lock`, taken by the planning transaction and each run transaction; a losing replica skips.
+- **Departure from part 4:** the repeat suppression compares direction and continuity of the clock readings, not a full fact set, because this pass has no row population to judge; the anomaly is a property of the clock alone.
 
 ### `ApprovalManager` ticket liveness (#6061, #6096) - a recorded disposition, not a retention pass
 

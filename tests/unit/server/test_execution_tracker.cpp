@@ -6,6 +6,8 @@
  */
 
 #include "execution_tracker.hpp"
+#include "execution_scope_rules.hpp" // confined_projection
+#include "gateway_delivery_failure.hpp"
 #include "execution_mutation.hpp" // #2146: make_tracker_mutation_ports against a real tracker
 #include "command_outbox_store.hpp" // #4982 Part B: reap_stuck_running_executions' cross-schema tests
 #include "execution_event_bus.hpp"
@@ -5293,6 +5295,12 @@ void sql(pg::PgPool& pool, const std::string& statement,
     REQUIRE(res.status() == PGRES_COMMAND_OK);
 }
 
+// Ends the sweep's hold, as if it had been served.
+void release_hold(pg::PgPool& pool) {
+    sql(pool, "UPDATE execution_tracker.reap_meta SET value = '0' "
+              "WHERE key = 'target_deadline_hold'");
+}
+
 // Moves one run's deadline and every signal on it into the past.
 void expire(pg::PgPool& pool, const std::string& id) {
     sql(pool, "UPDATE execution_tracker.executions SET deadline_at = deadline_at - 100000 "
@@ -5399,6 +5407,26 @@ TEST_CASE("ExecutionTracker coverage: recording alone settles replies that came 
     CHECK(status_of(t, *id) == "running");
 
     report(t, *id, "c", "success");
+    CHECK(status_of(t, *id) == "succeeded");
+}
+
+TEST_CASE("ExecutionTracker coverage: when every reply beats the record, the record finishes the "
+          "run by itself",
+          "[pg][execution_tracker][coverage]") {
+    StuckExecPg db;
+    auto& t = db.tracker();
+    auto exec = make_execution();
+    exec.expects_targets = true; // so the early replies alone cannot read `succeeded`
+    auto id = t.create_execution(exec);
+    REQUIRE(id.has_value());
+    report(t, *id, "a", "success");
+    report(t, *id, "b", "success");
+    REQUIRE(t.record_dispatch_targets(
+        *id, {{"a", TargetDisposition::Contacted}, {"b", TargetDisposition::Contacted}}, false));
+    CHECK(coverage_of(t, *id).pending == 0);
+    // The dispatcher writes the count afterwards, then recounts.
+    REQUIRE(t.set_agents_targeted(*id, 2));
+    t.refresh_counts(*id);
     CHECK(status_of(t, *id) == "succeeded");
 }
 
@@ -5519,7 +5547,8 @@ TEST_CASE("ExecutionTracker sweep: a run the outbox still owns is left alone",
     CHECK(status_of(t, id) == "running");
 }
 
-TEST_CASE("ExecutionTracker sweep: an implausible clock reading is declined once",
+TEST_CASE("ExecutionTracker sweep: an implausible clock reading is accepted only once it has "
+          "persisted, and then still waits",
           "[pg][execution_tracker][coverage]") {
     StuckExecPg db;
     auto& t = db.tracker();
@@ -5529,15 +5558,274 @@ TEST_CASE("ExecutionTracker sweep: an implausible clock reading is declined once
                    "('target_deadline_anchor', "
                    "(extract(epoch FROM now())::bigint - 86400)::text)");
 
-    auto first = t.sweep_response_deadlines();
-    REQUIRE(first.has_value());
-    CHECK(first->clock_anomaly);
+    for (int pass = 0; pass < 2; ++pass) { // a quick repeat is not persistence
+        auto declined = t.sweep_response_deadlines();
+        REQUIRE(declined.has_value());
+        CHECK(declined->clock_anomaly);
+        CHECK(status_of(t, id) == "running");
+    }
+
+    // As if the same shifted clock had been seen for longer than the persistence window.
+    sql(db.pool(), "UPDATE execution_tracker.reap_meta SET value = 'forward:' || "
+                   "(extract(epoch FROM now())::bigint - 700)::text || ':' || "
+                   "(extract(epoch FROM now())::bigint - 30)::text "
+                   "WHERE key = 'target_deadline_declined'");
+    auto accepted = t.sweep_response_deadlines();
+    REQUIRE(accepted.has_value());
+    CHECK_FALSE(accepted->clock_anomaly);
+    CHECK(accepted->held);
     CHECK(status_of(t, id) == "running");
 
-    // The same anomaly again is real elapsed time.
-    auto second = t.sweep_response_deadlines();
-    REQUIRE(second.has_value());
-    CHECK_FALSE(second->clock_anomaly);
-    CHECK(second->timed_out_targets == 1);
+    release_hold(db.pool());
+    auto swept = t.sweep_response_deadlines();
+    REQUIRE(swept.has_value());
+    CHECK(swept->timed_out_targets == 1);
     CHECK(status_of(t, id) == "completed");
+}
+
+TEST_CASE("ExecutionTracker sweep: missed passes hold expiry back before anything times out",
+          "[pg][execution_tracker][coverage]") {
+    StuckExecPg db;
+    auto& t = db.tracker();
+    const auto id = recorded_run(t, {"a"});
+    expire(db.pool(), id);
+    // The last pass was five minutes ago: the server or database was away.
+    sql(db.pool(), "INSERT INTO execution_tracker.reap_meta (key, value) VALUES "
+                   "('target_deadline_anchor', (extract(epoch FROM now())::bigint - 300)::text)");
+
+    for (int pass = 0; pass < 2; ++pass) {
+        auto held = t.sweep_response_deadlines();
+        REQUIRE(held.has_value());
+        CHECK(held->held);
+        CHECK(held->timed_out_targets == 0);
+    }
+    release_hold(db.pool());
+    auto swept = t.sweep_response_deadlines();
+    REQUIRE(swept.has_value());
+    CHECK(swept->timed_out_targets == 1);
+    REQUIRE(swept->runs.size() == 1);
+    CHECK(swept->runs[0].finished_status == "completed");
+}
+
+TEST_CASE("ExecutionTracker coverage: any device that did not succeed keeps the run from "
+          "succeeded",
+          "[pg][execution_tracker][coverage]") {
+    StuckExecPg db;
+    auto& t = db.tracker();
+    for (const char* answer : {"failure", "timeout", "rejected"}) {
+        INFO(answer);
+        const auto id = recorded_run(t, {"a", "b"});
+        report(t, id, "a", answer);
+        report(t, id, "b", "success");
+        CHECK(status_of(t, id) == "completed");
+        CHECK(coverage_of(t, id).failed == 1);
+    }
+}
+
+TEST_CASE("ExecutionTracker coverage: replies arriving together never finish a run with a "
+          "failure as succeeded",
+          "[pg][execution_tracker][coverage][concurrency]") {
+    StuckExecPg db;
+    auto& t = db.tracker();
+    for (int run = 0; run < 40; ++run) {
+        const auto id = recorded_run(t, {"a", "b", "c"});
+        report(t, id, "c", "success");
+        std::latch start{2};
+        const auto answer = [&](const char* agent, const char* status) {
+            AgentExecStatus s;
+            s.agent_id = agent;
+            s.status = status;
+            s.completed_at = 1;
+            start.arrive_and_wait();
+            (void)t.update_agent_status(id, s); // asserted below, on the test thread
+        };
+        std::thread ok(answer, "a", "success");
+        std::thread bad(answer, "b", "failure");
+        ok.join();
+        bad.join();
+        INFO("run " << run);
+        CHECK(status_of(t, id) == "completed");
+        const auto e = t.get_execution(id);
+        REQUIRE(e.has_value());
+        CHECK(e->agents_responded == 3);
+        CHECK(e->agents_success == 2);
+        CHECK(e->agents_failure == 1);
+    }
+}
+
+TEST_CASE("ExecutionTracker coverage: a tracked run whose list was not saved is never succeeded",
+          "[pg][execution_tracker][coverage]") {
+    StuckExecPg db;
+    auto& t = db.tracker();
+    auto exec = make_execution();
+    exec.expects_targets = true;
+
+    SECTION("nothing recorded: the count-only rule finishes it as completed") {
+        auto id = t.create_execution(exec);
+        REQUIRE(id.has_value());
+        REQUIRE(t.mark_targets_expected(*id));
+        REQUIRE(t.set_agents_targeted(*id, 1));
+        report(t, *id, "a", "success");
+        CHECK(status_of(t, *id) == "completed");
+        CHECK_FALSE(coverage_of(t, *id).recorded);
+    }
+    SECTION("a partial list stays unable to succeed") {
+        auto id = t.create_execution(exec);
+        REQUIRE(id.has_value());
+        REQUIRE(t.record_dispatch_targets(*id, {{"a", TargetDisposition::Contacted}}, true,
+                                          /*complete=*/false));
+        REQUIRE(t.set_agents_targeted(*id, 1));
+        report(t, *id, "a", "success");
+        CHECK(status_of(t, *id) == "completed");
+    }
+    SECTION("the whole list saved: it can succeed") {
+        auto id = t.create_execution(exec);
+        REQUIRE(id.has_value());
+        REQUIRE(t.mark_targets_expected(*id));
+        REQUIRE(t.record_dispatch_targets(*id, {{"a", TargetDisposition::Contacted}}, false));
+        REQUIRE(t.set_agents_targeted(*id, 1));
+        report(t, *id, "a", "success");
+        CHECK(status_of(t, *id) == "succeeded");
+    }
+    SECTION("nothing recorded and nobody answers: the sweep ends it after a further window") {
+        auto id = t.create_execution(exec);
+        REQUIRE(id.has_value());
+        REQUIRE(t.mark_targets_expected(*id));
+        REQUIRE(t.set_agents_targeted(*id, 1));
+        expire(db.pool(), *id);
+        auto swept = t.sweep_response_deadlines();
+        REQUIRE(swept.has_value());
+        CHECK(status_of(t, *id) == "completed");
+    }
+}
+
+TEST_CASE("ExecutionTracker coverage: a delivery failure is not the device's answer",
+          "[pg][execution_tracker][coverage]") {
+    StuckExecPg db;
+    auto& t = db.tracker();
+    const auto id = recorded_run(t, {"a", "b"});
+    AgentExecStatus undelivered;
+    undelivered.agent_id = "a";
+    undelivered.status = "failure";
+    undelivered.completed_at = 1;
+    undelivered.server_outcome = "not_delivered";
+    REQUIRE(t.update_agent_status(id, undelivered));
+    auto c = coverage_of(t, id);
+    CHECK(c.not_delivered == 1);
+    CHECK(c.failed == 0);
+    CHECK(c.pending == 1);
+
+    SECTION("a later answer from the device replaces it") {
+        report(t, id, "a", "success");
+        report(t, id, "b", "success");
+        const auto after = coverage_of(t, id);
+        CHECK(after.not_delivered == 0);
+        CHECK(after.responded == 2);
+        CHECK(status_of(t, id) == "succeeded");
+    }
+    SECTION("without one the run is completed, with the device listed apart") {
+        report(t, id, "b", "success");
+        CHECK(status_of(t, id) == "completed");
+        CHECK(coverage_of(t, id).not_delivered == 1);
+        CHECK(t.get_execution(id)->agents_failure == 1);
+    }
+}
+
+TEST_CASE("ExecutionTracker sweep: unmatched replies read unknown, and a rerun counts them",
+          "[pg][execution_tracker][coverage]") {
+    StuckExecPg db;
+    auto& t = db.tracker();
+    const auto id = recorded_run(t, {"a"});
+    t.mark_correlation_lost(id);
+    expire(db.pool(), id);
+    auto swept = t.sweep_response_deadlines();
+    REQUIRE(swept.has_value());
+    CHECK(swept->unknown_targets == 1);
+    CHECK(swept->timed_out_targets == 0);
+    CHECK(coverage_of(t, id).unknown == 1);
+    CHECK(status_of(t, id) == "completed");
+
+    auto rerun = t.create_rerun(id, "admin", /*failed_only=*/true);
+    REQUIRE(rerun.has_value());
+    CHECK(t.get_execution(*rerun)->agents_targeted == 1);
+}
+
+TEST_CASE("ExecutionTracker sweep: a run whose target count was never written still finishes",
+          "[pg][execution_tracker][coverage]") {
+    StuckExecPg db;
+    auto& t = db.tracker();
+    auto id = t.create_execution(make_execution());
+    REQUIRE(id.has_value());
+    REQUIRE(t.record_dispatch_targets(
+        *id, {{"a", TargetDisposition::Contacted}, {"b", TargetDisposition::Contacted}}, false));
+    report(t, *id, "a", "success");
+    expire(db.pool(), *id);
+
+    auto swept = t.sweep_response_deadlines();
+    REQUIRE(swept.has_value());
+    CHECK(swept->timed_out_targets == 1);
+    CHECK(status_of(t, *id) == "completed");
+    CHECK(t.get_execution(*id)->agents_targeted == 2);
+}
+
+TEST_CASE("ExecutionTracker coverage: an id that cannot be stored does not lose the record",
+          "[pg][execution_tracker][coverage]") {
+    StuckExecPg db;
+    auto& t = db.tracker();
+    auto id = t.create_execution(make_execution());
+    REQUIRE(id.has_value());
+    const std::string with_nul = std::string("a\0x", 3);
+    REQUIRE(t.record_dispatch_targets(*id,
+                                      {{"a", TargetDisposition::Contacted},
+                                       {with_nul, TargetDisposition::Offline},
+                                       {std::string(4000, 'z'), TargetDisposition::Offline}},
+                                      false));
+    const auto c = coverage_of(t, *id);
+    CHECK(c.intended == 3);
+    CHECK(c.offline == 2);
+}
+
+TEST_CASE("ExecutionTracker coverage: server-decided outcomes are added for counting",
+          "[pg][execution_tracker][coverage]") {
+    StuckExecPg db;
+    auto& t = db.tracker();
+    const auto id = recorded_run(t, {"a", "b"});
+    report(t, id, "a", "success");
+    expire(db.pool(), id);
+    REQUIRE(t.sweep_response_deadlines().has_value());
+    report(t, id, "b", "success"); // late
+
+    auto rows = t.get_agent_statuses(id);
+    REQUIRE(t.overlay_server_outcomes(id, rows));
+    REQUIRE(rows.size() == 2);
+    for (const auto& r : rows)
+        CHECK(r.status == (r.agent_id == "a" ? "success" : "timed_out"));
+    const auto counts = confined_projection(rows, authz::VisibleSet{std::unordered_set<std::string>{"b"}});
+    CHECK(counts.agents_targeted == 1);
+    CHECK(counts.agents_success == 0);
+    CHECK(counts.agents_failure == 1);
+}
+
+TEST_CASE("gateway delivery outcome: certain non-delivery is kept apart from undetermined",
+          "[execution_tracker][coverage]") {
+    using yuzu::server::gateway_delivery_outcome;
+    const auto frame = [](const char* code, const char* output) {
+        ::yuzu::agent::v1::CommandResponse r;
+        r.set_status(::yuzu::agent::v1::CommandResponse::FAILURE);
+        r.set_exit_code(-1);
+        if (*code)
+            r.mutable_error()->set_code(code);
+        r.set_output(output);
+        return r;
+    };
+    CHECK(gateway_delivery_outcome(frame("", "not_connected")) == "not_delivered");
+    CHECK(gateway_delivery_outcome(frame("gateway_unknown_cluster", "")) == "not_delivered");
+    CHECK(gateway_delivery_outcome(frame("gateway_unauthenticated", "")) == "not_delivered");
+    CHECK(gateway_delivery_outcome(frame("gateway_forward_failed", "")) == "undetermined");
+    CHECK(gateway_delivery_outcome(frame("gateway_unavailable", "")) == "undetermined");
+    CHECK(gateway_delivery_outcome(frame("", "agent_disconnected")) == "undetermined");
+    CHECK(gateway_delivery_outcome(frame("some_plugin_error", "boom")).empty());
+    auto answered = frame("", "not_connected");
+    answered.set_exit_code(1); // a device's own failure keeps its exit code
+    CHECK(gateway_delivery_outcome(answered).empty());
 }

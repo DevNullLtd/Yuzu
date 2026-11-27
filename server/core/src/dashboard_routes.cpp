@@ -1822,6 +1822,10 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                          message = "Invalid scope expression -- dispatch was not attempted. "
                                     "Fix the expression and resubmit; retrying unchanged will "
                                     "not help.";
+                     } else if (dispatch_outcome.resolution_failed) {
+                         // #2673: a failed read says nothing about who is connected.
+                         message = "The target list could not be read, so nothing was sent; "
+                                    "retry shortly.";
                      } else if (dispatch_outcome.containment_unreadable) {
                          message = "Containment state is unreadable — dispatch is failing "
                                     "closed and reaching no agent; check the quarantine store.";

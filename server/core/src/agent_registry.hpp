@@ -1334,6 +1334,10 @@ public:
                              const TagStore* tag_store,
                              const CustomPropertiesStore* props_store = nullptr) const;
 
+    /// #2673: false when the cross-replica presence directory cannot be read, so `all_ids()`
+    /// may be listing only this replica's devices. True when no directory is wired.
+    [[nodiscard]] bool presence_readable() const { return live_presence().has_value(); }
+
 private:
     mutable std::mutex mu_;
     std::unordered_map<std::string, std::shared_ptr<AgentSession>> agents_;

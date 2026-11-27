@@ -56,7 +56,7 @@ TEST_CASE("executions_page_render: derive_state maps every status exactly",
     struct Case {
         const char* status;
         int failure;
-        int responded;
+        int success;
         const char* cls;
         const char* label;
     };
@@ -66,14 +66,14 @@ TEST_CASE("executions_page_render: derive_state maps every status exactly",
         {"succeeded", 0, 5, "ok", "Succeeded"},
         {"cancelled", 0, 1, "idle", "Cancelled"},
         {"pending", 0, 0, "warn", "Pending"},
-        {"completed", 0, 5, "ok", "Completed"},
-        {"completed", 2, 5, "warn", "2 failed"},
-        {"completed", 5, 5, "bad", "5 failed"},
+        {"completed", 0, 5, "warn", "Not fully successful"}, // #2673: never green
+        {"completed", 2, 3, "warn", "2 failed"},
+        {"completed", 5, 0, "bad", "5 failed"},
         {"foo", 0, 0, "idle", "foo"},
     };
     for (const auto& c : cases) {
-        INFO(c.status << " failure=" << c.failure << " responded=" << c.responded);
-        const auto s = derive_state(c.status, c.failure, c.responded);
+        INFO(c.status << " failure=" << c.failure << " success=" << c.success);
+        const auto s = derive_state(c.status, c.failure, c.success);
         CHECK(s.cls == c.cls);
         CHECK(s.label == c.label);
         // The raw status is always recoverable from the hover text.
@@ -81,7 +81,7 @@ TEST_CASE("executions_page_render: derive_state maps every status exactly",
         CHECK(s.title.size() >= tail.size());
         CHECK(s.title.compare(s.title.size() - tail.size(), tail.size(), tail) == 0);
     }
-    CHECK(derive_state("completed", 2, 5).title == "Completed, 2 failed, status=completed");
+    CHECK(derive_state("completed", 2, 3).title == "Completed, 2 failed, status=completed");
 }
 
 TEST_CASE("executions_page_render: list rows carry the attributes the controller reads",
@@ -199,7 +199,7 @@ TEST_CASE("executions_page_render: the selected panel lays out the execution",
     CHECK(has(html, "<code class=\"blk\">{&quot;a&quot;:1}</code>"));
     // Running: progress at 40 percent (2 of 5), and the JSON responses link.
     CHECK(has(html, "style=\"width:40%\""));
-    CHECK(has(html, "40% of targeted devices have responded"));
+    CHECK(has(html, "40% of targeted devices have a final result"));
     CHECK(has(html, "href=\"/api/v1/executions/0123456789abcdef0123/responses?limit=1000\" "
                     "target=\"_blank\" rel=\"noopener\""));
     // Not finished: an em dash, not a 1970 date.
@@ -228,7 +228,7 @@ TEST_CASE("executions_page_render: a pending re-run with no targets renders zero
     v.row.agents_responded = 0;
     const auto html = render_exec_selected(v);
     CHECK(has(html, "style=\"width:0%\""));
-    CHECK(has(html, "0% of targeted devices have responded"));
+    CHECK(has(html, "0% of targeted devices have a final result"));
 }
 
 TEST_CASE("executions_page_render: a confined panel prints only the redaction it was handed",

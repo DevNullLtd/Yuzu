@@ -25,8 +25,9 @@ std::string epoch_cell(int64_t secs) {
 }
 
 void append_row(std::string& out, const ExecRow& e) {
-    const ExecState st = derive_state(e.status, e.agents_failure, e.agents_responded);
-    const int pending = std::max(0, e.agents_targeted - e.agents_responded);
+    const ExecState st = derive_state(e.status, e.agents_failure, e.agents_success);
+    // #2673: final = success + failure; a timed-out device is final without having responded.
+    const int pending = std::max(0, e.agents_targeted - e.agents_success - e.agents_failure);
     const std::string iso = html_escape(format_iso_utc(e.dispatched_at));
 
     out += "<tr class=\"row\" tabindex=\"0\" aria-selected=\"false\" data-execution-id=\"" +
@@ -111,7 +112,7 @@ std::string stack(std::string_view label, const std::string& code, bool empty) {
 
 } // namespace
 
-ExecState derive_state(std::string_view status, int agents_failure, int agents_responded) {
+ExecState derive_state(std::string_view status, int agents_failure, int agents_success) {
     const std::string raw = "status=" + std::string(status);
     if (status == "running")
         return {"info", "Running", "Running, " + raw};
@@ -124,10 +125,10 @@ ExecState derive_state(std::string_view status, int agents_failure, int agents_r
     if (status == "completed") {
         if (agents_failure > 0) {
             const std::string n = std::to_string(agents_failure);
-            return {agents_failure == agents_responded ? "bad" : "warn", n + " failed",
+            return {agents_success == 0 ? "bad" : "warn", n + " failed",
                     "Completed, " + n + " failed, " + raw};
         }
-        return {"ok", "Completed", "Completed, " + raw};
+        return {"warn", "Not fully successful", "Completed, not fully successful, " + raw};
     }
     return {"idle", std::string(status), raw};
 }
@@ -189,7 +190,7 @@ std::string render_stats_strip(const StatsStripView& v) {
 
 std::string render_exec_selected(const ExecSelectedView& v) {
     const ExecRow& e = v.row;
-    const ExecState st = derive_state(e.status, e.agents_failure, e.agents_responded);
+    const ExecState st = derive_state(e.status, e.agents_failure, e.agents_success);
     const bool live = e.status == "running" || e.status == "pending";
 
     std::string out;
@@ -228,11 +229,11 @@ std::string render_exec_selected(const ExecSelectedView& v) {
 
     if (live) {
         const int pct = e.agents_targeted > 0
-                            ? std::clamp(e.agents_responded * 100 / e.agents_targeted, 0, 100)
+                            ? std::clamp((e.agents_success + e.agents_failure) * 100 / e.agents_targeted, 0, 100)
                             : 0;
         out += "<div class=\"prog\"><div class=\"bar\"><i style=\"width:" + std::to_string(pct) +
                "%\"></i></div><span class=\"hint\">" + std::to_string(pct) +
-               "% of targeted devices have responded</span></div>";
+               "% of targeted devices have a final result</span></div>";
     }
     out += "<div class=\"btns\"><button type=\"button\" class=\"btn danger\" data-act=\"cancel\"";
     if (!live)

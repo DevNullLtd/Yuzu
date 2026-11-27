@@ -88,7 +88,7 @@ nlohmann::json execution_kpi_json(const ExecutionKpi& k);
 /// #2673: the `coverage` object of an execution detail read (REST v1 and MCP). The caller has
 /// already filtered the counts to the visible agents. An unrecorded run carries `state` and null
 /// counts: unknown is never zero.
-nlohmann::json execution_coverage_json(const ExecutionCoverage& c);
+nlohmann::json execution_coverage_json(const ExecutionCoverage& c, bool confined = false);
 
 /// One row of a resolved, already-confined child-execution read (`GET
 /// /api/v1/executions/{id}/children`, the legacy `GET

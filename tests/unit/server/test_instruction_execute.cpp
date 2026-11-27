@@ -1758,7 +1758,9 @@ TEST_CASE("execute: [pg] a dispatch that throws on the 2nd of 3 sends leaves a r
     row = tracker->get_execution(id);
     REQUIRE(row.has_value());
     CHECK(row->agents_responded == 1);
-    CHECK(row->status == "succeeded");
+    // #2673: sending broke off, so the other intended devices were never recorded: the run
+    // finishes, but never as `succeeded`.
+    CHECK(row->status == "completed");
     CHECK(row->completed_at > 0);
 }
 

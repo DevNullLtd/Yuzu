@@ -844,6 +844,9 @@ void register_command_routes(HttpRouteSink& sink, Deps deps) {
             route_unreadable = result.route_unreadable;
             if (!resolution_failed)
                 intended_count = result.intended_count;
+            // #2673: a partial device list with nobody on it is a failed read.
+            if (result.membership_partial && result.sent == 0 && !result.intended_count)
+                resolution_failed = true;
         } else if (arm == yuzu::server::DispatchArm::Scope) {
             // Scope expression dispatch.
             //
@@ -913,6 +916,9 @@ void register_command_routes(HttpRouteSink& sink, Deps deps) {
                 route_unreadable = result.route_unreadable;
                 if (!resolution_failed)
                     intended_count = result.intended_count;
+                // #2673: a partial device list with nobody on it is a failed read.
+                if (result.membership_partial && result.sent == 0 && !result.intended_count)
+                    resolution_failed = true;
             } else {
                 resolution_failed =
                     ladder.abort_reason == yuzu::server::ScopeAbortReason::DbDegraded ||
@@ -939,6 +945,9 @@ void register_command_routes(HttpRouteSink& sink, Deps deps) {
             route_unreadable = result.route_unreadable;
             if (!resolution_failed)
                 intended_count = result.intended_count;
+            // #2673: a partial device list with nobody on it is a failed read.
+            if (result.membership_partial && result.sent == 0 && !result.intended_count)
+                resolution_failed = true;
         } else if (arm == yuzu::server::DispatchArm::Broadcast) {
             // Explicitly asked for the fleet by its published name — #1788
             // still narrows delivery to the operator's visible set; the
@@ -953,6 +962,9 @@ void register_command_routes(HttpRouteSink& sink, Deps deps) {
             route_unreadable = result.route_unreadable;
             if (!resolution_failed)
                 intended_count = result.intended_count;
+            // #2673: a partial device list with nobody on it is a failed read.
+            if (result.membership_partial && result.sent == 0 && !result.intended_count)
+                resolution_failed = true;
         } else {
             // Broadcast ONLY when the caller named no target at all (#2500).
             // The shape check above already refuses a supplied-but-empty
@@ -1024,6 +1036,9 @@ void register_command_routes(HttpRouteSink& sink, Deps deps) {
             route_unreadable = result.route_unreadable;
             if (!resolution_failed)
                 intended_count = result.intended_count;
+            // #2673: a partial device list with nobody on it is a failed read.
+            if (result.membership_partial && result.sent == 0 && !result.intended_count)
+                resolution_failed = true;
         }
 
         // #881: emitted BEFORE the sent==0 -> 503 branch below, so a

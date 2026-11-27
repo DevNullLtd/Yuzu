@@ -590,6 +590,7 @@ bool ScheduleRunner::enqueue_occurrence(const InstructionSchedule& s, const std:
         exec.parameter_values =
             s.parameter_values.empty() ? std::string(kEmptyScheduleParams) : s.parameter_values;
         exec.dispatched_by = s.created_by;
+        exec.expects_targets = true; // #2673: delivered through the confined dispatch seam
         // #2673: the definition says how long its responses are gathered. An unreadable
         // definition leaves the default window.
         if (d_.instruction_store) {

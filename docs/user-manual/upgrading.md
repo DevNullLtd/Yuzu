@@ -11,6 +11,39 @@ A statement elsewhere on this page that a rollback, a mixed fleet or an in-place
 
 Running `dev` between releases? Some entries below describe changes on `dev` that are not in a release yet. For what a `git pull` of `dev` changed, run the repository script `python3 scripts/whats-new.py` (`--versions` for the version bumps, rebuild notes and Docker image bumps); see `changelog.d/README.md`.
 
+## ⚠️ Breaking: a run is `succeeded` only when every intended device succeeded, silent devices time out, and an empty target answers `422` (#2673, #2650)
+
+This describes the build in a fresh deployment (see "Deployment contract (hard cutover)" in the Forensics section of this page): every writer runs this build, and this page is not a procedure for a rolling or mixed-version upgrade.
+
+**In short.** Affected: anything that reads an execution's `status` or its counts, anything that retries a dispatch on `503`, and dashboards that use the execution success rates. To do:
+
+- Treat `completed` as "finished, and at least one intended device is not a recorded success", and read the `coverage` object for the counts. A check for `status == "succeeded"` now fails for any run with one intended device that failed, timed out or was never reached.
+- Treat `422` `no_targets` (MCP: status `no_targets`) as not retryable for the same request. **Just after a server or gateway restart, wait for agents to reconnect before treating it as final**: scope and broadcast targeting see only connected agents. Retry `target_resolution_failed` after `retry_after_ms`.
+- Expect the success rates to move (below).
+
+**Run results.**
+
+- A run is `succeeded` only when every intended device answered successfully; otherwise it is `completed`. A run whose device list was not fully saved (the record failed, the send threw part-way, or the cross-server presence directory could not be read) can be `completed` at best, and reads coverage state `unrecorded`.
+- The first final result from a device stands. One exception: a failure the server or gateway made up gives way to the device's own later answer. It reads `not_delivered` when the command certainly never reached the device, and `unknown` when it may have (the agent disconnected, or the gateway forward failed, including at its 300-second limit). A `timed_out` or `unknown` decided by the deadline sweep stands; a later answer is counted as `late`.
+- `agents_targeted` counts the devices the send accepted. `agents_failure` counts failure, timeout, rejection, `not_delivered`, `timed_out` and `unknown`. `agents_responded` includes the server- or gateway-made delivery failures but not the devices the deadline sweep marked `timed_out` or `unknown`. `progress_pct` is success plus failure over targeted.
+- A rerun with `failed_only` counts the devices of a recorded run without a successful result (failed, rejected, timed out, not delivered or unknown). Devices that were never reached are not counted.
+- On the Executions page a `completed` run is never green: it shows "N failed" or "Not fully successful", and the status filter "With failures" is now "Completed, not fully successful".
+- Software sync: selected devices that are offline (no session on the serving server) or too old to run the sync count as intended and not reached, so the run reads `completed`. Devices skipped as already fresh are not intended. For a recorded run the sync status read reports `failed` as device answers only and adds `timed_out`, `not_delivered`, `unknown` and `not_reached`.
+
+**Response deadline.** A contacted device that sends nothing for the response window is marked `timed_out`: the server recorded no result before the deadline, which includes a reply lost for a reason the server could not detect. The window is the definition's `gather_ttl_seconds` (300 when none applies; software sync 300 plus `delay_max_s`), never less than 660 seconds. The server checks about every 30 seconds and holds expiry for 360 seconds after missed checks or a server restart; after an outage longer than 15 minutes timeouts resume roughly 17 minutes after recovery. Each run it changes writes an `execution.deadline_sweep` audit row. Runbook: [Execution deadline sweep](metrics.md#execution-deadline-sweep-runbook-2673).
+
+**Dispatch that reaches no devices.** `POST /api/command`, `POST /api/v1/commands`, `POST /api/instructions/{id}/execute`, `POST /api/v1/instructions/{id}/execute` and the diagnostic dispatch routes (`POST /api/chargen/start`, `POST /api/chargen/stop`, `POST /api/procfetch/fetch`) answer `422` with `reason: "no_targets"` where they answered `503`. The MCP execute tools return status `no_targets`. v1 workflow execute stays `503`, with `error.reason: "no_targets"` and no retry hint. A target list that cannot be read answers `503` `target_resolution_failed` with `retry_after_ms: 5000`, and the scheduler delivers such an occurrence again. A caller whose dispatch is not confined and who names a device id that does not exist still gets the "no agents reached" answer, not `no_targets`; so does a caller who can see no device at all.
+
+**Success rates.** The fleet and per-definition success rates divide successes by contacted devices (`agents_targeted`) over finished runs. Devices that were never reached are not in the figure, so a run with one success and 99 offline devices contributes 100%. Runs with silent devices now finish and enter the rates.
+
+**Known limits.**
+
+- Coverage gives counts. No REST, MCP or dashboard read lists the devices that timed out or were never reached.
+- The server's gateway forward ends after 300 seconds, so a longer response window does not help a gateway-routed command: a command still running then is recorded as `unknown`, and its later answer does not reach the server.
+- An agent does not re-send the result of a command that finishes while it is disconnected.
+- The per-device target rows (`execution_target`) have no retention or pruning and no erasure path.
+- Processing replies for a run of about 100,000 devices is about twice as slow as before (debug-build measurements, indicative only).
+
 ## Behaviour change: the firewall `state` and `rules` reads answer through granted privilege on macOS and a root snapshot broker on packaged Linux, and a Windows rule property that cannot be read is `unknown`
 
 This describes the build in a fresh deployment (see "Deployment contract (hard cutover)" in the Forensics section of this page): every writer runs this build, and this page is not a procedure for a rolling or mixed-version upgrade.

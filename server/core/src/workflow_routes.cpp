@@ -497,6 +497,13 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                 degraded("tracker", "Execution tracker degraded, retry shortly.");
                 return;
             }
+            // #2673: visibility is decided on the agent rows; counts also include the
+            // outcomes the server decided itself.
+            auto counted = *statuses_opt;
+            if (!execution_tracker->overlay_server_outcomes(counted, ids)) {
+                degraded("tracker", "Execution tracker degraded, retry shortly.");
+                return;
+            }
             static const std::vector<AgentExecStatus> kEmptyStatuses;
             std::vector<Execution> projected;
             projected.reserve(execs.size());
@@ -505,7 +512,7 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                 const auto& statuses = it != statuses_opt->end() ? it->second : kEmptyStatuses;
                 if (!execution_visible(e, statuses, gate.scope, owner))
                     continue;
-                auto counts = confined_projection(statuses, gate.scope);
+                auto counts = confined_projection(counted[e.id], gate.scope);
                 Execution row = e;
                 row.agents_targeted = counts.agents_targeted;
                 row.agents_responded = counts.agents_responded;
@@ -924,7 +931,15 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                 row.agents_success = exec.agents_success;
                 row.agents_failure = exec.agents_failure;
                 if (gate.scope) {
-                    const auto c = confined_projection(agents, gate.scope);
+                    auto counted = agents; // #2673: plus the outcomes the server decided
+                    if (!execution_tracker->overlay_server_outcomes(exec.id, counted)) {
+                        res.status = 503;
+                        res.set_content("<div class=\"empty-state\">Execution tracker degraded "
+                                        "— retry shortly.</div>",
+                                        "text/html; charset=utf-8");
+                        return;
+                    }
+                    const auto c = confined_projection(counted, gate.scope);
                     row.agents_targeted = c.agents_targeted;
                     row.agents_responded = c.agents_responded;
                     row.agents_success = c.agents_success;
@@ -3931,6 +3946,7 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                 nlohmann::json(redact_sensitive_instruction_params(params)).dump();
             exec.dispatched_by = session->username;
             exec.response_window_s = def.gather_ttl_seconds;
+            exec.expects_targets = true; // #2673: dispatched through the confined seam
             if (auto created = execution_tracker->create_execution(exec); created.has_value()) {
                 execution_id = *created;
             }
@@ -4265,7 +4281,11 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         // count and refresh agents_responded counters now that dispatch
         // has confirmed how many agents the command went to.
         if (execution_tracker && !execution_id.empty()) {
-            if (!execution_tracker->set_agents_targeted(execution_id, sent)) {
+            const bool targeted = execution_tracker->set_agents_targeted(execution_id, sent);
+            // #2673: every reply may already be in, and only a recount finishes the run.
+            if (targeted)
+                execution_tracker->refresh_counts(execution_id);
+            if (!targeted) {
                 spdlog::error("workflow_routes: set_agents_targeted failed for execution_id={}",
                               execution_id);
                 // #4982 fix round 2 (Fix 5)

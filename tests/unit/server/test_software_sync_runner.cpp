@@ -48,6 +48,7 @@ struct Rig {
         std::int64_t delay{0};
         std::string execution_id;
     };
+    ss::RunTargets last_run;
     std::vector<Dispatch> dispatches;
     std::vector<std::string> events;
     std::vector<std::string> cancelled;
@@ -73,7 +74,8 @@ struct Rig {
             return r;
         };
         e.dispatch = [this](const auth::Session&, const std::vector<std::string>& ids, std::int64_t delay,
-                            const std::string& execution_id) {
+                            const std::string& execution_id, const ss::RunTargets& run) {
+            last_run = run;
             events.push_back("dispatch");
             dispatches.push_back({ids, delay, execution_id});
             if (on_dispatch)

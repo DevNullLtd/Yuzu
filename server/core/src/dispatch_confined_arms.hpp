@@ -125,6 +125,10 @@ struct ConfinedDispatchSink {
     /// path instead of silently skipping this check: fail-closed on missing
     /// wiring, never fail-open into a stale fast path.
     std::function<bool(const std::vector<std::string>& candidates)> presence_widens;
+    /// #2673: true when `known_agent_ids` may be missing devices because the cross-replica
+    /// presence directory could not be read. A broadcast then reports a partial list: it is
+    /// never "zero targets", and its run cannot read `succeeded`. Unset = complete.
+    std::function<bool()> membership_degraded;
 };
 
 /// Targets the CALLER has already resolved. Each arm reads only its own field;
@@ -223,6 +227,9 @@ struct ContainmentGate {
 /// multiplicity; nothing downstream assumes uniqueness.
 struct ArmDispatchResult {
     int sent = 0;
+    /// #2673: a broadcast whose device list may be incomplete (see
+    /// `ConfinedDispatchSink::membership_degraded`).
+    bool membership_partial = false;
     /// The ids withheld, for the audit rows that name a device. **Empty on a
     /// fail-closed denial** — see `denied_quarantined_count`.
     std::vector<std::string> denied_quarantined;
@@ -245,7 +252,8 @@ struct ArmDispatchResult {
     /// comment and the #881 "ONE store operation per dispatch" discipline),
     /// so it only COLLECTS the ids; `wire_and_dispatch_confined` is the seam
     /// that built `claim_fn` in the first place and is where the release
-    /// actually happens. Populated only for the Group/Scope/Ids arms — the
+    /// actually happens. Populated for the Group/Scope/Ids arms, and for a
+    /// Broadcast that collects its targets — the
     /// only arms `claim_fn` is ever applied to (ADR-1007: Broadcast/None are
     /// a documented non-goal).
     std::vector<std::string> not_sent;
@@ -422,6 +430,8 @@ struct ConfinedDispatchOutcome {
     std::vector<std::string> concurrency_skipped;
     /// #2673: the target record write failed (the caller counts it).
     bool targets_record_failed = false;
+    /// #2673: `ArmDispatchResult::membership_partial`.
+    bool membership_partial = false;
 };
 
 // The closed quarantine-control predicate lives in the shared pure header so the
@@ -847,6 +857,7 @@ dispatch_confined_arms(DispatchArm arm, const ConfinedDispatchTargets& targets,
         // field) is treated as "presence widens" (true), so a genuinely
         // non-empty fleet always falls through to the filtered path below.
         auto candidates = authz::filter_to_scope(sink.known_agent_ids(), exec_visible);
+        result.membership_partial = sink.membership_degraded && sink.membership_degraded();
         const bool widened = sink.presence_widens ? sink.presence_widens(candidates) : true;
         // #2673: the fast path names no ids, so a dispatch collecting its targets walks them.
         if (!collect_targets && !exec_visible && !gate.enforced && plugin_missing.empty() &&
@@ -923,7 +934,12 @@ dispatch_confined_arms(DispatchArm arm, const ConfinedDispatchTargets& targets,
             // WS-4 4.2b Task C: same shape as Group/Scope above.
             if (sink.prepare_route_fallback)
                 result.route_unreadable = sink.prepare_route_fallback(*targets.agent_ids);
-            for (const auto& aid : authz::filter_to_scope(*targets.agent_ids, exec_visible)) {
+            // #2673: an id named twice is one device: sent once and counted once.
+            const auto listed = authz::filter_to_scope(*targets.agent_ids, exec_visible);
+            std::unordered_set<std::string_view> seen;
+            for (const auto& aid : listed) {
+                if (!seen.insert(aid).second)
+                    continue;
                 note_intended(aid);
                 if (contained(aid) || os_killed(aid) || plugin_absent(aid))
                     continue;
@@ -947,6 +963,9 @@ dispatch_confined_arms(DispatchArm arm, const ConfinedDispatchTargets& targets,
             confined_broadcast();
         break;
     }
+    // A partial list with nobody on it is "could not tell", not "nobody".
+    if (result.membership_partial && result.intended_count && *result.intended_count == 0)
+        result.intended_count.reset();
     if (exec_visible && exec_visible->empty())
         result.intended_count.reset();
     return result;

@@ -59,6 +59,7 @@ Ports make_ports(const StoreBindings& b) {
             exec.parameter_values = row.parameter_values;
             exec.dispatched_by = row.dispatched_by;
             exec.response_window_s = row.response_window_s;
+            exec.expects_targets = true; // #2673: dispatched through the confined seam
             if (auto created = tracker->create_execution(exec); created.has_value())
                 return *created;
             return std::nullopt;

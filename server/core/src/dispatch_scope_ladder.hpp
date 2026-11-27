@@ -318,6 +318,9 @@ inline ConfinedDispatchOutcome resolve_and_dispatch_confined(
         outcome.kill_switched_os = std::move(r.kill_switched_os);
         outcome.kill_switched_os_count = r.kill_switched_os_count;
         outcome.route_unreadable = r.route_unreadable;
+        outcome.membership_partial = r.membership_partial;
+        if (r.membership_partial && r.sent == 0 && !r.intended_count)
+            outcome.resolution_failed = true;
         if (r.intended_count)
             outcome.intended_count = *r.intended_count + skipped.size();
         if (collect_targets) {
@@ -388,13 +391,21 @@ inline ConfinedDispatchOutcome resolve_and_dispatch_confined(
     }
 
     ConfinedDispatchTargets t;
+    std::vector<std::string> unique_ids;
     std::vector<std::string> claimed_ids;
     if (arm == DispatchArm::Ids) {
+        // #2673: de-duplicated BEFORE the claim, or a repeat would claim once and then read as
+        // held back by another run.
+        std::unordered_set<std::string_view> seen;
+        unique_ids.reserve(agent_ids.size());
+        for (const auto& id : agent_ids)
+            if (seen.insert(id).second)
+                unique_ids.push_back(id);
         if (claim_fn) {
-            claimed_ids = claim(agent_ids);
+            claimed_ids = claim(unique_ids);
             t.agent_ids = &claimed_ids;
         } else {
-            t.agent_ids = &agent_ids;
+            t.agent_ids = &unique_ids;
         }
     }
     auto done = finish(dispatch_confined_arms(arm, t, exec_visible, broadcast_on_none, gate, sink,
@@ -550,7 +561,8 @@ inline ConfinedDispatchOutcome wire_and_dispatch_confined(
         // even single-replica) had it shipped unwired.
         [&registry](const std::vector<std::string>& candidates) {
             return registry.has_remote_presence(candidates);
-        }};
+        },
+        [&registry] { return !registry.presence_readable(); }};
     // Counts sends accepted by the send path into the caller's SendProgressScope when one is open (the
     // instruction-execute core and POST /api/v1/commands), so a throw mid fan-out still tells
     // them how many agents hold the command. Identity otherwise.
@@ -653,6 +665,12 @@ inline ConfinedDispatchOutcome wire_and_dispatch_confined(
 
     // #2673: collect the target sets only for a dispatch that belongs to a run.
     const bool collect_targets = execution_tracker && !execution_id.empty();
+    // Say so BEFORE anything is sent: until the whole list is recorded below, the run cannot
+    // read `succeeded`, whatever happens to this call (a throw mid fan-out included).
+    if (collect_targets && !execution_tracker->mark_targets_expected(execution_id))
+        spdlog::warn("wire_and_dispatch_confined: could not mark execution_id={} as awaiting "
+                     "its target list",
+                     execution_id);
     auto outcome = resolve_and_dispatch_confined(agent_ids, scope_expr, exec_visible,
                                                  broadcast_on_none, gate, resolvers, sink, claim_fn,
                                                  plugin_missing, *os_kill_switched, collect_targets);
@@ -669,8 +687,11 @@ inline ConfinedDispatchOutcome wire_and_dispatch_confined(
         const auto arm = classify_dispatch_arm(!agent_ids.empty(), scope_expr);
         const bool connected_only = arm == DispatchArm::Scope || arm == DispatchArm::Broadcast ||
                                     arm == DispatchArm::None;
+        // A device list narrowed by an unreadable presence directory is recorded, but as
+        // partial.
         outcome.targets_record_failed = !execution_tracker->record_dispatch_targets(
-            execution_id, build_dispatch_targets(outcome, known), connected_only);
+            execution_id, build_dispatch_targets(outcome, known), connected_only,
+            /*complete=*/!outcome.membership_partial);
     }
 
     // ADR-1007 claim-leak fix: `claim_fn` above ran BEFORE the send, so every

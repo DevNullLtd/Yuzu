@@ -22,6 +22,7 @@
 #include "cidr_match.hpp"
 #include "dispatch_record_policy.hpp"
 #include "enrollment_token_rejection.hpp"
+#include "gateway_delivery_failure.hpp"
 #include "execution_tracker.hpp"
 #include "fleet_topology_store.hpp"
 #include "grpc_audit_signal.hpp"
@@ -2099,6 +2100,28 @@ ResponseProvenance AgentServiceImpl::resolve_response_provenance(const std::stri
 
 // -- record_command_dispatch (#4990 UP-7; PR 2; HA WS-1(1b) — PG-backed, ADR-2002 section 5) --
 
+namespace {
+/// #2673: marks this thread as applying a frame that came through the gateway ingress, the only
+/// path on which a made-up delivery failure can arrive (see gateway_delivery_failure.hpp). A
+/// scope rather than a parameter: the ingest calls to `notify_exec_tracker` are pinned in one
+/// shape by the wiring gates.
+class GatewayFrameScope {
+public:
+    GatewayFrameScope() noexcept : previous_(flag()) { flag() = true; }
+    ~GatewayFrameScope() { flag() = previous_; }
+    GatewayFrameScope(const GatewayFrameScope&) = delete;
+    GatewayFrameScope& operator=(const GatewayFrameScope&) = delete;
+    [[nodiscard]] static bool active() noexcept { return flag(); }
+
+private:
+    static bool& flag() noexcept {
+        thread_local bool value = false;
+        return value;
+    }
+    bool previous_;
+};
+} // namespace
+
 void AgentServiceImpl::record_command_dispatch(const std::string& command_id,
                                                const std::string& plugin,
                                                const std::string& execution_id,
@@ -2120,6 +2143,10 @@ void AgentServiceImpl::record_command_dispatch(const std::string& command_id,
     // command is still dispatched; its responses are labelled unverified), so an outage costs the
     // loop one short wait, not N. A null latch is every other caller: the ordinary budget, no skip.
     auto* tracker = execution_tracker_.load(std::memory_order_acquire);
+    // #2673: a skipped or failed record means this command's replies cannot be matched to the
+    // run, so its silent targets must read `unknown`.
+    if (tracker && latch && latch->tripped())
+        tracker->mark_correlation_lost(execution_id);
     if (latch && latch->tripped()) {
         latch->note_skipped();
         metrics_.counter("yuzu_exec_correlation_write_degrade_total").increment();
@@ -2142,12 +2169,15 @@ void AgentServiceImpl::record_command_dispatch(const std::string& command_id,
         if (tracker)
             tracker->note_unrecorded_dispatch();
     }
+    if (!recorded && tracker)
+        tracker->mark_correlation_lost(execution_id); // #2673
 }
 
 // -- process_gateway_response -------------------------------------------------
 
 void AgentServiceImpl::process_gateway_response(const std::string& agent_id,
                                                 const pb::CommandResponse& resp) {
+    const GatewayFrameScope from_gateway; // #2673: read by notify_exec_tracker
     if (resp.status() == pb::CommandResponse::RUNNING) {
         // Intercept __timing__ metadata
         if (resp.output().starts_with("__timing__|")) {
@@ -2647,6 +2677,9 @@ void AgentServiceImpl::notify_exec_tracker(const std::string& command_id,
     // A lost answer whose row could not be written is recorded instead, so a later terminal or
     // replayed frame of the pair still reports it. Noted even when a marker, a remembered command
     // or the latch already reports the pair: those may expire first (note keeps an existing entry).
+    // #2673: a failure the server or gateway made up is "not delivered", not the device's answer.
+    if (GatewayFrameScope::active())
+        s.server_outcome = std::string(gateway_delivery_outcome(resp));
     const bool recorded = tracker->update_agent_status(execution_id, s);
     if (response_dropped) {
         if (recorded)

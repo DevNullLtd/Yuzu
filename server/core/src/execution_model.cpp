@@ -97,14 +97,15 @@ nlohmann::json execution_kpi_json(const ExecutionKpi& k) {
     return j;
 }
 
-nlohmann::json execution_coverage_json(const ExecutionCoverage& c) {
+nlohmann::json execution_coverage_json(const ExecutionCoverage& c, bool confined) {
     const auto count = [&c](int64_t v) -> nlohmann::json {
         return c.recorded ? nlohmann::json(v) : nlohmann::json(nullptr);
     };
     return nlohmann::json{
         {"state", c.recorded ? "recorded" : "unrecorded"},
-        {"population", c.recorded ? nlohmann::json(c.connected_only ? "connected_only" : "listed")
-                                  : nlohmann::json(nullptr)},
+        {"population", c.recorded && !confined
+                           ? nlohmann::json(c.connected_only ? "connected_only" : "listed")
+                           : nlohmann::json(nullptr)},
         {"intended", count(c.intended)},
         {"contacted", count(c.contacted)},
         {"responded", count(c.responded)},
@@ -115,7 +116,11 @@ nlohmann::json execution_coverage_json(const ExecutionCoverage& c) {
         {"withheld", count(c.withheld)},
         {"pending", count(c.pending)},
         {"late", count(c.late)},
-        {"deadline_at", count(c.deadline_at)},
+        {"not_delivered", count(c.not_delivered)},
+        {"unknown", count(c.unknown)},
+        // The deadline and the population describe the whole run (a large run's deadline
+        // scales with its device count), so a confined caller gets neither.
+        {"deadline_at", confined ? nlohmann::json(nullptr) : count(c.deadline_at)},
     };
 }
 

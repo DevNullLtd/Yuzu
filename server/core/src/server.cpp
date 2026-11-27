@@ -4405,7 +4405,8 @@ public:
                           "ExecutionTracker::set_agents_targeted / ::mark_cancelled calls that "
                           "failed (pool exhaustion or a failed statement) at a dispatch call "
                           "site, by op (set_agents_targeted|mark_cancelled) and surface "
-                          "(rest|mcp|workflow|schedule|outbox). No retry is attempted inline - "
+                          "(rest|mcp|workflow|schedule|outbox), and failed target-list records "
+                          "(op=record_targets, surface=dispatch). No retry is attempted inline - "
                           "retrying in an already-degraded-store request handler/background "
                           "worker risks doubling request latency or delaying the next tick for "
                           "no reliability gain.",
@@ -4425,10 +4426,12 @@ public:
         metrics_.counter("yuzu_exec_tracker_conflicting_final_total");
         metrics_.describe("yuzu_exec_tracker_deadline_sweep_total",
                           "sweep_response_deadlines() results (#2673), by outcome: timed_out "
-                          "(counts agents marked), capped, skipped, clock_anomaly and degraded "
-                          "(each counts passes)",
+                          "and unknown (count targets marked), run_failed and audit_failed "
+                          "(count runs), capped, skipped, held, clock_anomaly and degraded "
+                          "(count passes)",
                           "counter");
-        for (auto outcome : {"timed_out", "capped", "skipped", "clock_anomaly", "degraded"})
+        for (auto outcome : {"timed_out", "unknown", "run_failed", "audit_failed", "capped",
+                             "skipped", "held", "clock_anomaly", "degraded"})
             metrics_.counter("yuzu_exec_tracker_deadline_sweep_total", {{"outcome", outcome}});
         // #4982 Part B — the recovery side of the counter above:
         // reap_stuck_running_executions() (execution_tracker.cpp) cancels an
@@ -15114,6 +15117,9 @@ private:
         exec.parameter_values = parameter_values_json;
         exec.dispatched_by = by;
         exec.response_window_s = response_window_s;
+        // #2673: every caller of this seam sends through a dispatch that records the run's
+        // targets.
+        exec.expects_targets = true;
         return execution_tracker_->create_execution(exec);
     }
 
@@ -15128,9 +15134,10 @@ private:
                 return software_sync_resolve(sess, sel);
             };
             env.dispatch = [this](const auth::Session& sess, const std::vector<std::string>& ids,
-                                  std::int64_t delay_max_s, const std::string& execution_id) {
+                                  std::int64_t delay_max_s, const std::string& execution_id,
+                                  const software_sync::RunTargets& run) {
                 return push_sync_now_confined(sess, ids, std::string(software_sync::kSource),
-                                              delay_max_s, execution_id);
+                                              delay_max_s, execution_id, &run);
             };
             env.caller_unfiltered = [this](const auth::Session& sess) {
                 return !derive_exec_visible(sess).has_value();
@@ -15224,7 +15231,8 @@ private:
     [[nodiscard]] yuzu::server::software_sync::DispatchResult
     push_sync_now_confined(const auth::Session& sess, const std::vector<std::string>& ids,
                            const std::string& source, std::int64_t delay_max_s = 0,
-                           const std::string& execution_id = {}) {
+                           const std::string& execution_id = {},
+                           const yuzu::server::software_sync::RunTargets* run = nullptr) {
         yuzu::server::software_sync::DispatchResult out;
         if (ids.empty())
             return out;
@@ -15233,8 +15241,16 @@ private:
         if (!cmd)
             return out; // a command that cannot be classified sends nothing and reports no id
         out.command_id = command_id;
+        const bool tracked = !execution_id.empty() && execution_tracker_;
+        // #2673: said BEFORE the send, so a run whose list is never recorded cannot read
+        // `succeeded`.
+        if (tracked && !execution_tracker_->mark_targets_expected(execution_id))
+            spdlog::warn("software sync: could not mark execution_id={} as awaiting its target "
+                         "list",
+                         execution_id);
+        const auto visible = derive_exec_visible(sess);
         const auto result = yuzu::server::dispatch_system_reserved_ids(
-            ids, derive_exec_visible(sess),
+            ids, visible,
             [this, &cmd](const std::string& id) {
                 // One failing stream does not abandon the rest of the run: a send that throws is a
                 // frame that was not accepted, and `sent` stays exact.
@@ -15250,7 +15266,7 @@ private:
         out.sent = static_cast<std::size_t>(result.sent);
         // #2673: this fan-out bypasses `wire_and_dispatch_confined`, so it records its own
         // targets, before the gateway flush so a reply finds them.
-        if (!execution_id.empty() && execution_tracker_ && !result.intended.empty()) {
+        if (tracked && !result.intended.empty()) {
             ConfinedDispatchOutcome recorded;
             recorded.intended = result.intended;
             recorded.contacted = result.contacted;
@@ -15260,9 +15276,17 @@ private:
                 const auto all = registry_.all_ids();
                 known.insert(all.begin(), all.end());
             }
+            auto targets = yuzu::server::build_dispatch_targets(recorded, known);
+            // Selected devices the run did not ask: intended, and not reached.
+            if (run) {
+                for (const auto& id : yuzu::server::authz::filter_to_scope(run->offline, visible))
+                    targets.push_back({id, yuzu::server::TargetDisposition::Offline});
+                for (const auto& id : yuzu::server::authz::filter_to_scope(run->too_old, visible))
+                    targets.push_back({id, yuzu::server::TargetDisposition::Withheld});
+            }
             if (!execution_tracker_->record_dispatch_targets(
-                    execution_id, yuzu::server::build_dispatch_targets(recorded, known),
-                    /*connected_only=*/false))
+                    execution_id, targets, run && run->connected_only,
+                    /*complete=*/registry_.presence_readable()))
                 count_target_record_failure();
         }
         if (out.sent > 0)
@@ -15450,7 +15474,8 @@ private:
             },
             [this](const std::vector<std::string>& candidates) {
                 return registry_.has_remote_presence(candidates);
-            }};
+            },
+            [this] { return !registry_.presence_readable(); }};
     }
 
     /// #881: the ONE place a `ContainmentGate` is built. Called once per
@@ -21064,21 +21089,31 @@ private:
                                              {{"outcome", outcome}})
                                     .increment(n);
                             };
-                            if (auto swept = execution_tracker_->sweep_response_deadlines()) {
+                            if (auto swept = execution_tracker_->sweep_response_deadlines([this] {
+                                    return stop_requested_.load(std::memory_order_acquire);
+                                })) {
                                 if (swept->timed_out_targets > 0)
                                     count("timed_out",
                                           static_cast<double>(swept->timed_out_targets));
+                                if (swept->unknown_targets > 0)
+                                    count("unknown",
+                                          static_cast<double>(swept->unknown_targets));
+                                if (swept->failed_runs > 0)
+                                    count("run_failed", static_cast<double>(swept->failed_runs));
+                                if (swept->held)
+                                    count("held", 1);
                                 if (swept->capped)
                                     count("capped", 1);
                                 if (swept->skipped)
                                     count("skipped", 1);
                                 if (swept->clock_anomaly)
                                     count("clock_anomaly", 1);
-                                // A background writer changing run results is audited, like
-                                // the reap above. Stop at the first failed write: a degraded
-                                // audit pool would hold this shared thread once per run.
+                                // A background writer changing run results is audited. Every
+                                // changed run gets its own attempt: one failed write must not
+                                // leave the rest unrecorded. A row that cannot be written is
+                                // counted and named in the log.
                                 if (audit_store_ && audit_store_->is_open()) {
-                                    for (const auto& swept_id : swept->execution_ids) {
+                                    for (const auto& run : swept->runs) {
                                         AuditEvent ev;
                                         ev.timestamp =
                                             std::chrono::duration_cast<std::chrono::seconds>(
@@ -21087,17 +21122,26 @@ private:
                                         ev.principal = "system";
                                         ev.action = "execution.deadline_sweep";
                                         ev.target_type = "execution";
-                                        ev.target_id = swept_id;
-                                        ev.detail = "sweep_response_deadlines";
+                                        ev.target_id = run.execution_id;
+                                        ev.detail =
+                                            "timed_out=" + std::to_string(run.timed_out) +
+                                            " unknown=" + std::to_string(run.unknown) +
+                                            " finished=" +
+                                            (run.finished_status.empty() ? std::string("no")
+                                                                         : run.finished_status);
                                         ev.result = "success";
                                         if (!audit_store_->log(ev)) {
+                                            count("audit_failed", 1);
                                             spdlog::warn("deadline sweep: audit write failed for "
-                                                         "execution_id={} -- the rest of this "
-                                                         "pass is unaudited",
-                                                         swept_id);
-                                            break;
+                                                         "execution_id={} ({})",
+                                                         run.execution_id, ev.detail);
                                         }
                                     }
+                                } else if (!swept->runs.empty()) {
+                                    count("audit_failed", static_cast<double>(swept->runs.size()));
+                                    spdlog::warn("deadline sweep: audit store unavailable, {} "
+                                                 "changed run(s) unaudited",
+                                                 swept->runs.size());
                                 }
                             } else {
                                 spdlog::warn("response deadline sweep failed: {}", swept.error());
@@ -22452,7 +22496,18 @@ private:
             -> std::expected<std::optional<Execution>, std::string> {
             if (!execution_tracker_)
                 return std::unexpected(std::string("no execution tracker"));
-            return execution_tracker_->get_execution_checked(execution_id);
+            auto read = execution_tracker_->get_execution_checked(execution_id);
+            if (!read || !*read)
+                return read;
+            // #2673: keep "answered with a failure" apart from devices that never answered.
+            const auto coverage = execution_tracker_->get_coverage_checked(execution_id);
+            if (!coverage)
+                return std::unexpected(std::string("coverage read degraded"));
+            if (coverage->recorded)
+                (*read)->unanswered = Execution::Unanswered{
+                    coverage->timed_out, coverage->not_delivered, coverage->unknown,
+                    coverage->offline + coverage->not_sent + coverage->withheld};
+            return read;
         };
         const software_sync::UnfilteredFn sync_unfiltered_fn = [this](const auth::Session& sess) {
             return !derive_exec_visible(sess).has_value();
@@ -26239,7 +26294,8 @@ private:
             },
             [&](const std::vector<std::string>& candidates) {
                 return registry_.has_remote_presence(candidates);
-            }};
+            },
+            [&] { return !registry_.presence_readable(); }};
         // #881: one of the two production sites that hits the unfiltered
         // `send_to_all_unfiltered` fast path in practice — a default install
         // with RBAC disabled (or a legacy-admin superuser) resolves
@@ -26335,6 +26391,10 @@ private:
             } else if (result.kill_switched_os_count > 0) {
                 res.set_content(
                     R"({"error":{"code":503,"message":"every target runs an OS for which this plugin action is switched off — dispatch was withheld, not attempted","reason":"kill_switched_os","retry_after_ms":null},"meta":{"api_version":"v1"}})",
+                    "application/json");
+            } else if (result.membership_partial && !result.intended_count) {
+                res.set_content(
+                    R"({"error":{"code":503,"message":"the target list could not be read, so nobody was resolved","reason":"target_resolution_failed","retry_after_ms":5000},"meta":{"api_version":"v1"}})",
                     "application/json");
             } else if (result.intended_count == 0) {
                 res.status = 422;

@@ -125,6 +125,16 @@ void register_execution_routes(HttpRouteSink& sink, Deps deps) {
                                 "application/json");
                 return;
             }
+            // #2673: visibility is decided on the agent rows; counts also include the
+            // outcomes the server decided itself.
+            auto counted = *statuses_opt;
+            if (!deps.execution_tracker->overlay_server_outcomes(counted, ids)) {
+                res.status = 503;
+                res.set_content(detail::a4_error(res, "execution tracker degraded",
+                                                {.retry_after_ms = 5000}),
+                                "application/json");
+                return;
+            }
             static const std::vector<AgentExecStatus> kEmptyStatuses;
             for (const auto& e : execs) {
                 auto it = statuses_opt->find(e.id);
@@ -132,7 +142,7 @@ void register_execution_routes(HttpRouteSink& sink, Deps deps) {
                     it != statuses_opt->end() ? it->second : kEmptyStatuses;
                 if (!execution_visible(e, statuses, gate.scope, owner))
                     continue;
-                auto counts = confined_projection(statuses, gate.scope);
+                auto counts = confined_projection(counted[e.id], gate.scope);
                 arr.push_back({{"id", e.id},
                                {"definition_id", e.definition_id},
                                {"status", e.status},
@@ -265,7 +275,15 @@ void register_execution_routes(HttpRouteSink& sink, Deps deps) {
         // rest_api_v1.cpp). Apply confinement whenever `gate.scope` is
         // engaged, dispatcher or not.
         if (gate.scope) {
-            auto counts = confined_projection(statuses, gate.scope);
+            auto counted = statuses; // #2673: plus the outcomes the server decided
+            if (!deps.execution_tracker->overlay_server_outcomes(id, counted)) {
+                res.status = 503;
+                res.set_content(detail::a4_error(res, "execution tracker degraded",
+                                                {.retry_after_ms = 5000}),
+                                "application/json");
+                return;
+            }
+            auto counts = confined_projection(counted, gate.scope);
             agents_targeted = counts.agents_targeted;
             agents_responded = counts.agents_responded;
             agents_success = counts.agents_success;
@@ -384,14 +402,24 @@ void register_execution_routes(HttpRouteSink& sink, Deps deps) {
         int agents_success = exec.agents_success;
         int agents_failure = exec.agents_failure;
         if (gate.scope) {
-            auto counts = confined_projection(statuses, gate.scope);
+            auto counted = statuses; // #2673: plus the outcomes the server decided
+            if (!deps.execution_tracker->overlay_server_outcomes(id, counted)) {
+                res.status = 503;
+                res.set_content(detail::a4_error(res, "execution tracker degraded",
+                                                {.retry_after_ms = 5000}),
+                                "application/json");
+                return;
+            }
+            auto counts = confined_projection(counted, gate.scope);
             agents_targeted = counts.agents_targeted;
             agents_responded = counts.agents_responded;
             agents_success = counts.agents_success;
             agents_failure = counts.agents_failure;
         }
-        const int progress_pct =
-            agents_targeted > 0 ? (agents_responded * 100 / agents_targeted) : 0;
+        // #2673: success + failure is every device with a final result, timeouts included.
+        const int progress_pct = agents_targeted > 0
+                                     ? ((agents_success + agents_failure) * 100 / agents_targeted)
+                                     : 0;
 
         res.set_content(nlohmann::json({{"id", exec.id},
                                         {"status", exec.status},
