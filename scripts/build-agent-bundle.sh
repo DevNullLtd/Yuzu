@@ -71,7 +71,7 @@ STAGING=""
 BUNDLE_ROOT=""                                # $STAGING/yuzu-agents -> /opt/yuzu-agents
 
 # ── Defaults / config ─────────────────────────────────────────────────────
-VERSION="${YUZU_VERSION:-0.15.0}"
+VERSION="${YUZU_VERSION:-0.16.0}"
 IMAGE_NAME="yuzu-agent-bundle-chisel"
 PUSH=0; MULTIARCH=0; RUN_TEST=1; KEEP_STAGING=0; VERIFY_ONLY=0; SIGNER_REPO=""
 STAGING_OWNED=0
