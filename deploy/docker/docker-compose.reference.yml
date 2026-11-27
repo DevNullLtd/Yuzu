@@ -35,7 +35,7 @@
 ## with a reverse proxy, and review docs/user-manual/ before exposing it.
 ##
 ## Usage:
-##   export YUZU_VERSION=0.15.0
+##   export YUZU_VERSION=0.16.0
 ##   # Two DISTINCT credentials — store both in your secrets manager. The
 ##   # superuser password stays inside the postgres service; the app role
 ##   # password is what the server's DSN carries. They must differ (the

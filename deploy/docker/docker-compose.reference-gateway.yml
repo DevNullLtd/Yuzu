@@ -74,7 +74,7 @@
 ## agents at the infra layer.
 ##
 ## Usage:
-##   export YUZU_VERSION=0.15.0
+##   export YUZU_VERSION=0.16.0
 ##   # the server REQUIRES Postgres (fails closed otherwise) — set the two
 ##   # DISTINCT db passwords (superuser + app role):
 ##   export YUZU_POSTGRES_PASSWORD="$(openssl rand -hex 24)"
