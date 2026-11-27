@@ -1306,8 +1306,10 @@ after Trivy:
   has no OS packages Trivy could see, so there is nothing to cross-check. This check can only refuse an
   image; Trivy's report stays the only coverage reader.
 - **OS packages catalogued.** A distro match alone does not show grype read any package. For an
-  image whose OS packages Trivy scanned, the image fails when grype's CycloneDX holds no OS-package
-  component (`pkg:apk/`, `pkg:deb/` or `pkg:rpm/`), or cannot be read. The count is reported as
+  image whose OS packages Trivy scanned, the image fails when grype's CycloneDX holds no component
+  that grype read from an OS package database (`syft:package:foundBy` of `dpkg-db-cataloger`,
+  `apk-db-cataloger` or `rpm-db-cataloger`), or cannot be read. Packages found another way, such as
+  the `pkg:deb/` components syft builds from ELF `.note.package` sections, are not counted. The count is reported as
   `os packages catalogued (grype)`. The check is for at least one; it does not compare the count
   with Trivy's, because the two scanners count packages differently and no ratio has been measured.
 - **Required components.** grype's JSON lists matches only, so a runtime grype did not recognise
@@ -1998,12 +2000,14 @@ except the agent bundle:
   the local Docker daemon`): `docker save` failed, usually a full disk under `RUNNER_TEMP` or a
   daemon fault. "Re-run failed jobs"; if it recurs, check the runner's free disk.
 - **grype catalogued no OS package** (`grype catalogued no OS package`): grype's CycloneDX holds no
-  OS-package component for an image whose OS packages Trivy scanned, so grype matched none. Open
-  `grype-<image>.attempt-<N>.json` and `.txt` in the report directory and compare with the Trivy
-  report's OS package count. Find the grype or package-database change that did it; a fix is a
-  commit, so re-tag.
+  package-database component for an image whose OS packages Trivy scanned, so grype matched none.
+  The report directory keeps `grype-<image>.attempt-<N>.json` and `.txt`, which list matches only and
+  cannot show what was catalogued. Reproduce with the pinned grype
+  (`grype <image> -o cyclonedx-json`) and read each component's `syft:package:foundBy`: ELF-note
+  entries only means the package database was not read. Find the grype or package-database change
+  that did it; a fix is a commit, so re-tag.
 - **grype OS packages unreadable** (`FAIL: grype OS packages unreadable`): grype's CycloneDX output
-  was missing, malformed or had no components list. The log shows the reason. Re-run the failed
+  was missing, malformed or had a components entry that was not a list. The log shows the reason. Re-run the failed
   jobs once; a repeat is a grype or export fault to find before re-tagging.
 - **grype did not detect the OS** (`grype did not detect the OS`): the image's OS release is one
   the pinned grype does not recognise; a newer grype or a supported OS release is a commit, so re-tag.

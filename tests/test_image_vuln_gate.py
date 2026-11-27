@@ -273,8 +273,12 @@ GRYPE_STUB = textwrap.dedent(
     if mode == "os-erlang":  # an OS package of the same name is not the runtime
         # Same name AND the expected version: only the purl tells it apart.
         comps = [{"name": "erlang", "version": "28.5.0.8", "purl": "pkg:apk/alpine/erlang@28.5.0.8"}]
-    if mode != "no-os-pkgs":  # grype's own cataloguing of an OS package
-        comps.append({"name": "libc6", "version": "2.36", "purl": "pkg:deb/debian/libc6@2.36"})
+    if mode != "no-os-pkgs":  # grype's own cataloguing of an OS package, from the dpkg database
+        comps.append({"name": "libc6", "version": "2.36", "purl": "pkg:deb/debian/libc6@2.36",
+                      "properties": [{"name": "syft:package:foundBy", "value": "dpkg-db-cataloger"}]})
+    if mode == "elf-note-only":  # a deb read from an ELF note is not a database package
+        comps = [{"name": "busybox", "version": "1.36", "purl": "pkg:deb/ubuntu/busybox@1.36",
+                  "properties": [{"name": "syft:package:foundBy", "value": "elf-binary-package-cataloger"}]}]
     if mode == "cdx-unreadable":
         comps = None
     if mode == "cdx-no-components-key":
@@ -1346,15 +1350,30 @@ class GateBehaviour(unittest.TestCase):
 
     def test_every_required_component_key_is_a_published_image_name(self):
         """GRYPE_REQUIRED_COMPONENTS is keyed on the NAME the workflows pass; a renamed leg
-        would silently skip the requirement (#8415, UP2-4)."""
+        would silently skip the requirement (#8415, UP2-4). Checked against the image loops of
+        the pre-release `security-scan` job and the image names release.yml's matrices publish."""
         gate = GATE.read_text(encoding="utf-8")
         body = re.search(r"GRYPE_REQUIRED_COMPONENTS=\((.*?)\n\)", gate, re.S).group(1)
         keys = re.findall(r"\[([a-z0-9-]+)\]=", body)
         self.assertTrue(keys)
         pre = PRE_RELEASE.read_text(encoding="utf-8")
+        job = re.search(r"\n  security-scan:\n(.*?)\n  [a-z][a-z0-9-]*:\n", pre, re.S)
+        self.assertIsNotNone(job, "no security-scan job in pre-release.yml")
+        loops = re.findall(r"for img in ((?:[^;]|\\\n)*?); do", job.group(1))
+        self.assertGreaterEqual(len(loops), 2, "expected the pull loop and the scan loop")
+        rel = RELEASE.read_text(encoding="utf-8")
+
+        def matrix_images(job_name):
+            j = re.search(r"\n  " + job_name + r":\n(.*?)\n  [a-z][a-z0-9-]*:\n", rel, re.S)
+            self.assertIsNotNone(j, job_name)
+            return re.findall(r"- image: ([a-z0-9-]+)", j.group(1))
+        released = {"yuzu-" + i for i in matrix_images("docker-publish")}
+        released |= {"yuzu-" + i + "-chisel" for i in matrix_images("docker-publish-chisel")}
         for k in keys:
             self.assertIn(k, PUBLISHED, k)
-            self.assertRegex(pre, r"(?<![\w-])" + re.escape(k) + r"(?![\w-])", f"{k} not in pre-release.yml")
+            for loop in loops:
+                self.assertIn(k, loop.replace("\\", " ").split(), f"{k} not in a security-scan image loop")
+            self.assertIn(k, released, f"{k} is not an image release.yml publishes")
 
     def test_grype_must_catalogue_os_packages_where_trivy_did(self):
         rep = self.tmp / "rep-ospkgs"
@@ -1364,6 +1383,11 @@ class GateBehaviour(unittest.TestCase):
                       (rep / "grype-yuzu-server.gate.txt").read_text(encoding="utf-8"))
         rep = self.tmp / "rep-noospkgs"
         r = self.run_gate("yuzu-server=img:1", grype_mode="no-os-pkgs", extra=("--report-dir", str(rep)))
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("gate: FAIL: grype catalogued no OS package",
+                      (rep / "grype-yuzu-server.gate.txt").read_text(encoding="utf-8"))
+        rep = self.tmp / "rep-elfonly"
+        r = self.run_gate("yuzu-server=img:1", grype_mode="elf-note-only", extra=("--report-dir", str(rep)))
         self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
         self.assertIn("gate: FAIL: grype catalogued no OS package",
                       (rep / "grype-yuzu-server.gate.txt").read_text(encoding="utf-8"))

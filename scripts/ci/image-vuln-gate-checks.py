@@ -1414,8 +1414,16 @@ def cmd_grype_components(path, names):
     return 1 if missing or wrong else 0
 
 
+_OS_DB_CATALOGERS = frozenset({"dpkg-db-cataloger", "apk-db-cataloger", "rpm-db-cataloger"})
+
+
 def cmd_grype_os_packages(path):
-    """Count the OS-package components (pkg:apk/, pkg:deb/, pkg:rpm/) in grype's CycloneDX."""
+    """Count the components grype read from an OS package database in its CycloneDX.
+
+A component counts when syft's `syft:package:foundBy` property names an OS package-database
+cataloger. A purl prefix is not enough: syft also emits `pkg:deb/` components from ELF
+`.note.package` sections (`elf-binary-package-cataloger`), which stay present when the database
+is no longer read."""
     try:
         d = _load_json_object(path, "grype CycloneDX output")
         if d.get("bomFormat") != "CycloneDX":
@@ -1427,8 +1435,12 @@ def cmd_grype_os_packages(path):
     except (OSError, ValueError, RecursionError) as e:
         print(f"grype os packages: cannot read {e}", file=sys.stderr)
         return 1
-    n = sum(1 for c in comps if isinstance(c, dict) and isinstance(c.get("purl"), str)
-            and c["purl"].startswith(("pkg:apk/", "pkg:deb/", "pkg:rpm/")))
+    def from_db(c):
+        props = c.get("properties") if isinstance(c, dict) else None
+        return isinstance(props, list) and any(
+            isinstance(p, dict) and p.get("name") == "syft:package:foundBy"
+            and p.get("value") in _OS_DB_CATALOGERS for p in props)
+    n = sum(1 for c in comps if from_db(c))
     print(f"os_packages={n}")
     return 0
 
