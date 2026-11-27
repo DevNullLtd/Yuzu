@@ -1225,7 +1225,7 @@ flip, with a red-first test each:
     latched apply failure also holds the generation, so corroborate with
     `yuzu.guardian_arm_failed`/`arm_pending`, the compensation tags and the agent log) or the compensation age gauge above a chosen threshold
     (no alert rule ships). Existing server signals to watch:
-    `yuzu_server_guardian_reconciles_total{result="sent"}`,
+    `yuzu_server_guardian_reconciles_total{result="sent"}` (plus `result="sent_remote"` on a multi-replica deployment, where a replica pushes through the route directory),
     `yuzu_server_guardian_pushes_dispatched_total{reason="reconcile"}`, and repeated
     `guaranteed_state.reconcile` audit rows for one `agent_id`. Recovery without a restart is
     one of the exits above (the full-push and re-key exits subject to the same-type condition); an agent restart also ends the hold (with `--spark-disable`
@@ -1443,7 +1443,7 @@ flip, with a red-first test each:
     per-agent metric: the agent log WARN (`N cached rule(s) failed to re-arm at boot`),
     repeated `guaranteed_state.reconcile` audit rows reading `generation 0 -> N` for one
     agent id, and the fleet-wide `yuzu_server_guardian_reconciles_total{result="sent"}`
-    rate. Fleet-wide detection of the tag and the alert decision are #5558. A persistently
+    rate (plus `result="sent_remote"` on a multi-replica deployment). Fleet-wide detection of the tag and the alert decision are #5558. A persistently
     failing rule is re-pushed with an agent-side back-off (after each failed catch-up the
     agent reports its real generation for the next 1, 2, 4, 8, then 10 heartbeats before
     reporting 0 again; about 60 s, 90 s, 150 s, 270 s, then 330 s apart at the default 30 s

@@ -1603,8 +1603,12 @@ def run_repeat(op, phase, backend, trigger_kind, cohort_ids, exp_rule_ids, repea
     wm = compute_window_math(t0["ts"], t0d["ts"], t1["ts"], result["selected"])
     row.update(wm)
 
-    reconcile_sent_delta = metric_sum(m1, 'yuzu_server_guardian_reconciles_total{result="sent"}') \
-        - metric_sum(m0, 'yuzu_server_guardian_reconciles_total{result="sent"}')
+    # `sent_remote` (a push through the route directory) exists only with a second replica; this
+    # rig runs one, so it stays 0 here, but it is summed so the figure is right on either shape.
+    reconcile_sent_delta = sum(
+        metric_sum(m1, f'yuzu_server_guardian_reconciles_total{{result="{r}"}}')
+        - metric_sum(m0, f'yuzu_server_guardian_reconciles_total{{result="{r}"}}')
+        for r in ("sent", "sent_remote"))
     pushes_policy_change_delta = (
         metric_sum(m1, 'yuzu_server_guardian_pushes_dispatched_total{reason="policy_change"}')
         - metric_sum(m0, 'yuzu_server_guardian_pushes_dispatched_total{reason="policy_change"}')

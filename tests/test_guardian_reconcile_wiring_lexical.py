@@ -942,6 +942,17 @@ def problems(src):
                              r"gateway_route_store_ ?\. ?get\( ?\), ?agent_id ?\) ?;", sg):
                 out.append("send_guardian_push no longer takes its route from resolve_guardian_directory_route"
                            "(registry_, gateway_route_store_.get(), agent_id) (u)")
+            # The switch must be on the resolver's own `route.kind`, directly after the resolve (no
+            # early return or reassignment between them), and the `count` lambda must be the
+            # unlabelled-by-caller shape that increments the push counter under kPush's label.
+            if not re.search(r"gateway_route_store_ ?\. ?get\( ?\), ?agent_id ?\) ?; ?switch \( ?route ?\. ?kind ?\) ?\{", sg):
+                out.append("send_guardian_push must switch on route.kind immediately after resolving it (u)")
+            if not re.search(r'auto count ?= ?\[&\]\( ?const char\* result ?\) ?\{ ?metrics_ ?\. ?counter\( ?'
+                             r'"yuzu_server_system_reserved_push_total", ?\{ ?\{ ?"capability", ?std::string\( ?'
+                             r'yuzu::server::system_reserved_push_label\( ?kPush ?\) ?\) ?\}, ?\{ ?"result", ?result ?\} ?\} ?\) ?'
+                             r'\. ?increment\( ?\) ?; ?\} ?;', sg):
+                out.append("send_guardian_push's count lambda no longer increments "
+                           "yuzu_server_system_reserved_push_total under kPush's label (u)")
             K = r"yuzu::server::GuardianDirectoryRoute::Kind::"
             if not re.search(r"\bcase " + K + r"not_needed ?: ?if \( ?send_system_reserved\( ?agent_id, ?cmd, ?kPush ?\) ?\) ?\{ ?"
                              r"forward_gateway_pending\( ?\) ?; ?return GuardianPushOutcome::sent ?; ?\} ?"
@@ -1823,6 +1834,12 @@ SERVER_MUTATIONS = [m for m in MUTATIONS if m[2] in SERVER_LETTERS] + [
      _after(SGP, 'count("sent");\n                forward_gateway_pending();', 'count("sent");'), "(u)"),
     ("send_guardian_push pushes as another capability",
      _after(SGP, "SystemReservedPush::guardian_push_rules;", "SystemReservedPush::asset_tags_sync;"), "(u)"),
+    ("send_guardian_push switches on a constant instead of the route kind",
+     _after(SGP, "switch (route.kind) {", "switch (yuzu::server::GuardianDirectoryRoute::Kind::not_needed) {"), "(u)"),
+    ("send_guardian_push returns early before the switch",
+     _after(SGP, "        switch (route.kind) {", "        if (agent_id.empty()) return GuardianPushOutcome::sent;\n        switch (route.kind) {"), "(u)"),
+    ("send_guardian_push count lambda increments another counter",
+     _after(SGP, '"yuzu_server_system_reserved_push_total"', '"yuzu_server_other_total"'), "(u)"),
     ("send_guardian_push takes the route from another agent",
      _after(SGP, "gateway_route_store_.get(),\n                                                           agent_id);",
             "gateway_route_store_.get(),\n                                                           other_agent_id_);"), "(u)"),

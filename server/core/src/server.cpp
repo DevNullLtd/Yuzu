@@ -14951,15 +14951,20 @@ private:
     ///  - a degraded directory read sends nothing (`route_unreadable`);
     ///  - the row must be `routable` (session present, lease live, cluster set);
     ///  - the row's `session_id` must equal this replica's session id for the agent, or the
-    ///    push would go to a superseded registration's cluster. That match is point-in-time:
-    ///    a re-registration between the read and the send can still queue for the old
-    ///    cluster, which the agent's generation check and the next heartbeat absorb. If a
+    ///    push would go to a superseded registration's cluster. The session id is read
+    ///    before the directory read and re-checked after it (a change during the read is
+    ///    `no_route`), and the flow withholds the push if the session changed since it
+    ///    started. A re-registration after that, before the send, can still queue rules built
+    ///    for the old session for the old cluster; they carry the same generation, so no
+    ///    later heartbeat repairs it until the generation moves (accepted). If a
     ///    CONNECTED lands in that gap `send_via_directory` hands the push to `send_to`, and
     ///    the outcome is still labelled `sent_remote`.
     /// A direct-connected agent never has a route row, so it stays `undelivered` here exactly
     /// as before. This path does not repeat `send_to`'s gateway-capability check (the session
-    /// has no advertised capabilities yet); `send_via_directory` applies the per-OS kill
-    /// switch. Both replicas may push one agent: the claim and budget are per replica.
+    /// has no advertised capabilities yet). `send_via_directory` also applies the per-OS kill
+    /// switch, but `__guard__.push_rules` is a protective action (`is_protective_action`), so it
+    /// is exempt and nothing is ever withheld here: do not count on a kill switch to stop this
+    /// push. Both replicas may push one agent: the claim and budget are per replica.
     [[nodiscard]] GuardianPushOutcome send_guardian_push(const std::string& agent_id,
                                                          const detail::ClassifiedCommand& cmd) {
         constexpr auto kPush = yuzu::server::SystemReservedPush::guardian_push_rules;

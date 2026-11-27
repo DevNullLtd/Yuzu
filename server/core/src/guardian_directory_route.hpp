@@ -22,7 +22,8 @@
 ///  - `unreadable`: the directory read degraded. Nothing may be sent; the caller aborts the
 ///    reconcile as degraded (an unreadable store is never read as "no route").
 ///  - `no_route`: no routable row, or a row that does not describe THIS replica's session
-///    (another session id, no session, an expired lease, no cluster). Sending would queue the
+///    (another session id, no session, a session that changed during the read, an expired
+///    lease, no cluster). Sending would queue the
 ///    push for a superseded registration's cluster while reporting success.
 ///  - `routed`: the row is `routable` (DB clock), names a cluster, and its `session_id` equals
 ///    the session this replica holds for the agent.
@@ -44,14 +45,22 @@ resolve_guardian_directory_route(const detail::AgentRegistry& registry, GatewayR
                                  const std::string& agent_id) {
     if (store == nullptr || !store->is_open() || !registry.needs_directory_consult(agent_id))
         return {GuardianDirectoryRoute::Kind::not_needed, {}};
+    // The session this decision is about is read BEFORE the Postgres read and re-checked after
+    // it: the lookup is the only slow step, and a re-registration during it must not let a row
+    // for the old session be matched against the new one (the rules were built for the session
+    // the flow started with, and an equal generation is not repaired by a later heartbeat).
+    // The flow withholds the push if the session changed since it started, immediately before
+    // calling `send_push`, so nothing slow sits between that check and this read.
+    const std::string local_session = registry.session_id_of(agent_id);
     const std::vector<std::string> ids{agent_id};
     auto routes = store->lookup_routes(ids);
     if (!routes)
         return {GuardianDirectoryRoute::Kind::unreadable, {}};
-    const std::string local_session = registry.session_id_of(agent_id);
+    if (local_session.empty() || registry.session_id_of(agent_id) != local_session)
+        return {GuardianDirectoryRoute::Kind::no_route, {}};
     for (const auto& rr : *routes) {
         if (rr.route.agent_id != agent_id || !rr.routable || !rr.route.cluster_id ||
-            !rr.route.session_id || local_session.empty() || *rr.route.session_id != local_session)
+            !rr.route.session_id || *rr.route.session_id != local_session)
             continue;
         return {GuardianDirectoryRoute::Kind::routed, *rr.route.cluster_id};
     }
