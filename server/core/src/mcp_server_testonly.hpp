@@ -54,6 +54,11 @@ std::vector<ToolSecurityRow> tool_security_rows_for_test();
 // generator's safe fallback.
 std::vector<std::string_view> tool_annotation_names_for_test();
 
+// The closed set of Read-class tools that dispatch to a device and store the result
+// (kDispatchProbeTools): the only tools the annotation cross-check test lets disagree with the
+// "readOnlyHint is the Read operation" rule. The test pins the content and the labels.
+std::vector<std::string_view> dispatch_probe_tool_names_for_test();
+
 // The --mcp-read-only guard's write-tool set (legacy kWriteToolsRaw plus the
 // registry records whose operation is not "Read"), so the cross-check test can
 // bind it to the non-Read dispatch class (a mutating tool missing from it would

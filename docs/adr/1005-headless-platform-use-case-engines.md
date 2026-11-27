@@ -2097,6 +2097,115 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        `docs/user-manual/audit-log.md`.
      - Recorded by the change author; ADR-owner acceptance pending.
 
+   - **2026-11-23 - the per-device live read has an MCP twin, `get_device_live`
+     (uptime and processes only); the REST route is rewritten onto the shared
+     zero-reach classifier and one lease.** This is the second change of the
+     per-device live read ladder. The row `get.fragments-device-live-run` stays
+     `planned:#2146`: it covers 22 kinds and 2 are served, so it flips in the
+     change that serves the rest, not here. `BASELINE_UNTWINNED` (196),
+     `BASELINE_GENERIC_PLANNED` (69), the strict exception pins, and
+     `GATE_PARITY_NO_GATE_MAX` (16) do not move.
+     - **Legacy-branch tool, Read pair, literal gates.** The tool is a branch of
+       `mcp_server.cpp`, not a registry tool. It declares `GuaranteedState:Read`,
+       the route's first gate, with service-scope class `confined`. Its
+       served annotations are overridden through a closed table
+       (`kDispatchProbeTools`): `readOnlyHint:false`, `idempotentHint:false`,
+       `destructiveHint:false`, `openWorldHint:false`, because the call
+       dispatches a command to the device and stores the result (owner ruling,
+       2026-11-24; the earlier "read-only and idempotent" labels are withdrawn).
+       The handler adds what the declaration cannot:
+       `tier_allows(Execution, Execute)`, the approval rule (a supervised token
+       is refused, as REST refuses it), and the `--mcp-read-only` refusal. The
+       REST route's local gate lambda is deleted: both surfaces now carry
+       literal scoped gate calls (`GuaranteedState:Read` and `Execution:Execute`
+       before the audit row, and again in the re-decision after it), which is
+       the form `check-api-parity.py` check 6 can read. Check 6 was proved
+       locally with a temporary ledger row naming both twins, which was then
+       reverted; the committed row names neither, so the check does not run in
+       CI for this pair yet.
+     - **Audit posture.** The MCP `requested` row (`device.live.uptime` or
+       `device.live.processes`) is fail-closed and written before the dispatch:
+       a probe that hashes executables on a device is usage-class behavioural
+       data, so the tool does not run without durable evidence. This is a
+       deliberate choice, recorded here, and is not a default for the next
+       behavioural MCP tool. The generic `mcp.get_device_live` row is
+       set-and-proceed, and is written after a successful answer, for a
+       tier, approval or read-only refusal, and as a `failure` row when the
+       `requested` row could not be stored (`audit_failed`, the refusal's own
+       record); the other refusals leave one domain `failure` row (after the
+       `requested` row) or none. Every domain row of a
+       call is written as the original session, even when the credential is
+       revoked mid-call. With audit switched off the call proceeds. The REST
+       `requested` row moves to the shared `emit_behavioral_audit` helper, so a
+       sink that throws answers `503` with `Sec-Audit-Failed` instead of a
+       `500`. The live answer is stored in the response store for
+       `response_retention_days` (a live read changes what the server stores,
+       which is why the tool is not labelled read-only).
+     - **REST behaviour change.** A send that reaches no agent is classified by
+       `classify_zero_reach`: `409` quarantined, `422` plugin not found, `403`
+       per-OS kill switch, and a retryable `503` for the other causes, each
+       with the cause as `error.reason`; a `failure` audit row follows the
+       `requested` row. The route's own in-flight guard is deleted: a new
+       `SseSurface::kLiveRead` (2 per principal, 4 in all) is taken from the
+       shared stream budget by the REST route, the MCP tool and the
+       containment-release confirmation wait, which skips the wait and answers
+       `202` when no slot is free. The metric `yuzu_server_live_requests_total`
+       is relabelled `{surface, kind, outcome}` with a closed outcome word set
+       of 32 words (31 at first, plus `bad_device_id`, added on 2026-11-25 for the
+       device-id floor that #7811 put in front of the route; 34 since #2673 added
+       `no_targets` and `target_resolution_failed`), every series
+       pre-seeded at boot; the HTTP status label is removed, and the gauge is renamed `yuzu_server_live_in_flight`. The
+       upgrade note is in `docs/user-manual/upgrading.md`.
+     - **Versioning basis.** The REST changes in this entry (the status and
+       reason of several answers, the new refusals, the shared limit, the poll
+       answering only a finished device) are
+       breaking under `docs/api-versioning-policy.md` and ship in place, on
+       `/api/v1`, without a `/api/v2` path or a deprecation window. Owner
+       ruling 2026-11-26: this route has no external consumer yet, so the
+       version increment is waived for this change. The announcement is the
+       `Breaking` changelog fragment and the upgrade note in
+       `docs/user-manual/upgrading.md`.
+     - **Poll.** One shared reader scopes the stored rows to the device at the
+       store, answers only after the device has finished (a stored row with a
+       terminal status; partial output without one is discarded and answered
+       `incomplete`, retryable after the poll's 25 second deadline (120 seconds for `processes`, whose run can hash that long), except an
+       answer already over the size cap, which MCP cuts and flags `truncated`
+       at once and REST refuses), joins the output chunks with a newline in stored order,
+       lets a failure row win, and is bounded by a 25 second wall-clock
+       deadline and a bounded store read; the MCP answer is capped at 1000
+       rows and 1 MiB with a `truncated` flag (an answer already over the cap is
+       cut and flagged at once, and the surviving rows are the start of what
+       was read and may not be a prefix of the full answer), the REST answer refuses over 4 MiB, 20000 rows or 64 stored
+       rows (`output_too_large`). A response-store ingest property remains and
+       is not fixed here: if one middle chunk of a multi-chunk device answer
+       is not stored, the read cannot detect the hole and may return the
+       surviving rows as complete.
+     - **Shutdown.** All three `kLiveRead` holders refuse (the REST route and
+       the MCP tool, `shutting_down`; the MCP code is `-32015`) or skip (the
+       quarantine release confirmation) a new wait once the server is draining;
+       the shutdown drain counts the `kLiveRead` leases, within its existing
+       30 second cap; a poll already running abandons its read when the
+       held-open budget closes.
+     - **Check order and denial mapping.** The MCP handler runs the tier
+       checks, argument validation and the two scoped gates before the
+       supervised and read-only refusals, so an out-of-scope device answers
+       the gate's `403` first. A chokepoint denial of `unclassified` or
+       `ambiguous` is answered as a server fault (`-32603`, REST `500`) because
+       the pair is server-named; the denial token rides as the error `reason`.
+     - **REST principal binding (2026-11-24).** The REST route now compares the
+       principal of its second resolution (the one the command is dispatched as)
+       with the first (the one every audit row is attributed to). A mismatch is a
+       `401` with a `caller_unresolved` `failure` row, written under the original
+       session and naming the second principal as `now=<principal>`, and nothing is
+       dispatched. The two scoped gates run again before that comparison, so a
+       credential that resolves to a different principal without the grants gets
+       the gate's own `403` (the failure row reads `permission_revoked`); the MCP
+       tool compares the principal first and answers `caller_unresolved` in both
+       cases.
+     - Wire reference: `docs/user-manual/mcp.md` (row 246) and
+       `docs/user-manual/rest-api.md`; audit rows: `docs/user-manual/audit-log.md`.
+     - Recorded by the change author; ADR-owner acceptance pending.
+
 ## Interim rules (until the named follow-ups ship)
 
 - **No engine principal class exists** until the auth-architecture follow-up lands. Until then, integrations authenticate as themselves via existing API tokens, and the server accepts **no** on-behalf-of assertion on any surface — any such header/field is rejected, not ignored.

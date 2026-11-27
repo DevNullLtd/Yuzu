@@ -146,6 +146,13 @@ constexpr std::string_view kDrainCountDecl =
     "workflow_engine_ ? workflow_engine_->in_flight_runs() : 0,"
     "stream_budget_ ? stream_budget_->active_for_surface("
     "yuzu::server::detail::SseSurface::kWorkflowRun) : 0);";
+// The per-device live reads this process holds (the `kLiveRead` leases: REST route, MCP tool,
+// quarantine release wait). Read INSIDE the loop, every tick, and fed to the rule: a live read pins
+// a worker for up to its poll budget and is neither tracked nor signalled, so without this count the
+// drain closes the listener under it.
+constexpr std::string_view kLiveCountDecl =
+    "const std::size_t live_reads = stream_budget_ ? stream_budget_->active_for_surface("
+    "yuzu::server::detail::SseSurface::kLiveRead) : 0;";
 constexpr std::string_view kDrainRuleCall = "shutdown_drain::keep_draining_for_work(";
 constexpr std::string_view kShouldStopCall = "workflow_engine_->set_should_stop(";
 constexpr std::string_view kStopBranch =
@@ -192,6 +199,9 @@ std::vector<std::string> drain_wiring_problems(const std::string& text) {
                  std::string::npos)
             out.push_back("the loop does not bind `workflow_runs` as workflow_runs_to_drain(engine "
                           "in_flight_runs(), kWorkflowRun lease count)");
+        else if (squeeze_ws(text.substr(loop_at, rule_at - loop_at)).find(squeeze_ws(kLiveCountDecl)) ==
+                 std::string::npos)
+            out.push_back("the loop does not bind `live_reads` as the kLiveRead lease count");
         // The call: its last two arguments are the tracker count then the engine count, it is the
         // condition of `if (!...) break;`, so neither a constant nor a dropped result survives.
         const std::size_t open = rule_at + kDrainRuleCall.size() - 1;
@@ -200,9 +210,10 @@ std::vector<std::string> drain_wiring_problems(const std::string& text) {
             out.push_back("unbalanced keep_draining_for_work( call");
         } else {
             const std::string call = collapse_ws(text.substr(rule_at, close + 1 - rule_at));
-            if (call != "shutdown_drain::keep_draining_for_work(elapsed, min_grace, running, workflow_runs)")
+            if (call != "shutdown_drain::keep_draining_for_work(elapsed, min_grace, running, "
+                        "workflow_runs, live_reads)")
                 out.push_back("keep_draining_for_work must read `(elapsed, min_grace, running, "
-                              "workflow_runs)`, found `" + call + "`");
+                              "workflow_runs, live_reads)`, found `" + call + "`");
             const std::string before = collapse_ws(text.substr(0, rule_at));
             if (!ends_with(before, "if (!"))
                 out.push_back("keep_draining_for_work must be the negated condition of an `if (!...)`");
@@ -211,8 +222,10 @@ std::vector<std::string> drain_wiring_problems(const std::string& text) {
                 out.push_back("the `if (!keep_draining_for_work(...))` must `break;` directly");
             // The progress log fires for an engine run too, so an operator sees what holds the drain.
             const std::string tail = collapse_ws(text.substr(close, stop_at - close));
-            if (tail.find("if (running > 0 || workflow_runs > 0) {") == std::string::npos)
-                out.push_back("the `if (running > 0 || workflow_runs > 0)` log branch is missing");
+            if (tail.find("if (running > 0 || workflow_runs > 0 || live_reads > 0) {") ==
+                std::string::npos)
+                out.push_back("the `if (running > 0 || workflow_runs > 0 || live_reads > 0)` log "
+                              "branch is missing");
         }
     }
     if (should_stop_at != std::string::npos) {
@@ -380,8 +393,8 @@ TEST_CASE("server.cpp: the drain wiring scan fails against each mutation of the 
     REQUIRE(drain_wiring_problems(text).empty());
 
     const std::string call_head = "if (!shutdown_drain::keep_draining_for_work(";
-    const std::string call_tail = "workflow_runs))";
-    const std::string log_cond = "if (running > 0 || workflow_runs > 0) {";
+    const std::string call_tail = "workflow_runs, live_reads))";
+    const std::string log_cond = "if (running > 0 || workflow_runs > 0 || live_reads > 0) {";
     const std::string loop_head = "for (;;) {\n                const auto elapsed = steady_clock::now() - drain_start;";
 
     // `pin` is the problem text the mutation must produce: a mutation that trips an unrelated pin
@@ -418,7 +431,8 @@ TEST_CASE("server.cpp: the drain wiring scan fails against each mutation of the 
          mutated(text, call_head, "if (shutdown_drain::keep_draining_for_work("),
          "must be the negated condition"},
         {"no break on the result",
-         mutated(text, "workflow_runs))\n                    break;", "workflow_runs)) {}"),
+         mutated(text, "workflow_runs, live_reads))\n                    break;",
+                 "workflow_runs, live_reads)) {}"),
          "must `break;` directly"},
         {"count read hoisted above the loop", hoisted, "read above the drain loop"},
         {"lease count zeroed (a run in prepare is not drained)", mutated(text, lease_arg, "0);"),
@@ -430,7 +444,26 @@ TEST_CASE("server.cpp: the drain wiring scan fails against each mutation of the 
         {"engine count dropped from the combined count", mutated(text, engine_arg, "0,\n"),
          "expected exactly one 'workflow_engine_->in_flight_runs()'"},
         {"log branch no longer sees the engine count",
-         mutated(text, log_cond, "if (running > 0) {"), "log branch is missing"},
+         mutated(text, log_cond, "if (running > 0 || live_reads > 0) {"), "log branch is missing"},
+        {"log branch no longer sees the live reads",
+         mutated(text, log_cond, "if (running > 0 || workflow_runs > 0) {"), "log branch is missing"},
+        // A per-device live read pins a worker for up to its poll budget; the drain must wait on it.
+        {"live reads dropped from the rule call (the 4-argument form compiles, the default is 0)",
+         mutated(text, "workflow_runs, live_reads))", "workflow_runs))"),
+         "keep_draining_for_work must read"},
+        {"live reads passed as a constant", mutated(text, "workflow_runs, live_reads))", "workflow_runs, 0))"),
+         "keep_draining_for_work must read"},
+        {"live lease count zeroed",
+         mutated(text,
+                 "stream_budget_ ? stream_budget_->active_for_surface(\n"
+                 "                                         yuzu::server::detail::SseSurface::kLiveRead)\n"
+                 "                                   : 0;",
+                 "0;"),
+         "does not bind `live_reads`"},
+        {"live lease count read from another surface",
+         mutated(text, "SseSurface::kLiveRead)\n                                   : 0;",
+                 "SseSurface::kMcpGet)\n                                   : 0;"),
+         "does not bind `live_reads`"},
         {"log branch removed", mutated(text, log_cond, "if (false) {"), "log branch is missing"},
         {"set_should_stop assigned something else",
          mutated(text, kShouldStopCall, "workflow_engine_->set_unrelated("),
@@ -477,17 +510,41 @@ TEST_CASE("shutdown_drain: a workflow run in flight extends the wait, and the SA
     using yuzu::server::shutdown_drain::keep_draining_for_work;
     using yuzu::server::shutdown_drain::kExecutionDrainCap;
     // Nothing in the tracker, no grace: only the engine's own run count holds the drain.
-    CHECK_FALSE(keep_draining_for_work(0s, 0s, 0, 0));
-    CHECK(keep_draining_for_work(0s, 0s, 0, 1));
-    CHECK(keep_draining_for_work(kExecutionDrainCap - 1s, 0s, 0, 3));
+    CHECK_FALSE(keep_draining_for_work(0s, 0s, 0, 0, 0));
+    CHECK(keep_draining_for_work(0s, 0s, 0, 1, 0));
+    CHECK(keep_draining_for_work(kExecutionDrainCap - 1s, 0s, 0, 3, 0));
     // The cap bounds it exactly as it bounds a tracked execution: a run still going at the cap is
     // stopped by stop_requested_, not waited for.
-    CHECK_FALSE(keep_draining_for_work(kExecutionDrainCap, 0s, 0, 1));
-    CHECK_FALSE(keep_draining_for_work(kExecutionDrainCap + 5s, 0s, 4, 4));
+    CHECK_FALSE(keep_draining_for_work(kExecutionDrainCap, 0s, 0, 1, 0));
+    CHECK_FALSE(keep_draining_for_work(kExecutionDrainCap + 5s, 0s, 4, 4, 0));
     // A tracked execution alone, and the minimum grace, behave as before.
-    CHECK(keep_draining_for_work(1s, 0s, 2, 0));
-    CHECK(keep_draining_for_work(5s, 10s, 0, 0));
-    CHECK_FALSE(keep_draining_for_work(10s, 10s, 0, 0));
+    CHECK(keep_draining_for_work(1s, 0s, 2, 0, 0));
+    CHECK(keep_draining_for_work(5s, 10s, 0, 0, 0));
+    CHECK_FALSE(keep_draining_for_work(10s, 10s, 0, 0, 0));
+}
+
+// CS-1 (b): a per-device live read holds a worker for up to its poll budget and is neither tracked
+// nor signalled, so the drain counts its `kLiveRead` lease. The same cap bounds it: a lease that
+// never fell costs at most the cap, and can never wedge the shutdown.
+TEST_CASE("shutdown_drain: a live read in flight extends the wait, and the SAME cap releases it",
+          "[shutdown_drain]") {
+    using namespace std::chrono_literals;
+    using yuzu::server::shutdown_drain::keep_draining_for_work;
+    using yuzu::server::shutdown_drain::kExecutionDrainCap;
+    // Nothing else in flight: only the live reads hold the drain.
+    CHECK_FALSE(keep_draining_for_work(0s, 0s, 0, 0, 0));
+    CHECK(keep_draining_for_work(0s, 0s, 0, 0, 1));
+    CHECK(keep_draining_for_work(kExecutionDrainCap - 1s, 0s, 0, 0, 4));
+    // A leaked lease costs at most the cap.
+    CHECK_FALSE(keep_draining_for_work(kExecutionDrainCap, 0s, 0, 0, 1));
+    CHECK_FALSE(keep_draining_for_work(kExecutionDrainCap + 5s, 0s, 3, 3, 4));
+    // With no live reads the rule is exactly the old one (live_reads is a required argument).
+    CHECK_FALSE(keep_draining_for_work(0s, 0s, 0, 0, 0));
+    CHECK(keep_draining_for_work(0s, 0s, 1, 0, 0));
+    CHECK(keep_draining_for_work(0s, 0s, 0, 1, 0));
+    // The minimum grace is unchanged.
+    CHECK(keep_draining_for_work(5s, 10s, 0, 0, 0));
+    CHECK_FALSE(keep_draining_for_work(10s, 10s, 0, 0, 0));
 }
 
 TEST_CASE("shutdown_drain: a run holding a lease but not yet in the engine (in prepare) keeps the "
@@ -498,15 +555,15 @@ TEST_CASE("shutdown_drain: a run holding a lease but not yet in the engine (in p
     using yuzu::server::shutdown_drain::kExecutionDrainCap;
     using yuzu::server::shutdown_drain::workflow_runs_to_drain;
     // Lease taken, engine not entered: the engine count alone would stop the drain.
-    CHECK_FALSE(keep_draining_for_work(0s, 0s, 0, 0));
-    CHECK(keep_draining_for_work(0s, 0s, 0, workflow_runs_to_drain(0, 1)));
-    CHECK(keep_draining_for_work(kExecutionDrainCap - 1s, 0s, 0, workflow_runs_to_drain(0, 2)));
+    CHECK_FALSE(keep_draining_for_work(0s, 0s, 0, 0, 0));
+    CHECK(keep_draining_for_work(0s, 0s, 0, workflow_runs_to_drain(0, 1), 0));
+    CHECK(keep_draining_for_work(kExecutionDrainCap - 1s, 0s, 0, workflow_runs_to_drain(0, 2), 0));
     // Both zero stops; the cap releases a lease-held run exactly as it releases an engine one.
-    CHECK_FALSE(keep_draining_for_work(0s, 0s, 0, workflow_runs_to_drain(0, 0)));
-    CHECK_FALSE(keep_draining_for_work(kExecutionDrainCap, 0s, 0, workflow_runs_to_drain(0, 1)));
+    CHECK_FALSE(keep_draining_for_work(0s, 0s, 0, workflow_runs_to_drain(0, 0), 0));
+    CHECK_FALSE(keep_draining_for_work(kExecutionDrainCap, 0s, 0, workflow_runs_to_drain(0, 1), 0));
     // The minimum grace is unchanged.
-    CHECK(keep_draining_for_work(5s, 10s, 0, workflow_runs_to_drain(0, 0)));
-    CHECK_FALSE(keep_draining_for_work(10s, 10s, 0, workflow_runs_to_drain(0, 0)));
+    CHECK(keep_draining_for_work(5s, 10s, 0, workflow_runs_to_drain(0, 0), 0));
+    CHECK_FALSE(keep_draining_for_work(10s, 10s, 0, workflow_runs_to_drain(0, 0), 0));
 }
 
 TEST_CASE("shutdown_drain: workflow_runs_to_drain is the larger of the two counts, never a sum, "

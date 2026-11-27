@@ -145,6 +145,9 @@ std::string error_json_a4(int code, std::string_view message, std::string_view c
     if (!opts.status_url.empty()) {
         err.add("status_url", opts.status_url);
     }
+    if (!opts.reason.empty()) {
+        err.add("reason", opts.reason);
+    }
     return JObj().raw("error", err.str()).raw("meta", R"({"api_version":"v1"})").str();
 }
 

@@ -689,10 +689,20 @@ does (agentic-first parity):
   foreign event id is a 404).
 - **`POST /api/v1/dex/devices/{id}/live?kind=uptime|processes`**, the "Get live
   info" read: it dispatches a read-only instruction to the device and waits up to
-  about 20 seconds for the result (hence POST, not GET). Needs scoped `Read` and
+  about 20 seconds when the store answers quickly (never longer than the 25 second poll deadline plus one 0.5 second interval and one store read) for the result (hence POST, not GET). Needs scoped `Read` and
   `Execute`, audited before dispatch (`device.live.uptime` or
-  `device.live.processes`), and answers 429, 502, 503 or 504 when the device
-  cannot answer in time.
+  `device.live.processes`), and answers 409, 422, 403, 429, 502, 503 or 504
+  when the device cannot answer (see the REST reference). It answers only after
+  the device has finished: partial output without a final row is never
+  returned, except an answer already over the size cap, which the MCP tool cuts
+  and flags `truncated` at once (REST refuses it). A chunk the server failed to
+  store cannot be detected, so a complete-looking list can have a hole. The reply is stored in the
+  response store for `response_retention_days` (90 by default), and process paths
+  can contain user names, so treat it as personal data. The MCP tool
+  `get_device_live` is its twin and shares its limit of 2 reads per caller and
+  4 in all; the tool is labelled as an action, not a passive read (not read-only,
+  not idempotent), because every call dispatches a command to the device, writes
+  audit rows and stores the result.
 
 The signal endpoints take a `window` of `24h`/`7d`/`30d`/`all` (and the
 catalogue rollup + per-signal drill-down additionally take the optional `os`
