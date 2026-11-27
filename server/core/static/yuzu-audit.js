@@ -149,6 +149,7 @@
     var d = row.dataset;
     return post(API + '/' + encodeURIComponent(id) + '/attestations', {
       principal_type: d.principalType, principal_id: d.principalId, role_name: d.roleName,
+      scope: d.scope, scope_group_id: d.scopeGroupId,
       decision: btn.dataset.decision, justification: justification
     }).then(function (r) {
       if (!r.ok) return failure(r);
@@ -183,10 +184,12 @@
     if (!row) return;
     var d = row.dataset;
     var just = justificationOf(btn);
+    var where = d.scope === 'management_group' ? 'on management group "' + d.scopeGroupId + '"'
+                                               : 'fleet-wide';
     YuzuDialog.form({
       title: 'Flag for revocation',
       body: 'Flag ' + d.principalType + ' "' + d.principalId + '" role "' + d.roleName +
-            '" for revocation? This records evidence only. It does NOT revoke the grant.',
+            '" (' + where + ') for revocation? This records evidence only. It does NOT revoke the grant.',
       submitLabel: 'Flag for revocation',
       danger: true,
       submit: function () { return decide(btn, just); }

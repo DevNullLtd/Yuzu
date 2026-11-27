@@ -34,6 +34,7 @@
 #include "access_review_model.hpp"
 #include "access_review_store.hpp"
 
+#include "pg/pg_migration_runner.hpp"
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
 
@@ -60,6 +61,8 @@
 using yuzu::server::AccessReviewStore;
 using yuzu::server::GrantRef;
 using yuzu::server::pg::PgConn;
+using yuzu::server::pg::PgMigration;
+using yuzu::server::pg::PgMigrationRunner;
 using yuzu::server::pg::PgPool;
 using yuzu::server::pg::PgResult;
 
@@ -72,6 +75,10 @@ yuzu::test::PgTestTemplate access_review_store_tpl{
         if (!store.is_open())
             throw std::runtime_error("access_review_store template: store failed to migrate");
     }};
+
+// The fleet-wide scope of a grant (the empty scope id). Every attest in this file that is not
+// about scope names it explicitly, so no call can silently take a scope it did not mean.
+const std::string kFleetScope;
 
 std::vector<GrantRef> three_grants() {
     return {
@@ -122,7 +129,7 @@ TEST_CASE("AccessReviewStore reports !is_open on an unreachable pool, and every 
     CHECK_FALSE(store.is_open());
 
     CHECK_FALSE(store.open_campaign("t", "admin", {}, "enabled").has_value());
-    CHECK_FALSE(store.record_attestation("x", "user", "a", "R", "attested", "r", "").has_value());
+    CHECK_FALSE(store.record_attestation("x", "user", "a", "R", kFleetScope, "attested", "r", "").has_value());
     CHECK_FALSE(store.get_campaign("x").has_value());
     CHECK_FALSE(store.close_campaign("x", "admin").has_value());
 }
@@ -363,11 +370,15 @@ TEST_CASE("get_campaign: a genuine read failure mid-enumeration is a plain error
 
 namespace {
 
+// The SCOPE is a required argument: a grant held fleet-wide and the same grant held on a group are
+// two rows, and a helper that ignored scope could inspect the fleet row twice and pass.
 const yuzu::server::AccessReviewAttestationRow* find_row(const yuzu::server::CampaignView& v,
                                                          std::string_view type, std::string_view id,
-                                                         std::string_view role) {
+                                                         std::string_view role,
+                                                         std::string_view scope) {
     for (const auto& a : v.attestations)
-        if (a.principal_type == type && a.principal_id == id && a.role_name == role)
+        if (a.principal_type == type && a.principal_id == id && a.role_name == role &&
+            a.scope_group_id == scope)
             return &a;
     return nullptr;
 }
@@ -385,7 +396,7 @@ TEST_CASE("record_attestation transitions a pending row and APPENDS a later deci
     REQUIRE(open_res.has_value());
     const auto cid = *open_res;
 
-    auto rec1 = store.record_attestation(cid, "user", "alice", "Admin", "attested", "carol", "ok");
+    auto rec1 = store.record_attestation(cid, "user", "alice", "Admin", kFleetScope, "attested", "carol", "ok");
     REQUIRE(rec1.has_value());
     CHECK(rec1->previous_decision == "pending");
     CHECK(rec1->seq == 1);
@@ -393,7 +404,7 @@ TEST_CASE("record_attestation transitions a pending row and APPENDS a later deci
     auto view1 = store.get_campaign(cid);
     REQUIRE(view1.has_value());
     CHECK(view1->pending_count == 2);
-    const auto* r1 = find_row(*view1, "user", "alice", "Admin");
+    const auto* r1 = find_row(*view1, "user", "alice", "Admin", kFleetScope);
     REQUIRE(r1 != nullptr);
     CHECK(r1->decision == "attested");
     CHECK(r1->reviewer == "carol");
@@ -405,7 +416,7 @@ TEST_CASE("record_attestation transitions a pending row and APPENDS a later deci
     // A different reviewer decides the SAME grant again: the current row advances to seq 2
     // and the earlier decision stays in the history, with what it superseded.
     auto rec2 =
-        store.record_attestation(cid, "user", "alice", "Admin", "flagged_revoke", "dave", "stale");
+        store.record_attestation(cid, "user", "alice", "Admin", kFleetScope, "flagged_revoke", "dave", "stale");
     REQUIRE(rec2.has_value());
     CHECK(rec2->previous_decision == "attested");
     CHECK(rec2->seq == 2);
@@ -414,7 +425,7 @@ TEST_CASE("record_attestation transitions a pending row and APPENDS a later deci
     REQUIRE(view2.has_value());
     CHECK(view2->attestations.size() == 3); // no new row added
     CHECK(view2->pending_count == 2);       // unchanged: still one non-pending row
-    const auto* r2 = find_row(*view2, "user", "alice", "Admin");
+    const auto* r2 = find_row(*view2, "user", "alice", "Admin", kFleetScope);
     REQUIRE(r2 != nullptr);
     CHECK(r2->decision == "flagged_revoke");
     CHECK(r2->reviewer == "dave");
@@ -454,17 +465,17 @@ TEST_CASE("record_attestation: an identical repeat decision appends at seq+1 too
     REQUIRE(open_res.has_value());
     const auto cid = *open_res;
 
-    auto first = store.record_attestation(cid, "group", "eng", "Reader", "attested", "carol", "ok");
+    auto first = store.record_attestation(cid, "group", "eng", "Reader", kFleetScope, "attested", "carol", "ok");
     REQUIRE(first.has_value());
     CHECK(first->seq == 1);
-    auto again = store.record_attestation(cid, "group", "eng", "Reader", "attested", "carol", "ok");
+    auto again = store.record_attestation(cid, "group", "eng", "Reader", kFleetScope, "attested", "carol", "ok");
     REQUIRE(again.has_value());
     CHECK(again->previous_decision == "attested"); // equal to the new decision
     CHECK(again->seq == 2);
 
     auto view = store.get_campaign(cid, true);
     REQUIRE(view.has_value());
-    const auto* row = find_row(*view, "group", "eng", "Reader");
+    const auto* row = find_row(*view, "group", "eng", "Reader", kFleetScope);
     REQUIRE(row != nullptr);
     CHECK(row->decision_seq == 2);
     REQUIRE(row->history.size() == 2);
@@ -486,7 +497,7 @@ TEST_CASE("record_attestation: a grant keeps at most kMaxDecisionsPerGrant decis
 
     for (std::int32_t i = 1; i <= yuzu::server::kMaxDecisionsPerGrant; ++i) {
         const std::string decision = i % 2 ? "attested" : "flagged_revoke";
-        auto r = store.record_attestation(cid, "group", "eng", "Reader", decision, "carol", "n");
+        auto r = store.record_attestation(cid, "group", "eng", "Reader", kFleetScope, decision, "carol", "n");
         REQUIRE(r.has_value());
         CHECK(r->seq == i);
         CHECK(r->previous_decision ==
@@ -496,14 +507,14 @@ TEST_CASE("record_attestation: a grant keeps at most kMaxDecisionsPerGrant decis
     const std::string expected = "bad_request: " + std::string(yuzu::server::kDecisionCapMessage);
     for (int attempt = 0; attempt < 2; ++attempt) { // refused again, never a different answer
         auto over =
-            store.record_attestation(cid, "group", "eng", "Reader", "attested", "dave", "x");
+            store.record_attestation(cid, "group", "eng", "Reader", kFleetScope, "attested", "dave", "x");
         REQUIRE_FALSE(over.has_value());
         CHECK(over.error() == expected);
     }
 
     auto view = store.get_campaign(cid, /*include_history=*/true);
     REQUIRE(view.has_value());
-    const auto* row = find_row(*view, "group", "eng", "Reader");
+    const auto* row = find_row(*view, "group", "eng", "Reader", kFleetScope);
     REQUIRE(row != nullptr);
     CHECK(row->decision_seq == 100);
     CHECK(row->decision == "flagged_revoke"); // the 100th decision, not the refused one
@@ -513,7 +524,7 @@ TEST_CASE("record_attestation: a grant keeps at most kMaxDecisionsPerGrant decis
     CHECK(row->history.back().seq == 100);
 
     // A different grant of the same campaign is unaffected.
-    auto other = store.record_attestation(cid, "user", "alice", "Admin", "attested", "carol", "ok");
+    auto other = store.record_attestation(cid, "user", "alice", "Admin", kFleetScope, "attested", "carol", "ok");
     REQUIRE(other.has_value());
     CHECK(other->seq == 1);
     CHECK(other->previous_decision == "pending");
@@ -530,11 +541,11 @@ TEST_CASE("get_campaign(include_history) returns each grant's latest kMaxDecisio
     auto open_res = store.open_campaign("Bounded", "admin", three_grants(), "enabled");
     REQUIRE(open_res.has_value());
     const auto cid = *open_res;
-    REQUIRE(store.record_attestation(cid, "group", "eng", "Reader", "attested", "carol", "first")
+    REQUIRE(store.record_attestation(cid, "group", "eng", "Reader", kFleetScope, "attested", "carol", "first")
                 .has_value());
-    REQUIRE(store.record_attestation(cid, "user", "alice", "Admin", "attested", "carol", "one")
+    REQUIRE(store.record_attestation(cid, "user", "alice", "Admin", kFleetScope, "attested", "carol", "one")
                 .has_value());
-    REQUIRE(store.record_attestation(cid, "user", "alice", "Admin", "flagged_revoke", "dave", "two")
+    REQUIRE(store.record_attestation(cid, "user", "alice", "Admin", kFleetScope, "flagged_revoke", "dave", "two")
                 .has_value());
 
     {
@@ -548,11 +559,11 @@ TEST_CASE("get_campaign(include_history) returns each grant's latest kMaxDecisio
              {"ALTER TABLE " + att + " DISABLE TRIGGER access_review_attestation_guard",
               "ALTER TABLE " + hist + " DISABLE TRIGGER access_review_history_consistent",
               "INSERT INTO " + hist +
-                  " (campaign_id, principal_type, principal_id, role_name, seq, decision, "
-                  "previous_decision, reviewer, justification, decided_at_ms) "
+                  " (campaign_id, principal_type, principal_id, role_name, scope_group_id, seq, "
+                  "decision, previous_decision, reviewer, justification, decided_at_ms) "
                   "SELECT '" +
                   cid +
-                  "','group','eng','Reader', g, 'attested', 'attested', "
+                  "','group','eng','Reader','', g, 'attested', 'attested', "
                   "'carol', 'row ' || g, g FROM generate_series(2,105) g",
               "UPDATE " + att + " SET decision_seq=105 WHERE campaign_id='" + cid +
                   "' AND principal_id='eng'"}) {
@@ -564,7 +575,7 @@ TEST_CASE("get_campaign(include_history) returns each grant's latest kMaxDecisio
 
     auto view = store.get_campaign(cid, /*include_history=*/true);
     REQUIRE(view.has_value());
-    const auto* eng = find_row(*view, "group", "eng", "Reader");
+    const auto* eng = find_row(*view, "group", "eng", "Reader", kFleetScope);
     REQUIRE(eng != nullptr);
     CHECK(eng->decision_seq == 105); // the total, so truncation reads as decision_seq > entries
     REQUIRE(eng->history.size() == 100);
@@ -575,13 +586,13 @@ TEST_CASE("get_campaign(include_history) returns each grant's latest kMaxDecisio
     CHECK(eng->history.front().justification == "row 6");
 
     // The other grants are not cut: alice keeps both entries, the pending grant has none.
-    const auto* alice = find_row(*view, "user", "alice", "Admin");
+    const auto* alice = find_row(*view, "user", "alice", "Admin", kFleetScope);
     REQUIRE(alice != nullptr);
     CHECK(alice->decision_seq == 2);
     REQUIRE(alice->history.size() == 2);
     CHECK(alice->history[0].seq == 1);
     CHECK(alice->history[1].seq == 2);
-    const auto* pending = find_row(*view, "engine", "engine:svc", "Writer");
+    const auto* pending = find_row(*view, "engine", "engine:svc", "Writer", kFleetScope);
     REQUIRE(pending != nullptr);
     CHECK(pending->decision_seq == 0);
     CHECK(pending->history.empty());
@@ -589,13 +600,13 @@ TEST_CASE("get_campaign(include_history) returns each grant's latest kMaxDecisio
     // The default read is unchanged: no history, the total still reported.
     auto bare = store.get_campaign(cid);
     REQUIRE(bare.has_value());
-    const auto* bare_eng = find_row(*bare, "group", "eng", "Reader");
+    const auto* bare_eng = find_row(*bare, "group", "eng", "Reader", kFleetScope);
     REQUIRE(bare_eng != nullptr);
     CHECK(bare_eng->decision_seq == 105);
     CHECK(bare_eng->history.empty());
 
     // Past the cap the write is refused, so the row stays at 105.
-    auto over = store.record_attestation(cid, "group", "eng", "Reader", "attested", "erin", "x");
+    auto over = store.record_attestation(cid, "group", "eng", "Reader", kFleetScope, "attested", "erin", "x");
     REQUIRE_FALSE(over.has_value());
     CHECK(over.error().starts_with("bad_request:"));
 }
@@ -611,32 +622,32 @@ TEST_CASE("record_attestation: the reviewer must differ from the subject of a us
     REQUIRE(open_res.has_value());
     const auto cid = *open_res;
 
-    auto self = store.record_attestation(cid, "user", "alice", "Admin", "attested", "alice", "me");
+    auto self = store.record_attestation(cid, "user", "alice", "Admin", kFleetScope, "attested", "alice", "me");
     REQUIRE_FALSE(self.has_value());
     CHECK(self.error() == "forbidden: reviewer is the subject of this grant");
 
     // Byte-exact: a different case is a different reviewer (no case folding).
-    auto cased = store.record_attestation(cid, "user", "alice", "Admin", "attested", "Alice", "");
+    auto cased = store.record_attestation(cid, "user", "alice", "Admin", kFleetScope, "attested", "Alice", "");
     REQUIRE(cased.has_value());
     CHECK(cased->seq == 1);
 
     // Nothing was written by the refused call (the cased call above wrote seq 1 only).
     auto view = store.get_campaign(cid, true);
     REQUIRE(view.has_value());
-    const auto* row = find_row(*view, "user", "alice", "Admin");
+    const auto* row = find_row(*view, "user", "alice", "Admin", kFleetScope);
     REQUIRE(row != nullptr);
     CHECK(row->decision_seq == 1);
     CHECK(row->history.size() == 1);
     // A flag cannot be undone by the subject either.
     auto flagged =
-        store.record_attestation(cid, "user", "alice", "Admin", "flagged_revoke", "carol", "no");
+        store.record_attestation(cid, "user", "alice", "Admin", kFleetScope, "flagged_revoke", "carol", "no");
     REQUIRE(flagged.has_value());
-    auto unflag = store.record_attestation(cid, "user", "alice", "Admin", "attested", "alice", "");
+    auto unflag = store.record_attestation(cid, "user", "alice", "Admin", kFleetScope, "attested", "alice", "");
     REQUIRE_FALSE(unflag.has_value());
     CHECK(unflag.error().starts_with("forbidden:"));
     auto after = store.get_campaign(cid, true);
     REQUIRE(after.has_value());
-    const auto* arow = find_row(*after, "user", "alice", "Admin");
+    const auto* arow = find_row(*after, "user", "alice", "Admin", kFleetScope);
     REQUIRE(arow != nullptr);
     CHECK(arow->decision == "flagged_revoke");
     CHECK(arow->history.size() == 2);
@@ -657,16 +668,16 @@ TEST_CASE("record_attestation: a self-subject user decision is forbidden even in
 
     // forbidden precedes not_found: the caller holds Attest and can read the campaign anyway.
     auto self_closed =
-        store.record_attestation(cid, "user", "alice", "Admin", "attested", "alice", "");
+        store.record_attestation(cid, "user", "alice", "Admin", kFleetScope, "attested", "alice", "");
     REQUIRE_FALSE(self_closed.has_value());
     CHECK(self_closed.error().starts_with("forbidden:"));
-    auto self_unknown = store.record_attestation(std::string(64, 'a'), "user", "alice", "Admin",
+    auto self_unknown = store.record_attestation(std::string(64, 'a'), "user", "alice", "Admin", kFleetScope,
                                                  "attested", "alice", "");
     REQUIRE_FALSE(self_unknown.has_value());
     CHECK(self_unknown.error().starts_with("forbidden:"));
     // A malformed campaign id is still a bad_request, ahead of the reviewer rule.
     auto bad_id =
-        store.record_attestation("bad id", "user", "alice", "Admin", "attested", "alice", "");
+        store.record_attestation("bad id", "user", "alice", "Admin", kFleetScope, "attested", "alice", "");
     REQUIRE_FALSE(bad_id.has_value());
     CHECK(bad_id.error().starts_with("bad_request:"));
 
@@ -674,9 +685,9 @@ TEST_CASE("record_attestation: a self-subject user decision is forbidden even in
     // other stores and belong to the route layer's gate.
     auto open2 = store.open_campaign("SoD kinds", "admin", three_grants(), "enabled");
     REQUIRE(open2.has_value());
-    auto grp = store.record_attestation(*open2, "group", "eng", "Reader", "attested", "eng", "");
+    auto grp = store.record_attestation(*open2, "group", "eng", "Reader", kFleetScope, "attested", "eng", "");
     REQUIRE(grp.has_value());
-    auto eng = store.record_attestation(*open2, "engine", "engine:svc", "Writer", "attested",
+    auto eng = store.record_attestation(*open2, "engine", "engine:svc", "Writer", kFleetScope, "attested",
                                         "engine:svc", "");
     REQUIRE(eng.has_value());
 
@@ -699,7 +710,7 @@ TEST_CASE("record_attestation rejects a decision outside {attested,flagged_revok
     auto open_res = store.open_campaign("Bad decision", "admin", three_grants(), "enabled");
     REQUIRE(open_res.has_value());
 
-    auto rec = store.record_attestation(*open_res, "user", "alice", "Admin", "pending", "carol",
+    auto rec = store.record_attestation(*open_res, "user", "alice", "Admin", kFleetScope, "pending", "carol",
                                         "");
     REQUIRE_FALSE(rec.has_value());
     // Not the not_found: prefix — this is a caller-input validation failure,
@@ -723,7 +734,7 @@ TEST_CASE("record_attestation rejects a write into a closed campaign",
     auto close_res = store.close_campaign(cid, "admin");
     REQUIRE(close_res.has_value());
 
-    auto rec = store.record_attestation(cid, "user", "alice", "Admin", "attested", "carol", "");
+    auto rec = store.record_attestation(cid, "user", "alice", "Admin", kFleetScope, "attested", "carol", "");
     REQUIRE_FALSE(rec.has_value());
     CHECK(rec.error().starts_with("not_found:"));
 
@@ -746,18 +757,18 @@ TEST_CASE("record_attestation into a closed campaign after a decision leaves his
     auto open_res = store.open_campaign("Closed after", "admin", three_grants(), "enabled");
     REQUIRE(open_res.has_value());
     const auto cid = *open_res;
-    REQUIRE(store.record_attestation(cid, "user", "alice", "Admin", "attested", "carol", "ok")
+    REQUIRE(store.record_attestation(cid, "user", "alice", "Admin", kFleetScope, "attested", "carol", "ok")
                 .has_value());
     REQUIRE(store.close_campaign(cid, "admin").has_value());
 
     auto late =
-        store.record_attestation(cid, "user", "alice", "Admin", "flagged_revoke", "dave", "late");
+        store.record_attestation(cid, "user", "alice", "Admin", kFleetScope, "flagged_revoke", "dave", "late");
     REQUIRE_FALSE(late.has_value());
     CHECK(late.error().starts_with("not_found:"));
 
     auto view = store.get_campaign(cid, true);
     REQUIRE(view.has_value());
-    const auto* row = find_row(*view, "user", "alice", "Admin");
+    const auto* row = find_row(*view, "user", "alice", "Admin", kFleetScope);
     REQUIRE(row != nullptr);
     CHECK(row->decision == "attested");
     CHECK(row->decision_seq == 1);
@@ -773,7 +784,7 @@ TEST_CASE("not_found: mapping on attestation/get/close for a bogus campaign_id",
     AccessReviewStore store{pool};
     REQUIRE(store.is_open());
 
-    auto att = store.record_attestation("bogus-campaign-id", "user", "alice", "Admin", "attested",
+    auto att = store.record_attestation("bogus-campaign-id", "user", "alice", "Admin", kFleetScope, "attested",
                                         "carol", "");
     REQUIRE_FALSE(att.has_value());
     CHECK(att.error().starts_with("not_found:"));
@@ -810,7 +821,7 @@ TEST_CASE("get/record/close refuse a malformed campaign_id with bad_request, nev
         REQUIRE_FALSE(get.has_value());
         CHECK(get.error().starts_with("bad_request:"));
 
-        auto att = store.record_attestation(bad, "user", "alice", "Admin", "attested", "carol", "");
+        auto att = store.record_attestation(bad, "user", "alice", "Admin", kFleetScope, "attested", "carol", "");
         REQUIRE_FALSE(att.has_value());
         CHECK(att.error().starts_with("bad_request:"));
 
@@ -837,7 +848,7 @@ TEST_CASE("a well-formed but unknown campaign_id is still not_found (64 bytes ac
     auto get = store.get_campaign(id64);
     REQUIRE_FALSE(get.has_value());
     CHECK(get.error().starts_with("not_found:"));
-    auto att = store.record_attestation(id64, "user", "alice", "Admin", "attested", "carol", "");
+    auto att = store.record_attestation(id64, "user", "alice", "Admin", kFleetScope, "attested", "carol", "");
     REQUIRE_FALSE(att.has_value());
     CHECK(att.error().starts_with("not_found:"));
     auto close = store.close_campaign(id64, "admin");
@@ -859,17 +870,17 @@ TEST_CASE("record_attestation refuses an embedded NUL in any text field and writ
 
     // principal_id "alice\0x" would truncate to the real grant "alice" and decide it.
     const std::string alice_nul("alice\0x", 7);
-    auto r1 = store.record_attestation(cid, "user", alice_nul, "Admin", "attested", "carol", "");
+    auto r1 = store.record_attestation(cid, "user", alice_nul, "Admin", kFleetScope, "attested", "carol", "");
     REQUIRE_FALSE(r1.has_value());
     CHECK(r1.error().starts_with("bad_request:"));
-    auto r2 = store.record_attestation(cid, "user", "alice", std::string("Admin\0x", 7), "attested",
+    auto r2 = store.record_attestation(cid, "user", "alice", std::string("Admin\0x", 7), kFleetScope, "attested",
                                        "carol", "");
     REQUIRE_FALSE(r2.has_value());
     CHECK(r2.error().starts_with("bad_request:"));
-    auto r3 = store.record_attestation(cid, "user", "alice", "Admin", "attested", "carol", nul);
+    auto r3 = store.record_attestation(cid, "user", "alice", "Admin", kFleetScope, "attested", "carol", nul);
     REQUIRE_FALSE(r3.has_value());
     CHECK(r3.error().starts_with("bad_request:"));
-    auto r4 = store.record_attestation(cid, "user", "alice", "Admin", "attested", nul, "ok");
+    auto r4 = store.record_attestation(cid, "user", "alice", "Admin", kFleetScope, "attested", nul, "ok");
     REQUIRE_FALSE(r4.has_value());
     CHECK(r4.error().starts_with("bad_request:"));
 
@@ -895,7 +906,7 @@ TEST_CASE("record_attestation refuses an embedded NUL in principal_type and writ
     const auto cid = *open_res;
 
     // "user\0x" would truncate to the real principal_type "user" and decide alice's row.
-    auto r = store.record_attestation(cid, std::string("user\0x", 6), "alice", "Admin", "attested",
+    auto r = store.record_attestation(cid, std::string("user\0x", 6), "alice", "Admin", kFleetScope, "attested",
                                       "carol", "");
     REQUIRE_FALSE(r.has_value());
     CHECK(r.error().starts_with("bad_request:"));
@@ -972,7 +983,7 @@ TEST_CASE("record_attestation refuses an empty reviewer and an over-long grant f
     const auto cid = *open_res;
 
     // An empty reviewer: bad_request (400), the same posture as close_campaign's empty closed_by.
-    auto empty = store.record_attestation(cid, "user", "alice", "Admin", "attested", "", "ok");
+    auto empty = store.record_attestation(cid, "user", "alice", "Admin", kFleetScope, "attested", "", "ok");
     REQUIRE_FALSE(empty.has_value());
     CHECK(empty.error().starts_with("bad_request:"));
     CHECK(empty.error().find("reviewer") != std::string::npos);
@@ -984,16 +995,16 @@ TEST_CASE("record_attestation refuses an empty reviewer and an over-long grant f
     const std::string text = "bad_request: " + std::string(yuzu::server::kGrantFieldInvalidMessage);
     const std::string over(1025, 'a');
     const std::string at_cap(1024, 'a');
-    auto r1 = store.record_attestation(cid, "user", over, "Admin", "attested", "carol", "");
+    auto r1 = store.record_attestation(cid, "user", over, "Admin", kFleetScope, "attested", "carol", "");
     REQUIRE_FALSE(r1.has_value());
     CHECK(r1.error() == text);
-    auto r2 = store.record_attestation(cid, "user", "alice", over, "attested", "carol", "");
+    auto r2 = store.record_attestation(cid, "user", "alice", over, kFleetScope, "attested", "carol", "");
     REQUIRE_FALSE(r2.has_value());
     CHECK(r2.error() == text);
-    auto r3 = store.record_attestation(cid, over, "alice", "Admin", "attested", "carol", "");
+    auto r3 = store.record_attestation(cid, over, "alice", "Admin", kFleetScope, "attested", "carol", "");
     REQUIRE_FALSE(r3.has_value());
     CHECK(r3.error() == text);
-    auto ok_len = store.record_attestation(cid, "user", at_cap, "Admin", "attested", "carol", "");
+    auto ok_len = store.record_attestation(cid, "user", at_cap, "Admin", kFleetScope, "attested", "carol", "");
     REQUIRE_FALSE(ok_len.has_value());
     CHECK(ok_len.error().starts_with("not_found:"));
 
@@ -1006,16 +1017,16 @@ TEST_CASE("record_attestation refuses an empty reviewer and an over-long grant f
     const std::string wide_over = wide_at_cap + "\xC3\xA9";
     REQUIRE(wide_at_cap.size() == 1024);
     REQUIRE(wide_over.size() == 1026);
-    auto w1 = store.record_attestation(cid, "user", wide_at_cap, "Admin", "attested", "carol", "");
+    auto w1 = store.record_attestation(cid, "user", wide_at_cap, "Admin", kFleetScope, "attested", "carol", "");
     REQUIRE_FALSE(w1.has_value());
     CHECK(w1.error().starts_with("not_found:"));
-    auto w2 = store.record_attestation(cid, "user", wide_over, "Admin", "attested", "carol", "");
+    auto w2 = store.record_attestation(cid, "user", wide_over, "Admin", kFleetScope, "attested", "carol", "");
     REQUIRE_FALSE(w2.has_value());
     CHECK(w2.error() == text);
-    auto w3 = store.record_attestation(cid, "user", "alice", wide_at_cap, "attested", "carol", "");
+    auto w3 = store.record_attestation(cid, "user", "alice", wide_at_cap, kFleetScope, "attested", "carol", "");
     REQUIRE_FALSE(w3.has_value());
     CHECK(w3.error().starts_with("not_found:"));
-    auto w4 = store.record_attestation(cid, "user", "alice", wide_over, "attested", "carol", "");
+    auto w4 = store.record_attestation(cid, "user", "alice", wide_over, kFleetScope, "attested", "carol", "");
     REQUIRE_FALSE(w4.has_value());
     CHECK(w4.error() == text);
 
@@ -1052,14 +1063,14 @@ TEST_CASE("record_attestation: an engine grant refuses the owner frozen at campa
     const auto cid = *open_res;
 
     auto refused =
-        store.record_attestation(cid, "engine", "engine:own", "Writer", "attested", "owen", "");
+        store.record_attestation(cid, "engine", "engine:own", "Writer", kFleetScope, "attested", "owen", "");
     REQUIRE_FALSE(refused.has_value());
     CHECK(refused.error() == std::string(yuzu::server::kStoreForbiddenEngineOwner));
     CHECK(refused.error().starts_with("forbidden:"));
     // Refused before the history INSERT: nothing recorded, the grant is still pending.
     auto view = store.get_campaign(cid, true);
     REQUIRE(view.has_value());
-    const auto* own = find_row(*view, "engine", "engine:own", "Writer");
+    const auto* own = find_row(*view, "engine", "engine:own", "Writer", kFleetScope);
     REQUIRE(own != nullptr);
     CHECK(own->decision == "pending");
     CHECK(own->decision_seq == 0);
@@ -1068,17 +1079,17 @@ TEST_CASE("record_attestation: an engine grant refuses the owner frozen at campa
     // Another reviewer is admitted; the owner is refused again afterwards (the rule is per
     // reviewer, not per grant state).
     auto other =
-        store.record_attestation(cid, "engine", "engine:own", "Writer", "attested", "carol", "");
+        store.record_attestation(cid, "engine", "engine:own", "Writer", kFleetScope, "attested", "carol", "");
     REQUIRE(other.has_value());
     auto again =
-        store.record_attestation(cid, "engine", "engine:own", "Writer", "attested", "owen", "");
+        store.record_attestation(cid, "engine", "engine:own", "Writer", kFleetScope, "attested", "owen", "");
     REQUIRE_FALSE(again.has_value());
     CHECK(again.error() == std::string(yuzu::server::kStoreForbiddenEngineOwner));
 
     // Nothing to compare against: an empty owner, a non-JSON snapshot, a non-string owner.
     for (const char* id : {"engine:orphan", "engine:junk", "engine:typed"}) {
         INFO(id);
-        auto ok = store.record_attestation(cid, "engine", id, "Writer", "attested", "owen", "");
+        auto ok = store.record_attestation(cid, "engine", id, "Writer", kFleetScope, "attested", "owen", "");
         CHECK(ok.has_value());
     }
     // The frozen owner only matters for ENGINE grants: a USER (or group) grant whose snapshot
@@ -1092,10 +1103,10 @@ TEST_CASE("record_attestation: an engine grant refuses the owner frozen at campa
         store.open_campaign("Frozen owner, other types", "admin", others, "enabled");
     REQUIRE(other_campaign.has_value());
     CHECK(
-        store.record_attestation(*other_campaign, "user", "dave", "Reader", "attested", "owen", "")
+        store.record_attestation(*other_campaign, "user", "dave", "Reader", kFleetScope, "attested", "owen", "")
             .has_value());
     CHECK(
-        store.record_attestation(*other_campaign, "group", "eng", "Reader", "attested", "owen", "")
+        store.record_attestation(*other_campaign, "group", "eng", "Reader", kFleetScope, "attested", "owen", "")
             .has_value());
 }
 
@@ -1117,14 +1128,14 @@ TEST_CASE(
     auto open_res = store.open_campaign("Times", "admin", three_grants(), "enabled");
     REQUIRE(open_res.has_value());
     const auto cid = *open_res;
-    auto rec = store.record_attestation(cid, "user", "alice", "Admin", "attested", "carol", "ok");
+    auto rec = store.record_attestation(cid, "user", "alice", "Admin", kFleetScope, "attested", "carol", "ok");
     REQUIRE(rec.has_value());
     REQUIRE(store.close_campaign(cid, "admin").has_value());
     const auto after = sys_ms();
 
     auto view = store.get_campaign(cid, true);
     REQUIRE(view.has_value());
-    const auto* row = find_row(*view, "user", "alice", "Admin");
+    const auto* row = find_row(*view, "user", "alice", "Admin", kFleetScope);
     REQUIRE(row != nullptr);
     constexpr std::int64_t kSlack = 120000; // DB and test share a host in CI; generous for skew
     for (const std::int64_t t :
@@ -1167,11 +1178,11 @@ TEST_CASE("record_attestation and close_campaign: a store fault returns a fixed 
             PQexec(conn.get(), "DROP TABLE access_review_store.access_review_attestation_history")};
         REQUIRE(d.ok());
     }
-    auto rec = store.record_attestation(cid, "user", "alice", "Admin", "attested", "carol", "");
+    auto rec = store.record_attestation(cid, "user", "alice", "Admin", kFleetScope, "attested", "carol", "");
     REQUIRE_FALSE(rec.has_value());
     CHECK(rec.error() == "record_attestation history write failed");
     CHECK(not_a_refusal(rec.error()));
-    auto again = store.record_attestation(cid, "user", "alice", "Admin", "attested", "dave", "");
+    auto again = store.record_attestation(cid, "user", "alice", "Admin", kFleetScope, "attested", "dave", "");
     REQUIRE_FALSE(again.has_value());
     CHECK(again.error() == "record_attestation history write failed");
 
@@ -1218,7 +1229,7 @@ TEST_CASE("record_attestation: a frozen grant with the longest ids the identity 
 
     for (const auto& g : grants) {
         INFO(g.principal_type);
-        auto r = store.record_attestation(cid, g.principal_type, g.principal_id, g.role_name,
+        auto r = store.record_attestation(cid, g.principal_type, g.principal_id, g.role_name, kFleetScope,
                                           "attested", "carol", "ok");
         REQUIRE(r.has_value());
         CHECK(r->seq == 1);
@@ -1226,7 +1237,7 @@ TEST_CASE("record_attestation: a frozen grant with the longest ids the identity 
     auto view = store.get_campaign(cid, /*include_history=*/true);
     REQUIRE(view.has_value());
     CHECK(view->pending_count == 0);
-    const auto* row = find_row(*view, "group", group_id, max_role);
+    const auto* row = find_row(*view, "group", group_id, max_role, kFleetScope);
     REQUIRE(row != nullptr);
     CHECK(row->history.size() == 1);
 }
@@ -1242,7 +1253,7 @@ TEST_CASE("record_attestation caps justification at 4096 bytes", "[access_review
     const auto cid = *open_res;
     REQUIRE(yuzu::server::kMaxJustificationBytes == 4096);
 
-    auto over = store.record_attestation(cid, "user", "alice", "Admin", "attested", "carol",
+    auto over = store.record_attestation(cid, "user", "alice", "Admin", kFleetScope, "attested", "carol",
                                          std::string(4097, 'j'));
     REQUIRE_FALSE(over.has_value());
     CHECK(over.error().starts_with("bad_request:"));
@@ -1250,7 +1261,7 @@ TEST_CASE("record_attestation caps justification at 4096 bytes", "[access_review
     REQUIRE(still_pending.has_value());
     CHECK(still_pending->pending_count == 3);
 
-    auto at_cap = store.record_attestation(cid, "user", "alice", "Admin", "attested", "carol",
+    auto at_cap = store.record_attestation(cid, "user", "alice", "Admin", kFleetScope, "attested", "carol",
                                            std::string(4096, 'j'));
     REQUIRE(at_cap.has_value());
     auto decided = store.get_campaign(cid);
@@ -1273,7 +1284,7 @@ TEST_CASE("record_attestation on a grant never in the frozen population is not_f
 
     // A real, open campaign — but this (principal, role) tuple was never in
     // the frozen population.
-    auto rec = store.record_attestation(*open_res, "user", "nobody", "NoSuchRole", "attested",
+    auto rec = store.record_attestation(*open_res, "user", "nobody", "NoSuchRole", kFleetScope, "attested",
                                         "carol", "");
     REQUIRE_FALSE(rec.has_value());
     CHECK(rec.error().starts_with("not_found:"));
@@ -1309,7 +1320,7 @@ TEST_CASE("campaign evidence persists across a fresh store/connection — there 
         auto open_res = store.open_campaign("Durable", "admin", three_grants(), "degraded");
         REQUIRE(open_res.has_value());
         cid = *open_res;
-        REQUIRE(store.record_attestation(cid, "user", "alice", "Admin", "attested", "carol", "")
+        REQUIRE(store.record_attestation(cid, "user", "alice", "Admin", kFleetScope, "attested", "carol", "")
                    .has_value());
     } // pool/store fully torn down here
 
@@ -1474,7 +1485,7 @@ TEST_CASE("schema v3 guards refuse every raw-SQL route around record_attestation
     auto open_res = store.open_campaign("Guards", "admin", three_grants(), "enabled");
     REQUIRE(open_res.has_value());
     const auto cid = *open_res;
-    REQUIRE(store.record_attestation(cid, "user", "alice", "Admin", "attested", "carol", "ok")
+    REQUIRE(store.record_attestation(cid, "user", "alice", "Admin", kFleetScope, "attested", "carol", "ok")
                 .has_value());
 
     PgConn conn{PQconnectdb(db.dsn().c_str())};
@@ -1495,9 +1506,10 @@ TEST_CASE("schema v3 guards refuse every raw-SQL route around record_attestation
     // A decided row inserted directly.
     CHECK(integrity_violation(
         sqlstate_of(c, "INSERT INTO " + att +
-                           " (campaign_id, principal_type, principal_id, role_name, decision, "
-                           "reviewer, decided_at_ms, justification, grant_snapshot) VALUES ('" +
-                           cid + "','user','mallory','Admin','attested','carol',1,'','{}')")));
+                           " (campaign_id, principal_type, principal_id, role_name, scope_group_id, "
+                           "decision, reviewer, decided_at_ms, justification, grant_snapshot) "
+                           "VALUES ('" +
+                           cid + "','user','mallory','Admin','','attested','carol',1,'','{}')")));
     // A justification-only edit of a pending row.
     CHECK(integrity_violation(sqlstate_of(c, "UPDATE " + att + " SET justification='x' WHERE " +
                                                  key + "group' AND principal_id='eng'")));
@@ -1514,9 +1526,9 @@ TEST_CASE("schema v3 guards refuse every raw-SQL route around record_attestation
     CHECK(sqlstate_of(c,
                       "INSERT INTO " + hist +
                           " (campaign_id, principal_type, principal_id, "
-                          "role_name, seq, decision, previous_decision, reviewer, justification, "
-                          "decided_at_ms) VALUES ('" +
-                          cid + "','user','alice','Admin',2,'attested','attested','alice','',9)") ==
+                          "role_name, scope_group_id, seq, decision, previous_decision, reviewer, "
+                          "justification, decided_at_ms) VALUES ('" +
+                          cid + "','user','alice','Admin','',2,'attested','attested','alice','',9)") ==
           "23514");
 
     // A history row committed with no state change is refused AT COMMIT (deferred consistency
@@ -1525,9 +1537,9 @@ TEST_CASE("schema v3 guards refuse every raw-SQL route around record_attestation
     CHECK(
         sqlstate_of(c, "INSERT INTO " + hist +
                            " (campaign_id, principal_type, principal_id, "
-                           "role_name, seq, decision, previous_decision, reviewer, justification, "
-                           "decided_at_ms) VALUES ('" +
-                           cid + "','group','eng','Reader',1,'attested','pending','carol','',5)")
+                           "role_name, scope_group_id, seq, decision, previous_decision, reviewer, "
+                           "justification, decided_at_ms) VALUES ('" +
+                           cid + "','group','eng','Reader','',1,'attested','pending','carol','',5)")
             .empty());
     CHECK(integrity_violation(sqlstate_of(c, "COMMIT")));
 
@@ -1537,9 +1549,9 @@ TEST_CASE("schema v3 guards refuse every raw-SQL route around record_attestation
     CHECK(
         sqlstate_of(c, "INSERT INTO " + hist +
                            " (campaign_id, principal_type, principal_id, "
-                           "role_name, seq, decision, previous_decision, reviewer, justification, "
-                           "decided_at_ms) VALUES ('" +
-                           cid + "','group','eng','Reader',1,'attested','pending','carol','',5)")
+                           "role_name, scope_group_id, seq, decision, previous_decision, reviewer, "
+                           "justification, decided_at_ms) VALUES ('" +
+                           cid + "','group','eng','Reader','',1,'attested','pending','carol','',5)")
             .empty());
     CHECK(sqlstate_of(c, "UPDATE " + att +
                              " SET decision='attested', reviewer='carol', "
@@ -1553,13 +1565,13 @@ TEST_CASE("schema v3 guards refuse every raw-SQL route around record_attestation
     REQUIRE(view.has_value());
     CHECK(view->attestations.size() == 3);
     CHECK(view->pending_count == 2);
-    const auto* alice = find_row(*view, "user", "alice", "Admin");
+    const auto* alice = find_row(*view, "user", "alice", "Admin", kFleetScope);
     REQUIRE(alice != nullptr);
     CHECK(alice->decision == "attested");
     CHECK(alice->reviewer == "carol");
     CHECK(alice->decision_seq == 1);
     CHECK(alice->history.size() == 1);
-    const auto* eng = find_row(*view, "group", "eng", "Reader");
+    const auto* eng = find_row(*view, "group", "eng", "Reader", kFleetScope);
     REQUIRE(eng != nullptr);
     CHECK(eng->decision == "pending");
     CHECK(eng->decision_seq == 0);
@@ -1569,7 +1581,7 @@ TEST_CASE("schema v3 guards refuse every raw-SQL route around record_attestation
     // guard), and the next decision on the grant the failed emulations touched lands at seq 1
     // with no primary-key collision.
     CHECK(store.open_campaign("After guards", "admin", three_grants(), "enabled").has_value());
-    auto next = store.record_attestation(cid, "group", "eng", "Reader", "attested", "dave", "");
+    auto next = store.record_attestation(cid, "group", "eng", "Reader", kFleetScope, "attested", "dave", "");
     REQUIRE(next.has_value());
     CHECK(next->previous_decision == "pending");
     CHECK(next->seq == 1);
@@ -1617,9 +1629,9 @@ TEST_CASE("schema v3 guard: every field the state row must share with its histor
                               "AND role_name='Reader'";
     const auto insert_history = [&](int seq) {
         return "INSERT INTO " + hist +
-               " (campaign_id, principal_type, principal_id, role_name, seq, decision, "
-               "previous_decision, reviewer, justification, decided_at_ms) VALUES ('" +
-               cid + "','group','eng','Reader'," + std::to_string(seq) +
+               " (campaign_id, principal_type, principal_id, role_name, scope_group_id, seq, "
+               "decision, previous_decision, reviewer, justification, decided_at_ms) VALUES ('" +
+               cid + "','group','eng','Reader',''," + std::to_string(seq) +
                ",'attested','pending','carol','j',5)";
     };
     // The state UPDATE with every value matching the history row, `set` overriding one.
@@ -1662,10 +1674,10 @@ TEST_CASE("schema v3 guard: every field the state row must share with its histor
         REQUIRE(failure_of(c, "BEGIN").empty());
         REQUIRE(failure_of(
                     c, "INSERT INTO " + hist +
-                           " (campaign_id, principal_type, principal_id, role_name, seq, "
-                           "decision, previous_decision, reviewer, justification, decided_at_ms) "
-                           "VALUES ('" +
-                           cid + "','group','eng','Reader',1,'attested','attested','carol','j',5)")
+                           " (campaign_id, principal_type, principal_id, role_name, scope_group_id, "
+                           "seq, decision, previous_decision, reviewer, justification, "
+                           "decided_at_ms) VALUES ('" +
+                           cid + "','group','eng','Reader','',1,'attested','attested','carol','j',5)")
                     .empty());
         const auto got = failure_of(c, update_state("attested", "carol", "5", "j", 1));
         REQUIRE(failure_of(c, "ROLLBACK").empty());
@@ -1692,13 +1704,13 @@ TEST_CASE("schema v3 guard: every field the state row must share with its histor
     // Nothing from any probe landed: the grant is still pending at seq 0 with no history.
     auto view = store.get_campaign(cid, true);
     REQUIRE(view.has_value());
-    const auto* eng = find_row(*view, "group", "eng", "Reader");
+    const auto* eng = find_row(*view, "group", "eng", "Reader", kFleetScope);
     REQUIRE(eng != nullptr);
     CHECK(eng->decision == "pending");
     CHECK(eng->decision_seq == 0);
     CHECK(eng->history.empty());
     // And the store still records on that grant.
-    auto next = store.record_attestation(cid, "group", "eng", "Reader", "attested", "dave", "");
+    auto next = store.record_attestation(cid, "group", "eng", "Reader", kFleetScope, "attested", "dave", "");
     REQUIRE(next.has_value());
     CHECK(next->seq == 1);
 }
@@ -1763,12 +1775,12 @@ TEST_CASE(
                                             std::string(kPreview, 'e'),
                                             std::string(kPreview + 1, 'f'), std::string(4096, 'g')};
     for (const auto& t : texts)
-        REQUIRE(store.record_attestation(cid, "user", "alice", "Admin", "attested", "carol", t)
+        REQUIRE(store.record_attestation(cid, "user", "alice", "Admin", kFleetScope, "attested", "carol", t)
                     .has_value());
 
     auto view = store.get_campaign(cid, true);
     REQUIRE(view.has_value());
-    const auto* row = find_row(*view, "user", "alice", "Admin");
+    const auto* row = find_row(*view, "user", "alice", "Admin", kFleetScope);
     REQUIRE(row != nullptr);
     REQUIRE(row->decision_seq == 5);
     REQUIRE(row->history.size() == 5);
@@ -1802,12 +1814,12 @@ TEST_CASE(
 
     // A grant decided once has only its latest entry: never cut, never flagged.
     REQUIRE(store
-                .record_attestation(cid, "group", "eng", "Reader", "attested", "carol",
+                .record_attestation(cid, "group", "eng", "Reader", kFleetScope, "attested", "carol",
                                     std::string(4096, 'z'))
                 .has_value());
     auto again = store.get_campaign(cid, true);
     REQUIRE(again.has_value());
-    const auto* once = find_row(*again, "group", "eng", "Reader");
+    const auto* once = find_row(*again, "group", "eng", "Reader", kFleetScope);
     REQUIRE(once != nullptr);
     REQUIRE(once->history.size() == 1);
     CHECK(once->history[0].justification == std::string(4096, 'z'));
@@ -1841,12 +1853,12 @@ TEST_CASE("get_campaign history: the cut counts characters, so a multibyte justi
     const std::string three = repeat("\xE2\x82\xAC", kLong); // U+20AC
     const std::string last = repeat("\xC3\xA9", kLong);
     for (const auto& t : {two, three, last})
-        REQUIRE(store.record_attestation(cid, "user", "alice", "Admin", "attested", "carol", t)
+        REQUIRE(store.record_attestation(cid, "user", "alice", "Admin", kFleetScope, "attested", "carol", t)
                     .has_value());
 
     auto view = store.get_campaign(cid, true);
     REQUIRE(view.has_value());
-    const auto* row = find_row(*view, "user", "alice", "Admin");
+    const auto* row = find_row(*view, "user", "alice", "Admin", kFleetScope);
     REQUIRE(row != nullptr);
     REQUIRE(row->history.size() == 3);
     CHECK(row->history[0].justification == repeat("\xC3\xA9", kPreview));
@@ -1892,10 +1904,10 @@ TEST_CASE("two attests of one grant serialise on the row lock and chain to seq 2
     held.run(grant_lock_sql(cid));
     yuzu::test::Workers workers([&] { held.rollback(); });
     workers.add([&] {
-        r1 = store.record_attestation(cid, "user", "alice", "Admin", "attested", "carol", "a");
+        r1 = store.record_attestation(cid, "user", "alice", "Admin", kFleetScope, "attested", "carol", "a");
     });
     workers.add([&] {
-        r2 = store.record_attestation(cid, "user", "alice", "Admin", "flagged_revoke", "dave", "b");
+        r2 = store.record_attestation(cid, "user", "alice", "Admin", kFleetScope, "flagged_revoke", "dave", "b");
     });
     REQUIRE(wait_for_row_lock_waiters(pool, 2)); // both are parked behind the held row
     held.rollback();
@@ -1908,7 +1920,7 @@ TEST_CASE("two attests of one grant serialise on the row lock and chain to seq 2
     CHECK((r1->seq == 1 ? r1->previous_decision : r2->previous_decision) == "pending");
     auto view = store.get_campaign(cid, true);
     REQUIRE(view.has_value());
-    const auto* row = find_row(*view, "user", "alice", "Admin");
+    const auto* row = find_row(*view, "user", "alice", "Admin", kFleetScope);
     REQUIRE(row != nullptr);
     CHECK(row->decision_seq == 2);
     REQUIRE(row->history.size() == 2);
@@ -1939,7 +1951,7 @@ TEST_CASE("a close issued while an attest holds its locks waits, then succeeds; 
     workers.join_all();
     REQUIRE(closed.has_value());
 
-    auto late = store.record_attestation(cid, "user", "alice", "Admin", "attested", "carol", "");
+    auto late = store.record_attestation(cid, "user", "alice", "Admin", kFleetScope, "attested", "carol", "");
     REQUIRE_FALSE(late.has_value());
     CHECK(late.error().starts_with("not_found:"));
     auto view = store.get_campaign(cid, true);
@@ -1966,7 +1978,7 @@ TEST_CASE("an attest issued while a close is in flight waits, then is not_found 
              cid + "'");
     yuzu::test::Workers workers([&] { held.rollback(); });
     workers.add([&] {
-        attested = store.record_attestation(cid, "user", "alice", "Admin", "attested", "carol", "");
+        attested = store.record_attestation(cid, "user", "alice", "Admin", kFleetScope, "attested", "carol", "");
     });
     REQUIRE(yuzu::test::wait_for_lock_waiter(pool)); // the attest is parked behind the close
     held.commit();
@@ -2008,7 +2020,7 @@ TEST_CASE("record_attestation and close_campaign: the row-lock wait is bounded a
     yuzu::test::Workers workers([&] { held.rollback(); });
     workers.add([&] {
         const auto t0 = std::chrono::steady_clock::now();
-        attested = store.record_attestation(cid, "user", "alice", "Admin", "attested", "carol", "");
+        attested = store.record_attestation(cid, "user", "alice", "Admin", kFleetScope, "attested", "carol", "");
         attest_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - t0);
     });
@@ -2037,7 +2049,7 @@ TEST_CASE("record_attestation and close_campaign: the row-lock wait is bounded a
     auto view = store.get_campaign(cid, true);
     REQUIRE(view.has_value());
     CHECK(view->campaign.status == "open");
-    const auto* row = find_row(*view, "user", "alice", "Admin");
+    const auto* row = find_row(*view, "user", "alice", "Admin", kFleetScope);
     REQUIRE(row != nullptr);
     CHECK(row->decision == "pending");
 }
@@ -2072,7 +2084,7 @@ TEST_CASE("a close waiting behind an attest does not block a new attest of anoth
     REQUIRE(yuzu::test::wait_for_lock_waiter(pool)); // the close is parked behind attest A
 
     // Attest B, a different grant of the same campaign, is issued AFTER the close queued.
-    auto b = store.record_attestation(cid, "group", "eng", "Reader", "attested", "carol", "");
+    auto b = store.record_attestation(cid, "group", "eng", "Reader", kFleetScope, "attested", "carol", "");
     b_done = true;
     REQUIRE(b.has_value());
     CHECK(b->seq == 1);
@@ -2089,7 +2101,7 @@ TEST_CASE("a close waiting behind an attest does not block a new attest of anoth
     auto view = store.get_campaign(cid, true);
     REQUIRE(view.has_value());
     CHECK(view->campaign.status == "open");
-    const auto* eng = find_row(*view, "group", "eng", "Reader");
+    const auto* eng = find_row(*view, "group", "eng", "Reader", kFleetScope);
     REQUIRE(eng != nullptr);
     CHECK(eng->decision == "attested");
     CHECK(eng->decision_seq == 1);
@@ -2168,8 +2180,16 @@ TEST_CASE("AccessReviewStore: a genuine v2->v3 upgrade backfills the history and
     {
         PgConn conn{PQconnectdb(db.dsn().c_str())};
         REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        // The store applies every migration after the seeded version, so a v2 database ends at
+        // v4 (v3 here, then v4's scope key on top of the backfilled rows).
         CHECK(scalar_of(conn.get(), "SELECT version FROM public.schema_meta WHERE store = "
-                                    "'access_review_store'") == "3");
+                                    "'access_review_store'") == "4");
+        // The backfilled rows carry the fleet-wide scope, and the state key now names it.
+        CHECK(scalar_of(conn.get(), "SELECT count(*) FROM access_review_store."
+                                    "access_review_attestation WHERE scope_group_id <> ''") == "0");
+        CHECK(scalar_of(conn.get(), "SELECT count(*) FROM access_review_store."
+                                    "access_review_attestation_history WHERE scope_group_id <> ''") ==
+              "0");
     }
 
     auto view = store.get_campaign("c1", true);
@@ -2177,7 +2197,7 @@ TEST_CASE("AccessReviewStore: a genuine v2->v3 upgrade backfills the history and
     REQUIRE(view->attestations.size() == 4);
     CHECK(view->pending_count == 2);
     // A decided row: seq 1, one backfilled history row, "not recorded" as the prior decision.
-    const auto* alice = find_row(*view, "user", "alice", "Admin");
+    const auto* alice = find_row(*view, "user", "alice", "Admin", kFleetScope);
     REQUIRE(alice != nullptr);
     CHECK(alice->decision == "attested");
     CHECK(alice->decision_seq == 1);
@@ -2188,27 +2208,27 @@ TEST_CASE("AccessReviewStore: a genuine v2->v3 upgrade backfills the history and
     CHECK(alice->history[0].reviewer == "carol");
     CHECK(alice->history[0].justification == "ok");
     CHECK(alice->history[0].decided_at_ms == 1234);
-    const auto* eng = find_row(*view, "group", "eng", "Reader");
+    const auto* eng = find_row(*view, "group", "eng", "Reader", kFleetScope);
     REQUIRE(eng != nullptr);
     CHECK(eng->decision == "flagged_revoke");
     CHECK(eng->decision_seq == 1);
     REQUIRE(eng->history.size() == 1);
     CHECK(eng->history[0].decided_at_ms == 1235);
     // A pending row: seq 0 and no history.
-    const auto* bob = find_row(*view, "user", "bob", "Operator");
+    const auto* bob = find_row(*view, "user", "bob", "Operator", kFleetScope);
     REQUIRE(bob != nullptr);
     CHECK(bob->decision == "pending");
     CHECK(bob->decision_seq == 0);
     CHECK(bob->history.empty());
 
     // The next decision on a migrated row chains behind the backfill.
-    auto next = store.record_attestation("c1", "user", "alice", "Admin", "flagged_revoke", "dave",
+    auto next = store.record_attestation("c1", "user", "alice", "Admin", kFleetScope, "flagged_revoke", "dave",
                                          "revisit");
     REQUIRE(next.has_value());
     CHECK(next->previous_decision == "attested");
     CHECK(next->seq == 2);
     // And a pending one starts at 1.
-    auto first = store.record_attestation("c1", "user", "bob", "Operator", "attested", "carol", "");
+    auto first = store.record_attestation("c1", "user", "bob", "Operator", kFleetScope, "attested", "carol", "");
     REQUIRE(first.has_value());
     CHECK(first->previous_decision == "pending");
     CHECK(first->seq == 1);
@@ -2250,4 +2270,894 @@ TEST_CASE("AccessReviewStore: a v2 database holding a self-recorded decision is 
     CHECK(scalar_of(conn.get(), "SELECT to_regclass('access_review_store."
                                 "access_review_attestation_history')::text")
               .empty());
+}
+
+// ── Schema v4: every grant is keyed by its SCOPE (#6969) ────────────────────
+
+namespace {
+
+// The same principal and role held fleet-wide and on two management groups, plus a second role on
+// one scope. The group NAMES are chosen so name order (alpha < zeta) differs from id order
+// (g-1 < g-2): the store keys and orders by id, never by name.
+std::vector<GrantRef> scoped_grants() {
+    const std::string fleet_snap = R"({"display_name":"alice","scope_group_name":""})";
+    const std::string g1_snap = R"({"display_name":"alice","scope_group_name":"zeta"})";
+    const std::string g2_snap = R"({"display_name":"alice","scope_group_name":"alpha"})";
+    return {
+        GrantRef{"user", "alice", "Operator", fleet_snap, ""},
+        GrantRef{"user", "alice", "Operator", g1_snap, "g-1"},
+        GrantRef{"user", "alice", "Operator", g2_snap, "g-2"},
+        GrantRef{"user", "alice", "Viewer", g1_snap, "g-1"},
+    };
+}
+
+// Every column of one attestation / history row a raw-SQL probe has to name, in one spot.
+constexpr const char* kAtt = "access_review_store.access_review_attestation";
+constexpr const char* kHist = "access_review_store.access_review_attestation_history";
+
+std::string hist_insert_sql(const std::string& cid, const std::string& scope, int seq,
+                            const std::string& decision, const std::string& previous,
+                            const std::string& reviewer, const std::string& decided_at_ms) {
+    return std::string("INSERT INTO ") + kHist +
+           " (campaign_id, principal_type, principal_id, role_name, scope_group_id, seq, decision, "
+           "previous_decision, reviewer, justification, decided_at_ms) VALUES ('" +
+           cid + "','user','alice','Operator','" + scope + "'," + std::to_string(seq) + ",'" +
+           decision + "','" + previous + "','" + reviewer + "','ok'," + decided_at_ms + ")";
+}
+
+} // namespace
+
+TEST_CASE("schema v4: the same principal and role at fleet scope and on two groups freeze as "
+          "distinct pending rows, in scope-id order",
+          "[access_review][store][pg][6969]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, access_review_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    AccessReviewStore store{pool};
+    REQUIRE(store.is_open());
+
+    auto open_res = store.open_campaign("Scoped", "admin", scoped_grants(), "enabled");
+    REQUIRE(open_res.has_value());
+    auto view = store.get_campaign(*open_res, true);
+    REQUIRE(view.has_value());
+    REQUIRE(view->attestations.size() == 4);
+    CHECK(view->pending_count == 4);
+
+    // Key order: type, id, role, then scope. Fleet ("") sorts before any group id, and g-1 before
+    // g-2 although its name ("zeta") sorts after g-2's ("alpha").
+    const std::vector<std::pair<std::string, std::string>> expected = {
+        {"Operator", ""}, {"Operator", "g-1"}, {"Operator", "g-2"}, {"Viewer", "g-1"}};
+    for (std::size_t i = 0; i < expected.size(); ++i) {
+        INFO("row " << i);
+        CHECK(view->attestations[i].role_name == expected[i].first);
+        CHECK(view->attestations[i].scope_group_id == expected[i].second);
+        CHECK(view->attestations[i].decision == "pending");
+        CHECK(view->attestations[i].decision_seq == 0);
+        CHECK(view->attestations[i].history.empty());
+    }
+    // Each row keeps its own frozen snapshot (the group name is evidence of the freeze).
+    CHECK(view->attestations[1].grant_snapshot.find("zeta") != std::string::npos);
+    CHECK(view->attestations[2].grant_snapshot.find("alpha") != std::string::npos);
+
+    // Lookup is by the full key: each of the four is reachable, and the fleet row is not the
+    // group row.
+    CHECK(find_row(*view, "user", "alice", "Operator", "g-1") != nullptr);
+    CHECK(find_row(*view, "user", "alice", "Viewer", "") == nullptr);
+    CHECK(find_row(*view, "user", "alice", "Viewer", "g-2") == nullptr);
+}
+
+TEST_CASE("schema v4: decisions on each scope's row count, chain and read back independently",
+          "[access_review][store][pg][6969]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, access_review_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    AccessReviewStore store{pool};
+    REQUIRE(store.is_open());
+    auto open_res = store.open_campaign("Scoped counts", "admin", scoped_grants(), "enabled");
+    REQUIRE(open_res.has_value());
+    const auto cid = *open_res;
+
+    // Fleet row: ONE decision. g-1: TWO decisions by two reviewers. g-2: THREE by three. The
+    // Viewer row on g-1 stays pending.
+    REQUIRE(store.record_attestation(cid, "user", "alice", "Operator", "", "attested", "carol", "f1")
+                .has_value());
+    REQUIRE(store.record_attestation(cid, "user", "alice", "Operator", "g-1", "attested", "carol",
+                                     "a1")
+                .has_value());
+    auto g1b = store.record_attestation(cid, "user", "alice", "Operator", "g-1", "flagged_revoke",
+                                        "dave", "a2");
+    REQUIRE(g1b.has_value());
+    CHECK(g1b->seq == 2);
+    CHECK(g1b->previous_decision == "attested");
+    REQUIRE(store.record_attestation(cid, "user", "alice", "Operator", "g-2", "flagged_revoke",
+                                     "carol", "b1")
+                .has_value());
+    REQUIRE(store.record_attestation(cid, "user", "alice", "Operator", "g-2", "attested", "dave",
+                                     "b2")
+                .has_value());
+    auto g2c = store.record_attestation(cid, "user", "alice", "Operator", "g-2", "attested", "erin",
+                                        "b3");
+    REQUIRE(g2c.has_value());
+    CHECK(g2c->seq == 3);
+    CHECK(g2c->previous_decision == "attested");
+
+    auto view = store.get_campaign(cid, true);
+    REQUIRE(view.has_value());
+    REQUIRE(view->attestations.size() == 4);
+    CHECK(view->pending_count == 1);
+
+    const auto* fleet = find_row(*view, "user", "alice", "Operator", "");
+    REQUIRE(fleet != nullptr);
+    CHECK(fleet->decision == "attested");
+    CHECK(fleet->reviewer == "carol");
+    CHECK(fleet->decision_seq == 1);
+    REQUIRE(fleet->history.size() == 1);
+    CHECK(fleet->history[0].reviewer == "carol");
+    CHECK(fleet->history[0].previous_decision == "pending");
+
+    const auto* g1 = find_row(*view, "user", "alice", "Operator", "g-1");
+    REQUIRE(g1 != nullptr);
+    CHECK(g1->decision == "flagged_revoke");
+    CHECK(g1->reviewer == "dave");
+    CHECK(g1->decision_seq == 2);
+    REQUIRE(g1->history.size() == 2);
+    CHECK(g1->history[0].seq == 1);
+    CHECK(g1->history[0].reviewer == "carol");
+    CHECK(g1->history[0].decision == "attested");
+    CHECK(g1->history[1].seq == 2);
+    CHECK(g1->history[1].reviewer == "dave");
+    CHECK(g1->history[1].decision == "flagged_revoke");
+    CHECK(g1->history[1].justification == "a2");
+
+    const auto* g2 = find_row(*view, "user", "alice", "Operator", "g-2");
+    REQUIRE(g2 != nullptr);
+    CHECK(g2->decision == "attested");
+    CHECK(g2->reviewer == "erin");
+    CHECK(g2->decision_seq == 3);
+    REQUIRE(g2->history.size() == 3);
+    const std::vector<std::string> g2_reviewers = {"carol", "dave", "erin"};
+    const std::vector<std::string> g2_previous = {"pending", "flagged_revoke", "attested"};
+    for (std::size_t i = 0; i < 3; ++i) {
+        INFO("g-2 history " << i);
+        CHECK(g2->history[i].seq == static_cast<std::int32_t>(i + 1));
+        CHECK(g2->history[i].reviewer == g2_reviewers[i]);
+        CHECK(g2->history[i].previous_decision == g2_previous[i]);
+    }
+
+    const auto* viewer = find_row(*view, "user", "alice", "Viewer", "g-1");
+    REQUIRE(viewer != nullptr);
+    CHECK(viewer->decision == "pending");
+    CHECK(viewer->decision_seq == 0);
+    CHECK(viewer->history.empty());
+
+    // Without history the state rows are the same and no row carries one.
+    auto bare = store.get_campaign(cid, false);
+    REQUIRE(bare.has_value());
+    CHECK(find_row(*bare, "user", "alice", "Operator", "g-2")->decision_seq == 3);
+    CHECK(find_row(*bare, "user", "alice", "Operator", "g-2")->history.empty());
+}
+
+TEST_CASE("schema v4: a group row round-trips: decide, replace, history of two, previous chain",
+          "[access_review][store][pg][6969]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, access_review_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    AccessReviewStore store{pool};
+    REQUIRE(store.is_open());
+    auto open_res = store.open_campaign("Group round trip", "admin", scoped_grants(), "enabled");
+    REQUIRE(open_res.has_value());
+    const auto cid = *open_res;
+
+    auto first = store.record_attestation(cid, "user", "alice", "Operator", "g-1", "attested",
+                                          "carol", "keep");
+    REQUIRE(first.has_value());
+    CHECK(first->previous_decision == "pending");
+    CHECK(first->seq == 1);
+    auto second = store.record_attestation(cid, "user", "alice", "Operator", "g-1",
+                                           "flagged_revoke", "dave", "no longer needed");
+    REQUIRE(second.has_value());
+    CHECK(second->previous_decision == "attested");
+    CHECK(second->seq == 2);
+
+    auto view = store.get_campaign(cid, true);
+    REQUIRE(view.has_value());
+    const auto* row = find_row(*view, "user", "alice", "Operator", "g-1");
+    REQUIRE(row != nullptr);
+    CHECK(row->decision == "flagged_revoke");
+    CHECK(row->justification == "no longer needed");
+    CHECK(row->decision_seq == 2);
+    REQUIRE(row->history.size() == 2);
+    CHECK(row->history[0].previous_decision == "pending");
+    CHECK(row->history[1].previous_decision == "attested");
+    // The other three rows of the campaign are untouched.
+    CHECK(view->pending_count == 3);
+    CHECK(find_row(*view, "user", "alice", "Operator", "")->decision == "pending");
+    CHECK(find_row(*view, "user", "alice", "Operator", "g-2")->decision == "pending");
+    CHECK(find_row(*view, "user", "alice", "Viewer", "g-1")->decision == "pending");
+}
+
+TEST_CASE("schema v4: a wrong scope is not_found; an over-long or NUL scope is bad_request at "
+          "attest and at open_campaign, and nothing is written",
+          "[access_review][store][pg][6969]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, access_review_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    AccessReviewStore store{pool};
+    REQUIRE(store.is_open());
+
+    // A campaign whose only grant for alice/Operator is on g-1: fleet scope and another group are
+    // not that grant.
+    auto open_res = store.open_campaign(
+        "Wrong scope", "admin", {GrantRef{"user", "alice", "Operator", "{}", "g-1"}}, "enabled");
+    REQUIRE(open_res.has_value());
+    const auto cid = *open_res;
+    for (const std::string& wrong : {std::string(""), std::string("g-2"), std::string("G-1"),
+                                     std::string(64, 'x')}) {
+        auto r = store.record_attestation(cid, "user", "alice", "Operator", wrong, "attested",
+                                          "carol", "");
+        INFO("scope '" << wrong << "'");
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error().starts_with("not_found:"));
+        CHECK(r.error().find("scope_group_id") != std::string::npos);
+    }
+
+    // The bound is the management-group id contract: 256 bytes pass the bound check, 257 and a NUL
+    // fail it.
+    STATIC_REQUIRE(yuzu::server::kScopeGroupIdMaxLen == 256);
+    const std::string at_cap(yuzu::server::kScopeGroupIdMaxLen, 'x');
+    const std::string over(yuzu::server::kScopeGroupIdMaxLen + 1, 'x');
+    const std::string nul("g\0-1", 4);
+    for (const std::string& bad : {over, nul}) {
+        auto r = store.record_attestation(cid, "user", "alice", "Operator", bad, "attested",
+                                          "carol", "");
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error().starts_with("bad_request:"));
+        CHECK(r.error().find("scope_group_id") != std::string::npos);
+    }
+
+    // open_campaign refuses a GrantRef over the bound, so a campaign never holds a row its attest
+    // endpoint would reject; no campaign is created.
+    const auto before = store.list_campaigns();
+    REQUIRE(before.has_value());
+    for (const std::string& bad : {over, nul}) {
+        auto r = store.open_campaign("Bad scope", "admin",
+                                     {GrantRef{"user", "bob", "Viewer", "{}", bad}}, "enabled");
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error().starts_with("bad_request:"));
+    }
+    const auto after = store.list_campaigns();
+    REQUIRE(after.has_value());
+    CHECK(after->size() == before->size());
+    // A scope at the cap freezes and is attestable.
+    auto capped = store.open_campaign("Cap scope", "admin",
+                                      {GrantRef{"user", "bob", "Viewer", "{}", at_cap}}, "enabled");
+    REQUIRE(capped.has_value());
+    CHECK(store.record_attestation(*capped, "user", "bob", "Viewer", at_cap, "attested", "carol", "")
+              .has_value());
+    // Nothing was written to the first campaign by any refusal above.
+    auto view = store.get_campaign(cid, true);
+    REQUIRE(view.has_value());
+    CHECK(view->pending_count == 1);
+    CHECK(view->attestations[0].history.empty());
+}
+
+TEST_CASE("schema v4: the reviewer-differs-from-subject rule holds on a group row, in the store "
+          "and in the database",
+          "[access_review][store][pg][6969]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, access_review_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    AccessReviewStore store{pool};
+    REQUIRE(store.is_open());
+    auto open_res = store.open_campaign("Group subject", "admin", scoped_grants(), "enabled");
+    REQUIRE(open_res.has_value());
+    const auto cid = *open_res;
+
+    // The subject is the principal whatever the scope: alice cannot decide her own group grant.
+    auto self = store.record_attestation(cid, "user", "alice", "Operator", "g-1", "attested",
+                                         "alice", "me");
+    REQUIRE_FALSE(self.has_value());
+    CHECK(self.error() == "forbidden: reviewer is the subject of this grant");
+    // Byte-exact (no case folding), as at fleet scope.
+    CHECK(store.record_attestation(cid, "user", "alice", "Operator", "g-1", "attested", "Alice", "")
+              .has_value());
+
+    // Backstops, raw SQL on the group scope. First the history CHECK (reviewer == subject).
+    PgConn conn{PQconnectdb(db.dsn().c_str())};
+    REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+    PGconn* c = conn.get();
+    CHECK(sqlstate_of(c, hist_insert_sql(cid, "g-2", 1, "attested", "pending", "alice", "5")) ==
+          "23514");
+    // And a state UPDATE naming the subject as reviewer on a group row has no history row that
+    // could back it (the CHECK refused it), so the guard refuses the advance.
+    CHECK(integrity_violation(sqlstate_of(
+        c, std::string("UPDATE ") + kAtt + " SET decision='attested', reviewer='alice', "
+                                           "decided_at_ms=5, justification='ok', decision_seq=1 "
+                                           "WHERE campaign_id='" +
+               cid + "' AND role_name='Operator' AND scope_group_id='g-2'")));
+    auto view = store.get_campaign(cid, true);
+    REQUIRE(view.has_value());
+    const auto* g2 = find_row(*view, "user", "alice", "Operator", "g-2");
+    REQUIRE(g2 != nullptr);
+    CHECK(g2->decision == "pending");
+    CHECK(g2->history.empty());
+}
+
+TEST_CASE("schema v4 guards: scope is part of every history-to-state comparison",
+          "[access_review][store][pg][6969]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, access_review_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    AccessReviewStore store{pool};
+    REQUIRE(store.is_open());
+    auto open_res = store.open_campaign(
+        "Scope guards", "admin",
+        {GrantRef{"user", "alice", "Operator", "{}", ""},
+         GrantRef{"user", "alice", "Operator", "{}", "g-1"}},
+        "enabled");
+    REQUIRE(open_res.has_value());
+    const auto cid = *open_res;
+    // The fleet row is decided through the store: a valid fleet history row and an advanced fleet
+    // state row now exist, with these exact values.
+    REQUIRE(store.record_attestation(cid, "user", "alice", "Operator", "", "attested", "carol", "ok")
+                .has_value());
+
+    PgConn conn{PQconnectdb(db.dsn().c_str())};
+    REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+    PGconn* c = conn.get();
+    const std::string decided_at = scalar_of(
+        c, std::string("SELECT decided_at_ms FROM ") + kHist + " WHERE campaign_id='" + cid +
+               "' AND scope_group_id='' AND seq=1");
+    REQUIRE_FALSE(decided_at.empty());
+    const std::string group_where = " WHERE campaign_id='" + cid +
+                                    "' AND principal_id='alice' AND role_name='Operator' AND "
+                                    "scope_group_id='g-1'";
+
+    SECTION("A6a: advancing the GROUP state row on the strength of the FLEET history row is refused "
+            "by the guard, scope being the only mismatch") {
+        // Every compared field matches the fleet history row (seq 1, decision, reviewer, time,
+        // justification, previous decision); only the scope differs.
+        const auto failure = failure_of(
+            c, std::string("UPDATE ") + kAtt +
+                   " SET decision='attested', reviewer='carol', decided_at_ms=" + decided_at +
+                   ", justification='ok', decision_seq=1" + group_where);
+        INFO(failure);
+        CHECK(failure.starts_with("23000|"));
+        CHECK(failure.find("no matching history row") != std::string::npos);
+        // Nothing moved.
+        auto view = store.get_campaign(cid, true);
+        REQUIRE(view.has_value());
+        CHECK(find_row(*view, "user", "alice", "Operator", "g-1")->decision == "pending");
+        CHECK(find_row(*view, "user", "alice", "Operator", "g-1")->decision_seq == 0);
+    }
+
+    SECTION("A6b: a GROUP history row committed while the group state stays pending is refused at "
+            "COMMIT, although the fleet state already carries that decision") {
+        REQUIRE(sqlstate_of(c, "BEGIN").empty());
+        CHECK(sqlstate_of(c, hist_insert_sql(cid, "g-1", 1, "attested", "pending", "carol",
+                                             decided_at))
+                  .empty());
+        const auto failure = failure_of(c, "COMMIT");
+        INFO(failure);
+        CHECK(failure.starts_with("23000|"));
+        CHECK(failure.find("committed ahead of the current decision") != std::string::npos);
+        auto view = store.get_campaign(cid, true);
+        REQUIRE(view.has_value());
+        CHECK(find_row(*view, "user", "alice", "Operator", "g-1")->history.empty());
+    }
+
+    SECTION("A6c: a history row for a scope with no frozen parent fails the foreign key; the scope "
+            "is immutable; history UPDATE and DELETE are still refused") {
+        // No frozen row has scope g-9: the history row has no parent.
+        CHECK(sqlstate_of(c, hist_insert_sql(cid, "g-9", 1, "attested", "pending", "carol", "5")) ==
+              "23503");
+        // Moving a frozen row to another scope is refused by the key-immutability clause.
+        const auto moved = failure_of(
+            c, std::string("UPDATE ") + kAtt + " SET scope_group_id='g-2'" + group_where);
+        CHECK(moved.starts_with("23000|"));
+        CHECK(moved.find("immutable") != std::string::npos);
+        // History stays append-only, and the scope column does not change that.
+        CHECK(integrity_violation(sqlstate_of(c, std::string("UPDATE ") + kHist +
+                                                     " SET scope_group_id='g-1'")));
+        CHECK(integrity_violation(sqlstate_of(c, std::string("DELETE FROM ") + kHist)));
+        CHECK(integrity_violation(sqlstate_of(c, std::string("DELETE FROM ") + kAtt + group_where)));
+    }
+
+    SECTION("control: the same group advance with its OWN history row, in one transaction, is "
+            "accepted, so the refusals above are the scope and nothing else") {
+        REQUIRE(sqlstate_of(c, "BEGIN").empty());
+        CHECK(sqlstate_of(c, hist_insert_sql(cid, "g-1", 1, "attested", "pending", "carol",
+                                             decided_at))
+                  .empty());
+        CHECK(sqlstate_of(c, std::string("UPDATE ") + kAtt +
+                                 " SET decision='attested', reviewer='carol', decided_at_ms=" +
+                                 decided_at + ", justification='ok', decision_seq=1" + group_where)
+                  .empty());
+        CHECK(sqlstate_of(c, "COMMIT").empty());
+        auto view = store.get_campaign(cid, true);
+        REQUIRE(view.has_value());
+        CHECK(find_row(*view, "user", "alice", "Operator", "g-1")->decision_seq == 1);
+    }
+}
+
+namespace {
+
+// A database at schema v3, built by the store's REAL migrations stopped at v3 (so the recorded
+// hashes of v1 to v3 are the real ones), then populated: two campaigns, decided and pending rows,
+// one row with two decisions. The v3 guards are live, so each decision is one transaction that
+// appends the history row and advances the state row.
+void seed_v3_database(const std::string& dsn) {
+    PgConn conn{PQconnectdb(dsn.c_str())};
+    REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+    std::vector<PgMigration> through_v3;
+    for (const auto& m : AccessReviewStore::migrations())
+        if (m.version <= 3)
+            through_v3.push_back(m);
+    REQUIRE(through_v3.size() == 3);
+    REQUIRE(PgMigrationRunner::run(conn.get(), "access_review_store", through_v3));
+    PgResult r{PQexec(
+        conn.get(),
+        "INSERT INTO access_review_store.access_review_campaign "
+        "  (campaign_id, title, status, created_by, created_at_ms, rbac_enforcement) VALUES "
+        "  ('c1','R1','open','admin',1000,'enabled'), ('c2','R2','open','admin',1001,'disabled');"
+        "INSERT INTO access_review_store.access_review_attestation (campaign_id, principal_type, "
+        "  principal_id, role_name, decision, grant_snapshot) VALUES "
+        "  ('c1','user','alice','Admin','pending','{\"display_name\":\"alice\",\"n\":1}'),"
+        "  ('c1','user','bob','Operator','pending','{\"display_name\":\"bob\"}'),"
+        "  ('c1','group','eng','Reader','pending','{\"display_name\":\"eng\"}'),"
+        "  ('c1','user','erin','Viewer','pending','{}'),"
+        "  ('c2','user','zed','Viewer','pending','{\"display_name\":\"zed\"}');"
+        "BEGIN;"
+        "INSERT INTO access_review_store.access_review_attestation_history (campaign_id, "
+        "  principal_type, principal_id, role_name, seq, decision, previous_decision, reviewer, "
+        "  justification, decided_at_ms) VALUES "
+        "  ('c1','user','alice','Admin',1,'attested','pending','carol','ok',2000),"
+        "  ('c1','user','alice','Admin',2,'flagged_revoke','attested','dave','stale',2001),"
+        "  ('c1','group','eng','Reader',1,'attested','pending','carol','fine',2002);"
+        "UPDATE access_review_store.access_review_attestation SET decision='attested', "
+        "  reviewer='carol', decided_at_ms=2000, justification='ok', decision_seq=1 "
+        "  WHERE campaign_id='c1' AND principal_id='alice';"
+        "UPDATE access_review_store.access_review_attestation SET decision='flagged_revoke', "
+        "  reviewer='dave', decided_at_ms=2001, justification='stale', decision_seq=2 "
+        "  WHERE campaign_id='c1' AND principal_id='alice';"
+        "UPDATE access_review_store.access_review_attestation SET decision='attested', "
+        "  reviewer='carol', decided_at_ms=2002, justification='fine', decision_seq=1 "
+        "  WHERE campaign_id='c1' AND principal_id='eng';"
+        "COMMIT;")};
+    REQUIRE(r.ok());
+}
+
+// Everything v4 must leave untouched, as text: the state rows and history rows without any scope
+// column, the frozen snapshots, and the recorded migration hashes.
+struct V3Facts {
+    std::string state, history, snapshots, hashes, guard_src, consistent_src;
+};
+
+V3Facts read_v3_facts(PGconn* c) {
+    V3Facts f;
+    f.state = scalar_of(
+        c, "SELECT string_agg(concat_ws('|', campaign_id, principal_type, principal_id, role_name, "
+           "decision, reviewer, decided_at_ms, justification, grant_snapshot, decision_seq), "
+           "E'\\n' ORDER BY campaign_id, principal_type, principal_id, role_name) "
+           "FROM access_review_store.access_review_attestation");
+    f.history = scalar_of(
+        c, "SELECT string_agg(concat_ws('|', campaign_id, principal_type, principal_id, role_name, "
+           "seq, decision, previous_decision, reviewer, justification, decided_at_ms), E'\\n' "
+           "ORDER BY campaign_id, principal_type, principal_id, role_name, seq) "
+           "FROM access_review_store.access_review_attestation_history");
+    f.snapshots = scalar_of(
+        c, "SELECT string_agg(grant_snapshot, E'\\n' ORDER BY campaign_id, principal_type, "
+           "principal_id, role_name) FROM access_review_store.access_review_attestation");
+    f.hashes = scalar_of(
+        c, "SELECT string_agg(version || ':' || sha256, ',' ORDER BY version) "
+           "FROM public.yuzu_schema_migrations WHERE store = 'access_review_store' AND version <= 3");
+    f.guard_src = scalar_of(c, "SELECT prosrc FROM pg_proc WHERE proname = "
+                               "'access_review_attestation_guard'");
+    f.consistent_src = scalar_of(c, "SELECT prosrc FROM pg_proc WHERE proname = "
+                                    "'access_review_history_consistent'");
+    return f;
+}
+
+std::string key_columns_of(PGconn* c, const std::string& table) {
+    return scalar_of(
+        c, "SELECT string_agg(a.attname, ',' ORDER BY k.ord) FROM pg_index i "
+           "JOIN LATERAL unnest(i.indkey) WITH ORDINALITY AS k(attnum, ord) ON true "
+           "JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = k.attnum "
+           "WHERE i.indisprimary AND i.indrelid = 'access_review_store." + table + "'::regclass");
+}
+
+// The history table's foreign key to the state table: "name|delete action|referencing columns".
+std::string history_state_fk_of(PGconn* c) {
+    return scalar_of(
+        c, "SELECT con.conname::text || '|' || con.confdeltype::text || '|' || "
+           "(SELECT string_agg(a.attname, ',' ORDER BY k.ord) FROM unnest(con.conkey) "
+           " WITH ORDINALITY AS k(attnum, ord) JOIN pg_attribute a ON a.attrelid = con.conrelid "
+           " AND a.attnum = k.attnum) FROM pg_constraint con "
+           "WHERE con.contype = 'f' AND con.conrelid = "
+           "'access_review_store.access_review_attestation_history'::regclass "
+           "AND con.confrelid = 'access_review_store.access_review_attestation'::regclass");
+}
+
+std::string triggers_of(PGconn* c) {
+    return scalar_of(
+        c, "SELECT string_agg(tgname::text || ':' || tgenabled::text, ',' ORDER BY tgname) FROM pg_trigger "
+           "WHERE NOT tgisinternal AND tgrelid IN "
+           "('access_review_store.access_review_attestation'::regclass, "
+           " 'access_review_store.access_review_attestation_history'::regclass)");
+}
+
+} // namespace
+
+TEST_CASE("schema v4: a populated v3 database upgrades with every row fleet-wide and every "
+          "guard intact (A7a)",
+          "[access_review][store][pg][migration][6969]") {
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
+    seed_v3_database(db.dsn());
+    V3Facts before;
+    {
+        PgConn conn{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        before = read_v3_facts(conn.get());
+        REQUIRE_FALSE(before.state.empty());
+        REQUIRE_FALSE(before.hashes.empty());
+        CHECK(scalar_of(conn.get(), "SELECT version FROM public.schema_meta WHERE store = "
+                                    "'access_review_store'") == "3");
+        // The v3 shape this test starts from (so the v4 assertions below are a change).
+        CHECK(key_columns_of(conn.get(), "access_review_attestation") ==
+              "campaign_id,principal_type,principal_id,role_name");
+    }
+
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AccessReviewStore store{pool};
+    REQUIRE(store.is_open());
+
+    PgConn conn{PQconnectdb(db.dsn().c_str())};
+    REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+    PGconn* c = conn.get();
+    CHECK(scalar_of(c, "SELECT version FROM public.schema_meta WHERE store = "
+                       "'access_review_store'") == "4");
+    // v1 to v3 hashes are byte-identical (the runner would have refused otherwise); v4 is recorded.
+    const auto after = read_v3_facts(c);
+    CHECK(after.hashes == before.hashes);
+    CHECK(scalar_of(c, "SELECT count(*) FROM public.yuzu_schema_migrations WHERE store = "
+                       "'access_review_store' AND version = 4") == "1");
+    // No row changed: not one byte of state, history or snapshot.
+    CHECK(after.state == before.state);
+    CHECK(after.history == before.history);
+    CHECK(after.snapshots == before.snapshots);
+    // Every pre-existing row is fleet-wide, in both tables.
+    CHECK(scalar_of(c, "SELECT count(*) FROM access_review_store.access_review_attestation WHERE "
+                       "scope_group_id <> ''") == "0");
+    CHECK(scalar_of(c, "SELECT count(*) FROM access_review_store.access_review_attestation_history "
+                       "WHERE scope_group_id <> ''") == "0");
+    // The column is NOT NULL and, once v4 has backfilled the old rows, has NO default (on both
+    // tables): see the "has no default" test below for what that refuses.
+    for (const char* table : {"access_review_attestation", "access_review_attestation_history"}) {
+        INFO(table);
+        CHECK(scalar_of(c, std::string("SELECT is_nullable || '|' || coalesce(column_default, '<none>') "
+                                       "FROM information_schema.columns WHERE table_schema = "
+                                       "'access_review_store' AND table_name = '") +
+                               table + "' AND column_name = 'scope_group_id'") == "NO|<none>");
+    }
+    // Both primary keys name the scope (history: before seq).
+    CHECK(key_columns_of(c, "access_review_attestation") ==
+          "campaign_id,principal_type,principal_id,role_name,scope_group_id");
+    CHECK(key_columns_of(c, "access_review_attestation_history") ==
+          "campaign_id,principal_type,principal_id,role_name,scope_group_id,seq");
+    // The history foreign key is re-created, NAMED, over the five columns, ON DELETE RESTRICT ('r'),
+    // and it is the only one from the history table to the state table.
+    CHECK(history_state_fk_of(c) ==
+          "access_review_history_grant_fk|r|"
+          "campaign_id,principal_type,principal_id,role_name,scope_group_id");
+    // Three user triggers, all enabled ('O'), none re-created under another name.
+    CHECK(triggers_of(c) == "access_review_attestation_guard:O,access_review_history_consistent:O,"
+                            "access_review_history_keep:O");
+    // The two functions changed (scope joined their comparisons); the third trigger's did not.
+    CHECK(after.guard_src != before.guard_src);
+    CHECK(after.guard_src.find("scope_group_id") != std::string::npos);
+    CHECK(after.consistent_src != before.consistent_src);
+    CHECK(after.consistent_src.find("scope_group_id") != std::string::npos);
+
+    // History survives and is read through the new key; the migrated rows chain onward.
+    auto view = store.get_campaign("c1", true);
+    REQUIRE(view.has_value());
+    const auto* alice = find_row(*view, "user", "alice", "Admin", kFleetScope);
+    REQUIRE(alice != nullptr);
+    CHECK(alice->decision_seq == 2);
+    REQUIRE(alice->history.size() == 2);
+    CHECK(alice->history[0].reviewer == "carol");
+    CHECK(alice->history[1].reviewer == "dave");
+    CHECK(view->pending_count == 2);
+    auto next = store.record_attestation("c1", "user", "alice", "Admin", kFleetScope, "attested",
+                                         "erin", "again");
+    REQUIRE(next.has_value());
+    CHECK(next->seq == 3);
+    CHECK(next->previous_decision == "flagged_revoke");
+    // And a GROUP-scoped grant, which v3 could not express, now freezes and is decided.
+    auto open_res = store.open_campaign(
+        "After v4", "admin",
+        {GrantRef{"user", "alice", "Admin", "{}", ""}, GrantRef{"user", "alice", "Admin", "{}", "g-1"}},
+        "enabled");
+    REQUIRE(open_res.has_value());
+    CHECK(store.record_attestation(*open_res, "user", "alice", "Admin", "g-1", "attested", "carol",
+                                   "")
+              .has_value());
+    auto reread = store.get_campaign(*open_res, true);
+    REQUIRE(reread.has_value());
+    CHECK(find_row(*reread, "user", "alice", "Admin", "")->decision == "pending");
+    CHECK(find_row(*reread, "user", "alice", "Admin", "g-1")->decision == "attested");
+}
+
+TEST_CASE("schema v4: a failure on v4's foreign-key statement rolls back everything v4 did, and the "
+          "store then reaches v4 once the cause is removed (A7b)",
+          "[access_review][store][pg][migration][6969]") {
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
+    seed_v3_database(db.dsn());
+    V3Facts before;
+    std::string state_key_before, history_key_before, fk_before;
+    {
+        PgConn conn{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        PGconn* c = conn.get();
+        before = read_v3_facts(c);
+        state_key_before = key_columns_of(c, "access_review_attestation");
+        history_key_before = key_columns_of(c, "access_review_attestation_history");
+        fk_before = history_state_fk_of(c);
+        REQUIRE_FALSE(fk_before.empty());
+        // A constraint already holding the name v4's foreign-key statement adds (the last
+        // statement that can fail on a name; only the two DROP DEFAULTs follow it): that statement
+        // fails after every earlier one succeeded. A CHECK (not a foreign key), so v4's lookup of the
+        // history table's foreign key is not confused by it.
+        PgResult plant{PQexec(c, "ALTER TABLE access_review_store.access_review_attestation_history "
+                                 "ADD CONSTRAINT access_review_history_grant_fk CHECK (seq >= 1)")};
+        REQUIRE(plant.ok());
+    }
+
+    {
+        PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+        REQUIRE(pool.valid());
+        yuzu::test::LogCapture log;
+        AccessReviewStore store{pool};
+        log.stop();
+        CHECK_FALSE(store.is_open());
+        // It failed at the foreign-key statement (the one adding the named constraint), not
+        // earlier: the database's message names the planted constraint, so everything before it
+        // had run.
+        CHECK(log.text().find("access_review_history_grant_fk") != std::string::npos);
+    }
+
+    {
+        PgConn conn{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        PGconn* c = conn.get();
+        // Nothing of v4 survived: version, hash row, column, keys, foreign key, both functions, data
+        // (the DROP DEFAULTs never ran, and the column they act on is gone with the rollback).
+        CHECK(scalar_of(c, "SELECT version FROM public.schema_meta WHERE store = "
+                           "'access_review_store'") == "3");
+        CHECK(scalar_of(c, "SELECT count(*) FROM public.yuzu_schema_migrations WHERE store = "
+                           "'access_review_store' AND version = 4") == "0");
+        CHECK(scalar_of(c, "SELECT count(*) FROM information_schema.columns WHERE table_schema = "
+                           "'access_review_store' AND column_name = 'scope_group_id'") == "0");
+        CHECK(key_columns_of(c, "access_review_attestation") == state_key_before);
+        CHECK(key_columns_of(c, "access_review_attestation_history") == history_key_before);
+        CHECK(history_state_fk_of(c) == fk_before);
+        const auto after = read_v3_facts(c);
+        CHECK(after.guard_src == before.guard_src);
+        CHECK(after.consistent_src == before.consistent_src);
+        CHECK(after.state == before.state);
+        CHECK(after.history == before.history);
+        CHECK(after.snapshots == before.snapshots);
+        CHECK(after.hashes == before.hashes);
+
+        PgResult drop{PQexec(c, "ALTER TABLE access_review_store.access_review_attestation_history "
+                                "DROP CONSTRAINT access_review_history_grant_fk")};
+        REQUIRE(drop.ok());
+    }
+
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    REQUIRE(pool.valid());
+    AccessReviewStore store{pool};
+    REQUIRE(store.is_open());
+    PgConn conn{PQconnectdb(db.dsn().c_str())};
+    REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+    CHECK(scalar_of(conn.get(), "SELECT version FROM public.schema_meta WHERE store = "
+                                "'access_review_store'") == "4");
+    CHECK(history_state_fk_of(conn.get()) ==
+          "access_review_history_grant_fk|r|"
+          "campaign_id,principal_type,principal_id,role_name,scope_group_id");
+}
+
+TEST_CASE("schema v4: scope_group_id has no default on either table, so a write that omits it "
+          "fails NOT NULL instead of landing on the fleet-wide row",
+          "[access_review][store][pg][6969]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, access_review_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    AccessReviewStore store{pool};
+    REQUIRE(store.is_open());
+    auto open_res = store.open_campaign("No default", "admin",
+                                        {GrantRef{"user", "alice", "Operator", "{}", ""}}, "enabled");
+    REQUIRE(open_res.has_value());
+
+    PgConn conn{PQconnectdb(db.dsn().c_str())};
+    REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+    PGconn* c = conn.get();
+    for (const char* table : {"access_review_attestation", "access_review_attestation_history"}) {
+        INFO(table);
+        // information_schema reports a NULL column_default for a column with no default; the
+        // sentinel makes a missing row read differently from a NULL one.
+        CHECK(scalar_of(c, std::string("SELECT coalesce(column_default, '<none>') FROM "
+                                       "information_schema.columns WHERE table_schema = "
+                                       "'access_review_store' AND table_name = '") +
+                               table + "' AND column_name = 'scope_group_id'") == "<none>");
+    }
+    // What an old binary's four-column write does now: 23502 (not_null_violation), on both tables.
+    CHECK(sqlstate_of(c, "INSERT INTO access_review_store.access_review_attestation "
+                         "(campaign_id, principal_type, principal_id, role_name, decision, "
+                         "grant_snapshot) VALUES ('" +
+                             *open_res + "','user','mallory','Admin','pending','{}')") == "23502");
+    CHECK(sqlstate_of(c, "INSERT INTO access_review_store.access_review_attestation_history "
+                         "(campaign_id, principal_type, principal_id, role_name, seq, decision, "
+                         "previous_decision, reviewer, justification, decided_at_ms) VALUES ('" +
+                             *open_res + "','user','alice','Operator',1,'attested','pending',"
+                                         "'carol','',1)") == "23502");
+    // The store's own writes name the column, so they are unaffected.
+    CHECK(store.record_attestation(*open_res, "user", "alice", "Operator", kFleetScope, "attested",
+                                   "carol", "")
+              .has_value());
+}
+
+TEST_CASE("schema v4: the same grant attested under fleet and under a group scope by two "
+          "concurrent reviewers lands as two independent rows, neither overwritten",
+          "[access_review][store][pg][6969]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, access_review_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AccessReviewStore store{pool};
+    REQUIRE(store.is_open());
+    auto open_res = store.open_campaign(
+        "Two scopes", "admin",
+        {GrantRef{"user", "alice", "Operator", "{}", ""},
+         GrantRef{"user", "alice", "Operator", "{}", "g-1"}},
+        "enabled");
+    REQUIRE(open_res.has_value());
+    const auto cid = *open_res;
+
+    // Repeat the paired writes from a shared start gate. This checks scope isolation (each scope
+    // keeps its own row, decision, seq and history); it does not force a particular interleaving.
+    constexpr int kRounds = 8;
+    std::atomic<bool> go{false};
+    std::atomic<int> failures{0};
+    auto attest = [&](const std::string& scope, const std::string& decision,
+                      const std::string& reviewer) {
+        while (!go.load(std::memory_order_acquire))
+            std::this_thread::yield();
+        for (int i = 0; i < kRounds; ++i) {
+            auto r = store.record_attestation(cid, "user", "alice", "Operator", scope, decision,
+                                              reviewer, "round " + std::to_string(i));
+            if (!r.has_value() || r->seq != i + 1)
+                failures.fetch_add(1);
+        }
+    };
+    {
+        // The guard is declared AFTER the threads, so it is destroyed FIRST: it opens the gate, then
+        // each jthread joins. A throwing second constructor therefore cannot leave the first worker
+        // spinning on a closed gate, or leave a joinable std::thread to std::terminate.
+        std::jthread fleet_thread;
+        std::jthread group_thread;
+        struct OpenGate {
+            std::atomic<bool>& gate;
+            ~OpenGate() { gate.store(true, std::memory_order_release); }
+        } open_gate{go};
+        fleet_thread = std::jthread{attest, std::string(), std::string("attested"),
+                                    std::string("carol")};
+        group_thread = std::jthread{attest, std::string("g-1"), std::string("flagged_revoke"),
+                                    std::string("dave")};
+        go.store(true, std::memory_order_release);
+    }
+    CHECK(failures.load() == 0);
+
+    auto view = store.get_campaign(cid, true);
+    REQUIRE(view.has_value());
+    REQUIRE(view->attestations.size() == 2);
+    const auto* fleet = find_row(*view, "user", "alice", "Operator", kFleetScope);
+    const auto* group = find_row(*view, "user", "alice", "Operator", "g-1");
+    REQUIRE(fleet != nullptr);
+    REQUIRE(group != nullptr);
+    // Each row carries its OWN reviewer, decision and a full, ordered history of its own.
+    CHECK(fleet->decision == "attested");
+    CHECK(fleet->reviewer == "carol");
+    CHECK(fleet->decision_seq == kRounds);
+    CHECK(group->decision == "flagged_revoke");
+    CHECK(group->reviewer == "dave");
+    CHECK(group->decision_seq == kRounds);
+    REQUIRE(fleet->history.size() == static_cast<std::size_t>(kRounds));
+    REQUIRE(group->history.size() == static_cast<std::size_t>(kRounds));
+    for (int i = 0; i < kRounds; ++i) {
+        CHECK(fleet->history[static_cast<std::size_t>(i)].seq == i + 1);
+        CHECK(fleet->history[static_cast<std::size_t>(i)].reviewer == "carol");
+        CHECK(group->history[static_cast<std::size_t>(i)].seq == i + 1);
+        CHECK(group->history[static_cast<std::size_t>(i)].reviewer == "dave");
+    }
+}
+
+TEST_CASE("schema v4: the migration refuses, and rolls back whole, a database whose constraint "
+          "shape it cannot find exactly once (the DO-block guards)",
+          "[access_review][store][pg][migration][6969]") {
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
+    seed_v3_database(db.dsn());
+
+    constexpr const char* kAttTable = "access_review_store.access_review_attestation";
+    constexpr const char* kHistTable = "access_review_store.access_review_attestation_history";
+    // Drops the one constraint of `contype` ('f' or 'p') on `table` (for 'f', only the one into
+    // the state table). Plain statements, so a planted shape is built without editing a migration.
+    const auto drop_constraint = [](const std::string& table, char contype) {
+        const std::string extra =
+            contype == 'f' ? std::string(" AND confrelid = 'access_review_store."
+                                         "access_review_attestation'::regclass")
+                           : std::string();
+        return "DO $d$ DECLARE n text; BEGIN SELECT conname INTO STRICT n FROM pg_constraint WHERE "
+               "contype = '" +
+               std::string(1, contype) + "' AND conrelid = '" + table + "'::regclass" + extra +
+               "; EXECUTE format('ALTER TABLE " + table + " DROP CONSTRAINT %I', n); END $d$;";
+    };
+
+    struct Plant {
+        const char* name;
+        std::vector<std::string> sql;
+        const char* message;
+    };
+    const std::vector<Plant> plants = {
+        {"no foreign key from the history table",
+         {drop_constraint(kHistTable, 'f')},
+         "expected exactly one foreign key from the history table to the state table, found 0"},
+        {"two foreign keys from the history table",
+         {std::string("ALTER TABLE ") + kHistTable +
+          " ADD CONSTRAINT plant_second_fk FOREIGN KEY (campaign_id, principal_type, principal_id, "
+          "role_name) REFERENCES " +
+          kAttTable + "(campaign_id, principal_type, principal_id, role_name)"},
+         "expected exactly one foreign key from the history table to the state table, found 2"},
+        {"no primary key on the state table",
+         {drop_constraint(kHistTable, 'f'), drop_constraint(kAttTable, 'p'),
+          std::string("ALTER TABLE ") + kAttTable +
+              " ADD CONSTRAINT plant_state_unique UNIQUE (campaign_id, principal_type, "
+              "principal_id, role_name)",
+          std::string("ALTER TABLE ") + kHistTable +
+              " ADD CONSTRAINT plant_fk FOREIGN KEY (campaign_id, principal_type, principal_id, "
+              "role_name) REFERENCES " +
+              kAttTable + "(campaign_id, principal_type, principal_id, role_name)"},
+         "expected exactly one primary key on the state table, found 0"},
+        {"no primary key on the history table",
+         {drop_constraint(kHistTable, 'p')},
+         "expected exactly one primary key on the history table, found 0"},
+    };
+
+    for (const auto& plant : plants) {
+        DYNAMIC_SECTION(plant.name) {
+            {
+                PgConn conn{PQconnectdb(db.dsn().c_str())};
+                REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+                for (const auto& sql : plant.sql) {
+                    INFO(sql);
+                    REQUIRE(sqlstate_of(conn.get(), sql).empty());
+                }
+            }
+            yuzu::test::LogCapture log;
+            {
+                PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+                REQUIRE(pool.valid());
+                AccessReviewStore store{pool};
+                log.stop();
+                CHECK_FALSE(store.is_open());
+            }
+            INFO(log.text());
+            CHECK(log.text().find(plant.message) != std::string::npos);
+            // The refusal rolled v4 back whole: still v3, the column its first statement adds is
+            // gone, and no v4 hash row was recorded.
+            PgConn conn{PQconnectdb(db.dsn().c_str())};
+            REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+            CHECK(scalar_of(conn.get(), "SELECT version FROM public.schema_meta WHERE store = "
+                                        "'access_review_store'") == "3");
+            CHECK(scalar_of(conn.get(), "SELECT count(*) FROM information_schema.columns WHERE "
+                                        "table_schema = 'access_review_store' AND column_name = "
+                                        "'scope_group_id'") == "0");
+            CHECK(scalar_of(conn.get(), "SELECT count(*) FROM public.yuzu_schema_migrations "
+                                        "WHERE store = 'access_review_store' AND version = 4") ==
+                  "0");
+        }
+    }
 }
