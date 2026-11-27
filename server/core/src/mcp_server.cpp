@@ -7439,6 +7439,9 @@ static_assert(std::is_same_v<ToolDeps::CiDetailFn, HardwareRoutes::CiDetailFn>,
 static_assert(std::is_same_v<decltype(ToolDeps::ci_page_reader),
                              decltype(HardwareRoutes::Deps::ci_page_reader)>,
               "ToolDeps::ci_page_reader drifted from HardwareRoutes::Deps::ci_page_reader");
+static_assert(std::is_same_v<decltype(ToolDeps::ci_watermark_fn),
+                             decltype(HardwareRoutes::Deps::ci_watermark_fn)>,
+              "ToolDeps::ci_watermark_fn drifted from HardwareRoutes::Deps::ci_watermark_fn");
 static_assert(std::is_same_v<ToolDeps::DexScoreFn, HardwareRoutes::DexScoreFn>,
               "ToolDeps::DexScoreFn drifted from HardwareRoutes::DexScoreFn");
 static_assert(std::is_same_v<ToolDeps::CryptoAccessFn, McpServer::CryptoAccessFn>,
