@@ -2235,7 +2235,7 @@ of reading as NOT TESTED.
   crypto NIF needs OpenSSL SM4 symbols that Red Hat's OpenSSL lacks. The
   same defect is waiting behind #5143 on rockylinux:9.
 
-**Known environment-dependent test.** In `tests/unit/test_echo_local_dispatcher.cpp`, the case "echo plugin: a rollup pass on an over-budget legacy database evicts to the byte target, converts it to incremental auto_vacuum and publishes the result" (one of the `[budget]`-tagged cases) fails intermittently on one Linux workstation, not always on the same check, while the Linux and macOS CI legs pass it. It has failed on a clean build of dev, so the change under test is not its cause; the cause is unknown and it is tracked as #7039. It is not in `tests/known-flaky.json`, so a red on it is not retried.
+**Known environment-dependent test.** In `tests/unit/test_echo_local_dispatcher.cpp`, the case "echo plugin: a rollup pass on an over-budget legacy database evicts to the byte target, converts it to incremental auto_vacuum and publishes the result" (one of the `[budget]`-tagged cases) fails intermittently on one Linux workstation, not always on the same check, while the Linux and macOS CI legs pass it. Its cause is unknown and it is tracked as #7039. It is not in `tests/known-flaky.json`, so a red on it is not retried.
 
 **Gateway-upstream peer authorization and the rigs.** The server refuses to start with
 `--gateway-upstream` unless gateway peer authorization is configured or acknowledged as disabled
