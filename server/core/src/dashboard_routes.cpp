@@ -1852,6 +1852,11 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                          // #5294
                          message = "Every target runs an OS for which this plugin action is "
                                     "switched off — dispatch was withheld, not attempted.";
+                     } else if (dispatch_outcome.intended_count &&
+                                *dispatch_outcome.intended_count == 0) {
+                         // #2673
+                         message = "No targets: nothing you can dispatch to matched. Only "
+                                    "connected agents are considered.";
                      }
                      res.set_content(
                          "<span id=\"result-context\" hx-swap-oob=\"true\""

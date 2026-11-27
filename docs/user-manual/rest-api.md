@@ -807,7 +807,7 @@ The `202` body carries counts only (`requested`, `agents_reached`, `skipped_offl
 
 #### `GET /api/v1/hardware/sync/{execution_id}`
 
-Reports how an on-demand software sync run is going, by the `execution_id` that `POST /api/v1/hardware/sync` answered with. MCP twin: `get_software_sync_status` (see [mcp.md](mcp.md)). **Permission:** `Execution:Execute`, checked as a global grant, like the POST. A caller reads the runs it started, or any sync run when its `Execution:Execute` is unfiltered; an unknown id, another operator's run and an execution that is not a sync run all answer the same `404`, so the route does not reveal which ids exist. The `200` body carries `execution_id`, `state` (the execution record's state), `targeted` (the frames the server's sessions accepted), `acknowledged` (agents that armed the sync), `failed` (agents that answered with a failure, for example because their daily-sync scheduler is not running), `dispatched_at`, `delay_max_s` and `estimated_completion_at`. For a run whose device list was saved, `failed` counts device answers only and the body adds `timed_out`, `not_delivered`, `unknown` and `not_reached` (selected devices that were offline, not sent to or unable to run the sync, including agents too old for it; devices skipped as already fresh are not counted). An agent answers when it **arms** the sync, not when its report lands, so `acknowledged` counts requests taken up, not reports received; a count of reports per run is not reported. `delay_max_s` and `estimated_completion_at` are estimates (see above). An execution record that cannot be read is a `503` with `retry_after_ms`, never an empty `200`; a server with no execution tracking answers `503` too. No audit row is written for a read.
+Reports how an on-demand software sync run is going, by the `execution_id` that `POST /api/v1/hardware/sync` answered with. MCP twin: `get_software_sync_status` (see [mcp.md](mcp.md)). **Permission:** `Execution:Execute`, checked as a global grant, like the POST. A caller reads the runs it started, or any sync run when its `Execution:Execute` is unfiltered; an unknown id, another operator's run and an execution that is not a sync run all answer the same `404`, so the route does not reveal which ids exist. The `200` body carries `execution_id`, `state` (the execution record's state), `targeted` (the frames the server's sessions accepted), `acknowledged` (agents that armed the sync), `failed` (agents that answered with a failure, for example because their daily-sync scheduler is not running), `dispatched_at`, `delay_max_s` and `estimated_completion_at`. When the run's coverage is recorded, `failed` counts device answers only (otherwise every unsuccessful result) and the body adds `timed_out`, `not_delivered`, `unknown` and `not_reached` (selected devices that were offline, not sent to or unable to run the sync, including agents too old for it; devices skipped as already fresh are not counted). An agent answers when it **arms** the sync, not when its report lands, so `acknowledged` counts requests taken up, not reports received; a count of reports per run is not reported. `delay_max_s` and `estimated_completion_at` are estimates (see above). An execution record that cannot be read is a `503` with `retry_after_ms`, never an empty `200`; a server with no execution tracking answers `503` too. No audit row is written for a read.
 
 ---
 
@@ -2538,10 +2538,14 @@ Quarantine a device.
 > | `plugin_not_found` (#3511) | The dispatched plugin is absent from every target's reported inventory — a command guaranteed to fail, withheld before dispatch rather than reported as a false success. Permanent for the current plugin name. If the plugin name and spelling are correct and it genuinely is installed on the target, the agent's REPORTED inventory is stale: it is populated once at registration and does not refresh until the agent's management connection next re-registers (a reconnect — daemon restart, or any dropped/re-established connection) — this reason can persist until then even after installation completes. | `null` — retrying will not help; check the plugin name/spelling instead, or trigger a reconnect on the target agent if the plugin was only just installed |
 > | `kill_switched_os` (#5294) | Every reachable target runs an OS for which this plugin action's per-OS kill switch is OFF. The dispatch was withheld, not attempted. | `null` — retrying will not help until the switch is turned back on for that OS |
 > | `os_gate_unreadable` (#5294) | Agent presence could not be read while a per-OS kill switch is set, so the dispatch failed closed rather than reaching only this replica's local agents. Transient. | `5000` |
-> | `no_targets` (#2650) | **`422`, not `503`.** The target list was read and is empty: nothing you may dispatch to matched (an empty group, a scope or broadcast matching no **connected** agent, or only ids outside your visible set). Just after a server or gateway restart, wait for agents to reconnect before treating it as final. | `null` — the same request will not succeed until a matching agent connects or your access changes |
+> | `no_targets` (#2650) | **`422`, not `503`.** The target list was read and is empty: nothing you may dispatch to matched (an empty group, a scope or broadcast matching no **connected** agent, or only ids outside your visible set). If no agent is reachable at all, this route answers the `503` `no agent connected` below instead. Just after a server or gateway restart, wait for agents to reconnect before treating it as final. | `null` — the same request will not succeed until a matching agent connects or your access changes |
 > | *(absent)* | `503`. Targets were resolved but none was reached, including an unconfined caller naming a device id that does not exist, and a caller who can see no device at all. | *(absent)* |
 >
 > Every row without a status of its own is a `503`.
+>
+> **No agent reachable at all.** Before any of the causes above, this route and the diagnostic
+> routes below answer `503` with the message `no agent connected`, no `reason` and no
+> `retry_after_ms`, when the server has no reachable agent.
 >
 > `plugin_not_found`, `kill_switched_os` and `os_gate_unreadable` are never produced for a
 > protective action (the firewall plugin's four containment actions and `__guard__.push_rules`); see
@@ -2550,7 +2554,8 @@ Quarantine a device.
 > The legacy diagnostic dispatch routes (`POST /api/chargen/start`,
 > `POST /api/chargen/stop`, `POST /api/procfetch/fetch`), which broadcast one
 > fixed command, answer `422` `no_targets` and `503` `target_resolution_failed`
-> in the same way, beside the other causes in this table.
+> in the same way, beside the other causes in this table; they rank
+> `target_resolution_failed` first.
 >
 > `reason` is a top-level key on the error object, not part of the A4
 > `error.data` envelope. `POST /api/instructions/{id}/execute` carries the
@@ -8062,7 +8067,7 @@ object).** Counts of who the run was meant for and what happened (#2673):
 
 | Field | Meaning |
 |---|---|
-| `state` | `recorded`, or `unrecorded` when the run's device list was not fully saved or the run does not track one (every other field is then `null`; unknown is not zero) |
+| `state` | `recorded`, or `unrecorded` (every other field is then `null`; unknown is not zero): the run does not track a device list, none has been saved yet (including while a send is in progress), a saved list was ever partial, a later send started before an earlier list was saved, or the saved list covers fewer devices than the run reports contacting |
 | `population` | `listed`, or `connected_only` when a scope, broadcast or fleet selector chose the targets: only connected agents are considered. `null` for a confined caller |
 | `intended` | Targets the run was meant to reach: `contacted + offline + not_sent + withheld`. A device id listed twice is sent once and counted once |
 | `contacted` | Sends accepted (for a gateway-routed agent, queued, not delivered): `responded + failed + timed_out + not_delivered + unknown + pending` |
@@ -8070,7 +8075,7 @@ object).** Counts of who the run was meant for and what happened (#2673):
 | `failed` | Answered with a failure, timeout or rejection |
 | `timed_out` | The server recorded no result before the deadline. This can include a reply lost for a reason the server could not detect |
 | `not_delivered` | A failure the server or gateway made up for a command that certainly never reached the device: gateway `not_connected`, or the server could not start the forward, was refused as unauthenticated by the gateway, or has no address for the agent's gateway cluster. The device's own later answer replaces it |
-| `unknown` | The server cannot say what happened. Either a gateway-routed command that may have reached the device (the agent disconnected while awaited; a gateway forward that failed, found the gateway unavailable or got no response for the targeted agent, including a command still running at the 300-second forward limit), which the device's own later answer replaces; or the deadline sweep knows it could not have recorded an answer (the run's command correlation record could not be written, the run is more than 24 hours old and those records are removed, or saving the device's status failed on this server, remembered in memory until the run finishes, so after a restart or on another replica such a device can read `timed_out`), which stands |
+| `unknown` | The server cannot say what happened. Either a gateway-routed command that may have reached the device (the agent disconnected while awaited; a gateway forward that failed, found the gateway unavailable or got no response for the targeted agent, including a command still running at the 300-second forward limit). A later answer from the device replaces it if it reaches the server (after the 300-second limit it does not). Or the deadline sweep knows it could not have recorded an answer (the run's command correlation record could not be written, the run is more than 24 hours old and those records are removed, or saving the device's status failed on this server, remembered in memory until the run finishes, so after a restart or on another replica such a device can read `timed_out`); this kind stands |
 | `offline`, `not_sent`, `withheld` | Not reached: no session or route; send not accepted; withheld by quarantine, plugin absence, a per-OS switch, a concurrency claim, a containment gate, or (software sync) an agent too old to run it |
 | `pending` | Contacted and still awaited |
 | `late` | An answer arrived after the deadline sweep marked the device `timed_out` or `unknown`; a subset of `timed_out + unknown`. An answer that replaces a made-up delivery failure is not late |
@@ -8110,11 +8115,12 @@ Example for a run of three intended devices (detail read, other fields shortened
 ```
 
 **Run status.** A run is `succeeded` only when every intended device answered successfully, otherwise
-`completed`. A run whose device list was not fully saved (a failed record, a send that threw
-part-way, or an unreadable agent presence directory) can be `completed` at best. The first final
-result from a device stands, except that a server- or gateway-made delivery failure (`not_delivered`, or
-`unknown` from the gateway path) gives way to the device's own later answer. The run's status does
-not change once it has finished.
+`completed`. A run that reads `unrecorded` because its list was partial or not saved can be
+`completed` at best; its counts come from the saved list where that covers the devices contacted, and
+otherwise from reported results plus the devices the server gave up on (counted as failures). The
+first final result from a device stands, except that a server- or gateway-made delivery failure
+(`not_delivered`, or `unknown` from the gateway path) gives way to the device's own later answer. The
+run's status does not change once it has finished.
 
 **Counters on a recorded run.** `agents_targeted` counts the devices the send accepted.
 `agents_failure` counts failure, timeout, rejection, `not_delivered`, `timed_out` and `unknown`.
@@ -8124,19 +8130,23 @@ success plus failure over targeted.
 
 **Deadline.** The response window is the definition's `gather_ttl_seconds` (300 when none applies;
 software sync 300 plus `delay_max_s`), never less than 660 seconds without a signal. A server sweep
-about every 30 seconds marks silent devices and can lag after an outage or restart (see the runbook
-in [metrics.md](metrics.md#execution-deadline-sweep-runbook-2673)). A run past its deadline plus one
-more window with no device still awaited is finished as `completed`. A window longer than 300 seconds
-does not help a gateway-routed command, which the gateway forward ends at 300 seconds (recorded as
-`unknown`).
+about every 30 seconds marks silent devices and can lag after an outage (see the runbook in
+[metrics.md](metrics.md#execution-deadline-sweep-runbook-2673)). A run with a saved list, no send
+outstanding, at least one contacted device and none still awaited is finished one window past its
+deadline, as `completed`, if the ordinary rules have not finished it. Any other run with nothing
+awaited is force-finished only 24 hours after dispatch, and only if it reached somebody; a run that
+reached nobody is left to the stuck-execution sweep. A window longer than 300 seconds does not help a
+gateway-routed command, which the gateway forward ends at 300 seconds (recorded as `unknown`).
 
-**Limits.** The response gives counts only. The `agents` array, `kpi` and every other per-device read
-are built from the results devices (or the gateway) reported, so they do not list a device as timed
-out or never reached (a device that sent progress and then timed out still shows `running`); no route
-lists those devices. A management-group-confined caller gets counts over visible devices only. Its
-list, detail and summary counts (REST, MCP and dashboard) include the `timed_out` and `unknown`
-devices the server decided, as failures. A confined caller who did not dispatch the run still needs a
-reported result from a visible device to read it.
+**Limits.** `coverage` gives counts only. In the `agents` array and `kpi` of `?include=agents` (and of
+MCP `get_execution_status`), a device the server gave up on is listed as `timed_out` or `unknown` and
+counted as failed, even if its answer arrived later; a gateway-made delivery failure shows as
+`failure`. Devices that were never reached are not listed, and no route lists them. The legacy
+`GET /api/executions/{id}/agents` route and the Executions page's per-device views show reported
+results only. A management-group-confined caller gets counts over visible devices only. Its list,
+detail and summary counts (REST, MCP and dashboard) include the `timed_out` and `unknown` devices the
+server decided, as failures. A confined caller who did not dispatch the run still needs a reported
+result from a visible device to read it.
 
 #### `GET /api/v1/executions/{id}/responses`
 
@@ -8245,10 +8255,10 @@ the change was applied, the success response carries `Sec-Audit-Failed: true`.
 
 **`POST /api/v1/executions/{id}/rerun`** takes an optional JSON object with one field,
 `failed_only` (boolean, default `false`; an empty body means `false`). `failed_only: true` sizes the
-new record, for an original whose device list was saved, to the devices without a successful result
-(failed, rejected, timed out, not delivered or unknown; devices never reached and devices still
-awaited are not counted), and otherwise to the original's reported failed, timed-out and rejected
-devices. The legacy
+new record, for an original with a saved device list, to the listed devices without a successful
+result (failed, rejected, timed out, not delivered or unknown; devices never reached and devices
+still awaited are not counted), and otherwise to the original's reported failed, timed-out and
+rejected devices plus any the server gave up on. The legacy
 `{"scope": "failed_only"}` string is **not** accepted: any other field, a non-object body or a
 non-boolean `failed_only` is a `400`. Each call creates another record. `201`:
 

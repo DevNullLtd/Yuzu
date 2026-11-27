@@ -89,6 +89,7 @@ struct Execution {
     /// #2673: parts of a recorded run that are not device answers. Filled only by the software
     /// sync status read; unset for every other read and for an unrecorded run.
     struct Unanswered {
+        int64_t failed{0}; ///< device answers that were not a success
         int64_t timed_out{0};
         int64_t not_delivered{0};
         int64_t unknown{0};
@@ -644,7 +645,8 @@ public:
 
     /// #2673: say that a dispatch for this running run is about to send. Until
     /// `record_dispatch_targets` completes, the run cannot finish `succeeded`, and it has a
-    /// deadline so the sweep can end it. False on a store failure.
+    /// deadline so the sweep can end it. Called again before the earlier send's list was saved,
+    /// it marks the run's list incomplete for good. False on a store failure.
     [[nodiscard]] bool mark_targets_expected(const std::string& execution_id);
 
     /// #2673: record who one dispatch was meant for and what happened to each, and set the run's
@@ -666,12 +668,15 @@ public:
     /// `unknown`) to the agent rows of the named runs: an existing row of that agent takes the
     /// outcome's status (a late answer counts for nothing), and an agent with no row gains one.
     /// A caller must decide visibility from the rows BEFORE this. False on a store failure.
+    /// `visible_agents` engaged limits the read to those agents (applied in SQL).
     [[nodiscard]] bool overlay_server_outcomes(
         std::unordered_map<std::string, std::vector<AgentExecStatus>>& by_execution,
-        const std::vector<std::string>& execution_ids) const;
+        const std::vector<std::string>& execution_ids,
+        const std::optional<std::vector<std::string>>& visible_agents = std::nullopt) const;
     /// The one-run form.
-    [[nodiscard]] bool overlay_server_outcomes(const std::string& execution_id,
-                                               std::vector<AgentExecStatus>& statuses) const;
+    [[nodiscard]] bool overlay_server_outcomes(
+        const std::string& execution_id, std::vector<AgentExecStatus>& statuses,
+        const std::optional<std::vector<std::string>>& visible_agents = std::nullopt) const;
 
     /// #2673: coverage counts for one run. With `visible_agents` engaged, only those agents are
     /// counted (applied in SQL; engaged-empty counts nobody). `nullopt` on a store failure, which
@@ -1258,10 +1263,13 @@ private:
     /// not recorded (count agent rows instead), nullopt on a store failure.
     [[nodiscard]] std::optional<int>
     count_unsuccessful_targets(const std::string& execution_id) const;
+    void forget_lost_replies(const std::string& execution_id);
+    /// Guards the three members below.
     std::mutex lost_replies_mu_;
     std::unordered_map<std::string, std::unordered_set<std::string>> lost_replies_;
-    /// The first sweep pass of this process holds expiry (agents are still reconnecting).
-    std::atomic<bool> first_deadline_pass_{true};
+    std::size_t lost_reply_agents_{0};
+    /// Runs whose sweep transaction failed: swept after the others until one succeeds.
+    std::unordered_set<std::string> failed_sweeps_;
     void publish_refresh_events(const std::string& execution_id, const RefreshEvents& events);
 
     /// One attempt at `update_agent_status`'s upsert + agent-transition SSE

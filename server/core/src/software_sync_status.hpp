@@ -74,8 +74,7 @@ sync_status(const std::expected<std::optional<Execution>, std::string>& read, bo
                           {"estimated_completion_at", e.dispatched_at + delay_max_s}};
     // #2673: for a recorded run `failed` is device answers only; the rest is listed apart.
     if (const auto& u = e.unanswered) {
-        body["failed"] = std::max<std::int64_t>(
-            0, e.agents_failure - u->timed_out - u->not_delivered - u->unknown);
+        body["failed"] = u->failed;
         body["timed_out"] = u->timed_out;
         body["not_delivered"] = u->not_delivered;
         body["unknown"] = u->unknown;

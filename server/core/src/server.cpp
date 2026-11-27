@@ -15012,7 +15012,8 @@ private:
     software_sync_resolve(const auth::Session& sess, const yuzu::server::software_sync::Selector& sel) {
         namespace software_sync = yuzu::server::software_sync;
         software_sync::Expansion ex;
-        ex.all_ids = [this] { return registry_.all_ids(); };
+        bool partial = false; // #2673: set by the same read that lists the fleet
+        ex.all_ids = [this, &partial] { return registry_.all_ids(&partial); };
         ex.group_members =
             [this](const std::string& group_id)
             -> std::optional<std::vector<std::string>> {
@@ -15062,8 +15063,9 @@ private:
                                        : "unknown";
             return out;
         };
-        return software_sync::resolve_targets(sel, derive_exec_visible(sess),
-                                               ex);
+        auto resolved = software_sync::resolve_targets(sel, derive_exec_visible(sess), ex);
+        resolved.partial_list = partial;
+        return resolved;
     }
 
     /// ManagementGroup:Write as a GLOBAL grant, decided from a session alone (the sync Runner has no
@@ -15286,7 +15288,7 @@ private:
             }
             if (!execution_tracker_->record_dispatch_targets(
                     execution_id, targets, run && run->connected_only,
-                    /*complete=*/registry_.presence_readable()))
+                    /*complete=*/!(run && run->partial_list)))
                 count_target_record_failure();
         }
         if (out.sent > 0)
@@ -15454,6 +15456,8 @@ private:
         // (per dispatch), never a ServerImpl member.
         auto route_fallback = std::make_shared<yuzu::server::GatewayRouteFallback>(
             registry_, gateway_route_store_.get());
+        // #2673: set by the SAME call that builds the broadcast list.
+        auto membership_degraded = std::make_shared<bool>(false);
         return yuzu::server::ConfinedDispatchSink{
             [this, &cmd, route_fallback](const std::string& aid) {
                 if (auto cluster = route_fallback->cluster_for(aid))
@@ -15461,13 +15465,13 @@ private:
                 return registry_.send_to(aid, cmd);
             },
             [this, &cmd] { return registry_.send_to_all(cmd); },
-            [this] {
+            [this, membership_degraded] {
                 // all_ids() copies only the ids under the registry lock — NOT
                 // to_json_obj()'s full 5-field-per-agent JSON serialisation under
                 // the heartbeat/dispatch hot-path mutex (gov perf-S2, the same
                 // rationale recorded at the inventory site ~12706). A confined
                 // operator broadcasting `__all__` is the enterprise-normal case.
-                return registry_.all_ids();
+                return registry_.all_ids(membership_degraded.get());
             },
             [route_fallback](const std::vector<std::string>& candidates) {
                 return route_fallback->prepare(candidates);
@@ -15475,7 +15479,7 @@ private:
             [this](const std::vector<std::string>& candidates) {
                 return registry_.has_remote_presence(candidates);
             },
-            [this] { return !registry_.presence_readable(); }};
+            [membership_degraded] { return *membership_degraded; }};
     }
 
     /// #881: the ONE place a `ContainmentGate` is built. Called once per
@@ -21108,11 +21112,12 @@ private:
                                     count("skipped", 1);
                                 if (swept->clock_anomaly)
                                     count("clock_anomaly", 1);
-                                // A background writer changing run results is audited. Every
-                                // changed run gets its own attempt: one failed write must not
-                                // leave the rest unrecorded. A row that cannot be written is
-                                // counted and named in the log.
+                                // A background writer changing run results is audited. After
+                                // the first failed write the pass stops writing: this thread is
+                                // shared, and a degraded audit pool would hold it for every
+                                // run. Each unwritten row is counted and logged in full.
                                 if (audit_store_ && audit_store_->is_open()) {
+                                    bool audit_down = false;
                                     for (const auto& run : swept->runs) {
                                         AuditEvent ev;
                                         ev.timestamp =
@@ -21130,7 +21135,10 @@ private:
                                             (run.finished_status.empty() ? std::string("no")
                                                                          : run.finished_status);
                                         ev.result = "success";
-                                        if (!audit_store_->log(ev)) {
+                                        if (audit_down ||
+                                            stop_requested_.load(std::memory_order_acquire) ||
+                                            !audit_store_->log(ev)) {
+                                            audit_down = true;
                                             count("audit_failed", 1);
                                             spdlog::warn("deadline sweep: audit write failed for "
                                                          "execution_id={} ({})",
@@ -22504,8 +22512,11 @@ private:
             if (!coverage)
                 return std::unexpected(std::string("coverage read degraded"));
             if (coverage->recorded)
+                // All from the one coverage read, so a sweep between the two reads cannot
+                // hide a device's failure.
                 (*read)->unanswered = Execution::Unanswered{
-                    coverage->timed_out, coverage->not_delivered, coverage->unknown,
+                    coverage->failed, coverage->timed_out, coverage->not_delivered,
+                    coverage->unknown,
                     coverage->offline + coverage->not_sent + coverage->withheld};
             return read;
         };
@@ -26281,6 +26292,7 @@ private:
         // which this route previously had no branch for and now needs one.
         auto legacy_route_fallback = std::make_shared<yuzu::server::GatewayRouteFallback>(
             registry_, gateway_route_store_.get());
+        bool legacy_membership_degraded = false; // #2673: set by the list read below
         const yuzu::server::ConfinedDispatchSink sink{
             [&](const std::string& aid) {
                 if (auto cluster = legacy_route_fallback->cluster_for(aid))
@@ -26288,14 +26300,14 @@ private:
                 return registry_.send_to(aid, *classified);
             },
             [&] { return registry_.send_to_all(*classified); },
-            [&] { return registry_.all_ids(); },
+            [&] { return registry_.all_ids(&legacy_membership_degraded); },
             [legacy_route_fallback](const std::vector<std::string>& candidates) {
                 return legacy_route_fallback->prepare(candidates);
             },
             [&](const std::vector<std::string>& candidates) {
                 return registry_.has_remote_presence(candidates);
             },
-            [&] { return !registry_.presence_readable(); }};
+            [&] { return legacy_membership_degraded; }};
         // #881: one of the two production sites that hits the unfiltered
         // `send_to_all_unfiltered` fast path in practice — a default install
         // with RBAC disabled (or a legacy-admin superuser) resolves
@@ -26372,7 +26384,11 @@ private:
             // fact, and must not fall through to the generic catch-all
             // below — mirrors command_routes.cpp's identical branch.
             res.status = 503;
-            if (containment_gate.fail_closed) {
+            if (result.membership_partial && !result.intended_count) {
+                res.set_content(
+                    R"({"error":{"code":503,"message":"the target list could not be read, so nobody was resolved","reason":"target_resolution_failed","retry_after_ms":5000},"meta":{"api_version":"v1"}})",
+                    "application/json");
+            } else if (containment_gate.fail_closed) {
                 res.set_content(
                     R"({"error":{"code":503,"message":"containment state is unreadable — dispatch is failing closed and reaching no agent; check the quarantine store","reason":"containment_unreadable","retry_after_ms":5000},"meta":{"api_version":"v1"}})",
                     "application/json");
@@ -26391,10 +26407,6 @@ private:
             } else if (result.kill_switched_os_count > 0) {
                 res.set_content(
                     R"({"error":{"code":503,"message":"every target runs an OS for which this plugin action is switched off — dispatch was withheld, not attempted","reason":"kill_switched_os","retry_after_ms":null},"meta":{"api_version":"v1"}})",
-                    "application/json");
-            } else if (result.membership_partial && !result.intended_count) {
-                res.set_content(
-                    R"({"error":{"code":503,"message":"the target list could not be read, so nobody was resolved","reason":"target_resolution_failed","retry_after_ms":5000},"meta":{"api_version":"v1"}})",
                     "application/json");
             } else if (result.intended_count == 0) {
                 res.status = 422;

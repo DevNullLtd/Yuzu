@@ -188,6 +188,21 @@ TEST_CASE("sync runner: audit is stored before the execution record and the send
     CHECK(rig.targeted == std::vector<std::size_t>{3});
 }
 
+TEST_CASE("sync runner: the record is told which selected devices were skipped and how they were "
+          "chosen",
+          "[server][software_sync][runner][coverage]") {
+    Rig rig;
+    rig.live(3);
+    rig.offline.insert(rig.resolved_ids.front());
+    ss::Runner runner(rig.env());
+    const auto out = runner.run(session_of("alice"), group("g"), rig.audit());
+    REQUIRE(out.status == ss::Status::Accepted);
+    CHECK(rig.last_run.offline == std::vector<std::string>{rig.resolved_ids.front()});
+    CHECK(rig.last_run.too_old.empty());
+    CHECK_FALSE(rig.last_run.connected_only); // a group is a listed population
+    CHECK_FALSE(rig.last_run.partial_list);
+}
+
 TEST_CASE("sync runner: a failed audit write sends nothing and gives the reservation back",
           "[server][software_sync][runner][security]") {
     Rig rig;

@@ -64,6 +64,7 @@ struct RunTargets {
     bool connected_only{false};        ///< a scope or fleet selector chose the devices
     std::vector<std::string> offline;  ///< selected but not connected here
     std::vector<std::string> too_old;  ///< selected but unable to run the sync
+    bool partial_list{false};          ///< the selected devices may not all be listed
 };
 
 /// The seams a run needs. The server wires them; a test fakes them.
@@ -418,7 +419,7 @@ private:
             sent = env_.dispatch(
                 session, plan.targets, delay_max_s, execution_id,
                 RunTargets{sel.arm == DispatchArm::Broadcast || sel.arm == DispatchArm::Scope,
-                           plan.offline, plan.too_old});
+                           plan.offline, plan.too_old, resolved.partial_list});
         } catch (...) {
             // Any throw, not only std::exception: one that skipped this branch would unwind through
             // the Reservation's defaults, releasing the ledger entry with no audit row and the

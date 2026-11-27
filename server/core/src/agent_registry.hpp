@@ -999,7 +999,7 @@ public:
     // this replica has no local session for — local ids always take
     // precedence, no id is ever duplicated. Unconfigured (no presence store
     // wired), this is byte-identical to the pre-WS-5 local-only behavior.
-    std::vector<std::string> all_ids() const;
+    std::vector<std::string> all_ids(bool* degraded = nullptr) const;
 
     // The ids of the sessions held ON THIS REPLICA only, under the same lock all_ids() takes, and
     // with NO presence read at all: nothing here can fail, be truncated or hit Postgres. The
@@ -1333,10 +1333,6 @@ public:
     evaluate_scope_for_agent(const std::string& agent_id, const yuzu::scope::Expression& expr,
                              const TagStore* tag_store,
                              const CustomPropertiesStore* props_store = nullptr) const;
-
-    /// #2673: false when the cross-replica presence directory cannot be read, so `all_ids()`
-    /// may be listing only this replica's devices. True when no directory is wired.
-    [[nodiscard]] bool presence_readable() const { return live_presence().has_value(); }
 
 private:
     mutable std::mutex mu_;

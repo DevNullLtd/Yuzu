@@ -535,6 +535,8 @@ inline ConfinedDispatchOutcome wire_and_dispatch_confined(
     // per-id consult) and `prepare_route_fallback` (the batched read).
     auto route_fallback =
         std::make_shared<yuzu::server::GatewayRouteFallback>(registry, gateway_route_store);
+    // #2673: set by the SAME call that builds the broadcast list.
+    auto membership_degraded = std::make_shared<bool>(false);
     yuzu::server::ConfinedDispatchSink raw_sink{
         [&registry, &cmd, route_fallback](const std::string& aid) {
             // A session that CAN deliver ALWAYS wins (route_fallback->prepare() never
@@ -546,7 +548,7 @@ inline ConfinedDispatchOutcome wire_and_dispatch_confined(
             return registry.send_to(aid, cmd);
         },
         [&registry, &cmd] { return registry.send_to_all(cmd); },
-        [&registry] { return registry.all_ids(); },
+        [&registry, membership_degraded] { return registry.all_ids(membership_degraded.get()); },
         [route_fallback](const std::vector<std::string>& candidates) {
             return route_fallback->prepare(candidates);
         },
@@ -562,7 +564,7 @@ inline ConfinedDispatchOutcome wire_and_dispatch_confined(
         [&registry](const std::vector<std::string>& candidates) {
             return registry.has_remote_presence(candidates);
         },
-        [&registry] { return !registry.presence_readable(); }};
+        [membership_degraded] { return *membership_degraded; }};
     // Counts sends accepted by the send path into the caller's SendProgressScope when one is open (the
     // instruction-execute core and POST /api/v1/commands), so a throw mid fan-out still tells
     // them how many agents hold the command. Identity otherwise.

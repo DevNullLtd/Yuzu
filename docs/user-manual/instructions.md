@@ -295,7 +295,7 @@ spec:
 | `concurrency` | string | `per-device` | One of: `per-device`, `per-definition`, `per-set`, `global:<N>`, `unlimited`. Only `per-device` is enforced — see [Section 8](#8-concurrency-model). |
 | `stagger.maxDelaySeconds` | int | `0` | Max random delay per agent before execution. `0` = no stagger. |
 | `stagger.fixedDelaySeconds` | int | `0` | Fixed delay per agent before execution, added before the random stagger. `0` = no fixed delay. Total wait = `fixedDelaySeconds` + random(`0`, `maxDelaySeconds`). |
-| `minSuccessPercent` | int | `100` | Minimum success percentage. `0` = best-effort. |
+| `minSuccessPercent` | int | `100` | Minimum success percentage. `0` = best-effort. Not applied to run status: `succeeded` requires every intended device. |
 
 ### Compatibility
 
@@ -1054,12 +1054,12 @@ pending   (a rerun record: nothing is sent)
 |---|---|
 | `running` | At least one contacted device is still awaited, or the run is not yet finished. |
 | `succeeded` | Every intended device answered successfully. |
-| `completed` | Finished, but not recorded as fully successful: a device failed, timed out, could not be delivered to, has an unknown outcome or was never reached, or the run's device list was not fully saved. |
+| `completed` | Finished, but not recorded as fully successful: a device failed, timed out, could not be delivered to, has an unknown outcome or was never reached, or the run's device list was partial or not saved. |
 | `cancelled` | Marked cancelled. |
 
 On the Executions page a `completed` run shows "N failed" or "Not fully successful" and is never shown as successful; the status filter for it is "Completed, not fully successful".
 
-**Coverage.** `GET /api/v1/executions/{id}` and the MCP tool `get_execution_status` carry a `coverage` object counting the intended devices and what happened to them. It gives counts only; no route lists the devices that timed out or were never reached. See [the REST reference](rest-api.md#get-apiv1executionsidincludeagents).
+**Coverage.** `GET /api/v1/executions/{id}` and the MCP tool `get_execution_status` carry a `coverage` object counting the intended devices and what happened to them. It gives counts only. The `?include=agents` expansion and `get_execution_status` list the devices the server gave up on as `timed_out` or `unknown`; no route lists the devices that were never reached. See [the REST reference](rest-api.md#get-apiv1executionsidincludeagents).
 
 **Response deadline.** A contacted device that sends nothing is marked `timed_out` after the response window: the definition's `gather.ttlSeconds` (300 when none applies; software sync 300 plus `delay_max_s`), never less than 660 seconds without a signal. `timed_out` means the server recorded no result. A longer window does not help a gateway-routed command, which the gateway forward ends at 300 seconds; a command still running then reads `unknown`. An agent does not re-send the result of a command that finishes while it is disconnected.
 
@@ -1109,7 +1109,7 @@ curl -s -b cookies.txt \
   -d '{"scope": "failed_only"}'
 ```
 
-The `scope` field sizes the new record. With `"scope": "failed_only"` it counts, for an original whose device list was saved, the devices without a successful result (failed, rejected, timed out, not delivered or unknown; devices never reached are not counted), and otherwise the devices that reported failure, timeout or rejection. Any other value (or omitting the field) takes the original's targeted count.
+The `scope` field sizes the new record. With `"scope": "failed_only"` it counts, for an original with a saved device list, the listed devices without a successful result (failed, rejected, timed out, not delivered or unknown; devices never reached are not counted), and otherwise the devices that reported failure, timeout or rejection plus any the server gave up on. Any other value (or omitting the field) takes the original's targeted count.
 
 **What a rerun does.** It creates a new `pending` execution record linked to the original; it does not send anything to any device. The REST v1 route `POST /api/v1/executions/{id}/rerun` and the MCP tool `record_execution_rerun` do the same, take a boolean `failed_only` instead of the `scope` string, and answer `dispatched_to_devices: false`. Likewise `POST /api/v1/executions/{id}/cancel` and `cancel_execution` only mark the execution cancelled; they do not stop a command a device already received. See `docs/user-manual/rest-api.md`.
 

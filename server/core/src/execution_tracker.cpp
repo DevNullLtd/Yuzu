@@ -626,8 +626,11 @@ const std::vector<pg::PgMigration>& migrations() {
          "DEFAULT false;"},
         // v11 (#2673): who each run was meant for and what happened to each of them.
         // `targets_state` is '' (targets not tracked: the count-only rules), 'expected' (a
-        // dispatch is meant to record them and has not fully done so: the run can never read
-        // `succeeded`) or 'recorded'. `correlation_lost` says a reply of this run cannot be
+        // dispatch is meant to record them and none has yet) or 'recorded' (a list was saved).
+        // `attempt_open` is true from just before a send until that send's list is saved, and
+        // `targets_incomplete` is sticky: a saved list was partial, or a later send started
+        // while an earlier one was still unsaved. A run can read `succeeded` only when it is
+        // untracked, or recorded with neither flag. `correlation_lost` says a reply of this run cannot be
         // matched to it. `server_outcome` marks a status the server or gateway made up
         // (`not_delivered` or `undetermined`) instead of the device. `execution_target` holds one row per intended agent and is never
         // truncated. Constant defaults: the ADD COLUMNs are metadata-only. The new table is empty,
@@ -638,6 +641,8 @@ const std::vector<pg::PgMigration>& migrations() {
          "  ADD COLUMN IF NOT EXISTS deadline_at BIGINT NOT NULL DEFAULT 0, "
          "  ADD COLUMN IF NOT EXISTS target_population TEXT NOT NULL DEFAULT '', "
          "  ADD COLUMN IF NOT EXISTS targets_state TEXT NOT NULL DEFAULT '', "
+         "  ADD COLUMN IF NOT EXISTS attempt_open BOOLEAN NOT NULL DEFAULT false, "
+         "  ADD COLUMN IF NOT EXISTS targets_incomplete BOOLEAN NOT NULL DEFAULT false, "
          "  ADD COLUMN IF NOT EXISTS correlation_lost BOOLEAN NOT NULL DEFAULT false;"
          "ALTER TABLE agent_exec_status "
          "  ADD COLUMN IF NOT EXISTS server_outcome TEXT NOT NULL DEFAULT '';"
@@ -837,6 +842,12 @@ std::optional<Execution> exec_by_id_at(PGconn* conn, const std::string& id) {
     if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) == 0)
         return std::nullopt;
     return row_to_exec(res.get(), 0);
+}
+
+/// A status that is final and not a success, including the ones the server decides itself.
+bool is_unsuccessful(std::string_view status) {
+    return status == "failure" || status == "timeout" || status == "rejected" ||
+           status == "timed_out" || status == "unknown";
 }
 
 /// The terminal statuses an agent itself reports.
@@ -1717,25 +1728,24 @@ bool ExecutionTracker::refresh_counts_in_txn(pg_conn* conn, const std::string& e
     if (!reconcile_targets(conn, execution_id, only_agent))
         return false;
 
-    // Recompute aggregate counts, then decide the terminal state.
-    //
-    // #2673: a recorded run counts its target outcomes in ONE statement, and the finish decision
-    // uses the values that SAME statement returns. Two statements would read two snapshots, and a
-    // failure committed between them could finish a run `succeeded`. A recount that waited behind
-    // a newer one keeps the stored counts (`newer`): final outcomes only accumulate, apart from
-    // `not_delivered` giving way to `success`.
-    // Targets are usable only when the whole list was recorded AND at least as many are
-    // `contacted` as dispatch reported reaching; otherwise this matches no row and the count-only
-    // rule below applies, which can never finish a tracked run as `succeeded`.
-    const std::string newer =
-        "(c.success + c.not_success > e.agents_success + e.agents_failure OR "
-        " (c.success + c.not_success = e.agents_success + e.agents_failure AND "
-        "  c.success >= e.agents_success))";
-    const std::string recorded_sql =
-        "UPDATE execution_tracker.executions e SET "
-        "  agents_responded = CASE WHEN " + newer + " THEN c.answered ELSE e.agents_responded END, "
-        "  agents_success = CASE WHEN " + newer + " THEN c.success ELSE e.agents_success END, "
-        "  agents_failure = CASE WHEN " + newer + " THEN c.not_success ELSE e.agents_failure END "
+    // #2673: lock the run row BEFORE counting, as its own statement. Every recount of one run is
+    // then serialised and each count statement reads everything committed before the lock was
+    // granted, so a stale count can neither overwrite a newer one nor decide the terminal state,
+    // and the record cannot commit between the two count statements below. Lock order stays
+    // targets (reconcile above), then the run row.
+    pg::PgResult locked = pg::exec_params(
+        conn, "SELECT 1 FROM execution_tracker.executions WHERE id = $1 FOR NO KEY UPDATE",
+        std::vector<std::string>{execution_id});
+    if (locked.status() != PGRES_TUPLES_OK)
+        return false;
+
+    // A recorded run counts its target outcomes in one pass, so an agent outside the intended
+    // set and a result that arrived after the server's `timed_out` cannot change them. Targets
+    // are usable only when a list was saved AND at least as many are `contacted` as dispatch
+    // reported reaching; otherwise this matches no row and the count rule below applies.
+    const char* const recorded_sql =
+        "UPDATE execution_tracker.executions e SET agents_responded = c.answered, "
+        "  agents_success = c.success, agents_failure = c.not_success "
         "FROM (SELECT "
         "    COUNT(*) FILTER (WHERE disposition = 'contacted') AS contacted, "
         "    COUNT(*) FILTER (WHERE outcome IN "
@@ -1748,26 +1758,33 @@ bool ExecutionTracker::refresh_counts_in_txn(pg_conn* conn, const std::string& e
         "  FROM execution_tracker.execution_target WHERE execution_id = $1) c "
         "WHERE e.id = $1 AND e.targets_state = 'recorded' AND e.deadline_at > 0 "
         "  AND c.contacted >= e.agents_targeted "
-        "RETURNING c.open, c.not_success, c.missed";
-    const char* const count_only_sql =
+        "RETURNING c.open, c.not_success, c.missed, "
+        "  NOT (e.attempt_open OR e.targets_incomplete)";
+    // The count rule: agent rows, except that a device the server itself gave up on
+    // (`timed_out`, `unknown`) counts once, as not successful, whatever arrived later.
+    const std::string gave_up =
+        "SELECT t.agent_id FROM execution_tracker.execution_target t "
+        "WHERE t.execution_id = $1 AND t.outcome IN ('timed_out','unknown')";
+    const std::string rows =
+        "(SELECT COUNT(*) FROM execution_tracker.agent_exec_status "
+        " WHERE execution_id=$1 AND agent_id NOT IN (" + gave_up + ") AND status ";
+    const std::string count_only_sql =
         "UPDATE execution_tracker.executions SET "
-        "  agents_responded = (SELECT COUNT(*) FROM execution_tracker.agent_exec_status "
-        "                      WHERE execution_id=$1 AND status IN "
-        "                      ('success','failure','timeout','rejected')), "
-        "  agents_success   = (SELECT COUNT(*) FROM execution_tracker.agent_exec_status "
-        "                      WHERE execution_id=$1 AND status='success'), "
-        "  agents_failure   = (SELECT COUNT(*) FROM execution_tracker.agent_exec_status "
-        "                      WHERE execution_id=$1 AND status IN "
-        "                      ('failure','timeout','rejected')) "
-        "WHERE id=$1 RETURNING agents_responded, agents_failure, targets_state";
+        "  agents_responded = " + rows + "IN ('success','failure','timeout','rejected')), "
+        "  agents_success = " + rows + "= 'success'), "
+        "  agents_failure = " + rows + "IN ('failure','timeout','rejected')) "
+        "    + (SELECT COUNT(*) FROM (" + gave_up + ") g) "
+        "WHERE id=$1 RETURNING agents_success + agents_failure, agents_failure, "
+        "  targets_state = ''";
     pg::PgResult rec =
-        pg::exec_params(conn, recorded_sql.c_str(), std::vector<std::string>{execution_id});
+        pg::exec_params(conn, recorded_sql, std::vector<std::string>{execution_id});
     if (rec.status() != PGRES_TUPLES_OK)
         return false;
     const bool recorded = PQntuples(rec.get()) > 0;
     pg::PgResult counted{nullptr};
     if (!recorded) {
-        counted = pg::exec_params(conn, count_only_sql, std::vector<std::string>{execution_id});
+        counted = pg::exec_params(conn, count_only_sql.c_str(),
+                                  std::vector<std::string>{execution_id});
         if (counted.status() != PGRES_TUPLES_OK)
             return false;
     }
@@ -1784,12 +1801,14 @@ bool ExecutionTracker::refresh_counts_in_txn(pg_conn* conn, const std::string& e
     } else if (exec && exec->agents_targeted > 0) {
         if (recorded) {
             finished = to_i64(col(rec.get(), 0, 0)) == 0;
-            // `succeeded` means EVERY intended agent answered successfully.
-            clean = to_i64(col(rec.get(), 0, 1)) == 0 && to_i64(col(rec.get(), 0, 2)) == 0;
+            // `succeeded` means EVERY intended agent answered successfully, and that the list
+            // of intended agents is known to be complete.
+            clean = to_i64(col(rec.get(), 0, 1)) == 0 && to_i64(col(rec.get(), 0, 2)) == 0 &&
+                    col_str(rec.get(), 0, 3) == "t";
         } else if (PQntuples(counted.get()) > 0) {
             finished = to_i64(col(counted.get(), 0, 0)) >= exec->agents_targeted;
-            // A run that tracks targets but has no complete list is never `succeeded`.
-            clean = to_i64(col(counted.get(), 0, 1)) == 0 && col_str(counted.get(), 0, 2).empty();
+            // A tracked run that falls back to this rule is never `succeeded`.
+            clean = to_i64(col(counted.get(), 0, 1)) == 0 && col_str(counted.get(), 0, 2) == "t";
         }
     }
     std::string final_status_str;
@@ -1838,8 +1857,18 @@ bool ExecutionTracker::refresh_counts_in_txn(pg_conn* conn, const std::string& e
     return true;
 }
 
+void ExecutionTracker::forget_lost_replies(const std::string& execution_id) {
+    std::lock_guard lock(lost_replies_mu_);
+    if (const auto it = lost_replies_.find(execution_id); it != lost_replies_.end()) {
+        lost_reply_agents_ -= it->second.size();
+        lost_replies_.erase(it);
+    }
+}
+
 void ExecutionTracker::publish_refresh_events(const std::string& execution_id,
                                               const RefreshEvents& events) {
+    if (events.terminal)
+        forget_lost_replies(execution_id);
     if (!event_bus_ || !events.progress)
         return;
     event_bus_->publish(execution_id, "execution-progress", events.progress_payload.dump(),
@@ -1873,9 +1902,10 @@ ExecutionTracker::create_rerun(const std::string& original_id, const std::string
             rerun.agents_targeted = *from_targets;
         } else {
             auto agents = get_agent_statuses(original_id);
+            (void)overlay_server_outcomes(original_id, agents);
             int failed_count = 0;
             for (const auto& a : agents) {
-                if (a.status == "failure" || a.status == "timeout" || a.status == "rejected")
+                if (is_unsuccessful(a.status))
                     ++failed_count;
             }
             rerun.agents_targeted = failed_count;
@@ -1914,11 +1944,11 @@ ExecutionTracker::create_rerun_checked(const std::string& original_id, const std
             rerun.agents_targeted = *from_targets;
         } else {
             auto agents = get_agent_statuses_checked(original_id);
-            if (!agents)
+            if (!agents || !overlay_server_outcomes(original_id, *agents))
                 return std::unexpected(RerunError::kStoreDegraded);
             int failed_count = 0;
             for (const auto& a : *agents) {
-                if (a.status == "failure" || a.status == "timeout" || a.status == "rejected")
+                if (is_unsuccessful(a.status))
                     ++failed_count;
             }
             rerun.agents_targeted = failed_count;
@@ -2017,6 +2047,7 @@ ExecutionTracker::mark_cancelled_checked(const std::string& id, const std::strin
     if (should_publish) {
         event_bus_->publish(id, "execution-completed", payload.dump(), /*is_terminal=*/true);
     }
+    forget_lost_replies(id);
     return MarkCancelledOutcome::kCancelled;
 }
 
@@ -4273,16 +4304,33 @@ constexpr auto kDeadlineSweepBudget = std::chrono::seconds(10);
 /// Command correlation records are reaped after a day, so an older run can no longer match a
 /// reply.
 constexpr std::int64_t kCorrelationRetentionSecs = 24 * 60 * 60;
-/// Bound on remembered lost status writes.
+/// Bound on remembered lost status writes (agents, across runs).
 constexpr std::size_t kMaxLostReplies = 10000;
 /// An id no agent can have (too long for the key, or containing NUL) is stored as a placeholder,
 /// so one bad id cannot fail the whole record.
 constexpr std::size_t kMaxTargetIdBytes = 512;
+/// Bound on runs remembered as failing to sweep.
+constexpr std::size_t kMaxFailedSweeps = 1000;
 
 /// The effective response window of the `executions` row in scope, in SQL.
 const std::string kWindowSql = "GREATEST(COALESCE(NULLIF(executions.response_window_s, 0), " +
                                std::to_string(kDefaultResponseWindowSecs) + "), " +
                                std::to_string(kMinResponseWindowSecs) + ")";
+
+/// When a run with nothing open may be force-finished (never as `succeeded`). With a saved list
+/// and no send outstanding: one window past the deadline. Otherwise some devices may be unknown
+/// to the server and still working, so only after the correlation records are gone (no reply
+/// could be matched any more), and only for a run that reached somebody: a run that reached
+/// nobody is the stuck-execution reaper's.
+std::string overdue_clause(const char* now) {
+    return std::string("((NOT attempt_open AND deadline_at + ") + kWindowSql + " < " + now +
+           "::bigint AND EXISTS (SELECT 1 FROM execution_tracker.execution_target t "
+           "WHERE t.execution_id = executions.id AND t.disposition = 'contacted')) "
+           "OR (dispatched_at < " + now + "::bigint - " +
+           std::to_string(kCorrelationRetentionSecs) +
+           " AND (agents_targeted > 0 OR EXISTS (SELECT 1 FROM "
+           "execution_tracker.agent_exec_status s WHERE s.execution_id = executions.id))))";
+}
 
 } // namespace
 
@@ -4351,20 +4399,24 @@ bool ExecutionTracker::record_dispatch_targets(const std::string& execution_id,
         if (!flush())
             return false;
 
-        // `complete` false (the caller knows the list is partial) leaves the run `expected`. The
-        // first complete record zeroes counts taken from agent rows, so the recount below
-        // starts from the targets.
+        // `complete` false (the caller knows the list is partial) marks the run's list
+        // incomplete, for good. The first record of a RUNNING run zeroes counts taken from
+        // agent rows, so the recount below starts from the targets; a finished run is left as
+        // it is.
         const std::string deadline_sql =
             "UPDATE execution_tracker.executions SET deadline_at = GREATEST(deadline_at, "
             "extract(epoch FROM now())::bigint + " +
             kWindowSql +
             "), target_population = CASE WHEN $2::boolean OR target_population = "
             "'connected_only' THEN 'connected_only' ELSE 'listed' END, "
-            "targets_state = CASE WHEN $3::boolean THEN 'recorded' ELSE 'expected' END, "
-            "agents_responded = CASE WHEN targets_state = 'recorded' THEN agents_responded "
-            "                        ELSE 0 END, "
-            "agents_success = CASE WHEN targets_state = 'recorded' THEN agents_success ELSE 0 END, "
-            "agents_failure = CASE WHEN targets_state = 'recorded' THEN agents_failure ELSE 0 END "
+            "targets_state = 'recorded', attempt_open = false, "
+            "targets_incomplete = targets_incomplete OR NOT $3::boolean, "
+            "agents_responded = CASE WHEN status <> 'running' OR targets_state = 'recorded' "
+            "                        THEN agents_responded ELSE 0 END, "
+            "agents_success = CASE WHEN status <> 'running' OR targets_state = 'recorded' "
+            "                      THEN agents_success ELSE 0 END, "
+            "agents_failure = CASE WHEN status <> 'running' OR targets_state = 'recorded' "
+            "                      THEN agents_failure ELSE 0 END "
             "WHERE id = $1";
         pg::PgResult upd = pg::exec_params(
             conn, deadline_sql.c_str(),
@@ -4374,8 +4426,12 @@ bool ExecutionTracker::record_dispatch_targets(const std::string& execution_id,
             return fail("deadline update", upd);
         return true;
     });
-    if (!stored)
+    if (!stored) {
+        spdlog::warn("ExecutionTracker::record_dispatch_targets: the target list was not saved "
+                     "for execution_id={}; the run cannot read succeeded",
+                     execution_id);
         return false;
+    }
 
     // Replies that beat this write. Run AFTER the commit above, on purpose: a reply whose status
     // committed before this pass is settled here, and a later one runs its own recount after the
@@ -4392,7 +4448,11 @@ bool ExecutionTracker::mark_targets_expected(const std::string& execution_id) {
         return false;
     return pool_.with_txn_for(kWriteTimeout, [&](PGconn* conn) -> bool {
         const std::string sql =
-            "UPDATE execution_tracker.executions SET targets_state = 'expected', "
+            "UPDATE execution_tracker.executions SET "
+            "targets_state = CASE WHEN targets_state = '' THEN 'expected' ELSE targets_state "
+            "                END, "
+            // An earlier send that never saved its list makes the run's list incomplete.
+            "targets_incomplete = targets_incomplete OR attempt_open, attempt_open = true, "
             "deadline_at = GREATEST(deadline_at, extract(epoch FROM now())::bigint + " +
             kWindowSql + ") WHERE id = $1 AND status = 'running'";
         pg::PgResult res =
@@ -4420,8 +4480,14 @@ void ExecutionTracker::mark_correlation_lost(const std::string& execution_id) {
 void ExecutionTracker::note_lost_reply(const std::string& execution_id,
                                        const std::string& agent_id) {
     std::lock_guard lock(lost_replies_mu_);
-    if (lost_replies_.size() < kMaxLostReplies)
-        lost_replies_[execution_id].insert(agent_id);
+    if (lost_reply_agents_ >= kMaxLostReplies) {
+        spdlog::warn("ExecutionTracker: too many lost status writes remembered; "
+                     "execution_id={} may read timed_out instead of unknown",
+                     execution_id);
+        return;
+    }
+    if (lost_replies_[execution_id].insert(agent_id).second)
+        ++lost_reply_agents_;
 }
 
 std::optional<int> ExecutionTracker::count_unsuccessful_targets(
@@ -4431,7 +4497,11 @@ std::optional<int> ExecutionTracker::count_unsuccessful_targets(
         return std::nullopt;
     pg::PgResult res = pg::exec_params(
         lease.get(),
-        "SELECT CASE WHEN e.targets_state = 'recorded' THEN "
+        // The same rule the recount uses: targets count only when a saved list covers every
+        // agent dispatch reported reaching.
+        "SELECT CASE WHEN e.targets_state = 'recorded' AND (SELECT COUNT(*) FROM "
+        "    execution_tracker.execution_target c WHERE c.execution_id = e.id "
+        "    AND c.disposition = 'contacted') >= e.agents_targeted THEN "
         "  (SELECT COUNT(*) FROM execution_tracker.execution_target t "
         "    WHERE t.execution_id = e.id AND t.outcome NOT IN ('','success'))::int "
         "  ELSE -1 END FROM execution_tracker.executions e WHERE e.id = $1",
@@ -4443,7 +4513,8 @@ std::optional<int> ExecutionTracker::count_unsuccessful_targets(
 
 bool ExecutionTracker::overlay_server_outcomes(
     std::unordered_map<std::string, std::vector<AgentExecStatus>>& by_execution,
-    const std::vector<std::string>& execution_ids) const {
+    const std::vector<std::string>& execution_ids,
+    const std::optional<std::vector<std::string>>& visible_agents) const {
     if (!open_)
         return false;
     if (execution_ids.empty())
@@ -4452,11 +4523,16 @@ bool ExecutionTracker::overlay_server_outcomes(
     if (!lease)
         return false;
     std::vector<std::string_view> views(execution_ids.begin(), execution_ids.end());
-    pg::PgResult res = pg::exec_params(
-        lease.get(),
+    std::string sql =
         "SELECT execution_id, agent_id, outcome FROM execution_tracker.execution_target "
-        "WHERE execution_id = ANY($1::text[]) AND outcome IN ('timed_out','unknown')",
-        std::vector<std::string>{pg::to_text_array(views)});
+        "WHERE execution_id = ANY($1::text[]) AND outcome IN ('timed_out','unknown')";
+    std::vector<std::string> binds{pg::to_text_array(views)};
+    if (visible_agents) {
+        std::vector<std::string_view> visible(visible_agents->begin(), visible_agents->end());
+        sql += " AND agent_id = ANY($2::text[])";
+        binds.push_back(pg::to_text_array(visible));
+    }
+    pg::PgResult res = pg::exec_params(lease.get(), sql.c_str(), binds);
     if (res.status() != PGRES_TUPLES_OK) {
         spdlog::warn("ExecutionTracker::overlay_server_outcomes: query failed: {}",
                      PQresultErrorMessage(res.get()));
@@ -4484,11 +4560,12 @@ bool ExecutionTracker::overlay_server_outcomes(
     return true;
 }
 
-bool ExecutionTracker::overlay_server_outcomes(const std::string& execution_id,
-                                               std::vector<AgentExecStatus>& statuses) const {
+bool ExecutionTracker::overlay_server_outcomes(
+    const std::string& execution_id, std::vector<AgentExecStatus>& statuses,
+    const std::optional<std::vector<std::string>>& visible_agents) const {
     std::unordered_map<std::string, std::vector<AgentExecStatus>> by_execution;
     by_execution.emplace(execution_id, statuses);
-    if (!overlay_server_outcomes(by_execution, {execution_id}))
+    if (!overlay_server_outcomes(by_execution, {execution_id}, visible_agents))
         return false;
     statuses = std::move(by_execution[execution_id]);
     return true;
@@ -4516,7 +4593,8 @@ std::optional<ExecutionCoverage> ExecutionTracker::get_coverage_checked(
     // `recorded` is judged on the UNFILTERED target set (the same rule the recount applies);
     // every count honours the visible-agent filter.
     const std::string sql =
-        "SELECT e.targets_state = 'recorded' AND e.deadline_at > 0 AND "
+        "SELECT e.targets_state = 'recorded' AND NOT e.attempt_open AND "
+        "       NOT e.targets_incomplete AND e.deadline_at > 0 AND "
         "       (SELECT COUNT(*) FROM execution_tracker.execution_target a "
         "         WHERE a.execution_id = e.id AND a.disposition = 'contacted') "
         "         >= e.agents_targeted, "
@@ -4646,7 +4724,6 @@ ExecutionTracker::sweep_response_deadlines(const std::function<bool()>& should_s
         // A hold further ahead than one hold can reach comes from a clock that went back.
         if (hold_until > *now + kDeadlineSweepHoldSecs)
             hold_until = *now + kDeadlineSweepHoldSecs;
-        const bool first_pass_here = first_deadline_pass_.load();
         if (anchor_text) {
             const auto anchor = parse_reap_i64(*anchor_text);
             if (!anchor || *anchor < 0) {
@@ -4693,7 +4770,7 @@ ExecutionTracker::sweep_response_deadlines(const std::function<bool()>& should_s
                 }
                 // Persisted: take it as real, and give agents one hold before expiring.
                 hold_until = *now + kDeadlineSweepHoldSecs;
-            } else if (*now - *anchor > kDeadlineSweepGapSecs || first_pass_here) {
+            } else if (*now - *anchor > kDeadlineSweepGapSecs) {
                 hold_until = *now + kDeadlineSweepHoldSecs;
             }
         }
@@ -4712,6 +4789,9 @@ ExecutionTracker::sweep_response_deadlines(const std::function<bool()>& should_s
         const std::string silent =
             "t.disposition = 'contacted' AND t.outcome = '' AND t.last_signal_at + " + kWindowSql +
             " < $1::bigint";
+        const std::string any_target =
+            "EXISTS (SELECT 1 FROM execution_tracker.execution_target t "
+            "        WHERE t.execution_id = executions.id AND t.disposition = 'contacted')";
         const std::string sql =
             "SELECT id FROM execution_tracker.executions WHERE status = 'running' "
             "AND deadline_at > 0 AND deadline_at < $1::bigint AND " +
@@ -4722,32 +4802,44 @@ ExecutionTracker::sweep_response_deadlines(const std::function<bool()>& should_s
             ") OR (NOT EXISTS (SELECT 1 FROM execution_tracker.execution_target t "
             "        WHERE t.execution_id = executions.id AND t.disposition = 'contacted' "
             "          AND t.outcome = '') "
-            "      AND (deadline_at + " + kWindowSql + " < $1::bigint "
-            "        OR (targets_state = 'recorded' AND EXISTS (SELECT 1 FROM "
-            "              execution_tracker.execution_target t WHERE t.execution_id = "
-            "              executions.id AND t.disposition = 'contacted') "
+            "      AND (" + overdue_clause("$1") +
+            "        OR (targets_state = 'recorded' AND " + any_target +
             "          AND (SELECT COUNT(*) FROM execution_tracker.execution_target t "
             "            WHERE t.execution_id = executions.id AND t.disposition = 'contacted') "
             "            >= agents_targeted)))) "
             "ORDER BY deadline_at ASC LIMIT $2::bigint";
+        std::size_t failing = 0;
+        {
+            std::lock_guard lock(lost_replies_mu_);
+            failing = failed_sweeps_.size();
+        }
+        const auto limit = static_cast<std::int64_t>(kDeadlineSweepCap + failing);
         pg::PgResult cr = pg::exec_params(
             c, sql.c_str(),
-            std::vector<std::string>{std::to_string(*now),
-                                     std::to_string(kDeadlineSweepCap + 1)});
+            std::vector<std::string>{std::to_string(*now), std::to_string(limit + 1)});
         if (cr.status() != PGRES_TUPLES_OK) {
             err = "deadline sweep candidate read failed";
             return false;
         }
-        out.capped = PQntuples(cr.get()) > kDeadlineSweepCap;
-        const int rows = (std::min)(PQntuples(cr.get()), kDeadlineSweepCap);
+        out.capped = PQntuples(cr.get()) > limit;
+        const int rows = static_cast<int>(
+            (std::min)(static_cast<std::int64_t>(PQntuples(cr.get())), limit));
         for (int i = 0; i < rows; ++i)
             candidates.push_back(col_str(cr.get(), i, 0));
         return true;
     });
     if (!planned)
         return std::unexpected(err.empty() ? "deadline sweep failed" : err);
-    if (!out.skipped)
-        first_deadline_pass_.store(false);
+    // Runs that failed on an earlier pass go last, so one slow failing run cannot use up the
+    // pass and starve the rest.
+    std::unordered_set<std::string> failed_before;
+    {
+        std::lock_guard lock(lost_replies_mu_);
+        failed_before = failed_sweeps_;
+    }
+    std::stable_partition(candidates.begin(), candidates.end(), [&](const std::string& id) {
+        return !failed_before.contains(id);
+    });
 
     // Pass 2: ONE short transaction per run, so a reply never waits on another run's rows, a
     // failing run does not roll back the others, and shutdown is honoured between runs.
@@ -4822,7 +4914,8 @@ ExecutionTracker::sweep_response_deadlines(const std::function<bool()>& should_s
                 "           AS open "
                 "  FROM execution_tracker.execution_target WHERE execution_id = $1) c "
                 "WHERE e.id = $1 AND e.status = 'running' AND e.agents_targeted = 0 "
-                "  AND e.targets_state = 'recorded' AND c.n > 0 AND c.open = 0",
+                "  AND e.targets_state = 'recorded' AND NOT e.attempt_open "
+                "  AND c.n > 0 AND c.open = 0",
                 std::vector<std::string>{id});
             if (repair.status() != PGRES_COMMAND_OK)
                 return fail("repairing the target count", repair);
@@ -4831,12 +4924,12 @@ ExecutionTracker::sweep_response_deadlines(const std::function<bool()>& should_s
                 return false;
             }
             if (!events.terminal) {
-                // A whole window past the deadline with nothing open, and still not finished by
-                // the ordinary rules: finish it, never as `succeeded`.
+                // Overdue with nothing open, and still not finished by the ordinary rules:
+                // finish it, never as `succeeded` (see `overdue_clause`).
                 const std::string overdue =
                     "SELECT 1 FROM execution_tracker.executions WHERE id = $1 "
-                    "AND status = 'running' AND deadline_at + " + kWindowSql +
-                    " < $2::bigint AND NOT EXISTS (SELECT 1 FROM "
+                    "AND status = 'running' AND " + overdue_clause("$2") +
+                    " AND NOT EXISTS (SELECT 1 FROM "
                     "execution_tracker.execution_target t WHERE t.execution_id = executions.id "
                     "AND t.disposition = 'contacted' AND t.outcome = '')";
                 pg::PgResult od = pg::exec_params(
@@ -4856,18 +4949,19 @@ ExecutionTracker::sweep_response_deadlines(const std::function<bool()>& should_s
                 run.finished_status = events.terminal_payload.value("status", "");
             return true;
         }); // transaction committed / lease released here — publishes below run lease-free.
+        {
+            std::lock_guard lock(lost_replies_mu_);
+            if (ok)
+                failed_sweeps_.erase(id);
+            else if (failed_sweeps_.size() < kMaxFailedSweeps)
+                failed_sweeps_.insert(id);
+        }
         if (!ok) {
             ++out.failed_runs;
             spdlog::warn("ExecutionTracker::sweep_response_deadlines: execution_id={} not "
                          "swept: {}",
                          id, why);
             continue;
-        }
-        // Forgotten only once the run has finished: a pass that skipped the run, or ran before
-        // that agent expired, must still say `unknown` later.
-        if (events.terminal) {
-            std::lock_guard lock(lost_replies_mu_);
-            lost_replies_.erase(id);
         }
         publish_refresh_events(id, events);
         if (run.timed_out == 0 && run.unknown == 0 && run.finished_status.empty())

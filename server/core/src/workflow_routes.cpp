@@ -500,7 +500,8 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             // #2673: visibility is decided on the agent rows; counts also include the
             // outcomes the server decided itself.
             auto counted = *statuses_opt;
-            if (!execution_tracker->overlay_server_outcomes(counted, ids)) {
+            if (!execution_tracker->overlay_server_outcomes(counted, ids,
+                    std::vector<std::string>(gate.scope->begin(), gate.scope->end()))) {
                 degraded("tracker", "Execution tracker degraded, retry shortly.");
                 return;
             }
@@ -609,7 +610,8 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             int failed = e.agents_failure;
             int responded = e.agents_responded;
             int targeted = e.agents_targeted;
-            int pending = targeted > responded ? (targeted - responded) : 0;
+            // #2673: final = succeeded + failed; a timed-out device has not responded.
+            int pending = targeted > succeeded + failed ? (targeted - succeeded - failed) : 0;
             int running = 0; // distinguishable only in the detail drawer
 
             // Definition name (or fallback to truncated id), memoized per request.
@@ -932,7 +934,8 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                 row.agents_failure = exec.agents_failure;
                 if (gate.scope) {
                     auto counted = agents; // #2673: plus the outcomes the server decided
-                    if (!execution_tracker->overlay_server_outcomes(exec.id, counted)) {
+                    if (!execution_tracker->overlay_server_outcomes(exec.id, counted,
+                    std::vector<std::string>(gate.scope->begin(), gate.scope->end()))) {
                         res.status = 503;
                         res.set_content("<div class=\"empty-state\">Execution tracker degraded "
                                         "— retry shortly.</div>",

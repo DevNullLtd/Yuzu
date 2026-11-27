@@ -1858,7 +1858,7 @@ std::string AgentRegistry::palette_html(std::string_view query) const {
     return html;
 }
 
-std::vector<std::string> AgentRegistry::all_ids() const {
+std::vector<std::string> AgentRegistry::all_ids(bool* degraded) const {
     // HA WS-5: live_presence() is cached (kPresenceCacheTtl) and runs OFF
     // mu_ — the same rule the evaluate_scope preloads follow, never holding
     // the registry lock across Postgres I/O. An empty presence_reader_
@@ -1878,7 +1878,13 @@ std::vector<std::string> AgentRegistry::all_ids() const {
     // (confined_broadcast's sink, an empty-scope Guardian push) are already
     // tracked separately for the same weakness (#5007) and are not widened
     // here.
-    std::vector<PresenceIdentity> presence = live_presence().value_or(std::vector<PresenceIdentity>{});
+    // #2673: `degraded` reports THIS read, the one the list is built from, so a caller can
+    // never pair a narrowed list with a later successful read.
+    auto read = live_presence();
+    if (degraded)
+        *degraded = !read.has_value();
+    std::vector<PresenceIdentity> presence =
+        std::move(read).value_or(std::vector<PresenceIdentity>{});
 
     std::lock_guard lock(mu_);
     std::vector<std::string> ids;

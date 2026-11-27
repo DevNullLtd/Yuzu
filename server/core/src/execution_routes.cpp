@@ -128,7 +128,8 @@ void register_execution_routes(HttpRouteSink& sink, Deps deps) {
             // #2673: visibility is decided on the agent rows; counts also include the
             // outcomes the server decided itself.
             auto counted = *statuses_opt;
-            if (!deps.execution_tracker->overlay_server_outcomes(counted, ids)) {
+            if (!deps.execution_tracker->overlay_server_outcomes(counted, ids,
+                    std::vector<std::string>(gate.scope->begin(), gate.scope->end()))) {
                 res.status = 503;
                 res.set_content(detail::a4_error(res, "execution tracker degraded",
                                                 {.retry_after_ms = 5000}),
@@ -276,7 +277,8 @@ void register_execution_routes(HttpRouteSink& sink, Deps deps) {
         // engaged, dispatcher or not.
         if (gate.scope) {
             auto counted = statuses; // #2673: plus the outcomes the server decided
-            if (!deps.execution_tracker->overlay_server_outcomes(id, counted)) {
+            if (!deps.execution_tracker->overlay_server_outcomes(id, counted,
+                    std::vector<std::string>(gate.scope->begin(), gate.scope->end()))) {
                 res.status = 503;
                 res.set_content(detail::a4_error(res, "execution tracker degraded",
                                                 {.retry_after_ms = 5000}),
@@ -403,7 +405,8 @@ void register_execution_routes(HttpRouteSink& sink, Deps deps) {
         int agents_failure = exec.agents_failure;
         if (gate.scope) {
             auto counted = statuses; // #2673: plus the outcomes the server decided
-            if (!deps.execution_tracker->overlay_server_outcomes(id, counted)) {
+            if (!deps.execution_tracker->overlay_server_outcomes(id, counted,
+                    std::vector<std::string>(gate.scope->begin(), gate.scope->end()))) {
                 res.status = 503;
                 res.set_content(detail::a4_error(res, "execution tracker degraded",
                                                 {.retry_after_ms = 5000}),

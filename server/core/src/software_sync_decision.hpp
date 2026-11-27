@@ -340,6 +340,7 @@ struct Resolved {
     std::string detail; // InvalidScope: the parse error; Aborted: the abort reason
     bool caller_unfiltered{false};
     std::vector<std::string> ids;
+    bool partial_list{false}; ///< a fleet list read that may be missing devices (#2673)
 };
 
 struct DispatchResult {

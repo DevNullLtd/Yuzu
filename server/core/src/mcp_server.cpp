@@ -1267,13 +1267,16 @@ static const ToolDef kTools[] = {
      "any other text is replaced by the fixed value forensics_error. Status and exit code are "
      "unchanged. Status succeeded means every intended device answered successfully; completed "
      "means finished with at least one that did not (failed, timed out, not delivered, unknown "
-     "or never reached). coverage counts the intended devices: state unrecorded means the "
+     "or never reached), or with a device list the server could not save in full, even when "
+     "every listed device succeeded. coverage counts the intended devices: state unrecorded "
+     "means the "
      "counts are not known (never zero); population connected_only means only connected agents "
      "were considered; a silent device is timed_out after the response window (at least 660 s) "
      "and a later answer counts as late without changing the result. The agents array and kpi "
-     "do not list devices that timed out or were never reached; no tool lists them yet.",
+     "include devices the server gave up on, as timed_out or unknown; no tool lists devices "
+     "that were never reached.",
      R"({"type":"object","properties":{"execution_id":{"type":"string","description":"Execution ID"},"include":{"type":"array","items":{"type":"string","enum":["agents"]},"description":"Optional; \"agents\" adds a confined per-agent array + kpi summary"}},"required":["execution_id"]})",
-     R"j({"type":"object","properties":{"id":{"type":"string"},"definition_id":{"type":"string"},"status":{"type":"string"},"scope_expression":{"type":"string"},"parameter_values":{"type":"string","description":"Redacted to \"(redacted - confined view)\" for a confined caller"},"dispatched_by":{"type":"string"},"dispatched_at":{"type":"integer"},"agents_targeted":{"type":"integer"},"agents_responded":{"type":"integer"},"agents_success":{"type":"integer"},"agents_failure":{"type":"integer"},"progress_pct":{"type":"integer"},"completed_at":{"type":"integer"},"parent_id":{"type":"string"},"rerun_of":{"type":"string"},"retry_after_ms":{"type":"integer","description":"Present only while status is non-terminal — minimum ms before polling again"},"agents":{"type":"array","description":"Present only when include contains \"agents\"","items":{"type":"object","properties":{"agent_id":{"type":"string"},"status":{"type":"string"},"dispatched_at":{"type":"integer"},"first_response_at":{"type":"integer"},"completed_at":{"type":"integer"},"exit_code":{"type":"integer"},"error_detail":{"type":"string"}}}},"kpi":{"type":"object","description":"Present only when include contains \"agents\"","properties":{"total":{"type":"integer"},"succeeded":{"type":"integer"},"failed":{"type":"integer"},"p50_ms":{"type":["number","null"]},"p95_ms":{"type":["number","null"]}}},"coverage":{"type":"object","description":"Per-target counts over the visible agents; every count is null while state is unrecorded","properties":{"state":{"type":"string","enum":["recorded","unrecorded"]},"population":{"type":["string","null"],"description":"listed, or connected_only when a scope or broadcast chose the targets (only connected agents are considered); null for a confined caller"},"intended":{"type":["integer","null"],"description":"Targets the run was meant to reach."},"contacted":{"type":["integer","null"],"description":"Targets whose send was accepted (queued, for a gateway-routed agent)."},"responded":{"type":["integer","null"],"description":"Targets that answered successfully."},"failed":{"type":["integer","null"],"description":"Targets that answered with a failure, timeout or rejection."},"timed_out":{"type":["integer","null"],"description":"Targets for which the server recorded no result before the response deadline."},"offline":{"type":["integer","null"],"description":"Targets with no session or route."},"not_sent":{"type":["integer","null"],"description":"Targets whose send was not accepted."},"withheld":{"type":["integer","null"],"description":"Targets withheld by quarantine, plugin absence, a per-OS switch, a concurrency claim or a containment gate."},"pending":{"type":["integer","null"],"description":"Contacted targets still being waited for."},"late":{"type":["integer","null"],"description":"Targets the server gave up on that answered afterwards; a subset of timed_out plus unknown."},"not_delivered":{"type":["integer","null"],"description":"Targets the server or gateway reported it could not deliver to."},"unknown":{"type":["integer","null"],"description":"Targets whose delivery or answer is not known: the server could not have recorded it, or the gateway could not say whether the command arrived."},"deadline_at":{"type":["integer","null"],"description":"Epoch seconds of the response deadline; null for a confined caller."}},"required":["state","population","intended","contacted","responded","failed","timed_out","offline","not_sent","withheld","pending","late","not_delivered","unknown","deadline_at"]},"audit_persisted":{"type":"boolean","description":"Present and false only when the per-agent expansion's audit row failed to persist"}},"required":["id","definition_id","status","scope_expression","parameter_values","dispatched_by","dispatched_at","agents_targeted","agents_responded","agents_success","agents_failure","progress_pct","completed_at","parent_id","rerun_of","coverage"]})j"},
+     R"j({"type":"object","properties":{"id":{"type":"string"},"definition_id":{"type":"string"},"status":{"type":"string"},"scope_expression":{"type":"string"},"parameter_values":{"type":"string","description":"Redacted to \"(redacted - confined view)\" for a confined caller"},"dispatched_by":{"type":"string"},"dispatched_at":{"type":"integer"},"agents_targeted":{"type":"integer"},"agents_responded":{"type":"integer"},"agents_success":{"type":"integer"},"agents_failure":{"type":"integer"},"progress_pct":{"type":"integer"},"completed_at":{"type":"integer"},"parent_id":{"type":"string"},"rerun_of":{"type":"string"},"retry_after_ms":{"type":"integer","description":"Present only while status is non-terminal — minimum ms before polling again"},"agents":{"type":"array","description":"Present only when include contains \"agents\"","items":{"type":"object","properties":{"agent_id":{"type":"string"},"status":{"type":"string"},"dispatched_at":{"type":"integer"},"first_response_at":{"type":"integer"},"completed_at":{"type":"integer"},"exit_code":{"type":"integer"},"error_detail":{"type":"string"}}}},"kpi":{"type":"object","description":"Present only when include contains \"agents\"","properties":{"total":{"type":"integer"},"succeeded":{"type":"integer"},"failed":{"type":"integer"},"p50_ms":{"type":["number","null"]},"p95_ms":{"type":["number","null"]}}},"coverage":{"type":"object","description":"Per-target counts over the visible agents; every count is null while state is unrecorded","properties":{"state":{"type":"string","enum":["recorded","unrecorded"]},"population":{"type":["string","null"],"description":"listed, or connected_only when a scope or broadcast chose the targets (only connected agents are considered); null for a confined caller"},"intended":{"type":["integer","null"],"description":"Targets the run was meant to reach."},"contacted":{"type":["integer","null"],"description":"Targets whose send was accepted (queued, for a gateway-routed agent)."},"responded":{"type":["integer","null"],"description":"Targets that answered successfully."},"failed":{"type":["integer","null"],"description":"Targets that answered with a failure, timeout or rejection."},"timed_out":{"type":["integer","null"],"description":"Targets for which the server recorded no result before the response deadline."},"offline":{"type":["integer","null"],"description":"Targets with no session or route."},"not_sent":{"type":["integer","null"],"description":"Targets whose send was not accepted."},"withheld":{"type":["integer","null"],"description":"Targets withheld by quarantine, plugin absence, a per-OS switch, a concurrency claim, a containment gate, or (software sync) an agent too old to run it."},"pending":{"type":["integer","null"],"description":"Contacted targets still being waited for."},"late":{"type":["integer","null"],"description":"Targets the server gave up on that answered afterwards; a subset of timed_out plus unknown."},"not_delivered":{"type":["integer","null"],"description":"Targets the server or gateway reported it could not deliver to."},"unknown":{"type":["integer","null"],"description":"Targets whose delivery or answer is not known: the server could not have recorded it, or the gateway could not say whether the command arrived."},"deadline_at":{"type":["integer","null"],"description":"Epoch seconds of the response deadline; null for a confined caller."}},"required":["state","population","intended","contacted","responded","failed","timed_out","offline","not_sent","withheld","pending","late","not_delivered","unknown","deadline_at"]},"audit_persisted":{"type":"boolean","description":"Present and false only when the per-agent expansion's audit row failed to persist"}},"required":["id","definition_id","status","scope_expression","parameter_values","dispatched_by","dispatched_at","agents_targeted","agents_responded","agents_success","agents_failure","progress_pct","completed_at","parent_id","rerun_of","coverage"]})j"},
 
     {"get_execution_children",
      "List an execution's child executions (spawned reruns, workflow-step "
@@ -1326,7 +1329,7 @@ static const ToolDef kTools[] = {
      "anything because of this call, and the new record stays 'pending'. Do NOT read a success "
      "result as 'the devices were re-run'; the result carries dispatched_to_devices:false. To run "
      "the work again on devices, dispatch it with execute_instruction. failed_only (default "
-     "false) sizes the new record to the original's devices without a successful result (failed, rejected, timed out, not delivered or unknown) "
+     "false) sizes the new record to the original's reached devices without a successful result (failed, rejected, timed out, not delivered or unknown; never-reached and still-pending devices are not counted) "
      "instead of its whole targeted list; it is a boolean (the legacy REST scope=\"failed_only\" "
      "string is not accepted here). Each call creates another record (not idempotent). A caller "
      "confined to management groups may use it only on an execution they dispatched that no "
@@ -1338,7 +1341,7 @@ static const ToolDef kTools[] = {
      "(execution.rerun) BEFORE the record is created and refuses with a retryable error, "
      "creating nothing, if that row cannot be saved. Requires Execution:Execute and "
      "Execution:Read.",
-     R"j({"type":"object","properties":{"execution_id":{"type":"string","pattern":"^[A-Za-z0-9_-]{1,128}$","maxLength":128,"description":"Id of the execution to record a rerun of, from list_executions or get_execution_status"},"failed_only":{"type":"boolean","description":"Default false. True sizes the new record to the original's devices without a successful result (failed, rejected, timed out, not delivered or unknown)"},"approval_id":{"type":"string","description":"Approval ticket id from a prior kApprovalRequired response; supply after administrator approval"}},"required":["execution_id"],"additionalProperties":false})j",
+     R"j({"type":"object","properties":{"execution_id":{"type":"string","pattern":"^[A-Za-z0-9_-]{1,128}$","maxLength":128,"description":"Id of the execution to record a rerun of, from list_executions or get_execution_status"},"failed_only":{"type":"boolean","description":"Default false. True sizes the new record to the original's reached devices without a successful result (failed, rejected, timed out, not delivered or unknown; never-reached and still-pending devices are not counted)"},"approval_id":{"type":"string","description":"Approval ticket id from a prior kApprovalRequired response; supply after administrator approval"}},"required":["execution_id"],"additionalProperties":false})j",
      R"j({"type":"object","properties":{"execution_id":{"type":"string","description":"Id of the NEW pending record"},"rerun_of":{"type":"string"},"status":{"const":"pending"},"failed_only":{"type":"boolean"},"dispatched_to_devices":{"const":false},"audit_persisted":{"type":"boolean","description":"Present (false) only when the outcome audit row failed to persist after the record had been created"}},"required":["execution_id","rerun_of","status","failed_only","dispatched_to_devices"]})j"},
 
     {"list_executions", "List recent command executions. Confined by management group: a "
@@ -16616,7 +16619,8 @@ McpServer::HandlerFn McpServer::build_handler(
                     // too, which fed a self-contradictory progress_pct==100
                     // below while agents were still executing.
                     auto counted = agents; // #2673: plus the outcomes the server decided
-                    if (!execution_tracker->overlay_server_outcomes(exec_id, counted)) {
+                    if (!execution_tracker->overlay_server_outcomes(exec_id, counted,
+                    std::vector<std::string>(gate.scope->begin(), gate.scope->end()))) {
                         res.set_content(a4_error(kInternalError, "execution tracker degraded", {},
                                                  /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
                                         "application/json");
@@ -16695,8 +16699,20 @@ McpServer::HandlerFn McpServer::build_handler(
                     // hard error (see docs/api-twin-recipe.md §4).
                     JArr agent_rows;
                     std::vector<AgentExecStatus> kpi_source;
-                    kpi_source.reserve(agents.size());
-                    for (const auto& a : agents) {
+                    // #2673: a device the server gave up on is listed as timed_out or unknown.
+                    auto listed = agents;
+                    if (!execution_tracker->overlay_server_outcomes(
+                            exec_id, listed,
+                            gate.scope ? std::optional(std::vector<std::string>(
+                                             gate.scope->begin(), gate.scope->end()))
+                                       : std::nullopt)) {
+                        res.set_content(a4_error(kInternalError, "execution tracker degraded", {},
+                                                 /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                                        "application/json");
+                        return;
+                    }
+                    kpi_source.reserve(listed.size());
+                    for (const auto& a : listed) {
                         if (gate.scope && !authz::in_scope(gate.scope, a.agent_id))
                             continue;
                         agent_rows.add_raw(execution_agent_status_json(a).dump());
@@ -17005,7 +17021,8 @@ McpServer::HandlerFn McpServer::build_handler(
                     }
                     statuses_by_exec = std::move(*statuses_opt);
                     // #2673: counts also include the outcomes the server decided itself.
-                    if (!execution_tracker->overlay_server_outcomes(statuses_by_exec, exec_ids)) {
+                    if (!execution_tracker->overlay_server_outcomes(statuses_by_exec, exec_ids,
+                    std::vector<std::string>(gate.scope->begin(), gate.scope->end()))) {
                         res.set_content(
                             a4_error(kInternalError, "execution tracker degraded", {},
                                      /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
@@ -26947,7 +26964,8 @@ McpServer::HandlerFn McpServer::build_handler(
                         int agents_responded = exec->agents_responded;
                         if (gate.scope) {
                             auto counted = exec_agents; // #2673: plus server-decided outcomes
-                            if (!execution_tracker->overlay_server_outcomes(target_id, counted)) {
+                            if (!execution_tracker->overlay_server_outcomes(target_id, counted,
+                    std::vector<std::string>(gate.scope->begin(), gate.scope->end()))) {
                                 res.set_content(a4_error(kInternalError,
                                                          "execution tracker degraded", {},
                                                          /*retry_after_ms=*/

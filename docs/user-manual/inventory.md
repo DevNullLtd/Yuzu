@@ -1637,6 +1637,7 @@ place, **Hardware** and **Software**, each its own page:
       `skipped_offline` counts the devices this server process did not reach that are not too old: it has no live session for them (a disconnected device, or one attached to another server), or the send was refused by the live stream (for example a gateway-attached agent whose gateway lacks the dispatch capability).
       Which devices are candidates depends on the scope: a group or a single named device lists its disconnected members too, but an `__all__` or scope-expression run lists only this server's own sessions plus the shared presence record, so a device that is offline everywhere is never counted, and if the presence read is degraded an `__all__` run lists fewer devices (those attached to other servers are not listed) while a scope-expression run is refused with 503 (the scope could not be evaluated) and sends nothing.
       `requested` and `skipped_offline` therefore describe what this server could reach; they are not a census of the fleet.
+      If the fleet list was read partially (unreadable presence), the record's coverage reads `unrecorded` and the run can finish `completed` at best.
       In the run's execution record (#2673) the selected devices that were offline or too old count as intended and not reached, so such a run finishes `completed`, not `succeeded`; devices skipped as already fresh are not intended. For an `__all__` or scope-expression run the record's `population` is `connected_only`. A run with no device to ask (all selected devices offline, too old or fresh) creates no execution record, and a record whose every send is refused is cancelled. Agents older than 0.13.1 are skipped
       and counted separately (`skipped_version`). A request may also carry `last_synced_before`
       (epoch seconds): only devices whose last accepted report is older are asked, and the rest
@@ -1686,7 +1687,7 @@ place, **Hardware** and **Software**, each its own page:
       accepted and the agents that armed the sync or failed (the MCP tool
       `get_software_sync_status` reads the same record). An agent answers when it arms
       the sync, not when its report lands, so those figures count requests taken up, not
-      reports received. For a run whose device list was saved, `failed` counts device
+      reports received. When the run's coverage is recorded, `failed` counts device
       answers only, and `timed_out`, `not_delivered`, `unknown` and `not_reached` are
       reported separately. A silent device is `timed_out` after 300 seconds plus
       `delay_max_s` (at least 660 seconds).
