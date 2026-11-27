@@ -99,10 +99,8 @@
 ///
 /// Schema v4 (#6969) appends `scope_group_id` to both attestation tables and to both primary keys,
 /// re-creates the history foreign key as `access_review_history_grant_fk` over the five columns
-/// and replaces the two guard functions so scope joins every identity comparison. It touches no row
-/// (every existing row takes `''`, which is true: only fleet-wide grants were ever frozen). An older
-/// binary against a v4 database is NOT mechanically blocked (the runner only warns when the
-/// database is ahead): do not run one.
+/// and replaces the two guard functions so scope joins every identity comparison. Fresh-database
+/// only (docs/user-manual/upgrading.md, "Deployment contract").
 ///
 /// Schema v3 REFUSES a database that holds a decision recorded by the
 /// subject of the grant (an earlier build allowed it): the store is

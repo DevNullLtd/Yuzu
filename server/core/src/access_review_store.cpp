@@ -255,9 +255,9 @@ CREATE CONSTRAINT TRIGGER access_review_history_consistent AFTER INSERT
         // DISABLE TRIGGER USER, and none is added: the trigger bindings are left untouched.
         //
         // The DEFAULT exists only to backfill those rows. The final two statements DROP it from both
-        // columns, so a write that does not name scope_group_id (a binary that still keys a grant by
-        // four columns) fails the NOT NULL check loudly instead of silently landing on the
-        // fleet-wide row ''. Every INSERT this store makes names the column explicitly.
+        // columns, so a write that does not name scope_group_id fails the NOT NULL check loudly
+        // instead of silently landing on the fleet-wide row ''. Every INSERT this store makes
+        // names the column explicitly.
         //
         // The history table's foreign key to the state table was unnamed in v3, and a primary key's
         // name is a Postgres default, so none is guessed: the DO block finds each in pg_constraint,
@@ -271,9 +271,7 @@ CREATE CONSTRAINT TRIGGER access_review_history_consistent AFTER INSERT
         // The two functions are replaced in place (CREATE OR REPLACE): a trigger binds to its
         // function, so none is re-created, and access_review_history_keep is untouched. Locks and
         // bounds as v3: ACCESS EXCLUSIVE on both tables for the whole transaction, the 30 s lock wait
-        // and 300 s statement bound set below. The runner's per-store advisory lock is taken before
-        // this SQL and is bounded by the pool's 10 s lock_timeout (set by the pool only when the
-        // DSN carries no options=; pg_pool.cpp), so start one replica first.
+        // and 300 s statement bound set below.
         //
         // The raw strings are split below the 15,000-byte segment ceiling (MSVC refuses a single
         // string token near 16,380 bytes; tests/test_openapi_literal_segments.py states the

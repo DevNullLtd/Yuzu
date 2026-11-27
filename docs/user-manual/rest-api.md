@@ -5207,8 +5207,8 @@ decision. `400`, one cause each:
   The first is `scope is required and must be "fleet" or "management_group"` (a missing, non-string or unknown
   `scope`), the second is `scope_group_id must be absent or empty when scope is "fleet"`, and the third is
   `scope_group_id is required when scope is "management_group" and must be a nonempty string of at most 256 bytes without NUL`.
-  A dashboard page loaded before the upgrade sends no scope and gets this `400` until it is reloaded; an API
-  caller must send `scope` itself. A queued or saved request that predates the change needs `scope` added.
+  An API caller must send `scope` itself, copied with `scope_group_id` from the grant's row in
+  `GET /api/v1/access-reviews/{id}`.
 - `principal_type`, `principal_id` or `role_name` is longer than 1024 bytes or contains a NUL byte. The
   message is `principal_type, principal_id and role_name must be 1-1024 bytes without NUL`. It is decided
   before any lookup, so it holds for all three principal types, and it writes no audit row (the schema

@@ -4901,11 +4901,7 @@ It refuses again on every boot until the database is replaced. Deploy into a fre
 is detected: decisions on engine or group grants made by earlier builds are not checked and read as "previous:
 not recorded". This is the project's "Deployment contract (hard cutover)" posture, a decision of the project
 owner recorded in `docs/user-manual/upgrading.md`; the executable refuses a schema state, it does not verify
-where the database came from. The schema v4 migration (the scope key, #6969) is written so that a populated v3 table
-keeps every row, each reading fleet-wide (`scope_group_id = ''`), and a unit test populates a v3 database and checks
-that; that is a property of the migration SQL, not a supported upgrade path. A database written by an earlier build is
-outside the supported population, no operation alongside an earlier build or return to one is described, and the
-executable does not stop an earlier binary from opening a database this build has migrated (the runner only warns).
+where the database came from.
 
 ## Render-time permission probes (capability hints)
 
