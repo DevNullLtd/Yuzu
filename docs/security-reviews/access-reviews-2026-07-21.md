@@ -34,6 +34,12 @@ was corrected).
 > and group staleness carry a recorded owner acceptance (2026-11-07). The reasons are in "Amended 2026-11-07"
 > at the end of this document.
 
+> **Addendum (2026-11-26, #6969).** The statements below that a grant is `(principal, role)` and that the
+> store is "schema v3, three tables" are superseded, and the #4752 "Input bounds" list is extended (`scope_group_id`, at most 256 bytes, no NUL; the other bounds stand): a grant is the
+> five-part key `(campaign_id, principal_type, principal_id, role_name, scope_group_id)` and the schema is
+> v4. See "Addendum (2026-11-26, #6969)" at the end of this document.
+>
+
 ## What shipped
 
 - **Export (stateless):** `GET /api/v1/access-reviews/export?format=json|csv`
@@ -62,7 +68,7 @@ was corrected).
   campaign that **freezes the complete current grant population** as
   `pending` attestation rows in one transaction; `POST
   /api/v1/access-reviews/{id}/attestations` records a reviewer decision
-  (`attested`/`flagged_revoke`) against one frozen `(principal, role)` grant
+  (`attested`/`flagged_revoke`) against one frozen grant (`(principal, role)` at a scope since #6969; see the #6969 addendum)
   — every decision is kept in the grant's history, the latest is the current decision and the grant cannot return to `pending` (an UPSERT until #4752, see the addendum at the end of this document); `POST
   /api/v1/access-reviews/{id}/close` closes the campaign; `GET
   /api/v1/access-reviews/{id}` returns the full evidentiary state
@@ -711,3 +717,37 @@ copy of the file can account for the difference.
   acceptance in residual 1 above (Dave Rae, project owner, 2026-11-07, for the release carrying #4752),
   replacing any wording that described them as maintainer-accepted. Reason: the acceptance names its
   scope, its worst-case timing, what it does not cover and the compensating control.
+
+## Addendum (2026-11-26, #6969): a grant is keyed by its scope
+
+This addendum records what the #6969 attestation-scope change alters in the statements above. It adds the
+scope to the identity of a grant; it does not change which grants are listed (the campaign population is
+unchanged, see below).
+
+- **Identity.** A grant is `(campaign_id, principal_type, principal_id, role_name, scope_group_id)`.
+  `scope_group_id` is `""` for a fleet-wide grant and the management group's id otherwise. A fleet-wide and a
+  group-scoped grant of the same role for the same principal are two grants, each decided and kept in
+  history on its own. Every statement above that a decision applies to one `(principal, role)` grant reads
+  as "at a scope" from this addendum on.
+- **Schema v4.** `scope_group_id TEXT NOT NULL` is a column of both `access_review_attestation` and
+  `access_review_attestation_history`, and of both primary keys; the history foreign key to the grant row
+  is re-created over the five columns (`ON DELETE RESTRICT`); the guard functions that keep history
+  append-only are replaced to compare the scope too (the row cannot change scope, and a history row must match a grant row on all five columns). The migration is appended after v3 (v1 to v3 are
+  unchanged). The deployment contract is "Deployment contract" in `docs/user-manual/upgrading.md`: a fresh
+  database, with every writer on this build.
+- **Request.** `POST /api/v1/access-reviews/{id}/attestations` and the MCP `record_attestation` require
+  `scope` (`fleet` or `management_group`); `scope_group_id` is at most 256 bytes without NUL. An absent
+  `scope` is refused with `400`; the permission gate still runs first, so an unauthorised caller learns
+  nothing about the shape. REST and MCP share one parser.
+- **Output.** Every attestation row of `GET /api/v1/access-reviews/{id}` carries `scope`, `scope_group_id`
+  and `scope_group_name`, and the campaign tables on the Settings and Access pages show a Scope column.
+- **Audit shape.** The grant tuple in the attestation audit `detail` ends with `scope=fleet` or
+  `scope=management_group scope_group_id=<token>`, appended after the earlier tokens so a parser that reads
+  those by prefix keeps working. `target_id` is still the campaign id alone. The scope word is a fixed literal and `scope_group_id`
+  passes through `audit_token` (CWE-117).
+- **What did not change.** Every grant frozen by this build is fleet-wide: the campaign population still
+  comes from `RbacStore::list_all_principal_roles_checked()` alone, so grants held through a management-group
+  role are not yet in a campaign. Clause (3) of the routed concern (grant-table-driven completeness) is
+  therefore met for the fleet-wide table only, and #6969 stays open until the group-role grants join the
+  population. The gate, flag != revoke, append-only history with no prune, and reviewer != subject are
+  unchanged and apply per scoped grant.

@@ -149,10 +149,11 @@ TEST_CASE("reviews glue: the attributes on a drawn grant row are exactly the dat
     v.attestations = {a};
     const std::string drawn = render_campaign(v, true);
 
-    // The row carries the whole frozen tuple, in three separate attributes (no joined key, so a
+    // The row carries the whole frozen tuple, in five separate attributes (the scope is part of it) (no joined key, so a
     // comma or a colon in a value cannot blur two grants together).
     const std::string tr = "<tr data-principal-type=\"group\" data-principal-id=\"it-ops\" "
-                           "data-role-name=\"Operator\">";
+                           "data-role-name=\"Operator\" data-scope=\"fleet\" "
+                           "data-scope-group-id=\"\">";
     CHECK_THAT(drawn, ContainsSubstring(tr));
 
     // Each data-* attribute on that row becomes a camelCase dataset name; the script must read
@@ -173,9 +174,13 @@ TEST_CASE("reviews glue: the attributes on a drawn grant row are exactly the dat
         INFO("dataset." << camel);
         CHECK_THAT(js, ContainsSubstring("d." + camel));
     }
-    CHECK(seen == 3);
+    CHECK(seen == 5);
     // ... and the request body names them in the shape the REST route validates.
     for (const char* field : {"principal_type: d.principalType", "principal_id: d.principalId",
-                              "role_name: d.roleName"})
+                              "role_name: d.roleName",
+                              "scope: d.scope", "scope_group_id: d.scopeGroupId"})
         CHECK_THAT(js, ContainsSubstring(field));
+    // The Flag dialog names the scope, so a reviewer flagging a group-scoped grant sees which one.
+    CHECK_THAT(js, ContainsSubstring("d.scope === 'management_group'"));
+    CHECK_THAT(js, ContainsSubstring("(' + where + ') for revocation?"));
 }
