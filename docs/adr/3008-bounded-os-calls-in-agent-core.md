@@ -196,9 +196,13 @@ Manual procedure, on a disposable Windows machine:
    `abandoned_call_pending`, and an `os_info.os_name` sent after the first timeout answers in under
    1 s.
 3. Resume the process. The next snapshot call completes.
-4. Suspend the process again, let one snapshot call time out, and stop the agent service while the
-   process is still suspended. It stops inside the service stop timeout with no crash dump. Start it
-   and call again.
+4. Enable Windows Error Reporting local dumps for the agent first, so that an absent dump is
+   evidence. Suspend the process again, let one snapshot call time out, and stop the agent service
+   while the process is still suspended. It stops inside the service stop timeout, the old agent
+   process is gone and no crash dump is written. Start it with the process still suspended: the
+   first snapshot call answers within 15 s plus 2 s with `deadline_exceeded` (a new agent process
+   has no abandoned call), and the next answers at once with `abandoned_call_pending`. Resume the
+   process. The next snapshot call completes.
 
 The other items raised in the #3925 comments (POSIX file reads, the reconnect join, the metric) are
 the D7 list and stay there.
