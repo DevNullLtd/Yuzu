@@ -14,6 +14,7 @@
 #include "execution_event_bus.hpp"
 #include "sweep_audit_queue.hpp"
 #include "recount_coalescer.hpp"
+#include "dispatch_announcement.hpp"
 #include "pg/pg_exec.hpp"
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
@@ -6001,6 +6002,85 @@ TEST_CASE("deadline sweep audit queue: a failed write is retried, one attempt pe
     CHECK(gone == std::vector<int>{4}); // the oldest goes first
     CHECK(announced_rows == std::vector<int>{1, 2, 3, 4, 5, 6});
     CHECK(announced == 2);
+}
+
+TEST_CASE("dispatch announcement: a send that could not announce itself neither closes an open "
+          "send nor saves a complete list",
+          "[pg][execution_tracker][coverage]") {
+    StuckExecPg db;
+    auto& t = db.tracker();
+    auto exec = make_execution();
+    exec.expects_targets = true;
+    auto id = t.create_execution(exec);
+    REQUIRE(id.has_value());
+    const auto flag = [&](const std::string& column) {
+        auto conn = db.pool().acquire();
+        REQUIRE(conn);
+        auto res = pg::exec_params(
+            conn.get(),
+            ("SELECT " + column + " FROM execution_tracker.executions WHERE id = $1").c_str(),
+            std::vector<std::string>{*id});
+        REQUIRE(res.status() == PGRES_TUPLES_OK);
+        REQUIRE(PQntuples(res.get()) == 1);
+        return std::string(PQgetvalue(res.get(), 0, 0)) == "t";
+    };
+    const std::vector<DispatchTarget> a{{"a", TargetDisposition::Contacted}};
+
+    SECTION("an announced send closes its own empty attempt") {
+        DispatchAnnouncement send(&t, *id, "test");
+        CHECK(flag("attempt_open"));
+        send.close_if_empty(false);
+        CHECK(flag("attempt_open")); // it named somebody: only a saved list closes it
+        send.close_if_empty(true);
+        CHECK_FALSE(flag("attempt_open"));
+    }
+    SECTION("an announced send saves a complete list, or an incomplete one when partial") {
+        DispatchAnnouncement send(&t, *id, "test");
+        REQUIRE(send.record(a, false, /*partial_list=*/false));
+        CHECK_FALSE(flag("targets_incomplete"));
+        DispatchAnnouncement partial(&t, *id, "test");
+        REQUIRE(partial.record(a, false, /*partial_list=*/true));
+        CHECK(flag("targets_incomplete"));
+    }
+    SECTION("an unannounced send") {
+        REQUIRE(t.mark_targets_expected(*id)); // an earlier send that never saved its list
+        // Refuse the next announcement only: the one that would mark the run incomplete while
+        // leaving the send open.
+        sql(db.pool(), "CREATE FUNCTION public.yuzu_test_refuse() RETURNS trigger LANGUAGE "
+                       "plpgsql AS $$ BEGIN RAISE EXCEPTION 'refused'; END $$");
+        sql(db.pool(), "CREATE TRIGGER yuzu_test_refuse BEFORE UPDATE ON "
+                       "execution_tracker.executions FOR EACH ROW WHEN (OLD.attempt_open AND "
+                       "NEW.attempt_open AND NEW.targets_incomplete AND NOT "
+                       "OLD.targets_incomplete) EXECUTE FUNCTION public.yuzu_test_refuse()");
+        DispatchAnnouncement send(&t, *id, "test");
+        send.close_if_empty(true);
+        CHECK(flag("attempt_open")); // not closed: the open send is somebody else's
+        REQUIRE(send.record(a, false, /*partial_list=*/false));
+        CHECK(flag("targets_incomplete"));
+    }
+    SECTION("an untracked dispatch is inert") {
+        DispatchAnnouncement send(&t, "", "test");
+        CHECK_FALSE(send.tracked());
+        send.close_if_empty(true);
+        CHECK(send.record(a, false, false));
+        CHECK_FALSE(flag("attempt_open"));
+    }
+}
+
+TEST_CASE("dispatch announcement: every fan-out that records targets goes through it",
+          "[execution_tracker][coverage]") {
+    // Wiring pin: the rules above hold for a fan-out only while it uses the one copy. Counted in
+    // comment-free source. It proves the calls are absent or present, not that they run.
+    for (const char* file : {"server.cpp", "dispatch_scope_ladder.hpp"}) {
+        INFO(file);
+        const std::string& src = yuzu::test::source_scan::comment_free_source(file);
+        CHECK(src.find("DispatchAnnouncement announcement(") != std::string::npos);
+        CHECK(src.find("announcement.close_if_empty(") != std::string::npos);
+        CHECK(src.find("announcement.record(") != std::string::npos);
+        CHECK(src.find("mark_targets_expected(") == std::string::npos);
+        CHECK(src.find("close_empty_attempt(") == std::string::npos);
+        CHECK(src.find("record_dispatch_targets(") == std::string::npos);
+    }
 }
 
 TEST_CASE("execution coverage JSON: a confined caller gets no run-wide value",

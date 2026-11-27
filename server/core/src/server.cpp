@@ -192,6 +192,7 @@
 #include "dispatch_confined_arms.hpp" // the ONE per-arm intersection, shared with /api/command
 #include "dispatch_destructive_gate.hpp" // #3685: the Destructive-class targeting verdict
 #include "dispatch_route_fallback.hpp" // WS-4 4.2b Task C: GatewayRouteFallback (fallback-only directory consult)
+#include "dispatch_announcement.hpp"
 #include "dispatch_scope_ladder.hpp" // A-3/QE-2: the shared scope-resolution ladder + caller wiring
 #include "json_extract.hpp" // #2557: shared JSON body-extraction helpers (was 7 ServerImpl statics)
 #include "command_routes.hpp" // #2557: POST /api/command, extracted onto the HttpRouteSink seam
@@ -15330,15 +15331,10 @@ private:
         if (!cmd)
             return out; // a command that cannot be classified sends nothing and reports no id
         out.command_id = command_id;
-        const bool tracked = !execution_id.empty() && execution_tracker_;
         // #2673: said BEFORE the send, so a run whose list is never recorded cannot read
         // `succeeded`.
-        const bool announced =
-            tracked && execution_tracker_->mark_targets_expected(execution_id);
-        if (tracked && !announced)
-            spdlog::warn("software sync: could not mark execution_id={} as awaiting its target "
-                         "list",
-                         execution_id);
+        yuzu::server::DispatchAnnouncement announcement(execution_tracker_.get(), execution_id,
+                                                        "software sync");
         const auto visible = derive_exec_visible(sess);
         const auto result = yuzu::server::dispatch_system_reserved_ids(
             ids, visible,
@@ -15355,13 +15351,10 @@ private:
             },
             /*collect_targets=*/!execution_id.empty());
         out.sent = static_cast<std::size_t>(result.sent);
-        if (announced && result.intended.empty() && result.sent == 0 &&
-            !execution_tracker_->close_empty_attempt(execution_id))
-            spdlog::warn("software sync: could not close the empty send of execution_id={}",
-                         execution_id);
+        announcement.close_if_empty(result.intended.empty() && result.sent == 0);
         // #2673: this fan-out bypasses `wire_and_dispatch_confined`, so it records its own
         // targets, before the gateway flush so a reply finds them.
-        if (tracked && !result.intended.empty()) {
+        if (announcement.tracked() && !result.intended.empty()) {
             ConfinedDispatchOutcome recorded;
             recorded.intended = result.intended;
             recorded.contacted = result.contacted;
@@ -15379,9 +15372,8 @@ private:
                 for (const auto& id : yuzu::server::authz::filter_to_scope(run->too_old, visible))
                     targets.push_back({id, yuzu::server::TargetDisposition::Withheld});
             }
-            if (!execution_tracker_->record_dispatch_targets(
-                    execution_id, targets, run && run->connected_only,
-                    /*complete=*/announced && !(run && run->partial_list)))
+            if (!announcement.record(targets, run && run->connected_only,
+                                     run && run->partial_list))
                 count_target_record_failure();
         }
         if (out.sent > 0)

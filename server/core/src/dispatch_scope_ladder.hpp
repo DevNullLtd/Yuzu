@@ -21,6 +21,7 @@
 #include "dispatch_route_fallback.hpp"
 #include "dispatch_send_progress.hpp"
 #include "dispatch_target_shape.hpp"
+#include "dispatch_announcement.hpp"
 #include "execution_tracker.hpp"
 #include "gateway_route_store.hpp"
 #include "management_group_store.hpp"
@@ -669,25 +670,14 @@ inline ConfinedDispatchOutcome wire_and_dispatch_confined(
     const bool collect_targets = execution_tracker && !execution_id.empty();
     // Say so BEFORE anything is sent: until the whole list is recorded below, the run cannot
     // read `succeeded`, whatever happens to this call (a throw mid fan-out included).
-    const bool announced =
-        collect_targets && execution_tracker->mark_targets_expected(execution_id);
-    if (collect_targets && !announced)
-        spdlog::warn("wire_and_dispatch_confined: could not mark execution_id={} as awaiting "
-                     "its target list",
-                     execution_id);
+    DispatchAnnouncement announcement(execution_tracker, execution_id,
+                                      "wire_and_dispatch_confined");
     auto outcome = resolve_and_dispatch_confined(agent_ids, scope_expr, exec_visible,
                                                  broadcast_on_none, gate, resolvers, sink, claim_fn,
                                                  plugin_missing, *os_kill_switched, collect_targets);
     outcome.command_id = command_id;
 
-    // #2673: returned normally with nothing sent and nobody named: there is no list to save, and
-    // leaving the send open would make a later, successful re-drive read as incomplete. Only the
-    // send that announced itself may close: otherwise the open one is somebody else's.
-    if (announced && outcome.intended.empty() && outcome.sent == 0 &&
-        !execution_tracker->close_empty_attempt(execution_id))
-        spdlog::warn("wire_and_dispatch_confined: could not close the empty send of "
-                     "execution_id={}",
-                     execution_id);
+    announcement.close_if_empty(outcome.intended.empty() && outcome.sent == 0);
 
     // #2673: record who this dispatch was meant for. Best effort: a failure never fails the
     // dispatch (the frames are already sent), and leaves the run on the count-only rules.
@@ -702,10 +692,8 @@ inline ConfinedDispatchOutcome wire_and_dispatch_confined(
                                     arm == DispatchArm::None;
         // A device list narrowed by an unreadable presence directory is recorded, but as
         // partial.
-        outcome.targets_record_failed = !execution_tracker->record_dispatch_targets(
-            execution_id, build_dispatch_targets(outcome, known), connected_only,
-            // An unannounced send cannot tell whether an earlier list was never saved.
-            /*complete=*/announced && !outcome.membership_partial);
+        outcome.targets_record_failed = !announcement.record(
+            build_dispatch_targets(outcome, known), connected_only, outcome.membership_partial);
     }
 
     // ADR-1007 claim-leak fix: `claim_fn` above ran BEFORE the send, so every

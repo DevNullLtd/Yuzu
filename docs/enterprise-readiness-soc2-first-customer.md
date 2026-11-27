@@ -1232,6 +1232,15 @@ who is also the change's author) on 2026-11-18; to be reviewed by 2027-05-18. Fo
 (refresh the runtime through agent self-update). Decision record: `docs/windows-build.md`,
 "Decision record: app-local Visual C++ runtime (2026-11-18)".
 
+**Accepted risk: a server crash can lose an execution deadline sweep's audit row (CC7.2),
+2026-11-27.** Risk-register entry. The response-deadline sweep (#2673) commits a run's change and
+writes its `execution.deadline_sweep` audit row afterwards from an in-memory queue, so a crash or
+kill in between loses the row. Likelihood: not measured. Mitigation: each changed run is logged to the
+server log when its change commits, failed audit writes are retried and logged, and the per-device
+`execution_target` rows keep the outcome and the time; a crash between the commit and the log line
+leaves only those rows. Accepted by fjarvis (maintainer; not the change's author) on 2026-11-27 on pull
+request #8914. Follow-up: #8916.
+
 ---
 
 ## 3.7 Workstream G — Customer Assurance Package (Enterprise Sales Enablement)
