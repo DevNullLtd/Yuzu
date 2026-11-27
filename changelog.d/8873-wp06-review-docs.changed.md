@@ -1,0 +1,1 @@
+- The `ci-architecture.md` entry for the over-budget echo rollup case names the exact case and calls it environment-dependent with an unknown cause (#7039). The `GET /events` upgrade section is titled `⚠️ Breaking`, and the SOC 2 and software-normaliser wording describes only this build. (#8732)
