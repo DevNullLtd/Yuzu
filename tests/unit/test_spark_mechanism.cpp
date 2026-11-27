@@ -34,11 +34,13 @@
 #include <memory>
 #include <mutex>
 #include <new>
+#include <optional>
 #include <set>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <thread>
+#include <utility>
 #include <vector>
 
 using namespace yuzu::agent;
@@ -567,6 +569,37 @@ TEST_CASE("arm(Registry) validation: hive must be HKLM/HKCU/HKCR/HKU", "[spark][
     CHECK_FALSE(engine.arm(*c, registry_spec("BOGUS", "Software\\Yuzu")).has_value());
     CHECK_FALSE(engine.arm(*c, registry_spec("HKLM", "")).has_value());
     CHECK(engine.arm(*c, registry_spec("HKLM", "Software\\Yuzu")).has_value());
+}
+
+// #7877 item 31 (R1): the name-verdict test seams are declared on every platform, default to
+// "off", and the committed-name observer answers "not the Windows Registry mechanism" for
+// anything else. The behavioural cases are Windows-only (below); this one pins the surface
+// the Linux and macOS legs still compile and link.
+TEST_CASE("Registry name-verdict test seams: declared everywhere, default off, and the "
+          "committed-name observer refuses a non-Registry mechanism (#7877 item 31)",
+          "[spark][mechanism][7877]") {
+    RegistryMechanismTestControls ctl;
+    CHECK_FALSE(static_cast<bool>(ctl.name_hook));
+    CHECK_FALSE(ctl.verify_fail_duplicate);
+    const RegistryMechanismDebugCounters zero;
+    CHECK(zero.verify_name_lost == 0);
+    CHECK(zero.verify_name_undecided == 0);
+    CHECK(zero.commit_name_recorded == 0);
+    CHECK(zero.commit_name_missing == 0);
+    CHECK(zero.verify_dup_failed == 0);
+    CHECK(zero.commit_capture_retry == 0);
+    CHECK(zero.warns_claimed_name_missing == 0);
+    CHECK(zero.warns_claimed_undecided == 0);
+    CHECK(zero.warns_claimed_dup_failed == 0);
+    CHECK(zero.warns_claimed_commit_unconfirmed == 0);
+
+    FakeMechanism fake;
+    CHECK_FALSE(registry_committed_name_for_test(fake, "any-key").has_value());
+    CHECK_FALSE(set_registry_test_controls_for_test(fake, std::move(ctl)));
+#ifndef _WIN32
+    // Off Windows there is no Registry mechanism at all, so the observer has nothing to read.
+    CHECK(make_registry_mechanism() == nullptr);
+#endif
 }
 
 TEST_CASE("arm(Service) validation: name charset and length", "[spark][mechanism]") {
@@ -4033,9 +4066,13 @@ TEST_CASE("Service spark (real mechanism, private bus): losing the bus faults an
 #include <aclapi.h> // SetEntriesInAclW / SetNamedSecurityInfoW (#5719 item 5 DENY-ACL case)
 
 #include <cmath> // std::floor / std::log2 - the #4658 pass-count bound
+#include <cstring> // std::memcpy - the NtQueryKey name buffer (#7877 item 31)
+#include <cstdlib> // std::getenv - YUZU_REQUIRE_WINDOWS_REGISTRY_TESTS (#7877 item 31 skips)
+#include <cwctype> // std::towlower - the #7877 canonical-name tail compare
 #include <condition_variable>
 #include <filesystem>
 #include <fstream>
+#include <sstream> // std::ostringstream - the failure-output state lines (#7877 item 31)
 
 #include <spdlog/sinks/base_sink.h> // PfStallLogger (#4658 PF-11/PF-12)
 #include <spdlog/spdlog.h>
@@ -17907,6 +17944,12 @@ struct RegRenameRig {
     [[nodiscard]] LONG rename_parent() const {
         return rename_key(HKEY_CURRENT_USER, wsub.c_str(), (wleaf + L"_renamed").c_str());
     }
+    /// The inverse of rename_parent(): the renamed tree gets its original name back (the
+    /// "rename away and back" residual case).
+    [[nodiscard]] LONG rename_parent_back() const {
+        const std::wstring renamed(renamed_sub.begin(), renamed_sub.end()); // ASCII only
+        return rename_key(HKEY_CURRENT_USER, renamed.c_str(), wleaf.c_str());
+    }
     /// One value write on <parent>\Child through a fresh handle: a change the watch must see.
     [[nodiscard]] bool write_child(DWORD v) const {
         RegKeyOwner k;
@@ -17938,8 +17981,12 @@ struct RegVerifyHarness {
     /// `make` builds the mechanism; null means the zero-argument factory. The REG-15-I2 cases
     /// pass the two-argument factory overload production uses, so they observe the FACTORY
     /// default and the opt-in value; the flag-to-factory wiring is pinned lexically.
+    /// `wait_healthy` false skips the two precondition checks at the end (Notification
+    /// coverage, no faulted watch): the commit-site cases that DEFER the establishment (its
+    /// confirming read is made to disagree) cannot be healthy on return, by construction.
     RegVerifyHarness(const std::vector<std::string>& keys, RegistryMechanismTestControls ctl,
-                     const std::function<std::unique_ptr<ISparkMechanism>()>& make = nullptr) {
+                     const std::function<std::unique_ptr<ISparkMechanism>()>& make = nullptr,
+                     const std::string& hive = "HKCU", bool wait_healthy = true) {
         auto mech = make ? make() : make_registry_mechanism();
         raw = mech.get();
         REQUIRE(engine.register_mechanism(SparkType::Registry, std::move(mech)).has_value());
@@ -17947,12 +17994,14 @@ struct RegVerifyHarness {
         auto c = engine.register_consumer("c", got.handler());
         REQUIRE(c.has_value());
         for (const auto& k : keys) {
-            specs.push_back(registry_spec("HKCU", k));
+            specs.push_back(registry_spec(hive, k));
             auto sub = engine.arm(*c, specs.back());
             REQUIRE(sub.has_value());
             subs.push_back(*sub);
         }
         engine.start();
+        if (!wait_healthy)
+            return;
         REQUIRE(eventually([&] { return all_notification(); }, kDeafBound));
         REQUIRE(engine.stats().armed_faulted == 0); // precondition: healthy
     }
@@ -18015,6 +18064,716 @@ struct KeyOpenCounter {
         };
     }
 };
+} // namespace
+
+// ── #7877 item 31 (R1): the Registry watch's NAME verdicts ───────────────────────────────────
+//
+// A verification now also reads the canonical NT name of the HELD key (NtQueryKey on a
+// duplicate of its handle) and of the fresh key the probe armed, and faults the watch when the
+// held key has moved (primary compare: held name vs the name recorded at commit) or the path
+// names a different key (secondary compare: fresh vs held). The helpers below drive that
+// through RegistryMechanismTestControls::name_hook, which runs on the detached probe worker
+// IMMEDIATELY BEFORE each NtQueryKey: `held == false` is the fresh key (also called on every
+// establishment and re-arm), `held == true` the duplicate (verification probes only).
+//
+// Every hook state is owned by a shared_ptr that the hook captures BY VALUE: the hook runs on
+// detached workers nothing joins (the rule of VerifyHookState and ProbeGate above).
+namespace {
+/// A precondition this token cannot meet (no HKLM\SOFTWARE\Classes write, no WRITE_DAC, no
+/// registry link, a mechanism that refuses a root key) is a SKIP by default and a FAILURE when
+/// YUZU_REQUIRE_WINDOWS_REGISTRY_TESTS is set to a non-empty value other than "0": the same
+/// semantics as skip_or_fail() in test_registry_win_internals.cpp and ci.yml's Windows leg, so a
+/// runner meant to run these cases cannot report them green without having run them. Every
+/// [7877] precondition skip that is about a missing privilege goes through here. The one
+/// deliberate bare SKIP() is skip_hkcr_case_under_local_system() below: a LocalSystem token
+/// has no per-user class view, which is a premise mismatch, not a privilege to require.
+void skip_or_fail_registry(const std::string& why) {
+    const char* req = std::getenv("YUZU_REQUIRE_WINDOWS_REGISTRY_TESTS");
+    if (req != nullptr && req[0] != '\0' && std::string_view{req} != "0")
+        FAIL(why << " (YUZU_REQUIRE_WINDOWS_REGISTRY_TESTS is set)");
+    SKIP(why);
+}
+
+using NameHookFn = decltype(RegistryMechanismTestControls::name_hook);
+using NameResult = std::optional<std::pair<long, std::wstring>>;
+
+// Raw NTSTATUS values as the mechanism's `long`; written as unsigned and converted so the
+// literal never narrows (the same reason spark_registry.cpp uses static_cast<LONG>).
+constexpr long kNtHiveUnloaded = static_cast<long>(0xC0000425u);
+constexpr long kNtKeyDeleted = static_cast<long>(0xC000017Cu);
+constexpr long kNtBufferOverflow = static_cast<long>(0x80000005u);
+constexpr long kNtUnsuccessful = static_cast<long>(0xC0000001u);
+constexpr long kNtAccessDenied = static_cast<long>(0xC0000022u);
+
+// The fault reasons, byte for byte as spark_registry.cpp states them (they reach the
+// operator, so a swapped or reworded one is a contract change this file must see).
+const char* const kRegReasonMoved = "registry watch key moved from its path";
+const char* const kRegReasonRepointed = "registry watch path re-pointed to another key";
+const char* const kRegReasonHiveUnloaded = "registry watch hive unloaded";
+const char* const kRegReasonPathLost = "registry watch key renamed or replaced";
+
+/// Injects what the next name queries answer, per side. Both empty = run the real query.
+struct NameInject {
+    std::mutex mu;
+    NameResult fresh;
+    NameResult held;
+    std::atomic<int> fresh_calls{0};
+    std::atomic<int> held_calls{0};
+    void set(NameResult f, NameResult h) {
+        std::lock_guard lk(mu);
+        fresh = std::move(f);
+        held = std::move(h);
+    }
+    void clear() { set(std::nullopt, std::nullopt); }
+};
+NameHookFn inject_hook(std::shared_ptr<NameInject> st) {
+    return [st = std::move(st)](std::string_view, bool held) -> NameResult {
+        (held ? st->held_calls : st->fresh_calls).fetch_add(1, std::memory_order_relaxed);
+        std::lock_guard lk(st->mu);
+        return held ? st->held : st->fresh;
+    };
+}
+
+/// Pass-through hook state that counts the name queries PER SUBKEY and side (the NameInject
+/// counters are per side only), so a case with two watches can say which watch's worker made a
+/// held-name query, i.e. which watch's verification really carried a duplicate.
+struct KeyedNameCount {
+    std::mutex mu;
+    std::map<std::string, int> held;
+    std::map<std::string, int> fresh;
+    [[nodiscard]] int held_for(const std::string& sub) {
+        std::lock_guard lk(mu);
+        const auto it = held.find(sub);
+        return it == held.end() ? 0 : it->second;
+    }
+    [[nodiscard]] int fresh_for(const std::string& sub) {
+        std::lock_guard lk(mu);
+        const auto it = fresh.find(sub);
+        return it == fresh.end() ? 0 : it->second;
+    }
+};
+NameHookFn keyed_count_hook(std::shared_ptr<KeyedNameCount> st) {
+    return [st = std::move(st)](std::string_view sub, bool held) -> NameResult {
+        std::lock_guard lk(st->mu);
+        ++(held ? st->held : st->fresh)[std::string(sub)];
+        return std::nullopt;
+    };
+}
+
+/// ntdll exports the SDK headers do not declare, resolved at run time; nullptr when absent.
+template <typename Fn>
+[[nodiscard]] Fn ntdll_export(const char* name) {
+    const HMODULE nt = ::GetModuleHandleW(L"ntdll.dll");
+    if (nt == nullptr)
+        return nullptr;
+    // GetProcAddress returns an untyped FARPROC; the export's signature is Fn's.
+    return reinterpret_cast<Fn>(reinterpret_cast<void*>(::GetProcAddress(nt, name)));
+}
+
+/// The raw NTSTATUS of NtQueryKey(KeyNameInformation) on `h`: 0 for a live key,
+/// STATUS_KEY_DELETED (0xC000017C) once the key object was deleted. Independent of the
+/// mechanism, so a case can state what the OS answered at a given moment.
+[[nodiscard]] long raw_key_name_status(HKEY h) {
+    using NtQueryKeyFn = LONG(NTAPI*)(HANDLE, int, PVOID, ULONG, PULONG);
+    static const auto fn = ntdll_export<NtQueryKeyFn>("NtQueryKey");
+    if (fn == nullptr || h == nullptr)
+        return kNtUnsuccessful;
+    alignas(8) unsigned char buf[4096];
+    ULONG len = 0;
+    return static_cast<long>(
+        fn(reinterpret_cast<HANDLE>(h), 3 /*KeyNameInformation*/, buf, sizeof(buf), &len));
+}
+
+/// Parks the next name query of one side (after the open and the notify arm, before the
+/// NtQueryKey), so a test can land a rename between the fresh open and the fresh-name query
+/// (`park_next(false)`) or between the two queries (`park_next(true)`). Passes every other
+/// call straight through to the real query. The worker is released by release() and by the
+/// destructor; declare it BEFORE the harness (it must outlive the engine's detached workers).
+/// The park is bounded (10 s, `timed_out`): a lost release can never hang the binary.
+/// `witness`, when set, is a test-held handle on the HELD key's object: the held-side hook
+/// reads its raw NtQueryKey status on the worker, just before the real query runs, so a case
+/// can state what the OS answered at that instant (`witness_status`; 0x7FFFFFFF = never read).
+struct NameHookGate {
+    struct State {
+        std::mutex mu;
+        std::condition_variable cv;
+        bool open{true};
+        int park_on{-1}; ///< 0 = park the fresh query, 1 = the held one, -1 = none
+        std::atomic<int> parked{0};
+        std::atomic<int> inside{0};
+        std::atomic<bool> timed_out{false};
+        std::atomic<HKEY> witness{nullptr};
+        std::atomic<long> witness_status{0x7FFFFFFF};
+    };
+    std::shared_ptr<State> st{std::make_shared<State>()};
+    NameHookGate() = default;
+    NameHookGate(const NameHookGate&) = delete;
+    NameHookGate& operator=(const NameHookGate&) = delete;
+    [[nodiscard]] NameHookFn hook() const {
+        return [st = this->st](std::string_view, bool held) -> NameResult {
+            struct Inside {
+                std::atomic<int>& n;
+                explicit Inside(std::atomic<int>& n_) : n(n_) {
+                    n.fetch_add(1, std::memory_order_acq_rel);
+                }
+                ~Inside() { n.fetch_sub(1, std::memory_order_acq_rel); }
+            } inside_scope{st->inside}; // declared first: destroyed last, after `lk`
+            {
+                std::unique_lock lk(st->mu);
+                if (!st->open && st->park_on == (held ? 1 : 0)) {
+                    st->parked.fetch_add(1, std::memory_order_acq_rel);
+                    if (!st->cv.wait_for(lk, 10s, [&] { return st->open; }))
+                        st->timed_out.store(true, std::memory_order_release);
+                }
+            }
+            if (held) {
+                if (const HKEY w = st->witness.load(std::memory_order_acquire))
+                    st->witness_status.store(raw_key_name_status(w), std::memory_order_release);
+            }
+            return std::nullopt;
+        };
+    }
+    void park_next(bool held) {
+        std::lock_guard lk(st->mu);
+        st->open = false;
+        st->park_on = held ? 1 : 0;
+    }
+    [[nodiscard]] int parked() const { return st->parked.load(std::memory_order_acquire); }
+    /// Releases a parked worker. Static on the shared state so a hook that holds only the
+    /// shared_ptr (the sweeper-first choreography below) can release too.
+    static void release_state(State& s) {
+        {
+            std::lock_guard lk(s.mu);
+            s.open = true;
+            s.park_on = -1;
+        }
+        s.cv.notify_all();
+    }
+    void release() { release_state(*st); }
+    ~NameHookGate() {
+        release(); // never leave a worker parked past the test
+        const auto deadline = std::chrono::steady_clock::now() + 10s;
+        while (st->inside.load(std::memory_order_acquire) > 0 &&
+               std::chrono::steady_clock::now() < deadline)
+            std::this_thread::sleep_for(1ms);
+    }
+};
+
+/// ASCII-and-beyond lower-casing for the canonical-name compares (the namespace is
+/// case-insensitive and the kernel preserves case).
+[[nodiscard]] std::wstring lower_name(std::wstring s) {
+    for (auto& c : s)
+        c = static_cast<wchar_t>(std::towlower(c));
+    return s;
+}
+
+/// True when `name` is a canonical NT name that starts with `root` (default: a user-hive name,
+/// `\REGISTRY\USER\...`, which is what an HKCU key reports, whether the user's SID or
+/// `.DEFAULT`) and whose tail is `\<sub>`, compared case-insensitively.
+[[nodiscard]] bool name_names_key(const std::wstring& name, const std::string& sub,
+                                  std::wstring_view root = L"\\registry\\user\\") {
+    const std::wstring tail = lower_name(L"\\" + std::wstring(sub.begin(), sub.end()));
+    const std::wstring n = lower_name(name);
+    return n.size() > tail.size() && n.rfind(root, 0) == 0 &&
+           n.compare(n.size() - tail.size(), tail.size(), tail) == 0;
+}
+/// True when `name` is the canonical name of the PER-USER class key for `rel` (an HKCR path):
+/// a user-hive name whose hive is the user's `<SID>_Classes`, not the machine's.
+[[nodiscard]] bool name_is_user_class_key(const std::wstring& name, const std::string& rel) {
+    return name_names_key(name, rel) && lower_name(name).find(L"_classes\\") != std::wstring::npos;
+}
+/// True when `name` is the canonical name of the MACHINE class key for `rel`.
+[[nodiscard]] bool name_is_machine_class_key(const std::wstring& name, const std::string& rel) {
+    return name_names_key(name, rel, L"\\registry\\machine\\software\\classes\\");
+}
+
+[[nodiscard]] std::size_t faulted_events(RegVerifyHarness& h, std::size_t i = 0) {
+    return count_kind(h.got, spark_key(h.specs.at(i)), SparkEventKind::Faulted);
+}
+[[nodiscard]] std::size_t recovered_events(RegVerifyHarness& h, std::size_t i = 0) {
+    return count_kind(h.got, spark_key(h.specs.at(i)), SparkEventKind::Recovered);
+}
+/// The reason of the FIRST Faulted event for the watch ("" when there is none).
+[[nodiscard]] std::string first_fault_reason(RegVerifyHarness& h, std::size_t i = 0) {
+    return first_detail(h.got, spark_key(h.specs.at(i)), SparkEventKind::Faulted);
+}
+/// The watch stays Notification-covered and unfaulted for the whole `window`.
+[[nodiscard]] bool stays_healthy(RegVerifyHarness& h, std::chrono::milliseconds window) {
+    bool steady = true;
+    const auto until = std::chrono::steady_clock::now() + window;
+    while (std::chrono::steady_clock::now() < until) {
+        if (h.engine.stats().armed_faulted != 0 || !h.all_notification())
+            steady = false;
+        std::this_thread::sleep_for(5ms);
+    }
+    return steady;
+}
+/// One line of the first watch's observable state, for the INFO of an assertion that follows
+/// a wait: the committed name, the ENGINE's view of coverage (the mechanism's last report to
+/// it, not the mechanism's own mark), the fault counts and the commit, retry and verify
+/// counters. A recurrence of a flake prints what the watch was doing, not just `false`.
+[[nodiscard]] std::string describe_watch_state(RegVerifyHarness& h) {
+    const auto c = h.counters();
+    std::ostringstream o;
+    o << "committed name: ";
+    if (const auto n = registry_committed_name_for_test(*h.raw, spark_key(h.specs.at(0))))
+        o << (n->empty() ? std::string("(empty)") : yuzu::win::from_wide(n->c_str()));
+    else
+        o << "(no watch)";
+    o << "; engine coverage: " << deaf_coverage_text(h.engine, h.subs.at(0))
+      << "; armed_faulted " << h.engine.stats().armed_faulted << "; fired " << h.fired()
+      << ", synthetic " << c.synthetic_fires << ", faulted events " << faulted_events(h)
+      << ", recovered events " << recovered_events(h) << "; commit_name_recorded "
+      << c.commit_name_recorded << ", commit_name_missing " << c.commit_name_missing
+      << ", commit_capture_retry " << c.commit_capture_retry << ", verify_launched "
+      << c.verify_launched << ", verify_name_lost " << c.verify_name_lost
+      << ", verify_name_undecided " << c.verify_name_undecided << ", verify_lost "
+      << c.verify_lost << ", verify_undecided " << c.verify_undecided << ", verify_dup_failed "
+      << c.verify_dup_failed << ", warns_claimed_commit_unconfirmed "
+      << c.warns_claimed_commit_unconfirmed << ", warns_claimed_name_missing "
+      << c.warns_claimed_name_missing << ", warns_claimed_undecided " << c.warns_claimed_undecided
+      << ", warns_claimed_dup_failed " << c.warns_claimed_dup_failed;
+    return o.str();
+}
+/// The re-arm that a consumed notification owes has COMMITTED, and the watch reads healthy:
+/// a commit recorded a name beyond `recorded0` (taken BEFORE the change that fires the watch),
+/// and the engine shows Notification coverage and no faulted watch. The engine's coverage is
+/// the mechanism's LAST REPORT: on_fire marks the coverage None under the mechanism's lock,
+/// but the engine hears of it only at the sweeper's next report (up to one sweep cadence,
+/// 20 ms here), so right after a fire `all_notification()` can still show the Notification of
+/// BEFORE the fire and pass before any re-arm has committed. The name counter moves only at
+/// an accepted commit, which closes that window. Not usable for a change that leaves the
+/// watch with no readable name (the counter would not move). Residue (INFO): in the
+/// delete-race loop a stray LATE commit of an earlier change can still satisfy this and let
+/// a case pass before the commit it meant to wait for; the window is narrow.
+[[nodiscard]] bool rearm_committed(RegVerifyHarness& h, std::uint64_t recorded0) {
+    return h.counters().commit_name_recorded > recorded0 && h.all_notification() &&
+           h.engine.stats().armed_faulted == 0;
+}
+/// A write through a fresh handle on the registered path fires the watch (it is not deaf).
+[[nodiscard]] bool write_fires(RegVerifyHarness& h, const RegRenameRig& rig, DWORD v) {
+    const auto before = h.fired();
+    if (!rig.write_child(v))
+        return false;
+    return eventually([&] { return h.fired() > before; }, kDeafBound);
+}
+/// <parent>\<leaf> created with the leaf spelled as given (the namespace keeps the case of
+/// the creating call): the case-variant half of the delete-and-recreate case.
+[[nodiscard]] bool create_leaf(const RegRenameRig& rig, const std::string& leaf) {
+    RegKeyOwner k;
+    const std::string path = rig.parent.sub + "\\" + leaf;
+    return ::RegCreateKeyExA(HKEY_CURRENT_USER, path.c_str(), 0, nullptr, 0, KEY_SET_VALUE,
+                             nullptr, &k.h, nullptr) == ERROR_SUCCESS;
+}
+
+// ── #7877 item 31 (R1): the process token and the real HKCU hive ─────────────────────────────
+//
+// Two premises of the HKCR and link cases hold only for an ordinary user token. Under
+// LocalSystem (a service, or a runner started as SYSTEM) HKCU is the `.DEFAULT` hive, not the
+// user's own `<SID>` hive, and the merged HKCR view has no per-user class layer to shadow the
+// machine key (rig run, build 26100, 2026-11-26). A SYSTEM token is therefore a premise
+// mismatch of those cases, not a missing privilege, so the HKCR cases skip on it WITHOUT
+// going through skip_or_fail_registry: YUZU_REQUIRE_WINDOWS_REGISTRY_TESTS must not turn a
+// SYSTEM run into a failure the token can never satisfy.
+
+/// True when the process token's user is LocalSystem (S-1-5-18). Read once per process; false
+/// when the token cannot be read (an unreadable token is not evidence of LocalSystem).
+[[nodiscard]] bool running_as_local_system() {
+    static const bool is_system = [] {
+        HANDLE raw = nullptr;
+        if (!::OpenProcessToken(::GetCurrentProcess(), TOKEN_QUERY, &raw))
+            return false;
+        UniqueHandle tok(raw);
+        DWORD n = 0;
+        ::GetTokenInformation(tok.h, TokenUser, nullptr, 0, &n);
+        if (n == 0)
+            return false;
+        std::vector<BYTE> buf(n);
+        if (!::GetTokenInformation(tok.h, TokenUser, buf.data(), n, &n))
+            return false;
+        return ::IsWellKnownSid(reinterpret_cast<TOKEN_USER*>(buf.data())->User.Sid,
+                                WinLocalSystemSid) != FALSE;
+    }();
+    return is_system;
+}
+
+/// The two HKCR cases need a per-user class layer over HKLM\SOFTWARE\Classes, which a
+/// LocalSystem token does not have. Skips under LocalSystem (see the block comment above)
+/// even when YUZU_REQUIRE_WINDOWS_REGISTRY_TESTS is set: a CI runner that ran as LocalSystem
+/// would skip these two cases (and so would not exercise the settle fix they carry) while
+/// reporting green; today only #7637 prevents that runner configuration.
+void skip_hkcr_case_under_local_system() {
+    if (running_as_local_system())
+        SKIP("HKCU is the .DEFAULT hive under LocalSystem: there is no per-user class view to "
+             "shadow the machine key");
+}
+
+/// The canonical NT name of the key behind `h` (NtQueryKey, KeyNameInformation), or empty
+/// when it cannot be read. `h` must be a real handle: a predefined root such as
+/// HKEY_CURRENT_USER answers STATUS_INVALID_HANDLE.
+[[nodiscard]] std::wstring nt_key_name(HKEY h) {
+    using NtQueryKeyFn = LONG(NTAPI*)(HANDLE, int, PVOID, ULONG, PULONG);
+    static const auto fn = ntdll_export<NtQueryKeyFn>("NtQueryKey");
+    if (fn == nullptr || h == nullptr)
+        return {};
+    alignas(8) unsigned char buf[4096];
+    ULONG len = 0;
+    if (fn(reinterpret_cast<HANDLE>(h), 3 /*KeyNameInformation*/, buf, sizeof(buf), &len) != 0)
+        return {};
+    ULONG bytes = 0; // KEY_NAME_INFORMATION: a ULONG byte length, then the UTF-16 name
+    std::memcpy(&bytes, buf, sizeof(bytes));
+    if (bytes == 0 || bytes > sizeof(buf) - sizeof(ULONG))
+        return {};
+    std::wstring name(bytes / sizeof(wchar_t), L'\0');
+    std::memcpy(name.data(), buf + sizeof(ULONG), name.size() * sizeof(wchar_t));
+    return name;
+}
+
+/// The canonical NT name of the hive HKCU resolves to for THIS token: `\REGISTRY\USER\<SID>`
+/// for a user, `\REGISTRY\USER\.DEFAULT` under LocalSystem. Read from a real handle
+/// (RegOpenCurrentUser), never derived from the token's SID, so it is right for every token.
+/// Empty when it cannot be read.
+[[nodiscard]] std::wstring current_user_hive_name() {
+    RegKeyOwner k;
+    if (::RegOpenCurrentUser(KEY_READ, &k.h) != ERROR_SUCCESS)
+        return {};
+    return nt_key_name(k.h);
+}
+
+// ── #7877 item 31 (R1): rigs for the HKCR, link and delete-race cases ────────────────────────
+//
+// Every key these rigs create has a `yuzu_test_` name salted with the process id, the process
+// salt and a counter (never a fixed name, never a clock or a thread id), and is removed by
+// path on destruction, which runs on a failed case too. Declare a rig BEFORE the harness, so
+// the mechanism's handles close first.
+
+[[nodiscard]] std::string salted_key_name(const char* tag) {
+    static std::atomic<int> n{0};
+    return std::string("yuzu_test_name_") + tag + "_" + std::to_string(::GetCurrentProcessId()) +
+           "_" + std::to_string(yuzu::test::process_random_salt() % 1000000000) + "_" +
+           std::to_string(n.fetch_add(1));
+}
+
+/// HKCU\Software\<salted>, with keys made, written and removed relative to it. The whole tree
+/// is removed by path on destruction.
+struct SaltedHkcuTree {
+    std::string base;
+    explicit SaltedHkcuTree(const char* tag) : base("Software\\" + salted_key_name(tag)) {}
+    ~SaltedHkcuTree() { ::RegDeleteTreeA(HKEY_CURRENT_USER, base.c_str()); }
+    SaltedHkcuTree(const SaltedHkcuTree&) = delete;
+    SaltedHkcuTree& operator=(const SaltedHkcuTree&) = delete;
+
+    [[nodiscard]] std::string full(const std::string& rel) const { return base + "\\" + rel; }
+    [[nodiscard]] LONG create_rc(const std::string& rel) const {
+        RegKeyOwner k;
+        return ::RegCreateKeyExA(HKEY_CURRENT_USER, full(rel).c_str(), 0, nullptr, 0,
+                                 KEY_SET_VALUE, nullptr, &k.h, nullptr);
+    }
+    [[nodiscard]] bool make(const std::string& rel) const {
+        return create_rc(rel) == ERROR_SUCCESS;
+    }
+    [[nodiscard]] bool remove_leaf(const std::string& rel) const {
+        return ::RegDeleteKeyA(HKEY_CURRENT_USER, full(rel).c_str()) == ERROR_SUCCESS;
+    }
+    /// One value write through a fresh handle: a change a watch on `rel` must see.
+    [[nodiscard]] bool write(const std::string& rel, DWORD v) const {
+        RegKeyOwner k;
+        if (::RegOpenKeyExA(HKEY_CURRENT_USER, full(rel).c_str(), 0, KEY_SET_VALUE, &k.h) !=
+            ERROR_SUCCESS)
+            return false;
+        return ::RegSetValueExA(k.h, "V", 0, REG_DWORD, reinterpret_cast<const BYTE*>(&v),
+                                sizeof(v)) == ERROR_SUCCESS;
+    }
+};
+
+/// `<link>` is a registry link (REG_OPTION_CREATE_LINK) to `<T1>` under one salted HKCU tree;
+/// `repoint_to_t2()` rewrites the link's target while a watch holds the key behind it. The link
+/// is removed BY HANDLE (NtDeleteKey on a REG_OPTION_OPEN_LINK handle) before the tree is: a
+/// RegDeleteTree of the parent would follow the link. `err` is the first Win32 error that
+/// stopped the setup (`ok` false), so a case can skip with the reason.
+struct RegLinkRig : SaltedHkcuTree {
+    std::string t1{full("T1")}, t2{full("T2")}, link{full("L")};
+    /// The NT name of the hive HKCU resolves to for this token (a link target is an NT path):
+    /// `\REGISTRY\USER\<SID>` for a user, `\REGISTRY\USER\.DEFAULT` under LocalSystem.
+    std::wstring hive{current_user_hive_name()};
+    bool ok{false};
+    LONG err{ERROR_SUCCESS};
+
+    explicit RegLinkRig(const char* tag) : SaltedHkcuTree(tag) {
+        if (hive.empty()) {
+            err = ERROR_NO_TOKEN;
+            return;
+        }
+        if (err = create_rc("T1"); err != ERROR_SUCCESS)
+            return;
+        if (err = create_rc("T2"); err != ERROR_SUCCESS)
+            return;
+        RegKeyOwner l;
+        err = ::RegCreateKeyExA(HKEY_CURRENT_USER, link.c_str(), 0, nullptr,
+                                REG_OPTION_CREATE_LINK, KEY_SET_VALUE | KEY_CREATE_LINK, nullptr,
+                                &l.h, nullptr);
+        if (err != ERROR_SUCCESS)
+            return;
+        err = set_target(l.h, t1);
+        ok = err == ERROR_SUCCESS;
+    }
+    ~RegLinkRig() {
+        using NtDeleteKeyFn = LONG(NTAPI*)(HANDLE);
+        static const auto nt_delete_key = ntdll_export<NtDeleteKeyFn>("NtDeleteKey");
+        RegKeyOwner l;
+        if (nt_delete_key != nullptr &&
+            ::RegOpenKeyExA(HKEY_CURRENT_USER, link.c_str(), REG_OPTION_OPEN_LINK, DELETE,
+                            &l.h) == ERROR_SUCCESS)
+            nt_delete_key(reinterpret_cast<HANDLE>(l.h));
+        // SaltedHkcuTree's destructor then removes the rest by path.
+    }
+    [[nodiscard]] bool repoint_to_t2() const {
+        RegKeyOwner l;
+        if (::RegOpenKeyExA(HKEY_CURRENT_USER, link.c_str(), REG_OPTION_OPEN_LINK, KEY_SET_VALUE,
+                            &l.h) != ERROR_SUCCESS)
+            return false;
+        return set_target(l.h, t2) == ERROR_SUCCESS;
+    }
+
+private:
+    /// A link's target is the NT path of the key it names, kept in `SymbolicLinkValue`.
+    [[nodiscard]] LONG set_target(HKEY link_key, const std::string& sub) const {
+        const std::wstring target = hive + L"\\" + std::wstring(sub.begin(), sub.end());
+        return ::RegSetValueExW(link_key, L"SymbolicLinkValue", 0, REG_LINK,
+                                reinterpret_cast<const BYTE*>(target.data()),
+                                static_cast<DWORD>(target.size() * sizeof(wchar_t)));
+    }
+};
+
+/// <salted>\child under HKLM\SOFTWARE\Classes (the machine class key) and under
+/// HKCU\Software\Classes (the per-user one that shadows it in the merged HKCR view). A watch
+/// on hive "HKCR" is registered with `rel_child`.
+struct ClassKeyRig {
+    std::string salt, machine_sub, user_sub, rel_child;
+    explicit ClassKeyRig(const char* tag)
+        : salt(salted_key_name(tag)), machine_sub("SOFTWARE\\Classes\\" + salt),
+          user_sub("Software\\Classes\\" + salt), rel_child(salt + "\\child") {}
+    ~ClassKeyRig() {
+        ::RegDeleteTreeA(HKEY_CURRENT_USER, user_sub.c_str());
+        ::RegDeleteTreeA(HKEY_LOCAL_MACHINE, machine_sub.c_str());
+    }
+    ClassKeyRig(const ClassKeyRig&) = delete;
+    ClassKeyRig& operator=(const ClassKeyRig&) = delete;
+
+    [[nodiscard]] bool create_machine() const { return make(HKEY_LOCAL_MACHINE, machine_sub); }
+    [[nodiscard]] bool create_user() const { return make(HKEY_CURRENT_USER, user_sub); }
+    void delete_user() const { ::RegDeleteTreeA(HKEY_CURRENT_USER, user_sub.c_str()); }
+    [[nodiscard]] bool write_user(DWORD v) const {
+        RegKeyOwner k;
+        if (::RegOpenKeyExA(HKEY_CURRENT_USER, (user_sub + "\\child").c_str(), 0, KEY_SET_VALUE,
+                            &k.h) != ERROR_SUCCESS)
+            return false;
+        return ::RegSetValueExA(k.h, "V", 0, REG_DWORD, reinterpret_cast<const BYTE*>(&v),
+                                sizeof(v)) == ERROR_SUCCESS;
+    }
+
+private:
+    [[nodiscard]] static bool make(HKEY root, const std::string& sub) {
+        RegKeyOwner k;
+        return ::RegCreateKeyExA(root, (sub + "\\child").c_str(), 0, nullptr, 0, KEY_SET_VALUE,
+                                 nullptr, &k.h, nullptr) == ERROR_SUCCESS;
+    }
+};
+
+/// The privilege guard of the HKCR cases: this token can create (and then delete) a key under
+/// HKLM\SOFTWARE\Classes. Probed once per process with a salted key; a standard user cannot,
+/// and the HKCR cases then SKIP with the reason instead of failing on a bare REQUIRE.
+[[nodiscard]] bool hklm_classes_writable() {
+    static const bool writable = [] {
+        const std::string sub = "SOFTWARE\\Classes\\" + salted_key_name("hklm_probe");
+        RegKeyOwner k;
+        if (::RegCreateKeyExA(HKEY_LOCAL_MACHINE, sub.c_str(), 0, nullptr, 0, KEY_SET_VALUE,
+                              nullptr, &k.h, nullptr) != ERROR_SUCCESS)
+            return false;
+        ::RegCloseKey(k.h);
+        k.h = nullptr;
+        return ::RegDeleteKeyA(HKEY_LOCAL_MACHINE, sub.c_str()) == ERROR_SUCCESS;
+    }();
+    return writable;
+}
+
+/// Waits until the harness' observable state (events, fires, counters, coverage) has not
+/// changed for three samples 150 ms apart (cap 10 s): the watch has stopped re-arming.
+[[nodiscard]] bool settles_quietly(RegVerifyHarness& h) {
+    const auto sample = [&] {
+        const auto c = h.counters();
+        std::ostringstream o;
+        o << h.fired() << '/' << faulted_events(h) << '/' << recovered_events(h) << '/'
+          << c.synthetic_fires << '/' << c.probe_launched << '/' << c.verify_launched << '/'
+          << c.verify_name_undecided << '/' << c.commit_name_recorded << '/'
+          << c.commit_name_missing << '/' << h.engine.stats().armed_faulted << '/'
+          << h.all_notification();
+        return o.str();
+    };
+    std::string prev;
+    int stable = 0;
+    const auto until = std::chrono::steady_clock::now() + 10s;
+    while (std::chrono::steady_clock::now() < until) {
+        const std::string cur = sample();
+        stable = (cur == prev) ? stable + 1 : 0;
+        prev = cur;
+        if (stable >= 3)
+            return true;
+        std::this_thread::sleep_for(150ms);
+    }
+    return false;
+}
+
+/// The "sweeper first" order of the delete race. The sweep hook runs on the sweeper thread
+/// UNDER mu_ at the top of a pass, so while it runs the delete's own notify callback (on_fire)
+/// cannot take mu_: the hook performs `act` (the delete, optionally with a re-create), releases
+/// the parked worker, and waits (at most 4 ms, inside the pass' 5 ms budget) for the worker to
+/// publish; the same pass then takes the published result while the watch still has the
+/// verification outstanding. `worker_done` records whether the worker really finished inside
+/// the hook (a slow box can lose that window: the driver then retries the whole scenario).
+/// All state is shared by value into the hook, which runs on a thread nothing here joins.
+struct SweeperFirst {
+    std::function<void()> act; ///< written before `armed` (release)
+    std::atomic<bool> armed{false};
+    std::atomic<bool> done{false};
+    std::atomic<bool> worker_done{false};
+
+    [[nodiscard]] static std::function<void()>
+    hook(std::shared_ptr<SweeperFirst> self, std::shared_ptr<NameHookGate::State> gate,
+         std::shared_ptr<std::atomic<std::size_t>> f3) {
+        return [self = std::move(self), gate = std::move(gate), f3 = std::move(f3)] {
+            if (!self->armed.load(std::memory_order_acquire) ||
+                self->done.load(std::memory_order_acquire))
+                return;
+            if (gate->parked.load(std::memory_order_acquire) < 1)
+                return; // the worker is not parked yet: a later pass
+            const auto limit = std::chrono::steady_clock::now() + 4ms;
+            self->act(); // the delete's notify callback now blocks on mu_
+            NameHookGate::release_state(*gate);
+            while (f3->load(std::memory_order_acquire) != 0 &&
+                   std::chrono::steady_clock::now() < limit)
+                std::this_thread::yield();
+            self->worker_done.store(f3->load(std::memory_order_acquire) == 0,
+                                    std::memory_order_release);
+            self->done.store(true, std::memory_order_release);
+        };
+    }
+};
+
+/// One pass of the delete race of #7877 item 31 (R1): a verification's HELD-name query meets a
+/// key that was DELETED while the worker was in flight, so the real NtQueryKey answers
+/// STATUS_KEY_DELETED (0xC000017C) on the held name. `recreate` re-creates the key at once
+/// (delete+recreate) or leaves it absent until the case re-creates it (delete only).
+///   natural order : the delete's own fire is consumed BEFORE the worker is released. The
+///     fire converts the outstanding verification into the re-arm, so the answer is never
+///     judged: `verify_name_undecided` stays 0. WHAT CHANGED in the second governance round:
+///     that converted result is no longer committed as it stands (it ran no confirming read,
+///     and its name was read after an open an administrator can race). It is retried ONCE as an
+///     ordinary re-arm, which gets the confirming read, so `commit_capture_retry` is now >= 1
+///     here (it was 0). What this still pins is unchanged: no fault, the real 0xC000017C seen
+///     on the held key's object, no name verdict, and the watch converges.
+///   sweeper first : the sweep hook forces the sweeper to take the worker's result before
+///     the delete's callback can run (see SweeperFirst): the held query is the by-name
+///     undecided row, `verify_name_undecided` goes 0 to 1.
+/// Either way: no fault, and the watch converges (a delete-only case recovers when the key is
+/// re-created, and a write then fires). Returns false, with nothing asserted, only when the
+/// sweeper-first window was lost to a slow box.
+[[nodiscard]] bool run_delete_race(bool sweeper_first, bool recreate) {
+    // Slow enough that the post-race apply(60 s) lands well before another verification is due.
+    constexpr auto kRaceVerify = 250ms;
+    SaltedHkcuTree tree(sweeper_first ? "race_sweeper" : "race_natural");
+    REQUIRE(tree.make("Child"));
+    const std::string child = tree.full("Child");
+    RegKeyOwner witness; // a test-held handle on the same key object: the raw status witness
+    REQUIRE(::RegOpenKeyExA(HKEY_CURRENT_USER, child.c_str(), 0, KEY_NOTIFY, &witness.h) ==
+            ERROR_SUCCESS);
+    auto f3 = std::make_shared<std::atomic<std::size_t>>(0);
+    NameHookGate gate; // before the harness: it must outlive the engine's detached workers
+    auto choreo = std::make_shared<SweeperFirst>();
+    auto ctl = [&](std::chrono::milliseconds verify) {
+        auto c = rename_controls(verify);
+        c.name_hook = gate.hook();
+        c.sweep_hook = SweeperFirst::hook(choreo, gate.st, f3);
+        // The natural order now takes two more sweeper passes after the release (the converted
+        // result, then its retry), all inside the grace the fire restarted; a wider grace keeps
+        // a loaded runner from adding a grace fault this case does not assert on.
+        c.health_grace = 400ms;
+        return c;
+    };
+    RegVerifyHarness h({child}, ctl(60s), [&] { return make_registry_mechanism(f3); });
+    gate.st->witness.store(witness.h, std::memory_order_release);
+
+    const auto fired0 = h.fired();
+    gate.park_next(true); // the next verification parks before its HELD-name query
+    if (sweeper_first) {
+        choreo->act = [&] {
+            (void)tree.remove_leaf("Child");
+            if (recreate)
+                (void)tree.make("Child");
+        };
+        choreo->armed.store(true, std::memory_order_release);
+    }
+    h.apply(ctl(kRaceVerify));
+    REQUIRE(eventually([&] { return gate.parked() >= 1; }, kDeafBound));
+    if (!sweeper_first) {
+        REQUIRE(tree.remove_leaf("Child"));
+        if (recreate)
+            REQUIRE(tree.make("Child"));
+        // The delete's own fire is consumed BEFORE the worker is released.
+        REQUIRE(eventually([&] { return h.fired() > fired0; }, kDeafBound));
+        h.apply(ctl(60s)); // no further verification while the case settles
+        gate.release();
+    } else {
+        REQUIRE(eventually([&] { return choreo->done.load(std::memory_order_acquire); },
+                           kDeafBound));
+        h.apply(ctl(60s));
+        if (!choreo->worker_done.load(std::memory_order_acquire))
+            return false; // the ordering was lost to a slow box: nothing is asserted
+    }
+    CHECK(settles_quietly(h));
+    const auto c = h.counters();
+    CHECK_FALSE(gate.st->timed_out.load());
+    // What the OS answered on the held key's object when the worker reached its query.
+    CHECK(gate.st->witness_status.load() == kNtKeyDeleted);
+    CHECK(c.verify_name_undecided == (sweeper_first ? 1u : 0u));
+    if (!sweeper_first) // the fire-converted verification was retried, not committed (C1)
+        CHECK(c.commit_capture_retry >= 1u);
+    CHECK(c.verify_name_lost == 0);
+    CHECK(c.verify_lost == 0);
+    CHECK(faulted_events(h) == 0);
+
+    // Convergence. A delete-only case leaves the watch sheltering under the parent (coverage
+    // None, NOT faulted); re-creating the key brings it back, and a write must then fire it.
+    if (!recreate) {
+        CHECK(h.engine.stats().armed_faulted == 0);
+        REQUIRE(tree.make("Child"));
+    }
+    REQUIRE(eventually([&] { return h.all_notification() && h.engine.stats().armed_faulted == 0; },
+                       kDeafBound));
+    CHECK(settles_quietly(h));
+    const auto before = h.fired();
+    const auto recorded1 = h.counters().commit_name_recorded;
+    REQUIRE(tree.write("Child", 9));
+    CHECK(eventually([&] { return h.fired() > before; }, kDeafBound)); // not deaf on the new key
+    REQUIRE(eventually([&] { return rearm_committed(h, recorded1); }, kDeafBound));
+    h.apply(ctl(20ms)); // verification back on: the converged watch must stay healthy
+    CHECK(stays_healthy(h, 500ms));
+    CHECK(h.counters().verify_name_lost == 0);
+    CHECK(faulted_events(h) == 0);
+    h.engine.stop();
+    return true;
+}
+
+/// Runs the sweeper-first race until its ordering is reached (a slow box can lose the 4 ms
+/// window; the retry is of the whole scenario, so no assertion ever sees a lost ordering).
+void run_sweeper_first_race(bool recreate) {
+    bool reached = false;
+    for (int attempt = 0; attempt < 5 && !reached; ++attempt) {
+        INFO("attempt " << attempt);
+        reached = run_delete_race(/*sweeper_first=*/true, recreate);
+    }
+    REQUIRE(reached); // five lost windows in a row is a defect, not a slow box
+}
 } // namespace
 
 // REG-15-I2 (owner ruling 2026-11-16): the Registry mechanism opens no key for path verification
@@ -18215,6 +18974,19 @@ TEST_CASE("Registry spark (real mechanism): an idle healthy watch is verified an
     CHECK(steady);
     CHECK(h.counters().verify_lost == 0);
     CHECK(h.counters().verify_undecided == 0);
+    // #7877 item 31 (R1), the positive control for the name verdicts: the held and the fresh
+    // name were read on every verification (a failed duplicate or query would count as
+    // name-undecided) and agreed with the name recorded at commit (nothing was lost).
+    CHECK(h.counters().verify_name_lost == 0);
+    CHECK(h.counters().verify_name_undecided == 0);
+    CHECK(h.counters().verify_dup_failed == 0);
+    CHECK(h.counters().commit_name_recorded >= 1);
+    // The observer: the recorded name is a real canonical name of THIS key. A dropped store at
+    // commit would still leave the secondary compare working, so only this observer sees it.
+    const auto recorded = registry_committed_name_for_test(*h.raw, spark_key(h.specs[0]));
+    REQUIRE(recorded.has_value());
+    INFO("committed name has " << recorded->size() << " UTF-16 units");
+    CHECK(name_names_key(*recorded, rig.child));
     // The live handle was never replaced by a verification: a write still fires.
     const auto before = h.fired();
     REQUIRE(rig.write_child(1));
@@ -18222,39 +18994,48 @@ TEST_CASE("Registry spark (real mechanism): an idle healthy watch is verified an
     h.engine.stop();
 }
 
-// DOCUMENTED RESIDUAL (#7836), pinned so a change to it is a deliberate one: a verification
-// only asks whether the registered path still resolves to a key, it does not compare that key
-// with the one the watch holds. A parent renamed away and a key re-created at the original
-// path BEFORE the next verification is therefore not noticed, and the watch stays deaf on the
-// renamed tree. Closing it needs the held handle's kernel name (NtQueryKey on a duplicate of
-// it); it is an ACCEPTED residual, deferred to #7877 item 31. If this case ever fails because
-// the watch IS faulted, the residual was closed: update the manual and the flip-gate text with it.
+// #7877 item 31 (R1), the pin of the #7836 residual INVERTED. A parent renamed away and a key
+// re-created at the original path BEFORE the next verification used to be invisible: the fresh
+// open succeeded and was never compared with the key the watch holds, so the watch stayed
+// deaf on the renamed tree. The verification now reads the HELD handle's canonical name (a
+// duplicate, NtQueryKey) and compares it with the name recorded at commit: the held key has
+// moved, so the watch faults with its own reason, owes a synthetic fire, and the ordinary
+// backend retry re-opens the path onto the NEW key. Still NOT detected (stated in the
+// mechanism header, never claimed closed): a rename away and back inside one interval; a
+// watch whose commit recorded no name AND whose fresh open is refused.
 TEST_CASE("Registry spark (real mechanism): a parent renamed away and its path re-created "
-          "before the next verification is not noticed (documented residual, #7836)",
-          "[spark][mechanism][windows][5719]") {
+          "before the next verification faults the watch and recovers onto the new key "
+          "(#7877 item 31)",
+          "[spark][mechanism][windows][5719][7877]") {
     RegRenameRig rig("deaf5719_replaced");
     REQUIRE(rig.ok);
     RegVerifyHarness h({rig.child}, rename_controls(60s)); // no verification until shortened
+    REQUIRE(h.counters().commit_name_recorded >= 1);       // establishment recorded the name
+    const auto rsyn_pre = h.counters().synthetic_fires;
     REQUIRE(rig.rename_parent() == ERROR_SUCCESS);
     REQUIRE(rig.create_child()); // the original path resolves again, to a DIFFERENT key
-    const auto p0 = h.counters().probe_launched;
     h.apply(rename_controls(50ms));
-    REQUIRE(eventually([&] { return h.counters().probe_launched >= p0 + 2; }, kDeafBound));
 
-    bool steady = true;
-    const auto until = std::chrono::steady_clock::now() + 400ms;
-    while (std::chrono::steady_clock::now() < until) {
-        if (h.engine.stats().armed_faulted != 0)
-            steady = false;
-        std::this_thread::sleep_for(5ms);
-    }
-    CHECK(steady);
+    // Oracle: the held key moved, so the watch is reported faulted (an event, not a poll of a
+    // state the 500 ms retry clears) with the by-name reason, and the PATH-level verdict, which
+    // needs the path to stop resolving, did not run: the path resolved the whole time.
+    CHECK(eventually([&] { return faulted_events(h) >= 1; }, kDeafBound));
+    CHECK(first_fault_reason(h) == kRegReasonMoved);
+    CHECK(h.counters().verify_name_lost >= 1);
     CHECK(h.counters().verify_lost == 0);
-    // The residual itself: the watch holds the renamed key, so a write to the new key is silent.
-    const auto before = h.fired();
-    REQUIRE(rig.write_child(3));
-    std::this_thread::sleep_for(300ms);
-    CHECK(h.fired() == before);
+    // The loss owes a synthetic fire (the observation gap): the retry's commit emits it.
+    CHECK(eventually([&] { return h.counters().synthetic_fires > rsyn_pre; }, kDeafBound));
+
+    // Recovery onto the NEW key: healthy again, a write there fires (the old pin asserted the
+    // opposite), and the recorded name is the new key's.
+    const auto fired0 = h.fired();
+    const auto rsyn0 = h.counters().synthetic_fires;
+    REQUIRE(eventually([&] { return h.settled(fired0, rsyn0); }, kDeafBound));
+    CHECK(eventually([&] { return recovered_events(h) >= 1; }, kDeafBound));
+    const auto recorded = registry_committed_name_for_test(*h.raw, spark_key(h.specs[0]));
+    REQUIRE(recorded.has_value());
+    CHECK(name_names_key(*recorded, rig.child));
+    CHECK(write_fires(h, rig, 3));
     h.engine.stop();
 }
 
@@ -18331,11 +19112,21 @@ TEST_CASE("Registry spark (real mechanism): a fire while a verification is outst
     // While it stays parked it is an overdue RE-ARM, so the ordinary grace applies from the
     // fire: the watch is reported faulted, not left healthy on a probe that never returns.
     CHECK(eventually([&] { return h.engine.stats().armed_faulted == 1; }, kDeafBound));
+    const auto retry0 = h.counters().commit_capture_retry;
     gate.release();
 
-    // The released probe is the watch's RE-ARM, not a verdict: it must commit.
+    // The released probe is the watch's RE-ARM, not a verdict: it converges. Since the second
+    // governance round it is not committed as it stands (a verification runs no confirming
+    // read): it is retried once as an ordinary re-arm, which is confirmed and committed.
     REQUIRE(eventually([&] { return h.settled(fired0, rsyn0); }, kDeafBound));
+    CHECK(h.counters().commit_capture_retry > retry0);
     CHECK(h.counters().synthetic_fires > rsyn0);
+    // #7877 item 31 (R1): the re-arm recorded the name of the key it now holds, and the
+    // converted verification was not judged (its held name is ignored on this path).
+    const auto rearmed = registry_committed_name_for_test(*h.raw, spark_key(h.specs[0]));
+    REQUIRE(rearmed.has_value());
+    CHECK(name_names_key(*rearmed, rig.child));
+    CHECK(h.counters().verify_name_lost == 0);
     const auto before = h.fired();
     REQUIRE(rig.write_child(2));
     CHECK(eventually([&] { return h.fired() > before; }, kDeafBound)); // not deaf
@@ -18388,5 +19179,2005 @@ TEST_CASE("Registry spark (real mechanism): a refused verification launch does n
                      kDeafBound));
     h.engine.stop();
 }
+
+// ── #7877 item 31 (R1): the name verdicts, case by case ──────────────────────────────────────
+//
+// Where each runs: every case below is Windows-only. Some need a rig-grade fact that a CI
+// token may not give (the deny-ACE case can set its ACE or it SKIPs with the reason; the
+// root-key case SKIPs when the mechanism refuses an empty subkey; the two HKCR cases write a
+// machine class key under HKLM\SOFTWARE\Classes and SKIP with the reason when this token
+// cannot, and ALWAYS skip under a LocalSystem token (no per-user class layer, whatever
+// YUZU_REQUIRE_WINDOWS_REGISTRY_TESTS says); the link case SKIPs when the token cannot create
+// a registry link). None fakes a result: a case that cannot establish its precondition says so
+// and skips.
+
+// The path-level verdict is unchanged by R1 and keeps its OWN reason: a parent renamed away
+// with nothing re-created leaves the path unresolvable, which the existing verdict reports
+// before any name is compared. The verification is held off until AFTER the rename, so the
+// held key can never be read between the fresh open and the held query of a rename that was
+// still landing (that interleaving belongs to the gap case below).
+TEST_CASE("Registry spark (real mechanism): a parent renamed away with nothing re-created keeps "
+          "the path-level verdict and its own reason (#7877 item 31)",
+          "[spark][mechanism][windows][5719][7877]") {
+    RegRenameRig rig("name_pathlevel");
+    REQUIRE(rig.ok);
+    RegVerifyHarness h({rig.child}, rename_controls(60s));
+    REQUIRE(rig.rename_parent() == ERROR_SUCCESS);
+    REQUIRE(rig.original_path_gone());
+    h.apply(rename_controls(50ms));
+    CHECK(eventually([&] { return faulted_events(h) >= 1; }, kDeafBound));
+    CHECK(first_fault_reason(h) == kRegReasonPathLost);
+    CHECK(h.counters().verify_lost >= 1);
+    CHECK(h.counters().verify_name_lost == 0); // the path verdict returned before any name compare
+    h.engine.stop();
+}
+
+// T2, the case a fresh-versus-held compare alone is blind to: the re-created key refuses
+// KEY_NOTIFY to this user, so the verification's own open fails with ERROR_ACCESS_DENIED
+// (`!r.ok`), yet the HELD key's name has still moved. The held name is read on that failure
+// path too, so the primary compare faults it; the retry's open is refused the same way, so the
+// watch STAYS visibly faulted for as long as the ACE stands, and recovers when it is lifted.
+// Rig facts: the ACE is set through DenyNotifyScope (the SDDL helper the UP-2 case uses); when
+// this token cannot set it, or the open is not then refused, the case skips with the reason.
+TEST_CASE("Registry spark (real mechanism): a re-created path whose open is refused still "
+          "faults the watch by name and stays visibly faulted (#7877 item 31, deny ACE)",
+          "[spark][mechanism][windows][5719][7877]") {
+    RegRenameRig rig("name_denyace");
+    REQUIRE(rig.ok);
+    RegVerifyHarness h({rig.child}, rename_controls(60s));
+    const auto rsyn_pre = h.counters().synthetic_fires;
+    REQUIRE(rig.rename_parent() == ERROR_SUCCESS);
+    REQUIRE(rig.create_child());
+    // Declared AFTER the rig and the harness, so its destructor lifts the ACE (a deny must not
+    // outlive the case: it would leave an undeletable key on a shared runner) before either
+    // of them is torn down.
+    std::optional<DenyNotifyScope> deny;
+    deny.emplace(rig.child);
+    if (!deny->applied)
+        skip_or_fail_registry(
+            "could not set a deny ACE on an HKCU key with this token (no user SID or no WRITE_DAC)");
+    {
+        RegKeyOwner probe;
+        const LONG rc =
+            ::RegOpenKeyExA(HKEY_CURRENT_USER, rig.child.c_str(), 0, KEY_NOTIFY, &probe.h);
+        if (rc != ERROR_ACCESS_DENIED)
+            skip_or_fail_registry("the deny ACE does not refuse KEY_NOTIFY for this token (the "
+                                  "open returned " +
+                                  std::to_string(rc) + ")");
+    }
+
+    h.apply(rename_controls(50ms));
+    CHECK(eventually([&] { return faulted_events(h) >= 1; }, kDeafBound));
+    CHECK(first_fault_reason(h) == kRegReasonMoved);
+    CHECK(h.counters().verify_name_lost >= 1);
+    CHECK(h.counters().verify_lost == 0); // the path resolved (to a key we may not watch)
+    // The refused fresh open is a path-level undecided, counted BEFORE the name verdict faults
+    // (the HP-1 ordering pin): the probe returned !ok, so verify_undecided is at least 1 even
+    // though the held-name verdict then decided.
+    CHECK(h.counters().verify_undecided >= 1);
+    REQUIRE(eventually([&] { return h.engine.stats().armed_faulted == 1; }, kDeafBound));
+    // Hold PAST the backend retry (rename_controls sets its base to 500 ms) and prove the retry
+    // really ran and failed: every failed backend attempt, the name verdict itself included,
+    // counts in probe_backend_failed. The retry's open of the same path is refused too, so the
+    // watch must stay faulted throughout, not recover onto a key it cannot watch.
+    const auto backend_failed0 = h.counters().probe_backend_failed;
+    bool stays_faulted = true;
+    const auto retry_deadline = std::chrono::steady_clock::now() + kDeafBound;
+    while (h.counters().probe_backend_failed <= backend_failed0 &&
+           std::chrono::steady_clock::now() < retry_deadline) {
+        if (h.engine.stats().armed_faulted != 1)
+            stays_faulted = false;
+        std::this_thread::sleep_for(5ms);
+    }
+    CHECK(h.counters().probe_backend_failed > backend_failed0); // the retry ran and failed
+    const auto until = std::chrono::steady_clock::now() + 300ms;
+    while (std::chrono::steady_clock::now() < until) {
+        if (h.engine.stats().armed_faulted != 1)
+            stays_faulted = false;
+        std::this_thread::sleep_for(5ms);
+    }
+    CHECK(stays_faulted);
+    CHECK(recovered_events(h) == 0);
+
+    deny->restore(); // lift the ACE: the next retry opens the new key and recovers onto it
+    const auto fired0 = h.fired();
+    const auto rsyn0 = h.counters().synthetic_fires;
+    REQUIRE(eventually([&] { return h.settled(fired0, rsyn0); }, kDeafBound * 2));
+    CHECK(h.counters().synthetic_fires > rsyn_pre);
+    CHECK(write_fires(h, rig, 5));
+    h.engine.stop();
+}
+
+// T3 + T4: a rename that lands INSIDE a verification. The held-versus-commit-time compare has
+// no open-to-query window at VERIFICATION time: the commit-time name was fixed before the
+// verification started and the held name is read once, so a rename still in effect when it is
+// read is caught on that very sample. (The window at COMMIT time, between a probe's open and
+// its first name read, is a different one: it is closed by the confirming second read except
+// for a flip between those two back-to-back reads, which the commit-race cases below drive.)
+//   held_side == false: the worker is parked after its fresh OPEN and notify arm, before the
+//     fresh NAME query; the parent is renamed AND the path re-created, then the worker is
+//     released. Both handles it then reads (the fresh one and the duplicate) sit on the
+//     renamed tree and AGREE, so a fresh-versus-held compare alone would call it healthy.
+//   held_side == true: the worker is parked between the two queries (fresh name already read
+//     at the old name); the parent is renamed (no re-creation) before the held query. This is
+//     the accepted true-but-unlucky straddle: one fault for a real rename, then the ordinary
+//     retry, which finds the path absent and resolves the ancestor.
+TEST_CASE("Registry spark (real mechanism): a rename landing inside a verification, around its "
+          "name queries, is caught by the held-name compare (#7877 item 31)",
+          "[spark][mechanism][windows][5719][7877]") {
+    const bool held_side = GENERATE(false, true);
+    INFO("parked before the " << (held_side ? "held" : "fresh") << " name query");
+    RegRenameRig rig(held_side ? "name_gap_held" : "name_gap_fresh");
+    REQUIRE(rig.ok);
+    NameHookGate gate; // before the harness: the hook outlives nothing the engine joins
+    auto ctl = [&](std::chrono::milliseconds verify) {
+        auto c = rename_controls(verify);
+        c.name_hook = gate.hook();
+        return c;
+    };
+    RegVerifyHarness h({rig.child}, ctl(60s));
+    const auto rsyn_pre = h.counters().synthetic_fires;
+    gate.park_next(held_side);
+    h.apply(ctl(50ms));
+    REQUIRE(eventually([&] { return gate.parked() >= 1; }, kDeafBound));
+
+    REQUIRE(rig.rename_parent() == ERROR_SUCCESS);
+    if (!held_side) {
+        REQUIRE(rig.create_child());
+    }
+    gate.release();
+
+    CHECK(eventually([&] { return faulted_events(h) >= 1; }, kDeafBound));
+    CHECK(first_fault_reason(h) == kRegReasonMoved);
+    CHECK(h.counters().verify_name_lost >= 1);
+    CHECK(h.counters().verify_lost == 0);
+    CHECK(eventually([&] { return h.counters().synthetic_fires > rsyn_pre; }, kDeafBound));
+
+    const auto fired0 = h.fired();
+    const auto rsyn0 = h.counters().synthetic_fires;
+    if (held_side) {
+        REQUIRE(rig.create_child()); // the appearance the (ancestor) retry is waiting for
+    }
+    REQUIRE(eventually([&] { return h.settled(fired0, rsyn0); }, kDeafBound));
+    CHECK(write_fires(h, rig, 2));
+    h.engine.stop();
+}
+
+// T5: R1 must not add a NAME-verdict fault to an ordinary delete-and-recreate of the watched
+// key, even when the re-creation changes the case of the leaf, and the watch must converge back
+// onto the new key every time. Ten rounds alternate the leaf case and END on the variant that
+// differs from the one the watch was armed on, so a committed name that a re-arm failed to
+// re-record would disagree with the held key's name during the closing hold and fault it
+// (the hold below runs verification at 20 ms). What it does NOT exercise: the STATUS_KEY_DELETED
+// answer of a held query read after a delete (no verification was seen to launch during
+// the churn on the rig; the delete-race cases at the end of this file drive that answer with
+// the worker parked), and the path-level false fault of #7877 item 37 (a
+// fresh open landing in the delete-to-recreate gap), which is untouched and tolerated:
+// `verify_lost` is deliberately NOT asserted, only the name verdicts.
+TEST_CASE("Registry spark (real mechanism): deleting the watched key and re-creating it, even "
+          "under a different case, adds no name-verdict fault (#7877 item 31)",
+          "[spark][mechanism][windows][5719][7877]") {
+    RegRenameRig rig("name_delrecreate");
+    REQUIRE(rig.ok);
+    RegVerifyHarness h({rig.child}, rename_controls(20ms));
+    for (int i = 0; i < 10; ++i) {
+        INFO("iteration " << i);
+        const auto fired0 = h.fired();
+        const auto rsyn0 = h.counters().synthetic_fires;
+        const auto recorded0 = h.counters().commit_name_recorded;
+        REQUIRE(::RegDeleteTreeA(HKEY_CURRENT_USER, rig.child.c_str()) == ERROR_SUCCESS);
+        REQUIRE(create_leaf(rig, (i % 2 == 0) ? "Child" : "child")); // ends on "child"
+        // The delete signals the held handle; then the watch must settle back onto the new key.
+        // Settled includes a COMMIT after the delete (a name recorded beyond `recorded0`): the
+        // engine's coverage can still show the Notification of before the fire, so settled()
+        // alone can pass with the re-arm not yet committed.
+        REQUIRE(eventually([&] { return h.fired() > fired0; }, kDeafBound));
+        REQUIRE(eventually([&] {
+            return h.settled(fired0, rsyn0) && h.counters().commit_name_recorded > recorded0;
+        }, kDeafBound));
+        // write_fires is itself a change the watch consumes: every consumed notification is a
+        // coverage gap until the re-arm commits (on_fire marks None, the sweeper commits one or
+        // two passes later; 31 ms on the rig, 2026-11-25), so coverage read straight after it
+        // is None by design and proves nothing, and the engine's view of it can still be the
+        // stale Notification of before the fire. Wait for that re-arm to COMMIT before the next
+        // round (and, after the last, before the hold), so every round's baseline is a settled
+        // watch and a later wait is never satisfied by an earlier round's commit.
+        const auto recorded_w = h.counters().commit_name_recorded;
+        REQUIRE(write_fires(h, rig, static_cast<DWORD>(i + 1)));
+        REQUIRE(eventually([&] { return rearm_committed(h, recorded_w); }, kDeafBound));
+    }
+    // Require the watch to STAY covered and unfaulted for a window with verification still
+    // running at 20 ms: a standing or recurring fault would show here, and a name verdict in
+    // the counters below.
+    const auto verifies0 = h.counters().verify_launched;
+    CHECK(stays_healthy(h, 300ms));
+    // The hold really ran verifications against the re-created key (it is not vacuous).
+    CHECK(h.counters().verify_launched >= verifies0 + 3);
+    CHECK(h.counters().verify_name_lost == 0);
+    CHECK(h.counters().verify_dup_failed == 0);
+    h.engine.stop();
+}
+
+// T6: a name capture that fails (here: the hook throws, as an allocation failure would) can
+// never fail an ESTABLISHMENT. The fresh capture runs on every establishment, not only on
+// verifications, so this runs with path verification OFF (the factory default): the watch is
+// still established with Notification coverage, no fault, no name recorded (counted as
+// missing), and a write still fires.
+TEST_CASE("Registry spark (real mechanism): a name capture that fails never fails the "
+          "establishment, with path verification off (#7877 item 31)",
+          "[spark][mechanism][windows][5719][7877]") {
+    RegRenameRig rig("name_capture_throw");
+    REQUIRE(rig.ok);
+    auto calls = std::make_shared<std::atomic<int>>(0);
+    auto ctl = rename_controls(0ms); // zero leaves the construction-time seed: verification off
+    ctl.name_hook = [calls](std::string_view, bool held) -> NameResult {
+        if (!held) {
+            calls->fetch_add(1, std::memory_order_relaxed);
+            throw std::runtime_error("name capture failed (test hook)");
+        }
+        return std::nullopt;
+    };
+    RegVerifyHarness h({rig.child}, ctl); // REQUIREs Notification coverage and no fault
+    CHECK(calls->load() >= 1);            // the hook really ran: the case is not vacuous
+    const auto c = h.counters();
+    CHECK(c.path_verify_ms == 0);
+    CHECK(c.verify_launched == 0);
+    CHECK(c.commit_name_recorded == 0);
+    CHECK(c.commit_name_missing >= 1);
+    const auto recorded = registry_committed_name_for_test(*h.raw, spark_key(h.specs[0]));
+    REQUIRE(recorded.has_value()); // the watch exists ...
+    CHECK(recorded->empty());      // ... and recorded no name
+    CHECK(stays_healthy(h, 300ms));
+    CHECK(write_fires(h, rig, 1));
+    // The write's re-arm is a second commit that records no name (counted), and with the check
+    // OFF it stages no "rename check" warn: nothing compares that name, so a warn saying the
+    // check is disabled for the watch would describe a check that is not running.
+    CHECK(eventually([&] { return h.counters().commit_name_missing >= 2 && h.all_notification(); },
+                     kDeafBound));
+    std::this_thread::sleep_for(150ms); // a warn staged by that commit would be logged by now
+    CHECK(h.counters().warns_claimed_name_missing == 0);
+    h.engine.stop();
+}
+
+// The other half of T6, with verification ON: a watch whose commit recorded NO name has no
+// primary compare, so it relies on the secondary alone. A rename-plus-recreate whose fresh open
+// succeeds is still caught (the fresh key's name differs from the held one); the next commit
+// records a name and the primary is back. (A deny-ACE re-creation on such a watch would stay
+// undecided: that is the documented residual, not asserted here.)
+TEST_CASE("Registry spark (real mechanism): a watch that recorded no name is covered by the "
+          "fresh-versus-held compare alone, until a commit records one (#7877 item 31)",
+          "[spark][mechanism][windows][5719][7877]") {
+    RegRenameRig rig("name_noname");
+    REQUIRE(rig.ok);
+    auto fail_fresh = std::make_shared<std::atomic<bool>>(true);
+    auto ctl = [&](std::chrono::milliseconds verify) {
+        auto c = rename_controls(verify);
+        c.name_hook = [fail_fresh](std::string_view, bool held) -> NameResult {
+            if (!held && fail_fresh->load(std::memory_order_acquire))
+                return NameResult{std::in_place, kNtUnsuccessful, std::wstring{}};
+            return std::nullopt;
+        };
+        return c;
+    };
+    RegVerifyHarness h({rig.child}, ctl(60s));
+    const auto rsyn_pre = h.counters().synthetic_fires;
+    REQUIRE(h.counters().commit_name_missing >= 1);
+    {
+        const auto none = registry_committed_name_for_test(*h.raw, spark_key(h.specs[0]));
+        REQUIRE(none.has_value());
+        CHECK(none->empty());
+    }
+    fail_fresh->store(false, std::memory_order_release); // later captures are real
+    REQUIRE(rig.rename_parent() == ERROR_SUCCESS);
+    REQUIRE(rig.create_child());
+    h.apply(ctl(50ms));
+
+    CHECK(eventually([&] { return faulted_events(h) >= 1; }, kDeafBound));
+    CHECK(first_fault_reason(h) == kRegReasonRepointed); // the secondary, not the primary
+    CHECK(h.counters().verify_name_lost >= 1);
+    CHECK(h.counters().verify_lost == 0);
+    CHECK(eventually([&] { return h.counters().synthetic_fires > rsyn_pre; }, kDeafBound));
+    const auto fired0 = h.fired();
+    const auto rsyn0 = h.counters().synthetic_fires;
+    REQUIRE(eventually([&] { return h.settled(fired0, rsyn0); }, kDeafBound));
+    // The retry's commit captured a real name, so the primary compare is back.
+    const auto recorded = registry_committed_name_for_test(*h.raw, spark_key(h.specs[0]));
+    REQUIRE(recorded.has_value());
+    CHECK(name_names_key(*recorded, rig.child));
+    CHECK(write_fires(h, rig, 4));
+    h.engine.stop();
+}
+
+// T8 (b, c, d): a name query that cannot be answered is UNDECIDED by name, on either side:
+// STATUS_KEY_DELETED (the delete's own fire converges it, so it must never fault), a generic
+// failure, access denied. The PATH verdict still decides (the path resolved), so
+// `verify_undecided` stays 0; only `verify_name_undecided` counts. A name past the 64 KiB cap
+// (raw 0x80000005) is NOT in this list since the governance fix: it is a proven mismatch when
+// the other side is readable, and has its own case ("a name past the cap").
+TEST_CASE("Registry spark (real mechanism): a name query that cannot be answered is undecided by "
+          "name, never a fault (#7877 item 31)",
+          "[spark][mechanism][windows][5719][7877]") {
+    const long status = GENERATE(as<long>{}, kNtKeyDeleted, kNtUnsuccessful, kNtAccessDenied);
+    const bool on_held = GENERATE(true, false);
+    INFO("injected NTSTATUS " << static_cast<unsigned long>(static_cast<std::uint32_t>(status))
+                              << " on the " << (on_held ? "held" : "fresh") << " query");
+    RegRenameRig rig("name_undecided");
+    REQUIRE(rig.ok);
+    auto st = std::make_shared<NameInject>();
+    auto ctl = [&](std::chrono::milliseconds verify) {
+        auto c = rename_controls(verify);
+        c.name_hook = inject_hook(st);
+        return c;
+    };
+    RegVerifyHarness h({rig.child}, ctl(60s));
+    const NameResult failure{std::in_place, status, std::wstring{}};
+    if (on_held)
+        st->set(std::nullopt, failure);
+    else
+        st->set(failure, std::nullopt);
+    h.apply(ctl(20ms));
+    REQUIRE(eventually([&] { return h.counters().verify_name_undecided >= 3; }, kDeafBound));
+    CHECK((on_held ? st->held_calls : st->fresh_calls).load() >= 3); // the injection was reached
+    CHECK(stays_healthy(h, 300ms));
+    CHECK(h.counters().verify_name_lost == 0);
+    CHECK(h.counters().verify_lost == 0);
+    CHECK(h.counters().verify_undecided == 0);
+    CHECK(faulted_events(h) == 0);
+    st->clear();
+    CHECK(write_fires(h, rig, 1));
+    h.engine.stop();
+}
+
+// T8 (a): STATUS_HIVE_UNLOADED on the held handle is LOST, with its own reason. A real unload
+// needs a second account (rig-only; peer-measured at the API level), so the status is injected.
+// The verdict is race-reachable only in production (a fire normally converts the verification
+// into the re-arm first), which is why the reason string proves nothing by its absence.
+TEST_CASE("Registry spark (real mechanism): STATUS_HIVE_UNLOADED on the held handle faults the "
+          "watch as 'hive unloaded' and the retry recovers (#7877 item 31)",
+          "[spark][mechanism][windows][5719][7877]") {
+    RegRenameRig rig("name_hive");
+    REQUIRE(rig.ok);
+    auto st = std::make_shared<NameInject>();
+    auto ctl = [&](std::chrono::milliseconds verify) {
+        auto c = rename_controls(verify);
+        c.name_hook = inject_hook(st);
+        return c;
+    };
+    RegVerifyHarness h({rig.child}, ctl(60s));
+    const auto rsyn_pre = h.counters().synthetic_fires;
+    st->set(std::nullopt, NameResult{std::in_place, kNtHiveUnloaded, std::wstring{}});
+    h.apply(ctl(20ms));
+    CHECK(eventually([&] { return faulted_events(h) >= 1; }, kDeafBound));
+    CHECK(first_fault_reason(h) == kRegReasonHiveUnloaded);
+    CHECK(h.counters().verify_name_lost >= 1);
+    CHECK(h.counters().verify_lost == 0);
+    st->clear(); // the hive is readable again: the retry commits and the next verification agrees
+    CHECK(eventually([&] { return h.counters().synthetic_fires > rsyn_pre; }, kDeafBound));
+    const auto fired0 = h.fired();
+    const auto rsyn0 = h.counters().synthetic_fires;
+    REQUIRE(eventually([&] { return h.settled(fired0, rsyn0); }, kDeafBound));
+    CHECK(write_fires(h, rig, 1));
+    h.engine.stop();
+}
+
+// T8 (e): the SECONDARY compare's CI-side oracle. The fresh key reports a name that differs
+// from the held key's real name (injected, status 0) while the held side is the real,
+// unmoved key: the path now names a DIFFERENT key (a user-hive class shadowing the machine
+// one, a re-pointed link). This case proves the compare and the reason with an injected name;
+// the two real events are the HKCR and link cases at the end of this file (NtQueryKey through
+// HKCR and through a link reports the underlying key's name, measured on the rig 2026-11-26).
+TEST_CASE("Registry spark (real mechanism): a fresh key whose name differs from the held key's "
+          "faults the watch as 're-pointed' and the retry recovers (#7877 item 31)",
+          "[spark][mechanism][windows][5719][7877]") {
+    RegRenameRig rig("name_repoint");
+    REQUIRE(rig.ok);
+    auto st = std::make_shared<NameInject>();
+    auto ctl = [&](std::chrono::milliseconds verify) {
+        auto c = rename_controls(verify);
+        c.name_hook = inject_hook(st);
+        return c;
+    };
+    RegVerifyHarness h({rig.child}, ctl(60s));
+    const auto rsyn_pre = h.counters().synthetic_fires;
+    st->set(NameResult{std::in_place, 0L,
+                       std::wstring{L"\\REGISTRY\\USER\\yuzu_test_injected\\SomewhereElse"}},
+            std::nullopt); // the held side stays real and unmoved
+    h.apply(ctl(20ms));
+    CHECK(eventually([&] { return faulted_events(h) >= 1; }, kDeafBound));
+    CHECK(first_fault_reason(h) == kRegReasonRepointed);
+    CHECK(h.counters().verify_name_lost >= 1);
+    CHECK(h.counters().verify_lost == 0);
+    st->clear(); // before the retry's commit records the injected name as the committed one
+    CHECK(eventually([&] { return h.counters().synthetic_fires > rsyn_pre; }, kDeafBound));
+    const auto fired0 = h.fired();
+    const auto rsyn0 = h.counters().synthetic_fires;
+    REQUIRE(eventually([&] { return h.settled(fired0, rsyn0); }, kDeafBound));
+    CHECK(write_fires(h, rig, 1));
+    h.engine.stop();
+}
+
+// T12: DuplicateHandle of the held key fails (the seam makes the sweeper treat it as failed
+// for every verification it stages). The PATH check still runs, the name check is undecided
+// (counted, never a fault) and nothing is skipped. When the duplicate works again the name
+// check is back: a rename-plus-recreate is then caught.
+TEST_CASE("Registry spark (real mechanism): a failed DuplicateHandle leaves the path check "
+          "running and the name check undecided, never a fault (#7877 item 31)",
+          "[spark][mechanism][windows][5719][7877]") {
+    RegRenameRig rig("name_dupfail");
+    REQUIRE(rig.ok);
+    auto ctl = [&](std::chrono::milliseconds verify, bool fail_duplicate) {
+        auto c = rename_controls(verify);
+        c.verify_fail_duplicate = fail_duplicate;
+        return c;
+    };
+    RegVerifyHarness h({rig.child}, ctl(60s, false));
+    h.apply(ctl(20ms, true));
+    REQUIRE(eventually(
+        [&] {
+            const auto d = h.counters();
+            return d.verify_launched >= 3 && d.verify_dup_failed >= 3 &&
+                   d.verify_name_undecided >= 3;
+        },
+        kDeafBound));
+    CHECK(stays_healthy(h, 300ms));
+    CHECK(h.counters().verify_name_lost == 0);
+    CHECK(h.counters().verify_lost == 0);
+    CHECK(h.counters().verify_undecided == 0);
+    CHECK(faulted_events(h) == 0);
+    // The failed duplicate warns ONCE with its own text (kind DupFailed), however many
+    // verifications failed; the generic "could not decide" warn is SUPPRESSED for it (the
+    // duplicate already reported), though every one of those verifications was name-undecided.
+    CHECK(eventually([&] { return h.counters().warns_claimed_dup_failed >= 1; }, kDeafBound));
+    CHECK(h.counters().warns_claimed_dup_failed == 1);
+    CHECK(h.counters().warns_claimed_undecided == 0);
+
+    // The duplicate works again: the failure counters stop growing ...
+    h.apply(ctl(20ms, false));
+    std::this_thread::sleep_for(100ms); // a verification already staged finishes
+    const auto failed = h.counters().verify_dup_failed;
+    const auto undecided = h.counters().verify_name_undecided;
+    std::this_thread::sleep_for(200ms);
+    CHECK(h.counters().verify_dup_failed == failed);
+    CHECK(h.counters().verify_name_undecided == undecided);
+    // ... and the name check catches a rename-plus-recreate again. The rename and the
+    // re-creation are two calls, so for about 0.4 ms between them the path genuinely names
+    // nothing, and a verification whose open lands there is rightly judged by the PATH verdict
+    // (the Ancestor row, which has precedence and its own reason). On Windows that is not a
+    // rare overlap: in the logged runs the rename began within tens of microseconds of the
+    // sweeper's pass (both appear to wake on the same coarse timer tick), so a rename-and-
+    // recreate made while verification runs at 20 ms hit the gap in 6 of 8 isolated runs and
+    // 28 of 40 runs with a random delay (rig, 2026-11-25).
+    // So verification is held off (60 s) across the two calls and then released, which is the
+    // order the other rename cases use; the by-name verdict is what is then decided, and its
+    // reason is asserted exactly.
+    h.apply(ctl(60s, false));
+    std::this_thread::sleep_for(100ms); // a verification already staged finishes
+    REQUIRE(rig.rename_parent() == ERROR_SUCCESS);
+    REQUIRE(rig.create_child());
+    h.apply(ctl(20ms, false));
+    CHECK(eventually([&] { return faulted_events(h) >= 1; }, kDeafBound));
+    CHECK(first_fault_reason(h) == kRegReasonMoved);
+    CHECK(h.counters().verify_name_lost >= 1);
+    CHECK(h.counters().verify_lost == 0); // the path resolved at every verification
+    h.engine.stop();
+}
+
+// T7: the duplicate lives INSIDE the F3-counted verification worker. While that worker is
+// parked (a hung hive) it stays counted on the shared F3 counter, whether the watch is retired
+// underneath it or the engine stops; and the counter returns to zero, with no worker active,
+// once the worker exits (its local owner closes the duplicate on every exit of the call).
+TEST_CASE("Registry spark (real mechanism): a verification worker parked while holding the "
+          "duplicate stays counted on the F3 counter, reaches the held-name query after it is "
+          "released, and exits on every path (#7877 item 31)",
+          "[spark][mechanism][windows][5719][7877]") {
+    RegRenameRig rig("name_f3");
+    REQUIRE(rig.ok);
+    auto f3 = std::make_shared<std::atomic<std::size_t>>(0);
+    ProbeGate gate; // before the harness: it must outlive the engine's detached workers
+    gate.open = true;
+    // A pass-through name hook that counts the calls: the HELD-side call can only happen when
+    // the parked job really carries a duplicate, so reaching it after the release proves the
+    // duplicate was staged (a job without one never queries the held name). That the duplicate
+    // is then CLOSED is asserted by the process-handle-count case, not here.
+    auto names = std::make_shared<NameInject>();
+    auto ctl = [&](std::chrono::milliseconds verify) {
+        auto c = rename_controls(verify);
+        c.probe_hook = gate.hook_for(rig.child);
+        c.name_hook = inject_hook(names);
+        return c;
+    };
+    RegVerifyHarness h({rig.child}, ctl(60s), [&] { return make_registry_mechanism(f3); });
+    const auto parked0 = gate.parked.load();
+    {
+        std::lock_guard lk(gate.mu);
+        gate.open = false; // the next probe of the key parks inside the hook
+    }
+    h.apply(ctl(50ms));
+    REQUIRE(eventually([&] { return gate.parked.load() > parked0; }, kDeafBound));
+    CHECK(f3->load() >= 1);
+    CHECK(h.counters().probe_workers_active >= 1);
+
+    SECTION("the watch is disarmed while the worker is parked") {
+        const auto discarded0 = h.counters().probe_discarded;
+        h.engine.disarm(h.subs[0]); // unwatch: the watch is retired and drained under the worker
+        CHECK(h.counters().probe_discarded >= discarded0 + 1); // the parked probe is abandoned
+        CHECK(f3->load() >= 1);                                // still parked: still counted
+        gate.release();
+        CHECK(eventually([&] { return names->held_calls.load() >= 1; }, kDeafBound));
+        CHECK(eventually([&] { return f3->load() == 0; }, kDeafBound));
+        CHECK(eventually([&] { return h.counters().probe_workers_active == 0; }, kDeafBound));
+        CHECK(eventually(
+            [&] {
+                const auto d = h.counters();
+                return d.live_watches == 0 && d.retiring == 0;
+            },
+            kDeafBound));
+        h.engine.stop();
+    }
+    SECTION("the engine stops while the worker is parked") {
+        h.engine.stop();
+        CHECK(h.raw->stats().quarantined_total >= 1); // leaked-and-counted, stop() did not wait
+        CHECK(f3->load() >= 1);
+        gate.release();
+        CHECK(eventually([&] { return names->held_calls.load() >= 1; }, kDeafBound));
+        CHECK(eventually([&] { return f3->load() == 0; }, kDeafBound));
+        CHECK(eventually([&] { return h.counters().probe_workers_active == 0; }, kDeafBound));
+    }
+}
+
+// A verification refused by the probe lane hands its job back to the sweeper, which drops it
+// (and the duplicate it carries) off-lock; the retry re-enters with a fresh duplicate. Proved
+// end to end for the RETRY: while key A's verification parks in the only lane slot, key B's
+// verifications are refused repeatedly; B's world is then changed; once the lane frees, B's
+// retried verification (with a NEW duplicate, shown by the held-name hook being reached)
+// catches the rename-plus-recreate. A stays healthy throughout. That the refused job's own
+// duplicate is closed is not asserted here by name: no handle of it is observable, and a leak
+// of one per refusal would show only in the process-handle-count case. The truly
+// never-OFFERED path (a throw between staging and the launch loop,
+// reconcile_probe_launches_locked) has no seam and is not reachable deterministically: review.
+TEST_CASE("Registry spark (real mechanism): a verification refused by the probe lane is retried "
+          "and the retried one still compares names through a fresh duplicate (#7877 item 31)",
+          "[spark][mechanism][windows][5719][7877]") {
+    RegRenameRig rig("name_lane_a");
+    RegRenameRig other("name_lane_b");
+    REQUIRE(rig.ok);
+    REQUIRE(other.ok);
+    ProbeGate gate; // parks only A's probes; before the harness (see above)
+    gate.open = true;
+    auto names = std::make_shared<KeyedNameCount>(); // pass-through; counts queries per key
+    auto ctl = [&](std::chrono::milliseconds verify) {
+        auto c = rename_controls(verify);
+        c.probe_lane_cap = 1;
+        c.admission_backoff_seed = 20ms;
+        c.probe_hook = gate.hook_for(rig.child);
+        c.name_hook = keyed_count_hook(names);
+        return c;
+    };
+    RegVerifyHarness h({rig.child, other.child}, ctl(60s));
+    const auto parked0 = gate.parked.load();
+    const auto rejected0 = h.counters().probe_admission_rejected;
+    {
+        std::lock_guard lk(gate.mu);
+        gate.open = false;
+    }
+    h.apply(ctl(50ms));
+    REQUIRE(eventually(
+        [&] {
+            return gate.parked.load() > parked0 &&
+                   h.counters().probe_admission_rejected > rejected0;
+        },
+        kDeafBound));
+
+    REQUIRE(other.rename_parent() == ERROR_SUCCESS); // B's world changes while B is refused
+    REQUIRE(other.create_child());
+    gate.release();
+
+    CHECK(eventually([&] { return faulted_events(h, 1) >= 1; }, kDeafBound));
+    CHECK(first_fault_reason(h, 1) == kRegReasonMoved);
+    CHECK(h.counters().verify_name_lost >= 1);
+    // B's retried verification really carried a duplicate: B (not A, whose own released
+    // verification also reaches its held query) made a held-name query. Establishment makes
+    // fresh queries only, so a held query for B's key can only be a verification's.
+    CHECK(names->held_for(other.child) >= 1);
+    CHECK(faulted_events(h, 0) == 0); // A was never judged lost
+    h.apply(ctl(60s));                // no further verification while the case settles
+    REQUIRE(eventually(
+        [&] { return h.all_notification() && h.engine.stats().armed_faulted == 0; },
+        kDeafBound * 2));
+    const auto before = h.fired(1);
+    REQUIRE(other.write_child(4));
+    CHECK(eventually([&] { return h.fired(1) > before; }, kDeafBound)); // B recovered, not deaf
+    h.engine.stop();
+}
+
+// T11: a root-key watch (an EMPTY subkey) names a predefined root. It is never duplicated and
+// never name-compared (a predefined root cannot be renamed), and counting it as name-undecided
+// would drown the signal for the life of the watch. What this case PROVES, and only this: once
+// the first verification of the root watch has been staged and launched, its staging took no
+// duplicate (no duplicate failure) and the watch recorded no fault and no missing-name count.
+// The name-verdict counters are asserted zero too, but they are NOT evidence about the verdict
+// side: a root-key verification never reaches resolve_verify_locked (below), so the
+// empty-subkey guards in name_verdict_locked are not exercised by this case.
+// What it does NOT prove, measured on the rig (build 26100, 2026-11-25): a root-key watch is
+// not verified REPEATEDLY, and its verification is never JUDGED. RegOpenKeyExW(HKCU, "")
+// returns the predefined pseudo-handle itself, so a verification's own RegNotifyChangeKeyValue
+// lands on the handle the live notify already uses and signals it; the verification is then
+// converted into the re-arm (resolve_verify_locked was never reached in 4 s), and each re-arm
+// commit closes the shared handle, which keeps the watch re-arming about every 30 ms with a
+// synthetic fire each time. With verification off the same watch stays quiet. That behaviour is
+// older than R1 and unreachable through the engine (it refuses an empty key), so it is recorded
+// here, not asserted. The mechanism is driven directly (the engine refuses an empty subkey at
+// arm()); if the mechanism refuses it too, the case skips and the skip is review-only.
+TEST_CASE("Registry spark (real mechanism): a root-key watch is never name-judged and is never "
+          "counted as name-undecided or as a missing name (#7877 item 31)",
+          "[spark][mechanism][windows][5719][7877]") {
+    auto mech = make_registry_mechanism();
+    REQUIRE(mech != nullptr);
+    {
+        auto ctl = rename_controls(20ms);
+        ctl.caller_wait_budget = 5000ms; // the initial probe commits inside watch() itself
+        REQUIRE(set_registry_test_controls_for_test(*mech, std::move(ctl)));
+    }
+    auto faults = std::make_shared<std::atomic<int>>(0);
+    mech->start([](const std::string&, SparkData) {},
+                [faults](const std::string&, bool faulted, std::string_view) {
+                    if (faulted)
+                        faults->fetch_add(1, std::memory_order_relaxed);
+                });
+    const auto spec = registry_spec("HKCU", "");
+    const std::string key = spark_key(spec);
+    const auto armed = mech->watch(key, spec.params);
+    if (!armed.has_value()) {
+        mech->stop();
+        skip_or_fail_registry("the Registry mechanism refuses a root-key watch (" + armed.error() +
+                              "): the empty-subkey skip is review-only");
+    }
+    const auto counters = [&] {
+        return registry_debug_counters_for_test(*mech).value_or(RegistryMechanismDebugCounters{});
+    };
+    // One launch is all a root-key watch was observed to give (see the header).
+    REQUIRE(eventually([&] { return counters().verify_launched >= 1; }, kDeafBound));
+    std::this_thread::sleep_for(300ms);
+    const auto c = counters();
+    CHECK(c.verify_name_undecided == 0);
+    CHECK(c.verify_dup_failed == 0);
+    CHECK(c.verify_name_lost == 0);
+    CHECK(c.verify_undecided == 0);
+    CHECK(c.commit_name_missing == 0); // a root key is not "a watch that could not record one"
+    CHECK(faults->load() == 0);
+    // Deliberately NOT asserted: whether a name was recorded (the open returns the predefined
+    // pseudo-handle and NtQueryKey answers STATUS_INVALID_HANDLE for it, so none is) and the
+    // number of verifications or re-arms (see the header).
+    mech->stop();
+}
+
+// ── #7877 item 31 (R1): the secondary compare against the real OS, and the delete race ───────
+//
+// The three cases below drive the fresh-versus-held compare with the events it was built for:
+// a per-user HKCR class key shadowing a held machine key, a registry link re-pointed, and (the
+// quiet counterpart) a shadowing key vanishing. None of them can use the primary compare: the
+// held handle did not move, so its name is still the one recorded at commit, and the OS sends
+// the held handle no notification (measured on the rig, 2026-11-26), so only the secondary
+// compare sees the event.
+
+// A per-user class key appearing OVER a machine key a watch holds through HKCR. The merged view
+// now resolves the path to the per-user key while the held handle still is the machine key, so
+// the fresh name differs from the held one: the watch faults once, with the re-pointed reason,
+// and the ordinary retry re-opens the path onto the per-user key. The negative control runs
+// first: with only the machine key present and verification on, nothing faults.
+TEST_CASE("Registry spark (real mechanism): a per-user HKCR class key appearing over a held "
+          "machine key faults the watch as 're-pointed' and the retry recovers onto it "
+          "(#7877 item 31, HKCR)",
+          "[spark][mechanism][windows][5719][7877]") {
+    skip_hkcr_case_under_local_system(); // a premise mismatch, not a missing privilege
+    if (!hklm_classes_writable())
+        skip_or_fail_registry("HKLM\\SOFTWARE\\Classes is not writable with this token: the HKCR "
+                              "cases need a machine class key");
+    ClassKeyRig rig("hkcr_appear");
+    REQUIRE(rig.create_machine());
+    RegVerifyHarness h({rig.rel_child}, rename_controls(20ms), nullptr, "HKCR");
+    const auto held = registry_committed_name_for_test(*h.raw, spark_key(h.specs[0]));
+    REQUIRE(held.has_value());
+    CHECK(name_is_machine_class_key(*held, rig.rel_child)); // the merged view resolved to the machine key
+
+    // Negative control: nothing changes, verification keeps running, nothing faults or flaps.
+    REQUIRE(eventually([&] { return h.counters().verify_launched >= 3; }, kDeafBound));
+    CHECK(stays_healthy(h, 500ms));
+    CHECK(h.counters().verify_name_lost == 0);
+    CHECK(h.counters().verify_name_undecided == 0);
+    CHECK(faulted_events(h) == 0);
+
+    h.apply(rename_controls(60s)); // the shadow lands with no verification in flight
+    std::this_thread::sleep_for(100ms);
+    const auto rsyn_pre = h.counters().synthetic_fires;
+    REQUIRE(rig.create_user());
+    h.apply(rename_controls(50ms));
+    CHECK(eventually([&] { return faulted_events(h) >= 1; }, kDeafBound));
+    CHECK(first_fault_reason(h) == kRegReasonRepointed);
+    CHECK(h.counters().verify_name_lost >= 1);
+    CHECK(h.counters().verify_lost == 0); // the path resolved at every verification
+    CHECK(eventually([&] { return h.counters().synthetic_fires > rsyn_pre; }, kDeafBound));
+
+    // Recovery onto the per-user key: healthy again, its committed name is the per-user one,
+    // a write to it fires, and the watch does not flap afterwards.
+    const auto fired0 = h.fired();
+    const auto rsyn0 = h.counters().synthetic_fires;
+    REQUIRE(eventually([&] { return h.settled(fired0, rsyn0); }, kDeafBound));
+    CHECK(eventually([&] { return recovered_events(h) >= 1; }, kDeafBound));
+    const auto recorded = registry_committed_name_for_test(*h.raw, spark_key(h.specs[0]));
+    REQUIRE(recorded.has_value());
+    CHECK(name_is_user_class_key(*recorded, rig.rel_child));
+    const auto before = h.fired();
+    const auto recorded1 = h.counters().commit_name_recorded;
+    REQUIRE(rig.write_user(3));
+    CHECK(eventually([&] { return h.fired() > before; }, kDeafBound));
+    // The write's own fire is a coverage gap until the re-arm commits; judge the flap after it.
+    // Wait for that commit itself (rearm_committed), not for the engine's possibly stale view.
+    REQUIRE(eventually([&] { return rearm_committed(h, recorded1); }, kDeafBound));
+    CHECK(stays_healthy(h, 400ms));
+    CHECK(faulted_events(h) == 1); // one fault for one shadowing, none after the recovery
+    h.engine.stop();
+}
+
+// The opposite direction: the per-user key a watch holds is DELETED while the machine key
+// remains. The held handle is "deleted" (STATUS_KEY_DELETED, no name), which the verdict table
+// calls undecided; no re-pointed verdict is reached and none is wanted. The watch converges
+// from the delete's own fire: the re-arm re-opens the path onto the machine key and records
+// its name. Verification is held off until the watch has settled, so the order is the one the
+// delete race cases below call natural; a verification racing the delete is those cases.
+TEST_CASE("Registry spark (real mechanism): the per-user HKCR class key a watch holds being "
+          "deleted settles onto the machine key with no fault (#7877 item 31, HKCR)",
+          "[spark][mechanism][windows][5719][7877]") {
+    skip_hkcr_case_under_local_system(); // a premise mismatch, not a missing privilege
+    if (!hklm_classes_writable())
+        skip_or_fail_registry("HKLM\\SOFTWARE\\Classes is not writable with this token: the HKCR "
+                              "cases need a machine class key");
+    ClassKeyRig rig("hkcr_vanish");
+    REQUIRE(rig.create_machine());
+    REQUIRE(rig.create_user());
+    RegVerifyHarness h({rig.rel_child}, rename_controls(60s), nullptr, "HKCR");
+    const auto held = registry_committed_name_for_test(*h.raw, spark_key(h.specs[0]));
+    REQUIRE(held.has_value());
+    CHECK(name_is_user_class_key(*held, rig.rel_child)); // the per-user key wins the merged view
+
+    const auto fired0 = h.fired();
+    const auto rsyn0 = h.counters().synthetic_fires;
+    rig.delete_user();
+    CHECK(eventually([&] { return h.fired() > fired0; }, kDeafBound)); // the delete's own fire
+    // Wait for the committed name itself, not for a snapshot of it. settled() reads the
+    // ENGINE's coverage, which is the mechanism's last report: the delete's fire marks the
+    // coverage None under the mechanism's lock, but the engine hears of it only at the
+    // sweeper's next report (up to the 20 ms cadence), so right after the fire settled() can
+    // pass on the Notification of before the delete, with the re-arm not yet committed and the
+    // committed name still the per-user one. That is the reading of the one failure seen (1 of
+    // 40 full-set rig runs, 2026-11-26: the name check and the hold below both failed, in the
+    // 500 ms after the harness started); it was derived from the code and the log timing, not
+    // reproduced or measured. The wait is bounded and the state is printed if it expires.
+    const auto on_machine_key = [&] {
+        const auto n = registry_committed_name_for_test(*h.raw, spark_key(h.specs[0]));
+        return n.has_value() && name_is_machine_class_key(*n, rig.rel_child);
+    };
+    const bool converged =
+        eventually([&] { return on_machine_key() && h.settled(fired0, rsyn0); }, kDeafBound);
+    {
+        INFO("state when the wait ended: " << describe_watch_state(h));
+        REQUIRE(converged); // committed onto the machine key, healthy, synthetic fires delivered
+        CHECK(faulted_events(h) == 0);
+        const auto recorded = registry_committed_name_for_test(*h.raw, spark_key(h.specs[0]));
+        REQUIRE(recorded.has_value());
+        CHECK(name_is_machine_class_key(*recorded, rig.rel_child)); // back on the machine key
+        // Nothing else is still re-arming (a second notification of the same delete would show
+        // here): the hold below starts from a quiet watch.
+        CHECK(settles_quietly(h));
+    }
+
+    // Verification on again: it compares the machine key with itself, so no false fault.
+    h.apply(rename_controls(20ms));
+    const auto launched0 = h.counters().verify_launched;
+    const bool healthy = stays_healthy(h, 500ms);
+    INFO("state after the hold: " << describe_watch_state(h));
+    CHECK(healthy);
+    CHECK(h.counters().verify_launched >= launched0 + 3); // the hold really ran verifications
+    CHECK(h.counters().verify_name_lost == 0);
+    CHECK(h.counters().verify_name_undecided == 0);
+    CHECK(faulted_events(h) == 0);
+    h.engine.stop();
+}
+
+// A registry link re-pointed from T1 to T2 while a watch holds the key behind it. A verification
+// opens the path through the link and so lands on T2, while the held handle still is T1 and
+// nobody told it: the same secondary compare, with the same reason and recovery. HKCU only.
+// The rig removes the link by handle before the tree (a path delete would follow it). A link
+// target is an NT path, so the rig names the hive HKCU really resolves to for this token
+// (`\REGISTRY\USER\<SID>`, or `\REGISTRY\USER\.DEFAULT` under LocalSystem) rather than
+// building it from the token's SID; the case runs under LocalSystem too.
+TEST_CASE("Registry spark (real mechanism): a registry link re-pointed to another key faults "
+          "the watch as 're-pointed' and the retry recovers onto the new target "
+          "(#7877 item 31, link)",
+          "[spark][mechanism][windows][5719][7877]") {
+    RegLinkRig rig("link");
+    if (!rig.ok)
+        skip_or_fail_registry("could not create a registry link under HKCU with this token "
+                              "(Win32 error " +
+                              std::to_string(rig.err) + ")");
+    RegVerifyHarness h({rig.link}, rename_controls(20ms));
+    const auto held = registry_committed_name_for_test(*h.raw, spark_key(h.specs[0]));
+    REQUIRE(held.has_value());
+    CHECK(name_names_key(*held, rig.t1)); // the watch holds the TARGET, not the link key
+
+    // Negative control: an untouched link is verified repeatedly and never faulted.
+    REQUIRE(eventually([&] { return h.counters().verify_launched >= 3; }, kDeafBound));
+    CHECK(stays_healthy(h, 500ms));
+    CHECK(h.counters().verify_name_lost == 0);
+    CHECK(h.counters().verify_name_undecided == 0);
+    CHECK(faulted_events(h) == 0);
+
+    h.apply(rename_controls(60s)); // the link moves with no verification in flight
+    std::this_thread::sleep_for(100ms);
+    const auto rsyn_pre = h.counters().synthetic_fires;
+    REQUIRE(rig.repoint_to_t2());
+    h.apply(rename_controls(50ms));
+    CHECK(eventually([&] { return faulted_events(h) >= 1; }, kDeafBound));
+    CHECK(first_fault_reason(h) == kRegReasonRepointed);
+    CHECK(h.counters().verify_name_lost >= 1);
+    CHECK(h.counters().verify_lost == 0); // the path resolved at every verification
+    CHECK(eventually([&] { return h.counters().synthetic_fires > rsyn_pre; }, kDeafBound));
+
+    // Recovery onto T2: its name is committed, a write to T2 fires, and the watch does not flap.
+    const auto fired0 = h.fired();
+    const auto rsyn0 = h.counters().synthetic_fires;
+    REQUIRE(eventually([&] { return h.settled(fired0, rsyn0); }, kDeafBound));
+    CHECK(eventually([&] { return recovered_events(h) >= 1; }, kDeafBound));
+    const auto recorded = registry_committed_name_for_test(*h.raw, spark_key(h.specs[0]));
+    REQUIRE(recorded.has_value());
+    CHECK(name_names_key(*recorded, rig.t2));
+    const auto before = h.fired();
+    const auto recorded1 = h.counters().commit_name_recorded;
+    REQUIRE(rig.write("T2", 7));
+    CHECK(eventually([&] { return h.fired() > before; }, kDeafBound));
+    REQUIRE(eventually([&] { return rearm_committed(h, recorded1); }, kDeafBound));
+    CHECK(stays_healthy(h, 400ms));
+    CHECK(faulted_events(h) == 1);
+    h.engine.stop();
+}
+
+// ── #7877 item 31 (R1): the delete race, the one way a verification's held-name query meets
+// STATUS_KEY_DELETED (0xC000017C) ─────────────────────────────────────────────────────────────
+//
+// The held-name query is read AFTER the fresh open, so it answers "deleted" only when the key
+// is deleted while the verification worker is in flight, and the table calls that undecided
+// (never a fault). The worker is parked before its held query (NameHookGate), the key is
+// deleted, and the worker is released; the raw status the OS gave is read on the worker and
+// asserted. Two orders, each with the delete alone and with a delete+recreate (four cases):
+//   natural       the delete's fire is consumed before the worker is released, so it converts
+//                 the verification into the re-arm and the answer is never judged
+//                 (`verify_name_undecided` stays 0); the converted result is retried once as
+//                 an ordinary re-arm with the confirming read (`commit_capture_retry` >= 1),
+//                 not committed as it stands;
+//   sweeper-first the sweep hook makes the sweeper take the worker's result before the delete's
+//                 callback can run (SweeperFirst), so the by-name undecided row is reached
+//                 (`verify_name_undecided` 0 to 1). That row is race-reachable ONLY: with the
+//                 delete's fire consumed first it is not reached, which is why the sweeper's
+//                 order has to be forced to see it.
+// Deliberately NOT committed (measured on the rig, 2026-11-26, and recorded in the flip gate):
+// a plain delete with the worker parked BEFORE its open (the fresh open then finds no key and
+// the PATH verdict faults 'renamed or replaced': the item 37 class, not an R1 verdict) and an
+// unforced loop of delete+recreate rounds (probabilistic: the undecided row did not occur).
+TEST_CASE("Registry spark (real mechanism): a key deleted while its verification is in flight, "
+          "the delete's fire consumed first, is never judged (#7877 item 31, delete race)",
+          "[spark][mechanism][windows][5719][7877]") {
+    REQUIRE(run_delete_race(/*sweeper_first=*/false, /*recreate=*/false));
+}
+
+TEST_CASE("Registry spark (real mechanism): a key deleted and re-created while its verification "
+          "is in flight, the delete's fire consumed first, is never judged "
+          "(#7877 item 31, delete race)",
+          "[spark][mechanism][windows][5719][7877]") {
+    REQUIRE(run_delete_race(/*sweeper_first=*/false, /*recreate=*/true));
+}
+
+TEST_CASE("Registry spark (real mechanism): a key deleted while its verification is in flight, "
+          "the sweeper judging first, is a name-undecided answer and never a fault "
+          "(#7877 item 31, delete race)",
+          "[spark][mechanism][windows][5719][7877]") {
+    run_sweeper_first_race(/*recreate=*/false);
+}
+
+TEST_CASE("Registry spark (real mechanism): a key deleted and re-created while its "
+          "verification is in flight, the sweeper judging first, is a name-undecided answer "
+          "and never a fault (#7877 item 31, delete race)",
+          "[spark][mechanism][windows][5719][7877]") {
+    run_sweeper_first_race(/*recreate=*/true);
+}
+
+// ── #7877 item 31 (R1), governance fix round: the held-name overflow, the commit-capture race,
+// handle closure, per-watch warns and the pinned residuals ──────────────────────────────────────
+//
+// Every case here follows the rules above: salted `yuzu_test_` keys, RAII cleanup that also runs
+// when a REQUIRE fails, hook state owned by shared_ptr and captured by value, and a missing
+// privilege goes through skip_or_fail_registry (never a bare SKIP). The cases are written for
+// the rig and CI Windows legs; none was built or run in the session that wrote them.
+
+namespace {
+/// A tree of nine 255-character components under one salted HKCU key: the canonical name of its
+/// leaf is far past the single-call limit of the name query's 4096-byte stack buffer (about
+/// 4092 bytes of name, 2046 UTF-16 units), so reading it takes the heap retry. Level 0 is the
+/// ancestor an administrator renames (to another
+/// 255-character name, so the leaf's name keeps its length and only its spelling moves).
+struct DeepKeyRig : SaltedHkcuTree {
+    static constexpr int kLevels = 9;
+    std::string deep;        ///< the leaf, relative to HKCU
+    std::string level0_full; ///< <base>\<255 x 'a'>
+    std::string level0_new;  ///< 255 x 'z'
+    std::wstring level0_full_w;
+    std::wstring level0_new_w;
+    RegRenameKeyFn rename_key{resolve_reg_rename_key()};
+    bool ok{false};
+
+    explicit DeepKeyRig(const char* tag) : SaltedHkcuTree(tag) {
+        std::string path = base;
+        for (int i = 0; i < kLevels; ++i) {
+            path += "\\" + std::string(255, static_cast<char>('a' + i));
+            if (i == 0)
+                level0_full = path;
+        }
+        deep = path;
+        level0_new.assign(255, 'z');
+        level0_full_w.assign(level0_full.begin(), level0_full.end()); // ASCII only
+        level0_new_w.assign(level0_new.begin(), level0_new.end());
+        ok = rename_key != nullptr && create_deep();
+    }
+    [[nodiscard]] bool create_deep() const {
+        RegKeyOwner k;
+        return ::RegCreateKeyExA(HKEY_CURRENT_USER, deep.c_str(), 0, nullptr, 0, KEY_SET_VALUE,
+                                 nullptr, &k.h, nullptr) == ERROR_SUCCESS;
+    }
+    [[nodiscard]] LONG rename_level0() const {
+        return rename_key(HKEY_CURRENT_USER, level0_full_w.c_str(), level0_new_w.c_str());
+    }
+    [[nodiscard]] bool write_deep(DWORD v) const {
+        RegKeyOwner k;
+        if (::RegOpenKeyExA(HKEY_CURRENT_USER, deep.c_str(), 0, KEY_SET_VALUE, &k.h) !=
+            ERROR_SUCCESS)
+            return false;
+        return ::RegSetValueExA(k.h, "V", 0, REG_DWORD, reinterpret_cast<const BYTE*>(&v),
+                                sizeof(v)) == ERROR_SUCCESS;
+    }
+};
+
+/// Handles the process holds right now (kernel32; counts every object kind). Fails loudly: a
+/// failed call or a zero count would make every "after <= before + k" comparison pass for the
+/// wrong reason (0 <= 0 + k), so both are REQUIREd here, on the test thread.
+[[nodiscard]] DWORD process_handle_count() {
+    DWORD n = 0;
+    const BOOL ok = ::GetProcessHandleCount(::GetCurrentProcess(), &n);
+    REQUIRE(ok != FALSE);
+    REQUIRE(n != 0);
+    return n;
+}
+
+/// The harness has no verification, probe worker or drain in flight, and the sweeper has
+/// had two cadences to close what a finished pass left behind (a dead SweepWork closes its
+/// handles one pass after the result is taken).
+[[nodiscard]] bool quiesced(RegVerifyHarness& h) {
+    if (!eventually([&] { return h.counters().probe_workers_active == 0; }, kDeafBound))
+        return false;
+    std::this_thread::sleep_for(150ms);
+    return true;
+}
+
+/// One parked-worker lifecycle: a verification worker parks (holding its duplicate), the engine
+/// stops, the worker is released and exits. Everything it created is destroyed before return.
+/// Positive control: after the release the worker reaches its HELD-name query, which only a job
+/// that carries a duplicate makes, so the duplicate whose closure the caller then counts
+/// really existed in every cycle.
+void parked_worker_stop_cycle() {
+    RegRenameRig rig("name_hcount_stop");
+    REQUIRE(rig.ok);
+    auto f3 = std::make_shared<std::atomic<std::size_t>>(0);
+    ProbeGate gate; // before the harness: it must outlive the engine's detached workers
+    gate.open = true;
+    auto names = std::make_shared<NameInject>(); // pass-through; counts the held-name queries
+    auto ctl = [&](std::chrono::milliseconds verify) {
+        auto c = rename_controls(verify);
+        c.probe_hook = gate.hook_for(rig.child);
+        c.name_hook = inject_hook(names);
+        return c;
+    };
+    RegVerifyHarness h({rig.child}, ctl(60s), [&] { return make_registry_mechanism(f3); });
+    const auto parked0 = gate.parked.load();
+    {
+        std::lock_guard lk(gate.mu);
+        gate.open = false;
+    }
+    h.apply(ctl(50ms));
+    REQUIRE(eventually([&] { return gate.parked.load() > parked0; }, kDeafBound));
+    h.engine.stop();
+    gate.release();
+    REQUIRE(eventually([&] { return names->held_calls.load() >= 1; }, kDeafBound));
+    REQUIRE(eventually([&] { return f3->load() == 0; }, kDeafBound));
+    REQUIRE(eventually([&] { return h.counters().probe_workers_active == 0; }, kDeafBound));
+}
+} // namespace
+
+// B1, the real OS side of the single-call limit (4096-byte buffer, about 4092 bytes of name).
+// The key's canonical name is past the stack buffer, so
+// the commit-time name only exists because the query retried into a heap buffer sized from the
+// kernel's reported length; and the held-name compare must still work on such a name. Before the
+// fix the held name overflowed, the verdict was "undecided" and an administrator who built a
+// path this deep could hide a rename from the check for as long as he liked.
+TEST_CASE("Registry spark (real mechanism): a watched key whose canonical name is past the 4 KiB "
+          "buffer is recorded and a renamed ancestor is still detected (#7877 item 31, deep name)",
+          "[spark][mechanism][windows][5719][7877]") {
+    DeepKeyRig rig("deepname");
+    if (!rig.ok)
+        skip_or_fail_registry("could not build a nine-level tree of 255-character key names under "
+                              "HKCU with this token or this OS (or RegRenameKey is missing)");
+    RegVerifyHarness h({rig.deep}, rename_controls(60s));
+    const auto before = registry_committed_name_for_test(*h.raw, spark_key(h.specs[0]));
+    REQUIRE(before.has_value());
+    INFO("committed name has " << before->size() << " UTF-16 units");
+    // 4092 usable bytes of the 4096-byte buffer: a longer name went through the retry
+    CHECK(before->size() > 2046);
+    CHECK(name_names_key(*before, rig.deep));
+    CHECK(h.counters().commit_name_recorded >= 1);
+    CHECK(h.counters().commit_name_missing == 0);
+
+    const auto rsyn_pre = h.counters().synthetic_fires;
+    REQUIRE(rig.rename_level0() == ERROR_SUCCESS); // the held key's whole tree moves
+    REQUIRE(rig.create_deep());                    // and the original path resolves again
+    h.apply(rename_controls(50ms));
+    CHECK(eventually([&] { return faulted_events(h) >= 1; }, kDeafBound));
+    CHECK(first_fault_reason(h) == kRegReasonMoved);
+    CHECK(h.counters().verify_name_lost >= 1);
+    CHECK(h.counters().verify_lost == 0);            // the path resolved at every verification
+    CHECK(h.counters().verify_name_undecided == 0);  // the long held name was READ, not overflowed
+    CHECK(eventually([&] { return h.counters().synthetic_fires > rsyn_pre; }, kDeafBound));
+
+    // Recovery onto the new key: its (equally long) name is recorded and a write there fires.
+    const auto fired0 = h.fired();
+    const auto rsyn0 = h.counters().synthetic_fires;
+    REQUIRE(eventually([&] { return h.settled(fired0, rsyn0); }, kDeafBound * 2));
+    const auto after = registry_committed_name_for_test(*h.raw, spark_key(h.specs[0]));
+    REQUIRE(after.has_value());
+    CHECK(after->size() > 2046);
+    CHECK(name_names_key(*after, rig.deep));
+    const auto fired1 = h.fired();
+    REQUIRE(rig.write_deep(3));
+    CHECK(eventually([&] { return h.fired() > fired1; }, kDeafBound));
+    h.engine.stop();
+}
+
+// B1, the cap branch. A name past 64 KiB cannot be built on a rig (it takes about 260 levels),
+// so the raw STATUS_BUFFER_OVERFLOW the helper returns past its cap is injected on the held or
+// the fresh side through name_hook. Held side with a recorded commit-time name: that name fit,
+// the held one does not, so they differ (key moved). Fresh side with a readable held name:
+// the path names a different key (re-pointed). Held side with NO recorded name: nothing to
+// compare against, so undecided, never a fault.
+TEST_CASE("Registry spark (real mechanism): a name past the 64 KiB cap is a proven mismatch "
+          "against a readable name and undecided against none (#7877 item 31, cap)",
+          "[spark][mechanism][windows][5719][7877]") {
+    const int mode = GENERATE(0, 1, 2); // 0: held side, name recorded; 1: fresh side; 2: held, none
+    INFO("mode " << mode << (mode == 0   ? " (held overflow, commit-time name recorded)"
+                             : mode == 1 ? " (fresh overflow, held name readable)"
+                                         : " (held overflow, no commit-time name)"));
+    RegRenameRig rig("name_cap");
+    REQUIRE(rig.ok);
+    auto st = std::make_shared<NameInject>();
+    const NameResult overflow{std::in_place, kNtBufferOverflow, std::wstring{}};
+    if (mode == 2) // the establishment's fresh read fails, so no name is recorded
+        st->set(NameResult{std::in_place, kNtUnsuccessful, std::wstring{}}, std::nullopt);
+    auto ctl = [&](std::chrono::milliseconds verify) {
+        auto c = rename_controls(verify);
+        c.name_hook = inject_hook(st);
+        return c;
+    };
+    RegVerifyHarness h({rig.child}, ctl(60s));
+    if (mode == 2)
+        REQUIRE(h.counters().commit_name_missing >= 1);
+    if (mode == 1)
+        st->set(overflow, std::nullopt);
+    else
+        st->set(std::nullopt, overflow);
+    h.apply(ctl(20ms));
+    if (mode == 2) {
+        REQUIRE(eventually([&] { return h.counters().verify_name_undecided >= 3; }, kDeafBound));
+        CHECK(stays_healthy(h, 300ms));
+        CHECK(h.counters().verify_name_lost == 0);
+        CHECK(faulted_events(h) == 0);
+    } else {
+        CHECK(eventually([&] { return faulted_events(h) >= 1; }, kDeafBound));
+        CHECK(first_fault_reason(h) == (mode == 0 ? kRegReasonMoved : kRegReasonRepointed));
+        CHECK(h.counters().verify_name_lost >= 1);
+        CHECK(h.counters().verify_name_undecided == 0);
+        CHECK(h.counters().verify_lost == 0);
+    }
+    st->clear(); // before any retry commits (500 ms): later captures are real
+    h.engine.stop();
+}
+
+// B2, the commit-capture race, accessible variant. The re-arm probe has opened and armed the key
+// but not yet read its name; the parent is renamed and the path re-created; the first read then
+// returns the MOVED name (the handle follows the renamed tree). Before the fix that name was
+// committed: held == committed for ever, so every later verification called the deaf watch
+// healthy. The confirming second read opens the path afresh, names the NEW key, disagrees, and
+// the commit is retried instead; the retry opens the new key and commits its real name.
+TEST_CASE("Registry spark (real mechanism): a rename landing between a re-arm's open and its name "
+          "read is retried and never recorded as the committed name (#7877 item 31, commit race)",
+          "[spark][mechanism][windows][5719][7877]") {
+    RegRenameRig rig("name_commitrace");
+    REQUIRE(rig.ok);
+    NameHookGate gate; // before the harness: the hook outlives nothing the engine joins
+    auto ctl = [&](std::chrono::milliseconds verify) {
+        auto c = rename_controls(verify);
+        c.name_hook = gate.hook();
+        return c;
+    };
+    RegVerifyHarness h({rig.child}, ctl(60s)); // no verification: only the re-arm is in play
+    const auto original = registry_committed_name_for_test(*h.raw, spark_key(h.specs[0]));
+    REQUIRE(original.has_value());
+    REQUIRE(name_names_key(*original, rig.child));
+    const auto retry0 = h.counters().commit_capture_retry;
+
+    gate.park_next(false); // the next FRESH read parks: the re-arm's, after its open and arm
+    REQUIRE(rig.write_child(1)); // consumes the notification; the re-arm probe launches
+    REQUIRE(eventually([&] { return gate.parked() >= 1; }, kDeafBound));
+    REQUIRE(rig.rename_parent() == ERROR_SUCCESS);
+    REQUIRE(rig.create_child()); // the original path resolves again, to a DIFFERENT key
+    gate.release();
+
+    CHECK(eventually([&] { return h.counters().commit_capture_retry > retry0; }, kDeafBound));
+    // The moved name is never the committed one, at any sample on the way back to healthy.
+    bool poisoned = false;
+    const bool healthy = eventually(
+        [&] {
+            if (const auto n = registry_committed_name_for_test(*h.raw, spark_key(h.specs[0])))
+                if (lower_name(*n).find(L"_renamed") != std::wstring::npos)
+                    poisoned = true;
+            return h.all_notification() && h.engine.stats().armed_faulted == 0;
+        },
+        kDeafBound * 2);
+    CHECK(healthy);
+    CHECK_FALSE(poisoned);
+    const auto recorded = registry_committed_name_for_test(*h.raw, spark_key(h.specs[0]));
+    REQUIRE(recorded.has_value());
+    CHECK(name_names_key(*recorded, rig.child));
+    CHECK(lower_name(*recorded).find(L"_renamed") == std::wstring::npos);
+    CHECK(write_fires(h, rig, 2)); // the watch is on the NEW key, not deaf on the renamed tree
+    h.engine.stop();
+}
+
+// B2, deny-ACE variant: the re-created key refuses KEY_NOTIFY to this user, so the confirming
+// open is REFUSED and the commit is not accepted either. The retries are refused the same way, so
+// the watch stays visibly faulted, with the moved name never committed, until the ACE is lifted;
+// then it recovers onto the new key with its real name.
+TEST_CASE("Registry spark (real mechanism): a re-arm whose confirming read is refused is not "
+          "committed and stays visibly faulted until it can be (#7877 item 31, commit race)",
+          "[spark][mechanism][windows][5719][7877]") {
+    RegRenameRig rig("name_commitrace_deny");
+    REQUIRE(rig.ok);
+    NameHookGate gate;
+    auto ctl = [&](std::chrono::milliseconds verify) {
+        auto c = rename_controls(verify);
+        c.name_hook = gate.hook();
+        return c;
+    };
+    RegVerifyHarness h({rig.child}, ctl(60s));
+    const auto retry0 = h.counters().commit_capture_retry;
+    gate.park_next(false);
+    REQUIRE(rig.write_child(1));
+    REQUIRE(eventually([&] { return gate.parked() >= 1; }, kDeafBound));
+    REQUIRE(rig.rename_parent() == ERROR_SUCCESS);
+    REQUIRE(rig.create_child());
+    // Declared after the rig and the harness: its destructor lifts the ACE before either goes.
+    std::optional<DenyNotifyScope> deny;
+    deny.emplace(rig.child);
+    if (!deny->applied) {
+        gate.release();
+        skip_or_fail_registry("could not set a deny ACE on an HKCU key with this token (no user "
+                              "SID or no WRITE_DAC)");
+    }
+    {
+        RegKeyOwner probe;
+        const LONG rc =
+            ::RegOpenKeyExA(HKEY_CURRENT_USER, rig.child.c_str(), 0, KEY_NOTIFY, &probe.h);
+        if (rc != ERROR_ACCESS_DENIED) {
+            gate.release();
+            skip_or_fail_registry("the deny ACE does not refuse KEY_NOTIFY for this token (the "
+                                  "open returned " +
+                                  std::to_string(rc) + ")");
+        }
+    }
+    gate.release();
+
+    CHECK(eventually([&] { return h.counters().commit_capture_retry > retry0; }, kDeafBound));
+    CHECK(eventually([&] { return h.engine.stats().armed_faulted == 1; }, kDeafBound)); // visible
+    bool poisoned = false;
+    bool stays_faulted = true;
+    const auto until = std::chrono::steady_clock::now() + 700ms; // past the 500 ms backend retry
+    while (std::chrono::steady_clock::now() < until) {
+        if (const auto n = registry_committed_name_for_test(*h.raw, spark_key(h.specs[0])))
+            if (lower_name(*n).find(L"_renamed") != std::wstring::npos)
+                poisoned = true;
+        if (h.engine.stats().armed_faulted != 1)
+            stays_faulted = false;
+        std::this_thread::sleep_for(5ms);
+    }
+    CHECK_FALSE(poisoned);
+    CHECK(stays_faulted);
+
+    deny->restore();
+    REQUIRE(eventually([&] { return h.all_notification() && h.engine.stats().armed_faulted == 0; },
+                       kDeafBound * 2));
+    const auto recorded = registry_committed_name_for_test(*h.raw, spark_key(h.specs[0]));
+    REQUIRE(recorded.has_value());
+    CHECK(name_names_key(*recorded, rig.child));
+    CHECK(lower_name(*recorded).find(L"_renamed") == std::wstring::npos);
+    CHECK(write_fires(h, rig, 2));
+    h.engine.stop();
+}
+
+// B3, the duplicate is closed. ASan cannot see a kernel handle, so this reads the process handle
+// count. Each verification takes a duplicate of the held key; a duplicate left open would add one
+// handle per verification (60 here), against an allowance of 12 for what the harness may
+// legitimately keep between the two quiescent samples (a lazily created pool thread, a timer, a
+// cached event). The second section stops an engine while a worker parked in a hung-hive
+// probe holds its duplicate, releases it, and repeats the cycle: one leaked duplicate per cycle
+// is 12 against an allowance of 5. Both are bounds, not zero: the process owns handles the test
+// does not control. The tolerances are sized against the leak being hunted (one handle per
+// verification or per cycle), so they detect a leak on EVERY item (60 against 12, 12 against 5)
+// and not a stray one; a defect that leaks on one verification in five would sit near the
+// first allowance and is not claimed to be caught. Each section warms up before its baseline
+// (lazily created process-wide state such as a pool thread is then already counted), and each
+// carries a positive control that the duplicate really existed (the held-name hook count),
+// so a mechanism that stopped taking duplicates cannot pass as "closed". The handle count is
+// REQUIREd non-zero (process_handle_count). Run single-threaded (nothing else in the binary
+// runs concurrently).
+TEST_CASE("Registry spark (real mechanism): the verification's duplicate handle is closed after "
+          "every verification and after a stop with a parked worker (#7877 item 31, handles)",
+          "[spark][mechanism][windows][5719][7877]") {
+    SECTION("over sixty verifications") {
+        RegRenameRig rig("name_hcount");
+        REQUIRE(rig.ok);
+        auto names = std::make_shared<NameInject>(); // pass-through; counts the held-name queries
+        auto ctl = [&](std::chrono::milliseconds verify) {
+            auto c = rename_controls(verify);
+            c.name_hook = inject_hook(names);
+            return c;
+        };
+        RegVerifyHarness h({rig.child}, ctl(60s));
+        // Warm-up: ten verifications first, so what a first verification creates once per
+        // process (a pool thread, a cached event) is in the baseline, not counted as a leak.
+        h.apply(ctl(20ms));
+        REQUIRE(eventually([&] { return h.counters().verify_launched >= 10; }, kDeafBound));
+        h.apply(ctl(60s));
+        REQUIRE(quiesced(h));
+        const DWORD before = process_handle_count();
+        const auto launched0 = h.counters().verify_launched;
+        const int held0 = names->held_calls.load();
+        h.apply(ctl(20ms));
+        REQUIRE(eventually([&] { return h.counters().verify_launched >= launched0 + 60; }, 40s));
+        h.apply(ctl(60s));
+        REQUIRE(quiesced(h));
+        const DWORD after = process_handle_count();
+        INFO("process handles before " << before << ", after " << after);
+        CHECK(h.counters().verify_dup_failed == 0);
+        CHECK(h.counters().verify_name_undecided == 0); // every verification really held a duplicate
+        // Positive control: the duplicates whose closure is counted existed. Each verification
+        // that read its held name did so through one (the count is of those queries).
+        CHECK(names->held_calls.load() >= held0 + 50);
+        CHECK(after <= before + 12);
+        h.engine.stop();
+    }
+    SECTION("over twelve stops with a parked worker") {
+        for (int i = 0; i < 2; ++i) // warm up: lazily created process-wide state is not a leak
+            parked_worker_stop_cycle();
+        const DWORD before = process_handle_count();
+        for (int i = 0; i < 12; ++i)
+            parked_worker_stop_cycle();
+        std::this_thread::sleep_for(200ms);
+        const DWORD after = process_handle_count();
+        INFO("process handles before " << before << ", after " << after);
+        CHECK(after <= before + 5);
+    }
+}
+
+// B4, the per-watch warns, observed through the test-only `warns_claimed_*` counters. A blind
+// watch (its held name unreadable, so the check cannot decide) warns ONCE however many
+// verifications run blind; a verification that decides re-arms the warn, so the NEXT blind
+// episode warns again.
+TEST_CASE("Registry spark (real mechanism): a blind watch warns once per blind episode and a "
+          "deciding verification re-arms the warn (#7877 item 31, warns)",
+          "[spark][mechanism][windows][5719][7877]") {
+    RegRenameRig rig("name_warn_blind");
+    REQUIRE(rig.ok);
+    auto st = std::make_shared<NameInject>();
+    auto ctl = [&](std::chrono::milliseconds verify) {
+        auto c = rename_controls(verify);
+        c.name_hook = inject_hook(st);
+        return c;
+    };
+    const NameResult unreadable{std::in_place, kNtUnsuccessful, std::wstring{}};
+    RegVerifyHarness h({rig.child}, ctl(60s));
+    st->set(std::nullopt, unreadable);
+    h.apply(ctl(20ms));
+    REQUIRE(eventually([&] { return h.counters().verify_name_undecided >= 5; }, kDeafBound));
+    REQUIRE(eventually([&] { return h.counters().warns_claimed_undecided >= 1; }, kDeafBound));
+    std::this_thread::sleep_for(150ms);
+    CHECK(h.counters().warns_claimed_undecided == 1); // five blind verifications, one warn
+    CHECK(faulted_events(h) == 0);                   // blind is never a fault in R1
+
+    st->clear(); // the next verification decides: equal names, which re-arms the warn
+    const auto launched1 = h.counters().verify_launched;
+    REQUIRE(eventually([&] { return h.counters().verify_launched >= launched1 + 3; }, kDeafBound));
+    const auto undecided1 = h.counters().verify_name_undecided;
+    std::this_thread::sleep_for(100ms);
+    CHECK(h.counters().verify_name_undecided == undecided1); // decided verifications: no growth
+
+    st->set(std::nullopt, unreadable); // a second blind episode
+    REQUIRE(eventually([&] { return h.counters().warns_claimed_undecided >= 2; }, kDeafBound));
+    std::this_thread::sleep_for(150ms);
+    CHECK(h.counters().warns_claimed_undecided == 2);
+    CHECK(h.counters().warns_claimed_name_missing == 0);
+    CHECK(h.counters().warns_claimed_dup_failed == 0);
+    st->clear();
+    h.engine.stop();
+}
+
+// B4, the missing-name warn: per watch, only while the check is on, re-armed by a commit that
+// records a name. The "check off" half is asserted in the capture-throws case above.
+TEST_CASE("Registry spark (real mechanism): a watch that recorded no name warns once while the "
+          "check is on and again only after a commit recorded one (#7877 item 31, warns)",
+          "[spark][mechanism][windows][5719][7877]") {
+    RegRenameRig rig("name_warn_missing");
+    REQUIRE(rig.ok);
+    auto fail_fresh = std::make_shared<std::atomic<bool>>(true);
+    auto ctl = [&](std::chrono::milliseconds verify) {
+        auto c = rename_controls(verify);
+        c.name_hook = [fail_fresh](std::string_view, bool held) -> NameResult {
+            if (!held && fail_fresh->load(std::memory_order_acquire))
+                return NameResult{std::in_place, kNtUnsuccessful, std::wstring{}};
+            return std::nullopt;
+        };
+        return c;
+    };
+    RegVerifyHarness h({rig.child}, ctl(60s)); // the check is ON (a 60 s interval)
+    REQUIRE(h.counters().commit_name_missing >= 1);
+    // A write forces a re-arm commit through the sweeper (the establishment commit may have run
+    // inside watch(), which never logs); it records no name either, so the warn is logged now.
+    // A positive expectation (a warn WAS claimed) is awaited with eventually(); only the
+    // negative ones (no further warn) hold a fixed sleep, after the commit that would have
+    // staged it was observed.
+    const auto step = [&](DWORD v, std::uint64_t expect_commits_min) {
+        REQUIRE(rig.write_child(v));
+        REQUIRE(eventually(
+            [&] {
+                return h.all_notification() &&
+                       h.counters().commit_name_missing + h.counters().commit_name_recorded >=
+                           expect_commits_min;
+            },
+            kDeafBound));
+    };
+    auto total = [&] {
+        const auto c = h.counters();
+        return c.commit_name_missing + c.commit_name_recorded;
+    };
+    step(1, total() + 1);
+    CHECK(eventually([&] { return h.counters().warns_claimed_name_missing == 1; }, kDeafBound));
+    step(2, total() + 1); // another commit with no name: counted, not logged again
+    std::this_thread::sleep_for(150ms); // negative: the pass that committed has logged by now
+    CHECK(h.counters().warns_claimed_name_missing == 1);
+
+    fail_fresh->store(false, std::memory_order_release); // later captures are real
+    const auto recorded0 = h.counters().commit_name_recorded;
+    step(3, total() + 1);
+    CHECK(h.counters().commit_name_recorded > recorded0); // a commit recorded a name: re-armed
+    std::this_thread::sleep_for(150ms);                   // negative again
+    CHECK(h.counters().warns_claimed_name_missing == 1);
+
+    fail_fresh->store(true, std::memory_order_release); // blind again
+    step(4, total() + 1);
+    CHECK(eventually([&] { return h.counters().warns_claimed_name_missing == 2; }, kDeafBound));
+    fail_fresh->store(false, std::memory_order_release);
+    h.engine.stop();
+}
+
+// B7 (i): a rename away AND back inside one verification interval is NOT noticed. This is the
+// #7836 residual the item 31 compare could not close: the held handle follows its key, and the key
+// is back under its original name before the next sample. Documented residual (tracked in
+// #7877; the File mechanism has the same class). The case pins it so that a later change that
+// starts to notice it (or that faults on it wrongly) is a deliberate decision, not a surprise.
+TEST_CASE("Registry spark (real mechanism): a parent renamed away and back inside one interval "
+          "is not noticed, a documented residual (#7877 item 31)",
+          "[spark][mechanism][windows][5719][7877]") {
+    RegRenameRig rig("name_awayback");
+    REQUIRE(rig.ok);
+    RegVerifyHarness h({rig.child}, rename_controls(60s));
+    REQUIRE(rig.rename_parent() == ERROR_SUCCESS);
+    REQUIRE(rig.rename_parent_back() == ERROR_SUCCESS);
+    h.apply(rename_controls(20ms));
+    const auto launched0 = h.counters().verify_launched;
+    REQUIRE(eventually([&] { return h.counters().verify_launched >= launched0 + 3; }, kDeafBound));
+    CHECK(stays_healthy(h, 400ms));
+    CHECK(h.counters().verify_name_lost == 0);
+    CHECK(h.counters().verify_lost == 0);
+    CHECK(faulted_events(h) == 0);
+    CHECK(write_fires(h, rig, 1)); // and it is not deaf: the key never really moved
+    h.engine.stop();
+}
+
+// B7 (ii): the name compare is exact on UTF-16 units. A case-only difference between the held
+// name and the commit-time one (what a case-only rename of an ancestor produces: the path still
+// resolves to the same key, only its spelling differs) is ONE false fault that heals at the retry.
+// Documented accepted cost (tracked in #7877), pinned here with an injected held name that differs
+// from the committed one only in case; the real rename is not driven because whether RegRenameKey
+// accepts a case-only rename was not measured.
+TEST_CASE("Registry spark (real mechanism): a held name that differs only in case is one false "
+          "fault that heals at the retry, a documented residual (#7877 item 31)",
+          "[spark][mechanism][windows][5719][7877]") {
+    RegRenameRig rig("name_caseonly");
+    REQUIRE(rig.ok);
+    // ONE-SHOT injection: the variant is answered to the FIRST held-name query only and every
+    // later query is real, so nothing here depends on how soon the test thread clears a state
+    // (the retry that heals the watch runs 500 ms after the fault, and a loaded runner can make
+    // the test thread later than that; an injection that was still set would then fault the
+    // healed watch again and make the "one false fault" count flaky).
+    struct OneShot {
+        std::mutex mu;
+        std::optional<std::wstring> variant; ///< set before verification is enabled
+        bool used{false};
+        int taken{0};
+    };
+    auto st = std::make_shared<OneShot>();
+    auto ctl = [&](std::chrono::milliseconds verify) {
+        auto c = rename_controls(verify);
+        c.name_hook = [st](std::string_view, bool held) -> NameResult {
+            if (!held)
+                return std::nullopt;
+            std::lock_guard lk(st->mu);
+            if (!st->variant || st->used)
+                return std::nullopt;
+            st->used = true;
+            ++st->taken;
+            return NameResult{std::in_place, 0L, *st->variant};
+        };
+        return c;
+    };
+    RegVerifyHarness h({rig.child}, ctl(60s));
+    const auto committed = registry_committed_name_for_test(*h.raw, spark_key(h.specs[0]));
+    REQUIRE(committed.has_value());
+    std::wstring variant = *committed;
+    for (auto& c : variant)
+        c = std::iswupper(c) ? static_cast<wchar_t>(std::towlower(c))
+                             : static_cast<wchar_t>(std::towupper(c));
+    REQUIRE(variant != *committed);
+    REQUIRE(lower_name(variant) == lower_name(*committed)); // case only, by construction
+
+    {
+        std::lock_guard lk(st->mu);
+        st->variant = variant;
+    }
+    h.apply(ctl(20ms));
+    CHECK(eventually([&] { return faulted_events(h) >= 1; }, kDeafBound));
+    CHECK(first_fault_reason(h) == kRegReasonMoved);
+    CHECK(h.counters().verify_name_lost >= 1);
+    {
+        std::lock_guard lk(st->mu);
+        CHECK(st->taken == 1); // the injection was reached, exactly once
+    }
+    REQUIRE(eventually([&] { return h.all_notification() && h.engine.stats().armed_faulted == 0; },
+                       kDeafBound * 2));
+    CHECK(stays_healthy(h, 400ms));
+    CHECK(faulted_events(h) == 1); // one false fault, then healed
+    CHECK(write_fires(h, rig, 1));
+    h.engine.stop();
+}
+
+// B7 (iii) and UP-1's family: a held name that cannot be read hides a real rename-and-recreate
+// for as long as it stays unreadable, because neither compare has two readable names to
+// compare. R1 does NOT close this (Dave, no independent adjudicator, 2026-11-26: closed by R2
+// item 32, which turns repeated undecided into a visible fault); it makes it visible (a counter
+// and a warn) and this case pins the behaviour: the rename is NOT reported while the held
+// name is unreadable, and IS reported by the first verification that can read it.
+TEST_CASE("Registry spark (real mechanism): an unreadable held name hides a rename until a "
+          "verification can read it, a documented residual (#7877 item 31)",
+          "[spark][mechanism][windows][5719][7877]") {
+    RegRenameRig rig("name_hiddenrename");
+    REQUIRE(rig.ok);
+    auto st = std::make_shared<NameInject>();
+    auto ctl = [&](std::chrono::milliseconds verify) {
+        auto c = rename_controls(verify);
+        c.name_hook = inject_hook(st);
+        return c;
+    };
+    RegVerifyHarness h({rig.child}, ctl(60s));
+    st->set(std::nullopt, NameResult{std::in_place, kNtUnsuccessful, std::wstring{}});
+    REQUIRE(rig.rename_parent() == ERROR_SUCCESS);
+    REQUIRE(rig.create_child());
+    h.apply(ctl(20ms));
+    REQUIRE(eventually([&] { return h.counters().verify_name_undecided >= 3; }, kDeafBound));
+    CHECK(stays_healthy(h, 300ms)); // the watch reads healthy while it is deaf on the renamed tree
+    CHECK(h.counters().verify_name_lost == 0);
+    CHECK(faulted_events(h) == 0);
+    CHECK(h.counters().warns_claimed_undecided == 1); // visible, once
+
+    st->clear(); // the held name is readable again: the first verification that decides reports it
+    CHECK(eventually([&] { return faulted_events(h) >= 1; }, kDeafBound));
+    CHECK(first_fault_reason(h) == kRegReasonMoved);
+    h.engine.stop();
+}
+
+// ── #7877 item 31 (R1), SECOND governance fix round ──────────────────────────────────────────
+//
+// What this round changed in the mechanism, and so what these cases pin: the confirming second
+// read of a commit now runs only while the check is ON (and never for a verification job); a
+// verification that a concurrent fire converted into the re-arm is retried as an ordinary re-arm
+// instead of being committed; a watch that recorded no name warns at its first verification; a
+// deferred commit warns once per episode; and the per-watch warn claim is identity-checked by a
+// serial. The same rules as above apply: salted keys, RAII cleanup, hook state by shared_ptr,
+// skip_or_fail_registry for a missing privilege.
+// Rig result for the bytes at tip 187a56bc75 (author-reported, one box: weecolin, Windows build
+// 26100, MSVC 19.44; not a CI run; raw logs local only): `[7877]` 39 of 39 (1197 assertions) and
+// 40 of 40 sequential repeats; both red proofs of this round (the fire-converted retry disabled,
+// the confirming read ignoring the interval) go red as designed. See docs/spark-flip-gate.md.
+
+namespace {
+/// Makes the CONFIRMING read of a commit disagree, by call sequence: every probe that commits a
+/// Target key makes two fresh-side name queries in a row (the capture, then, when the check was
+/// on at launch, the confirming read), so on the fresh side an odd call is a capture and an even
+/// call is a confirmation. `budget` confirmations are answered with a name that cannot be the
+/// key's; every other call runs the real query. (A watch that makes only the capture, a check-off
+/// establishment, would shift the parity: the cases that use this keep the check on.)
+struct ConfirmPoison {
+    std::atomic<int> fresh_n{0};
+    std::atomic<int> budget{0};
+    std::atomic<int> poisoned{0};
+};
+NameHookFn confirm_poison_hook(std::shared_ptr<ConfirmPoison> st) {
+    return [st = std::move(st)](std::string_view, bool held) -> NameResult {
+        if (held)
+            return std::nullopt;
+        const int n = st->fresh_n.fetch_add(1, std::memory_order_acq_rel) + 1;
+        if (n % 2 == 0 && st->budget.fetch_sub(1, std::memory_order_acq_rel) > 0) {
+            st->poisoned.fetch_add(1, std::memory_order_acq_rel);
+            return NameResult{std::in_place, 0L,
+                              std::wstring{L"\\REGISTRY\\USER\\yuzu_test_injected\\Elsewhere"}};
+        }
+        return std::nullopt;
+    };
+}
+
+/// Captures the log lines the mechanism writes through the process default logger (those that
+/// carry "spark_registry:"), keeping the previous sinks. The same technique, and the same
+/// precondition, as PfStallLogger above: spdlog is one shared image on Windows, nothing else may
+/// log through spdlog's free functions while an instance is alive, and an instance is declared
+/// BEFORE the harness so the sweeper is joined before the previous logger is restored. A user
+/// MUST treat zero captured lines as "the swap did not reach the library", never as "no warn".
+class RegLogCapture {
+public:
+    RegLogCapture() : sink_(std::make_shared<Sink>()), prev_(spdlog::default_logger()) {
+        // The captured lines are WARN lines: a default logger raised above warn would hide them
+        // from the sink, and a case would then SKIP (or, on the CI leg, fail) for a reason
+        // unrelated to the code under test. Refuse here, before anything is swapped, as
+        // reg_run_log_off_lock does for its own level.
+        INFO("default logger level " << static_cast<int>(prev_->level()));
+        REQUIRE(prev_->level() <= spdlog::level::warn);
+        std::vector<spdlog::sink_ptr> sinks = prev_->sinks();
+        sinks.push_back(sink_);
+        auto logger = std::make_shared<spdlog::logger>(kName, sinks.begin(), sinks.end());
+        logger->set_level(prev_->level());
+        spdlog::set_default_logger(std::move(logger));
+    }
+    ~RegLogCapture() {
+        spdlog::set_default_logger(prev_);
+        spdlog::drop(kName); // by name: one instance at a time
+    }
+    RegLogCapture(const RegLogCapture&) = delete;
+    RegLogCapture& operator=(const RegLogCapture&) = delete;
+
+    [[nodiscard]] std::vector<std::string> lines() const {
+        std::lock_guard lk(sink_->mu_lines);
+        return sink_->lines;
+    }
+    [[nodiscard]] std::size_t hits() const { return lines().size(); }
+    /// The first captured line containing `needle`, or "" when none.
+    [[nodiscard]] std::string find(std::string_view needle) const {
+        for (const auto& l : lines())
+            if (l.find(needle) != std::string::npos)
+                return l;
+        return {};
+    }
+
+private:
+    static constexpr const char* kName = "reg_warn_capture";
+    struct Sink final : spdlog::sinks::base_sink<std::mutex> {
+        void sink_it_(const spdlog::details::log_msg& msg) override {
+            const std::string_view payload(msg.payload.data(), msg.payload.size());
+            if (payload.find("spark_registry:") == std::string_view::npos)
+                return;
+            std::lock_guard lk(mu_lines);
+            lines.emplace_back(payload);
+        }
+        void flush_() override {}
+        mutable std::mutex mu_lines;
+        std::vector<std::string> lines;
+    };
+    std::shared_ptr<Sink> sink_;
+    std::shared_ptr<spdlog::logger> prev_;
+};
+
+/// A moved name was committed: `committed_name` of the watch names the renamed tree.
+[[nodiscard]] bool moved_name_committed(RegVerifyHarness& h) {
+    if (const auto n = registry_committed_name_for_test(*h.raw, spark_key(h.specs[0])))
+        return lower_name(*n).find(L"_renamed") != std::wstring::npos;
+    return false;
+}
+} // namespace
+
+// T1, the ESTABLISHMENT commit site (watch_incarnation): the other cases of the commit race drive
+// the re-arm site (resolve_probe_locked). The initial probe commits inside watch() itself (the
+// caller budget is widened so it always does), its confirming read is made to disagree ONCE, and
+// the commit is not accepted: the watch is retried on the admission schedule and then commits a
+// confirmed name. The harness does not insist on a healthy watch on return: a deferred
+// establishment is not healthy, by construction.
+TEST_CASE("Registry spark (real mechanism): an establishment whose confirming read disagrees is "
+          "retried and then committed with a confirmed name (#7877 item 31, commit race)",
+          "[spark][mechanism][windows][5719][7877]") {
+    RegRenameRig rig("name_estab_once");
+    REQUIRE(rig.ok);
+    auto st = std::make_shared<ConfirmPoison>();
+    st->budget.store(1);
+    auto ctl = rename_controls(60s); // the check is ON: the confirming read runs
+    ctl.caller_wait_budget = 5000ms; // the initial probe commits inside watch() itself
+    ctl.name_hook = confirm_poison_hook(st);
+    RegVerifyHarness h({rig.child}, ctl, nullptr, "HKCU", /*wait_healthy=*/false);
+    CHECK(h.counters().commit_capture_retry >= 1); // the establishment commit was NOT accepted
+    CHECK(st->poisoned.load() == 1);               // the disagreement was really injected
+    REQUIRE(eventually([&] { return h.all_notification() && h.engine.stats().armed_faulted == 0; },
+                       kDeafBound));
+    CHECK(h.counters().commit_name_recorded >= 1);
+    const auto recorded = registry_committed_name_for_test(*h.raw, spark_key(h.specs[0]));
+    REQUIRE(recorded.has_value());
+    CHECK(name_names_key(*recorded, rig.child)); // the confirmed name, never the injected one
+    CHECK(write_fires(h, rig, 1));
+    h.engine.stop();
+}
+
+// T1, permanent variant: the confirming read ALWAYS disagrees. The watch is never established,
+// so it has no coverage, no name is recorded, the ordinary grace reports it, and the retries are
+// bounded by the admission backoff (50 ms doubling): about five attempts in 1.2 s, never the 60
+// a retry at the sweeper's 20 ms cadence would make. The warn is logged once for the episode
+// (the first deferral, made inside watch(), logs nothing by design). When the disagreement ends
+// the watch recovers on its own.
+TEST_CASE("Registry spark (real mechanism): a confirming read that always disagrees leaves the "
+          "watch unestablished, visibly faulted and retried on a bounded backoff, and it recovers "
+          "when the disagreement ends (#7877 item 31, commit race)",
+          "[spark][mechanism][windows][5719][7877]") {
+    RegRenameRig rig("name_estab_perm");
+    REQUIRE(rig.ok);
+    auto st = std::make_shared<ConfirmPoison>();
+    st->budget.store(1'000'000);
+    auto ctl = rename_controls(60s);
+    ctl.caller_wait_budget = 5000ms;
+    ctl.name_hook = confirm_poison_hook(st);
+    RegVerifyHarness h({rig.child}, ctl, nullptr, "HKCU", /*wait_healthy=*/false);
+    const auto t0 = std::chrono::steady_clock::now();
+    CHECK(deaf_coverage(h.engine, h.subs[0]) != SparkCoverage::Notification);
+    REQUIRE(eventually([&] { return h.counters().commit_capture_retry >= 1; }, kDeafBound));
+    CHECK(eventually([&] { return faulted_events(h) >= 1; }, kDeafBound)); // grace: visible
+    CHECK(eventually([&] { return h.counters().warns_claimed_commit_unconfirmed >= 1; },
+                     kDeafBound));
+    std::this_thread::sleep_until(t0 + 1200ms);
+    const auto retries = h.counters().commit_capture_retry;
+    INFO("deferrals in 1.2 s: " << retries);
+    CHECK(retries >= 2);
+    CHECK(retries <= 7); // log-bounded: a linear retry at the 20 ms cadence would be about 60
+    CHECK(h.counters().warns_claimed_commit_unconfirmed == 1); // once per episode, not per retry
+    CHECK(deaf_coverage(h.engine, h.subs[0]) != SparkCoverage::Notification);
+    {
+        const auto none = registry_committed_name_for_test(*h.raw, spark_key(h.specs[0]));
+        REQUIRE(none.has_value());
+        CHECK(none->empty()); // nothing was committed, so no name was recorded
+    }
+
+    st->budget.store(0); // the disagreement ends: the next retry confirms and commits
+    REQUIRE(eventually([&] { return h.all_notification() && h.engine.stats().armed_faulted == 0; },
+                       kDeafBound));
+    const auto recorded = registry_committed_name_for_test(*h.raw, spark_key(h.specs[0]));
+    REQUIRE(recorded.has_value());
+    CHECK(name_names_key(*recorded, rig.child));
+    CHECK(write_fires(h, rig, 1));
+    h.engine.stop();
+}
+
+// T2 (sec G8-1), the fire-converted verification. A verification worker is parked at its fresh
+// name read, after its open and notify arm. A value write fires the watch's live notify, which
+// converts the outstanding verification into the re-arm. The parent is then renamed and the path
+// re-created BEFORE the worker is released, so the name it reads is the MOVED one. A verification
+// runs no confirming read, so before this fix round that result was committed as the re-arm: the
+// watch held the renamed tree under its moved name for ever, and every later verification called
+// it healthy. It is now retried as an ordinary re-arm (with the confirming read), so the moved
+// name is never committed. The accessible variant recovers onto the new key; the deny-ACE variant
+// (the re-created key refuses KEY_NOTIFY, so the retry's open fails) stays visibly faulted until
+// the ACE is lifted and never commits the moved name either.
+TEST_CASE("Registry spark (real mechanism): a verification converted into the re-arm by a fire is "
+          "retried, never committed under a moved name (#7877 item 31, commit race)",
+          "[spark][mechanism][windows][5719][7877]") {
+    const bool deny = GENERATE(false, true);
+    INFO((deny ? "deny-ACE variant" : "accessible variant"));
+    RegRenameRig rig(deny ? "name_fireconv_deny" : "name_fireconv");
+    REQUIRE(rig.ok);
+    NameHookGate gate; // before the harness: the hook outlives nothing the engine joins
+    // Counts every fresh-side (held == false) name call at ENTRY, before the gate can park it.
+    // Owned by value in the hook (shared_ptr), like every other hook state in this file.
+    auto fresh_calls = std::make_shared<std::atomic<int>>(0);
+    auto ctl = [&](std::chrono::milliseconds verify) {
+        auto c = rename_controls(verify);
+        c.name_hook = [fresh_calls, inner = gate.hook()](std::string_view key, bool held) {
+            if (!held)
+                fresh_calls->fetch_add(1, std::memory_order_acq_rel);
+            return inner(key, held);
+        };
+        return c;
+    };
+    RegVerifyHarness h({rig.child}, ctl(60s));
+    const auto retry0 = h.counters().commit_capture_retry;
+    const int fresh0 = fresh_calls->load(std::memory_order_acquire); // after the establishment
+    gate.park_next(false); // the next FRESH read parks: the verification's, after open and arm
+    h.apply(ctl(50ms));
+    REQUIRE(eventually([&] { return gate.parked() >= 1; }, kDeafBound));
+
+    const auto fired0 = h.fired();
+    REQUIRE(rig.write_child(1)); // the live notify fires: the verification becomes the re-arm
+    REQUIRE(eventually([&] { return h.fired() > fired0; }, kDeafBound));
+    h.apply(ctl(60s)); // no further verification while the case settles
+    REQUIRE(rig.rename_parent() == ERROR_SUCCESS);
+    REQUIRE(rig.create_child()); // the original path resolves again, to a DIFFERENT key
+    // Declared after the rig and the harness: its destructor lifts the ACE before either goes.
+    std::optional<DenyNotifyScope> deny_scope;
+    if (deny) {
+        deny_scope.emplace(rig.child);
+        if (!deny_scope->applied) {
+            gate.release();
+            skip_or_fail_registry("could not set a deny ACE on an HKCU key with this token (no "
+                                  "user SID or no WRITE_DAC)");
+        }
+        RegKeyOwner probe;
+        const LONG rc =
+            ::RegOpenKeyExA(HKEY_CURRENT_USER, rig.child.c_str(), 0, KEY_NOTIFY, &probe.h);
+        if (rc != ERROR_ACCESS_DENIED) {
+            gate.release();
+            skip_or_fail_registry("the deny ACE does not refuse KEY_NOTIFY for this token (the "
+                                  "open returned " +
+                                  std::to_string(rc) + ")");
+        }
+    }
+    gate.release(); // the worker now reads the MOVED name through its pre-rename handle
+
+    CHECK(eventually([&] { return h.counters().commit_capture_retry > retry0; }, kDeafBound));
+    // The retry MUST perform the confirming read (QE2-1). Counted on the fresh side from the
+    // end of the establishment: the verification's own read is call 1, and every commit that
+    // follows (the retry, and any later re-arm) makes a PAIR (the capture, then the confirming
+    // read) while the check is on. So the delta is odd, and at least 3, exactly when at least
+    // one commit completed with its confirming read: a retry that skipped the confirming read
+    // would leave the delta at 2 (even), and extra pairs keep the parity, so an unrelated
+    // spurious re-arm cannot turn that into a pass. `>= 3` rather than `== 3` because a stray
+    // notification may cause an additional, complete re-arm (the rename of the parent does
+    // not signal the child key's own notify handle, so it is not the source; where the stray
+    // notification comes from was not established). In the deny
+    // variant the retry's open is refused until the ACE is lifted, so the same condition is
+    // reached only after the lift (the wait below is bounded by kDeafBound * 2).
+    auto confirming_read_made = [&] {
+        const int delta = fresh_calls->load(std::memory_order_acquire) - fresh0;
+        return delta >= 3 && delta % 2 == 1;
+    };
+    bool poisoned = false;
+    if (!deny) {
+        const bool healthy = eventually(
+            [&] {
+                poisoned = poisoned || moved_name_committed(h);
+                return h.all_notification() && h.engine.stats().armed_faulted == 0;
+            },
+            kDeafBound * 2);
+        CHECK(healthy);
+        CHECK_FALSE(poisoned);
+        const auto recorded = registry_committed_name_for_test(*h.raw, spark_key(h.specs[0]));
+        REQUIRE(recorded.has_value());
+        CHECK(name_names_key(*recorded, rig.child));
+        CHECK(lower_name(*recorded).find(L"_renamed") == std::wstring::npos);
+        CHECK(eventually(confirming_read_made, kDeafBound)); // before write_fires adds re-arms
+        CHECK(write_fires(h, rig, 2)); // on the NEW key, not deaf on the renamed tree
+    } else {
+        CHECK(eventually([&] { return h.engine.stats().armed_faulted == 1; }, kDeafBound));
+        const auto until = std::chrono::steady_clock::now() + 700ms; // past the 500 ms retry
+        while (std::chrono::steady_clock::now() < until) {
+            poisoned = poisoned || moved_name_committed(h);
+            std::this_thread::sleep_for(5ms);
+        }
+        CHECK_FALSE(poisoned);
+        CHECK(h.engine.stats().armed_faulted == 1); // visibly faulted for as long as the ACE stands
+        deny_scope->restore();
+        REQUIRE(eventually([&] { return h.all_notification() && h.engine.stats().armed_faulted == 0; },
+                           kDeafBound * 2));
+        const auto recorded = registry_committed_name_for_test(*h.raw, spark_key(h.specs[0]));
+        REQUIRE(recorded.has_value());
+        CHECK(name_names_key(*recorded, rig.child));
+        CHECK(lower_name(*recorded).find(L"_renamed") == std::wstring::npos);
+        CHECK(eventually(confirming_read_made, kDeafBound));
+        CHECK(write_fires(h, rig, 2));
+    }
+    h.engine.stop();
+}
+
+// T3 (xplat X5, sre F1), the check OFF (the factory default). What a default agent pays for the
+// name check is ONE name read on the handle the probe already holds, per establishment or
+// re-arm: no second by-path open (the confirming read), no duplicate, no warn. Counted through
+// the name hook, which sees every name query: exactly one fresh-side call per establishment and
+// per re-arm, never two. The positive control, a second watch with the check ON, makes exactly
+// two (the capture and the confirming read), so the counter can see a confirming read.
+TEST_CASE("Registry spark (real mechanism): with the check off a commit makes one name read and no "
+          "confirming second open (#7877 item 31, interval 0)",
+          "[spark][mechanism][windows][5719][7877]") {
+    SECTION("check off: one name read per establishment and per re-arm") {
+        RegRenameRig rig("name_interval0");
+        REQUIRE(rig.ok);
+        auto names = std::make_shared<NameInject>(); // pass-through; counts both sides
+        auto ctl = rename_controls(0ms); // zero leaves the construction-time seed: check off
+        ctl.name_hook = inject_hook(names);
+        RegVerifyHarness h({rig.child}, ctl);
+        CHECK(h.counters().path_verify_ms == 0);
+        CHECK(names->fresh_calls.load() == 1); // the capture only: no confirming second read
+        CHECK(names->held_calls.load() == 0);  // and no duplicate
+        CHECK(h.counters().commit_capture_retry == 0);
+        CHECK(h.counters().commit_name_recorded >= 1); // the name is still recorded at commit
+        const auto recorded = registry_committed_name_for_test(*h.raw, spark_key(h.specs[0]));
+        REQUIRE(recorded.has_value());
+        CHECK(name_names_key(*recorded, rig.child));
+
+        // A re-arm (a write consumes the notification): exactly one more read.
+        REQUIRE(write_fires(h, rig, 1));
+        REQUIRE(eventually([&] { return h.all_notification() && names->fresh_calls.load() >= 2; },
+                           kDeafBound));
+        std::this_thread::sleep_for(150ms); // negative: a late confirming read would show by now
+        CHECK(names->fresh_calls.load() == 2);
+        CHECK(names->held_calls.load() == 0);
+        const auto c = h.counters();
+        CHECK(c.commit_capture_retry == 0);
+        CHECK(c.verify_launched == 0);
+        CHECK(c.warns_claimed_name_missing == 0);
+        CHECK(c.warns_claimed_undecided == 0);
+        CHECK(c.warns_claimed_dup_failed == 0);
+        CHECK(c.warns_claimed_commit_unconfirmed == 0);
+        h.engine.stop();
+    }
+    SECTION("positive control, check on: the capture and the confirming read") {
+        RegRenameRig rig("name_interval_on");
+        REQUIRE(rig.ok);
+        auto names = std::make_shared<NameInject>();
+        auto ctl = rename_controls(60s);
+        ctl.name_hook = inject_hook(names);
+        RegVerifyHarness h({rig.child}, ctl);
+        CHECK(names->fresh_calls.load() == 2);
+        CHECK(h.counters().commit_capture_retry == 0); // they agreed: nothing was retried
+        h.engine.stop();
+    }
+}
+
+// C3 (sec G8-2, sre F2): a watch whose FIRST commit recorded no name (here the initial probe
+// commits inside watch(), which logs nothing, so its warn is counter-only) used to take the
+// verification's decided branch in silence for as long as it stayed so: nothing compared the held
+// name, and nothing said so. The first verification now announces it, once per episode, and never
+// faults. The log text is captured: it must not print a zero status as an NTSTATUS.
+TEST_CASE("Registry spark (real mechanism): a watch that recorded no name at establishment warns "
+          "at its first verification, once, and is never faulted (#7877 item 31, warns)",
+          "[spark][mechanism][windows][5719][7877]") {
+    RegLogCapture cap; // before the rig and the harness (see its doc)
+    RegRenameRig rig("name_warn_first");
+    REQUIRE(rig.ok);
+    auto fail_fresh = std::make_shared<std::atomic<bool>>(true);
+    auto ctl = [&](std::chrono::milliseconds verify) {
+        auto c = rename_controls(verify);
+        c.caller_wait_budget = 5000ms; // the initial probe commits inside watch(): nothing logged
+        c.name_hook = [fail_fresh](std::string_view, bool held) -> NameResult {
+            if (!held && fail_fresh->load(std::memory_order_acquire))
+                return NameResult{std::in_place, kNtUnsuccessful, std::wstring{}};
+            return std::nullopt;
+        };
+        return c;
+    };
+    RegVerifyHarness h({rig.child}, ctl(60s));
+    REQUIRE(h.counters().commit_name_missing >= 1);
+    std::this_thread::sleep_for(150ms); // negative: nothing has been claimed before a verification
+    CHECK(h.counters().warns_claimed_name_missing == 0);
+
+    fail_fresh->store(false, std::memory_order_release); // verifications read for real
+    h.apply(ctl(20ms));
+    REQUIRE(eventually([&] { return h.counters().verify_launched >= 3; }, kDeafBound));
+    CHECK(eventually([&] { return h.counters().warns_claimed_name_missing >= 1; }, kDeafBound));
+    std::this_thread::sleep_for(150ms); // negative: several verifications, one warn
+    CHECK(h.counters().warns_claimed_name_missing == 1);
+    CHECK(h.counters().verify_name_undecided == 0); // both names were readable: decided
+    CHECK(faulted_events(h) == 0);
+    CHECK(stays_healthy(h, 200ms));
+    h.engine.stop();
+
+    if (cap.hits() == 0)
+        skip_or_fail_registry("the default-logger swap did not reach the mechanism's logging, so "
+                              "the warn text cannot be asserted");
+    const std::string line = cap.find("no canonical name is recorded");
+    REQUIRE_FALSE(line.empty());
+    CHECK(line.find("NTSTATUS 0x00000000") == std::string::npos); // never a zero shown as a status
+    // The spark key's token is logged (it is how an operator names the watch), but never a
+    // canonical NT name (`\REGISTRY\...`), which the check reads and keeps to itself.
+    CHECK(lower_name(std::wstring(line.begin(), line.end())).find(L"\\registry\\") ==
+          std::wstring::npos);
+    CHECK(line.find("NOT protected") != std::string::npos);
+}
+
+// T4 (QE-2): the text of one warn (the blind-watch warn: the cause, the status as a real
+// NTSTATUS, the exposure statement, and no canonical NT name), and TWO watches warn
+// independently.
+TEST_CASE("Registry spark (real mechanism): the blind-watch warn names its cause and exposure and "
+          "never a canonical name (#7877 item 31, warns)",
+          "[spark][mechanism][windows][5719][7877]") {
+    RegLogCapture cap;
+    RegRenameRig rig("name_warn_text");
+    REQUIRE(rig.ok);
+    auto st = std::make_shared<NameInject>();
+    auto ctl = [&](std::chrono::milliseconds verify) {
+        auto c = rename_controls(verify);
+        c.name_hook = inject_hook(st);
+        return c;
+    };
+    RegVerifyHarness h({rig.child}, ctl(60s));
+    st->set(std::nullopt, NameResult{std::in_place, kNtUnsuccessful, std::wstring{}});
+    h.apply(ctl(20ms));
+    REQUIRE(eventually([&] { return h.counters().warns_claimed_undecided >= 1; }, kDeafBound));
+    st->clear();
+    h.engine.stop();
+
+    if (cap.hits() == 0)
+        skip_or_fail_registry("the default-logger swap did not reach the mechanism's logging, so "
+                              "the warn text cannot be asserted");
+    const std::string line = cap.find("could not decide");
+    REQUIRE_FALSE(line.empty());
+    CHECK(line.find("the held key's name could not be read") != std::string::npos);
+    CHECK(line.find("NTSTATUS 0xc0000001") != std::string::npos);
+    CHECK(line.find("NOT protected") != std::string::npos);
+    // The spark key's token is logged, never a canonical NT name.
+    CHECK(lower_name(std::wstring(line.begin(), line.end())).find(L"\\registry\\") ==
+          std::wstring::npos);
+}
+
+TEST_CASE("Registry spark (real mechanism): two blind watches each warn once, independently "
+          "(#7877 item 31, warns)",
+          "[spark][mechanism][windows][5719][7877]") {
+    RegRenameRig a("name_warn2_a");
+    RegRenameRig b("name_warn2_b");
+    REQUIRE(a.ok);
+    REQUIRE(b.ok);
+    auto st = std::make_shared<NameInject>(); // answers both watches: both are blind
+    auto ctl = [&](std::chrono::milliseconds verify) {
+        auto c = rename_controls(verify);
+        c.name_hook = inject_hook(st);
+        return c;
+    };
+    RegVerifyHarness h({a.child, b.child}, ctl(60s));
+    st->set(std::nullopt, NameResult{std::in_place, kNtUnsuccessful, std::wstring{}});
+    h.apply(ctl(20ms));
+    REQUIRE(eventually([&] { return h.counters().verify_name_undecided >= 8; }, kDeafBound));
+    CHECK(eventually([&] { return h.counters().warns_claimed_undecided >= 2; }, kDeafBound));
+    std::this_thread::sleep_for(150ms); // negative: eight blind verifications, two warns
+    CHECK(h.counters().warns_claimed_undecided == 2);
+    CHECK(faulted_events(h, 0) == 0);
+    CHECK(faulted_events(h, 1) == 0);
+    st->clear();
+    h.engine.stop();
+}
+// Not covered, a recorded gap: the claim of a staged warn for a RETIRED watch (the flag of a
+// watch that no longer exists, or of a new watch at a reused address, is never taken: claim_warn
+// compares the pointer AND the watch's serial). Reaching it needs a watch retired between the
+// staging of a line and its log call, inside one sweeper pass; no seam parks the sweeper there.
+// The code is reviewed, not tested.
 
 #endif // _WIN32
