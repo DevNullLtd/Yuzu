@@ -142,9 +142,9 @@ Rows are pipe-delimited, one per record, and start with a literal discriminator 
 | Field | Type | Values | Available | Example | Description |
 |---|---|---|---|---|---|
 | `username` | string | - | Windows, Linux, macOS | `jsmith` | The local account's username. Values: free text. |
-| `enabled` | bool | - | Windows, Linux, macOS | `true` | Whether the account is enabled. Values: true, false. |
+| `enabled` | string | - | Windows, Linux, macOS | `true` | Whether the account is enabled; macOS reports unknown when the login-shell read failed or was cut off. Values: true, false, unknown. |
 | `last_logon` | string | - | Windows, Linux, macOS | `2026-09-07 11:08:37` | The account's most recent login timestamp, or a sentinel when unknown or never logged in. Values: "YYYY-MM-DD HH:MM:SS", "Never", "unknown". |
-| `description` | string | - | Windows, Linux, macOS | `Built-in account for administering the computer/domain` | The account's comment/description text (Windows comment, macOS RealName, Linux GECOS field), or "-" when empty. Values: free text or "-". |
+| `description` | string | - | Windows, Linux, macOS | `Built-in account for administering the computer/domain` | The account's comment/description text (Windows comment, macOS RealName, Linux GECOS field), or "-" when empty or, on macOS, not read. Values: free text or "-". |
 | `console_state` | string | - | macOS | `true` | Tri-state flag for whether this account is the current GUI/console-login user; the field is entirely absent (not empty) on Linux and Windows. Values: true, false, unknown. |
 
 **`device.users.logged_on` — `username|domain|logon_type|session_id`**
@@ -218,7 +218,7 @@ Windows sets the status when the Security-channel query fails, when a session, a
 ## Sample output
 
 <!-- BEGIN GENERATED: plugin-doc-gen samples -->
-**Windows** — captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM (account name redacted to jsmith; account SID replaced with a placeholder) · leg-hash 5734018da5be
+**Windows** — captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-11-27 · SYSTEM (account name redacted to jsmith; computer name replaced with DESKTOP-EXAMPLE) · leg-hash bdc2a71645c5
 
 ```
 == action=logged_on
@@ -228,18 +228,17 @@ Windows sets the status when the Security-channel query fails, when a session, a
 [result_status] UNDECLARED / UNKNOWN
 
 == action=local_users
-local_user|Administrator|false|2021-10-14 11:15:58|Built-in account for administering the computer/domain
-local_user|jsmith|true|2026-09-07 11:08:37|-
-local_user|CodexSandboxOffline|true|Never|-
-local_user|CodexSandboxOnline|true|Never|-
+local_user|Administrator|false|2026-04-27 08:00:43|Built-in account for administering the computer/domain
+local_user|jsmith|true|2026-11-27 12:01:50|-
 local_user|DefaultAccount|false|Never|A user account managed by the system.
 local_user|Guest|false|Never|Built-in account for guest access to the computer/domain
+local_user|MUSR_MQADMIN|true|2026-11-27 10:01:47|IBM MQ Administrator
 local_user|WDAGUtilityAccount|false|Never|A user account managed and used by the system for Windows Defender Application Guard scenarios.
 [result_status] UNDECLARED / UNKNOWN
 
 == action=local_admins
-admin|Administrator|user|DESKTOP-04DNSIG
-admin|jsmith|user|DESKTOP-04DNSIG
+admin|Administrator|user|DESKTOP-EXAMPLE
+admin|jsmith|user|DESKTOP-EXAMPLE
 [result_status] UNDECLARED / UNKNOWN
 
 == action=group_members group=Administrators
@@ -248,40 +247,42 @@ group_member|jsmith|Administrators|user
 [result_status] UNDECLARED / UNKNOWN
 
 == action=primary_user
-primary_user|jsmith|118|event_log_4624
+primary_user|jsmith|130|event_log_4624
 [result_status] UNDECLARED / UNKNOWN
 
 == action=session_history
-session_history|jsmith|logoff|network|-|2026-09-07T10:08:37.8345208Z|4634
-session_history|sshd_6888|logoff|service|-|2026-09-07T10:08:37.8345130Z|4634
-session_history|jsmith|logon|network|-|2026-09-07T10:08:37.5888936Z|4624
-session_history|jsmith|logoff|network|-|2026-09-07T10:08:37.5439466Z|4634
-session_history|jsmith|logon|network|-|2026-09-07T10:08:37.5436517Z|4624
-session_history|sshd_6888|logon|service|-|2026-09-07T10:08:37.4636668Z|4624
-session_history|jsmith|logoff|network|-|2026-09-07T10:08:06.3059890Z|4634
-session_history|sshd_4452|logoff|service|-|2026-09-07T10:08:06.3059802Z|4634
-session_history|jsmith|logon|network|-|2026-09-07T10:08:06.0444630Z|4624
-session_history|jsmith|logoff|network|-|2026-09-07T10:08:05.9047716Z|4634
-session_history|jsmith|logon|network|-|2026-09-07T10:08:05.9044759Z|4624
-session_history|sshd_4452|logon|service|-|2026-09-07T10:08:05.8249284Z|4624
-… 12 of 50 rows shown
+session_history|jsmith|logon|network|-|2026-11-27T12:01:50.4975723Z|4624
+session_history|jsmith|logoff|network|-|2026-11-27T12:01:50.4656800Z|4634
+session_history|jsmith|logon|network|-|2026-11-27T12:01:50.4654505Z|4624
+session_history|sshd_3944|logon|service|-|2026-11-27T12:01:50.3773226Z|4624
+session_history|jsmith|logoff|network|-|2026-11-27T12:01:50.3434142Z|4634
+session_history|sshd_7244|logoff|service|-|2026-11-27T12:01:50.3434142Z|4634
+session_history|jsmith|logon|network|-|2026-11-27T12:01:50.1336759Z|4624
+session_history|jsmith|logoff|network|-|2026-11-27T12:01:50.1016712Z|4634
+session_history|jsmith|logon|network|-|2026-11-27T12:01:50.1014235Z|4624
+session_history|sshd_7244|logon|service|-|2026-11-27T12:01:50.0146062Z|4624
+session_history|sshd_10204|logoff|service|-|2026-11-27T12:01:49.9759189Z|4634
+session_history|jsmith|logoff|network|-|2026-11-27T12:01:49.9759183Z|4634
+… 12 of 49 rows shown
 [result_status] UNDECLARED / UNKNOWN
 ```
 
-**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (jsmith) · leg-hash 5734018da5be
+**macOS** — captured: macos macOS 27.2.1 arm64 · bare-metal · 2026-11-27 · euid 501 (jsmith; account name and full name redacted) · leg-hash bdc2a71645c5
 
 ```
 == action=logged_on
 user|jsmith|local|console|console
+user|jsmith|local|remote|ttys000
 [result_status] UNDECLARED / UNKNOWN
 
 == action=sessions
-session|console|jsmith|Active|-|13:35
+session|console|jsmith|Active|-|21:14
+session|s000|jsmith|Active|-|1:33
 [result_status] UNDECLARED / UNKNOWN
 
 == action=local_users
-local_user|jsmith|true|2026-09-06 21:20:00|Jordan Smith|true
-local_user|root|true|2026-09-06 21:15:00|System Administrator|false
+local_user|jsmith|true|2026-11-26 14:30:00|Jordan Smith|true
+local_user|root|true|Never|System Administrator|false
 [result_status] UNDECLARED / UNKNOWN
 
 == action=local_admins
@@ -297,27 +298,17 @@ group_member|_mbsetupuser|admin|user
 [result_status] UNDECLARED / UNKNOWN
 
 == action=primary_user
-primary_user|jsmith|35|last
+primary_user|jsmith|2|last
 [result_status] UNDECLARED / UNKNOWN
 
 == action=session_history
-session_history|jsmith|console|Sun|console|active|Sep  6 21:20   still logged in
-session_history|reboot|time|Sun|system|completed|Sep  6 21:19
-session_history|shutdown|time|Sun|system|completed|Sep  6 21:15
-session_history|root|console|Sun|console|completed|Sep  6 21:15 - shutdown  (00:00)
-session_history|jsmith|ttys000|Sun|remote|completed|Sep  6 18:53 - 18:53  (00:00)
-session_history|jsmith|ttys000|Sun|remote|completed|Sep  6 18:53 - 18:53  (00:00)
-session_history|jsmith|ttys000|Mon|remote|completed|Aug 31 09:30 - 09:30  (00:00)
-session_history|jsmith|console|Mon|console|completed|Aug 31 09:30 - 21:14 (6+11:44)
-session_history|reboot|time|Mon|system|completed|Aug 31 09:29
-session_history|jsmith|ttys000|Fri|remote|completed|Aug 28 09:51 - 09:51  (00:00)
-session_history|jsmith|console|Fri|console|completed|Aug 28 09:51 - 22:26  (12:35)
-session_history|reboot|time|Fri|system|completed|Aug 28 09:50
-… 12 of 50 rows shown
+session_history|jsmith|ttys000|Thu|remote|active|Nov 26 14:30   still logged in
+session_history|jsmith|console|Thu|console|active|Nov 26 14:20   still logged in
+session_history|reboot|time|Thu|system|completed|Nov 26 14:18
 [result_status] UNDECLARED / UNKNOWN
 ```
 
-**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash 5734018da5be
+**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-11-27 · euid 0 · leg-hash bdc2a71645c5
 
 ```
 == action=logged_on
@@ -359,9 +350,10 @@ session_history|error|last command failed
 ## Source and tests
 
 <!-- BEGIN GENERATED: plugin-doc-gen source -->
-- Plugin: `agents/plugins/users/src/users_group_lookup.hpp` · `agents/plugins/users/src/users_macos_last.hpp` · `agents/plugins/users/src/users_plugin.cpp` · `agents/plugins/users/src/users_win_events.hpp`
+- Plugin: `agents/plugins/users/src/users_group_lookup.hpp` · `agents/plugins/users/src/users_macos_last.hpp` · `agents/plugins/users/src/users_plugin.cpp` · `agents/plugins/users/src/users_tool_budget.hpp` · `agents/plugins/users/src/users_win_events.hpp` · `agents/plugins/users/src/users_win_rows.hpp`
 - Definitions: `content/definitions/users.yaml`
 - Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_b.hpp`
-- Tests: `tests/unit/test_users_macos_last.cpp` · `tests/unit/test_users_posix_actions.cpp` · `tests/unit/test_users_win_events.cpp`
+- Tests: `tests/unit/test_users_macos_last.cpp` · `tests/unit/test_users_posix_actions.cpp` · `tests/unit/test_users_tool_budget.cpp` · `tests/unit/test_users_win_events.cpp` · `tests/unit/test_users_win_rows.cpp`
 - Privilege row: `docs/agent-privilege-model.md` (no row yet)
+- Changelog: `changelog.d/3925-users-enabled-string.changed.md`
 <!-- END GENERATED -->
