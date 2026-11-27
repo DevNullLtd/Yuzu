@@ -44,6 +44,7 @@ This describes the build in a fresh deployment (see "Deployment contract (hard c
 - The server's gateway forward ends after 300 seconds, so a longer response window does not help a gateway-routed command: a command still running then is recorded as `unknown`, and its later answer does not reach the server.
 - An agent does not re-send the result of a command that finishes while it is disconnected.
 - The per-device target rows (`execution_target`) have no retention or pruning and no erasure path.
+- Known exception to the `succeeded` rule: if several database writes fail while a scheduled command is being re-sent, the run can read `succeeded` without devices that only the failed attempt reached.
 - Replies to one run share recounts, so a run's counts and progress can trail its latest replies by a moment, and a burst publishes fewer progress events than there are replies.
 
 ## ⚠️ Breaking: `users.local_users` `enabled` is a string, and some Windows reads now have a time limit that can fail a command (#3925)
