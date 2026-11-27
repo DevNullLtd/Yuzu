@@ -4517,44 +4517,6 @@ TEST_CASE("migration v5 adds changed_at with a stable default and builds its ind
     CHECK(yuzu::server::kChangedSinceMarginSecs == 300);
 }
 
-// Kills: the upgrading.md v5 drift recipe pinning the wrong hash. The recipe deletes the recorded v5
-// row ONLY `WHERE sha256 = '<hash>'`, the hash of the unreleased PRE-GUARD v5 text (commit
-// 559baadde1: the current text without the `DO $v5guard$ ... $v5guard$;` block), so that it can
-// never remove a row recorded for any other text. The runner records `sha256_hex(m.sql)` of the
-// whole text as is (pg_migration_runner.cpp), lower-case hex. The pre-guard text is derived HERE
-// from the current one by cutting the guard block, and a block that is not found fails loudly (a
-// reworded guard must update this derivation, and the recipe, deliberately). The constant was
-// cross-checked against the value the runner really recorded for the current text (same method).
-TEST_CASE("the v5 pre-guard text hashes to the value the upgrading.md drift recipe pins",
-          "[device_ci][migration][v5][changed_since]") {
-    constexpr const char* kPreGuardV5Sha256 = "c2c3ca704946929d0d0d1bba87840cc2f67a30e967d9738580091f50c9cdce6b";
-    const auto& all = yuzu::server::device_inventory_migrations();
-    REQUIRE(all.size() >= 6); // v7+ (the removals feed) append; indices below stay valid
-    REQUIRE(all[4].version == 5);
-    const std::string& current = all[4].sql;
-    const std::string kBegin = "DO $v5guard$";
-    const std::string kEnd = "END $v5guard$; ";
-    const auto begin = current.find(kBegin);
-    const auto end = current.find(kEnd);
-    REQUIRE(begin != std::string::npos);
-    REQUIRE(end != std::string::npos);
-    REQUIRE(begin < end);
-    REQUIRE(current.find(kBegin, begin + 1) == std::string::npos); // exactly one guard block
-    const std::string pre_guard = current.substr(0, begin) + current.substr(end + kEnd.size());
-    // the pre-guard text is the three statements of 559baadde1 and nothing of the guard
-    CHECK(pre_guard.find("v5guard") == std::string::npos);
-    CHECK(pre_guard.find("RAISE") == std::string::npos);
-    CHECK(pre_guard.find("ALTER TABLE device_ci ADD COLUMN IF NOT EXISTS changed_at") != std::string::npos);
-    CHECK(pre_guard.find("CREATE INDEX IF NOT EXISTS device_ci_changed_at_idx") != std::string::npos);
-    const auto digest = yuzu::server::sha256_hex(pre_guard);
-    REQUIRE(digest.has_value());
-    CHECK(*digest == kPreGuardV5Sha256);
-    // and the current text hashes to something else (the runner's drift check is what refuses it)
-    const auto current_digest = yuzu::server::sha256_hex(current);
-    REQUIRE(current_digest.has_value());
-    CHECK(*current_digest != kPreGuardV5Sha256);
-}
-
 // Kills: a v6 that can drop v4's index while the composite is absent or unusable, loses the
 // transaction-local settings (the runner's pooled connection carries a 30 s statement_timeout and a
 // 10 s lock_timeout, and a failed migration refuses to start the server on every restart), is not

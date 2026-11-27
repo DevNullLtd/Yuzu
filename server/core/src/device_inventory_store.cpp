@@ -334,9 +334,8 @@ const std::string kMigrationV5Sql =
 // unqualified `DROP INDEX IF EXISTS` falls through to `public` and would drop a same-named index
 // there (verified). That is a deliberate local exception to the unqualified-DDL convention of the
 // other migrations (the CREATE and the LOCK resolve through the store schema, which comes first).
-// A SEPARATE migration, not an edit of v5, so a database that already applied v5 (a development or
-// UAT rig on a branch build) needs no hash-drift recipe: it only runs v6. Idempotent (a re-run drops
-// and rebuilds), built under v4's transaction-local settings for the same reasons, and not
+// A SEPARATE migration, not an edit of v5: a recorded migration's text is frozen (the runner
+// refuses a drifted hash). Idempotent (a re-run drops and rebuilds), built under v4's transaction-local settings for the same reasons, and not
 // CONCURRENTLY (the runner's transaction refuses it).
 // THE CONSTANTS BELOW FEED v6's RECORDED HASH: changing the index name, the key spelling or
 // `index_ddl` changes v6's SHA-256 in every database that ran it (the tests pin it), so it needs a
@@ -555,7 +554,7 @@ void warn_if_index_unusable(PGconn* conn, const IndexCheck& chk) {
                  "records stay correct but {} Create it as the table owner, in a session that first "
                  "ran SET lock_timeout = '30s' (a plain build blocks writers to device_ci and queues "
                  "behind any session holding a lock on it), then run{}: {} See "
-                 "docs/user-manual/upgrading.md, \"Migration v6\".",
+                 "docs/user-manual/upgrading.md, \"Checked at every start\".",
                  chk.name, problem, chk.consequence,
                  problem == "is missing" ? "" : " both statements (the existing index must be dropped first)",
                  statements);
