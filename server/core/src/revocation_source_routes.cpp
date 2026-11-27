@@ -72,7 +72,9 @@ void service_error(httplib::Response& res, const rs::ServiceError& e) {
         return;
     case K::kVersionConflict:
         rest_error(res, 409, e.message, false,
-                   "read the source (GET /api/v1/crypto/revocation-sources/{id}) and resend with "
+                   "read the source (GET /api/v1/crypto/revocation-sources/{id}); if it already "
+                   "shows the change you meant (for a reset, high_water.reset_at and the kept "
+                   "ca_certificates) do not resend, otherwise resend the same request with "
                    "expected_config_version=" + std::to_string(e.existing_id));
         return;
     case K::kConflict:
@@ -417,7 +419,8 @@ void RevocationSourceRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                       unknown_id(req, res, verb, cid);
                       return;
                   }
-                  // An empty body is the same as `{}` (reset to now).
+                  // An empty body is read as `{}`, which validate_reset refuses: keep_key_sha256
+                  // and expected_config_version are required (#6590).
                   nlohmann::json body = nlohmann::json::object();
                   if (!req.body.empty() && !parse_body(req, res, verb, raw, body))
                       return;

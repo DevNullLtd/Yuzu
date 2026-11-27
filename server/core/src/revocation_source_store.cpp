@@ -4,6 +4,7 @@
 #include "pg/pg_migration_runner.hpp"
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
+#include "revocation_url_canonical.hpp"
 #include "utf8_sanitize.hpp"
 
 #include <libpq-fe.h>
@@ -28,8 +29,9 @@ const std::vector<pg::PgMigration>& migrations() {
     // transaction. Runtime statements below schema-qualify explicitly.
     //
     // v1 creates the tables of the design's "The store" section that the fetcher (2b-1b) uses;
-    // `cert_signature_check` (2b-2) is not created here. The #6590 rulings (2026-11-18: reset key
-    // list, `scope_key` encoding, canonical URLs) land as migration v2 before 2b-1b.
+    // `cert_signature_check` (2b-2) is not created here. v2 is the #6590 rulings (owner,
+    // 2026-11-18) that touch the schema; the third, canonical URLs, is the open-time pass in
+    // `canonicalise_urls` (C++, so it lives beside the migrations, not inside one).
     //
     // Times a CA signs (`this_update`, `next_update`, `revocation_date`) are the CA's own;
     // `fetched_at`, `last_*_at`, `created_at` and `updated_at` are Postgres now(). CRL numbers are
@@ -43,6 +45,18 @@ const std::vector<pg::PgMigration>& migrations() {
     // reset and never cleared.
     //
     // `verified_key_sha256` is the SPKI hash of the registered key the CRL verified under.
+    //
+    // v2, ONE encoded scope key (#6590): `scope_key` is `full` or `idp:<64 lowercase hex of the
+    // IDP DER SHA-256>`, then `:base` or `:delta`, pinned by a CHECK on `crl` and on
+    // `rollback_high_water`, whose CHECK alone also admits '*' (the CA-level reset row). The CA is
+    // each table's own column, never part of the key. `crl.is_delta` becomes a column GENERATED
+    // from the suffix, so it cannot disagree with the key; `UNIQUE (source_id, scope_key,
+    // is_delta)` is re-created over it and stays, because the fetcher replaces a held CRL by
+    // delete-then-insert inside one acceptance transaction. A v1 `crl` row keeps its scope as
+    // the prefix and gains the suffix its `is_delta` named; a v1 row (in either table) whose key
+    // is not then in the pinned form fails the CHECK, and so the migration and the open: an
+    // anti-rollback mark is never silently dropped. 2b-1a is in no release and writes neither
+    // table's scoped rows, so only a development database can hold one.
     static const std::vector<pg::PgMigration> kMigrations = {
         {1, "CREATE TABLE source ("
             "  id                     BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,"
@@ -109,6 +123,18 @@ const std::vector<pg::PgMigration>& migrations() {
             "  reset_at               TIMESTAMPTZ,"
             "  pinned_crl_sha256      TEXT,"
             "  PRIMARY KEY (ca_subject_name_sha256, scope_key));"},
+        {2, "UPDATE crl SET scope_key = scope_key || CASE WHEN is_delta THEN ':delta' ELSE "
+            "  ':base' END;"
+            // Dropping the column drops the v1 UNIQUE (source_id, scope_key, is_delta) with it.
+            "ALTER TABLE crl DROP COLUMN is_delta;"
+            "ALTER TABLE crl ADD COLUMN is_delta BOOLEAN NOT NULL "
+            "  GENERATED ALWAYS AS (right(scope_key, 6) = ':delta') STORED;"
+            "ALTER TABLE crl ADD CONSTRAINT crl_scope_key_form "
+            "  CHECK (scope_key ~ '^(full|idp:[0-9a-f]{64}):(base|delta)$');"
+            "ALTER TABLE crl ADD CONSTRAINT crl_source_scope_unique "
+            "  UNIQUE (source_id, scope_key, is_delta);"
+            "ALTER TABLE rollback_high_water ADD CONSTRAINT rollback_high_water_scope_key_form "
+            "  CHECK (scope_key = '*' OR scope_key ~ '^(full|idp:[0-9a-f]{64}):(base|delta)$');"},
     };
     return kMigrations;
 }
@@ -283,6 +309,11 @@ std::optional<RevocationSourceStoreError> source_error(const NewRevocationSource
         if (u.url.empty() || u.url.size() > RevocationSourceStore::kMaxUrlBytes || u.host.empty() ||
             !bindable(u.url) || !bindable(u.host))
             return bad("invalid URL");
+        // Only the canonical form is ever stored (#6590): it is what UNIQUE (source_id, url) and
+        // `replace` compare, so a second spelling of one URL must never reach a row.
+        if (const auto c = revocation_source::canonical_crl_url(u.url);
+            !c || c->url != u.url || c->host != u.host)
+            return bad("URL not in canonical form");
         for (const auto& c : u.confirmed_address_classes)
             if (c.empty() || c.find(',') != std::string::npos || !bindable(c))
                 return bad("invalid address class");
@@ -424,7 +455,166 @@ insert_url(PGconn* conn, std::int64_t id, const NewRevocationSource::Url& u) {
     return {};
 }
 
+// The open-time canonical-URL pass (#6590, the design's "Proposed, for the migration v2 PR"):
+// every stored URL is rewritten to the canonical form, keeping its id and so its fetch status and
+// held CRLs. Refuses (nullopt, nothing changed) when a stored URL cannot be canonicalised or two
+// URLs of one source collapse into one: two rows would then claim one URL, and choosing which
+// keeps the fetch state is an administrator's call. The log names the source and URL ids, never
+// the URL text. Returns the number of rows rewritten.
+//
+// The steady state takes NO lock: a first unlocked read decides whether anything needs doing, so a
+// boot is never held up, or refused, by an unrelated transaction holding a source row (an open
+// psql session, a reset in flight on another replica). Only when that read finds work (a row to
+// rewrite, or an apparent refusal) does the pass lock - the same advisory lock as `create`, then
+// every source row, under its own lock_timeout - and decide again on what it then reads, so a
+// replica opening while another writes cannot interleave and a refusal is never decided on a
+// read another writer was changing. Idempotent: a canonical row is left untouched.
+struct UrlRewrite {
+    std::int64_t url_id;
+    std::string url;
+    std::string host;
+};
+
+// The rewrites the stored URLs need, or nullopt on a refusal (logged) or a read failure (logged).
+// `log_refusal` is false for the unlocked first look, whose refusal or read failure is only a
+// reason to read again under the locks.
+std::optional<std::vector<UrlRewrite>> plan_url_rewrites(PGconn* conn, bool log_refusal) {
+    pg::PgResult urls = pg::exec_params(
+        conn,
+        "SELECT source_id, id, url, host FROM revocation_source_store.source_url ORDER BY "
+        "source_id, id",
+        std::vector<std::string>{});
+    if (urls.status() != PGRES_TUPLES_OK) {
+        // The first, unlocked look only gates the locked pass, which reads again and reports.
+        if (log_refusal)
+            spdlog::error("RevocationSourceStore: canonical URL pass could not read URLs "
+                          "(SQLSTATE {})",
+                          sqlstate(urls));
+        return std::nullopt;
+    }
+    std::vector<UrlRewrite> rewrites;
+    std::map<std::pair<std::int64_t, std::string>, std::int64_t> seen; // (source, canonical) -> url id
+    for (int i = 0; i < PQntuples(urls.get()); ++i) {
+        const std::int64_t source_id = to_i64(urls, i, 0);
+        const std::int64_t url_id = to_i64(urls, i, 1);
+        const std::string url = PQgetvalue(urls.get(), i, 2);
+        const std::string host = PQgetvalue(urls.get(), i, 3);
+        const auto c = revocation_source::canonical_crl_url(url);
+        if (!c) {
+            if (log_refusal)
+                spdlog::error("RevocationSourceStore: refusing to open: CRL URL id {} of revocation "
+                              "source {} cannot be put in the canonical form; remove that URL from "
+                              "the source in the database, then restart",
+                              url_id, source_id);
+            return std::nullopt;
+        }
+        const auto [it, fresh] = seen.emplace(std::make_pair(source_id, c->url), url_id);
+        if (!fresh) {
+            if (log_refusal)
+                spdlog::error("RevocationSourceStore: refusing to open: CRL URL ids {} and {} of "
+                              "revocation source {} are one URL in the canonical form; delete one "
+                              "of the two source_url rows in the database, then restart",
+                              it->second, url_id, source_id);
+            return std::nullopt;
+        }
+        if (c->url != url || c->host != host)
+            rewrites.push_back({url_id, c->url, c->host});
+    }
+    return rewrites;
+}
+
+// Bounds the transaction's waits whatever the pool's session settings are (a DSN `options`
+// setting replaces them).
+bool bound_pass_txn(PGconn* conn) {
+    pg::PgResult timeouts = pg::exec_params(
+        conn, "SELECT set_config('lock_timeout', '10s', true), "
+              "set_config('statement_timeout', '30s', true)",
+        std::vector<std::string>{});
+    if (timeouts.status() == PGRES_TUPLES_OK)
+        return true;
+    spdlog::error("RevocationSourceStore: canonical URL pass could not set its timeouts (SQLSTATE {})",
+                  sqlstate(timeouts));
+    return false;
+}
+
+std::optional<std::int64_t> canonicalise_urls(PGconn* conn) {
+    // First look, taking no row or advisory lock (a read-only transaction, bounded like the
+    // locked one): the steady state ends here.
+    {
+        if (!begin(conn, "BEGIN READ ONLY"))
+            return std::nullopt;
+        pg::PgTxn look(conn);
+        if (!bound_pass_txn(conn))
+            return std::nullopt;
+        const auto first = plan_url_rewrites(conn, false);
+        if (first && first->empty()) {
+            if (!look.commit())
+                return std::nullopt;
+            return 0;
+        }
+    } // anything else: rolled back, and decided again under the locks
+
+    if (!begin(conn, "BEGIN"))
+        return std::nullopt;
+    pg::PgTxn txn(conn);
+    if (!bound_pass_txn(conn))
+        return std::nullopt;
+    pg::PgResult lock = pg::exec_params(
+        conn, "SELECT pg_advisory_xact_lock(hashtext('revocation_source.registration'))",
+        std::vector<std::string>{});
+    if (lock.status() != PGRES_TUPLES_OK) {
+        spdlog::error("RevocationSourceStore: canonical URL pass could not take the registration "
+                      "lock (SQLSTATE {}; 55P03 means another transaction held it past 10s - "
+                      "find and end it, then restart)",
+                      sqlstate(lock));
+        return std::nullopt;
+    }
+    pg::PgResult rows_lock = pg::exec_params(
+        conn, "SELECT id FROM revocation_source_store.source ORDER BY id FOR UPDATE",
+        std::vector<std::string>{});
+    if (rows_lock.status() != PGRES_TUPLES_OK) {
+        spdlog::error("RevocationSourceStore: canonical URL pass could not lock the sources "
+                      "(SQLSTATE {}; 55P03 means another transaction held a source row past 10s - "
+                      "find and end it, then restart)",
+                      sqlstate(rows_lock));
+        return std::nullopt;
+    }
+    // Decide again on what the locked read shows.
+    const auto rewrites = plan_url_rewrites(conn, true);
+    if (!rewrites)
+        return std::nullopt;
+    // No two rows of a source share a canonical form, and a canonical row is its own canonical
+    // form, so no UPDATE below can meet another row's current value: UNIQUE (source_id, url)
+    // holds at every step.
+    for (const auto& r : *rewrites) {
+        pg::PgResult u = pg::exec_params(
+            conn,
+            "UPDATE revocation_source_store.source_url SET url = $2, host = $3 WHERE id = $1::bigint",
+            std::vector<std::string>{std::to_string(r.url_id), r.url, r.host});
+        if (u.status() != PGRES_COMMAND_OK) {
+            spdlog::error("RevocationSourceStore: canonical URL pass could not rewrite URL id {} "
+                          "(SQLSTATE {})",
+                          r.url_id, sqlstate(u));
+            return std::nullopt;
+        }
+    }
+    if (!txn.commit())
+        return std::nullopt;
+    if (!rewrites->empty()) {
+        // The rewrite has no audit row (it runs before any caller exists); the per-row ids are
+        // its evidence, naming each source_url row whose text changed. The URLs are not logged.
+        for (const auto& r : *rewrites)
+            spdlog::info("RevocationSourceStore: rewrote stored CRL URL id {} to the canonical form",
+                         r.url_id);
+        spdlog::info("RevocationSourceStore: rewrote {} stored CRL URL(s) to the canonical form",
+                     rewrites->size());
+    }
+    return static_cast<std::int64_t>(rewrites->size());
+}
+
 } // namespace
+
+const std::vector<pg::PgMigration>& revocation_source_store_migrations() { return migrations(); }
 
 RevocationSourceStore::RevocationSourceStore(pg::PgPool& pool) : pool_(pool) {
     auto lease = pool_.acquire();
@@ -437,7 +627,18 @@ RevocationSourceStore::RevocationSourceStore(pg::PgPool& pool) : pool_(pool) {
         spdlog::error("RevocationSourceStore: schema migration failed");
         return;
     }
+    if (!canonicalise_urls(lease.get())) {
+        spdlog::error("RevocationSourceStore: canonical CRL URL pass failed; the store stays closed");
+        return;
+    }
     open_ = true;
+}
+
+std::optional<std::int64_t> RevocationSourceStore::canonicalise_stored_urls_for_test() {
+    auto lease = pool_.try_acquire_for(timeout_);
+    if (!lease)
+        return std::nullopt;
+    return canonicalise_urls(lease.get());
 }
 
 std::expected<std::vector<RevocationSourceRecord>, RevocationSourceStoreError>
@@ -671,12 +872,15 @@ RevocationSourceStore::replace(std::int64_t id, const NewRevocationSource& src) 
         pg::PgResult d = pg::exec_params(
             conn,
             "DELETE FROM revocation_source_store.source_ca_key WHERE source_id = $1::bigint AND "
-            "cert_sha256 = $2 RETURNING 1",
+            "cert_sha256 = $2 RETURNING cert_sha256",
             std::vector<std::string>{std::to_string(id), k.cert_sha256});
         if (d.status() != PGRES_TUPLES_OK)
             return statement_error("replace drop key", conn, d, true);
         out.dropped_keys += PQntuples(d.get());
+        for (int i = 0; i < PQntuples(d.get()); ++i)
+            out.dropped_key_sha256.emplace_back(PQgetvalue(d.get(), i, 0));
     }
+    std::ranges::sort(out.dropped_key_sha256);
     for (const auto& k : src.keys)
         if (!cur_keys.contains(k.cert_sha256))
             if (auto r = insert_key(conn, id, k); !r)
@@ -762,17 +966,30 @@ std::expected<void, RevocationSourceStoreError> RevocationSourceStore::remove(st
 }
 
 std::expected<HighWaterReset, RevocationSourceStoreError>
-RevocationSourceStore::reset_high_water(std::int64_t id, const std::string& reset_at_rfc3339,
-                                        const std::string& pin_crl_sha256) {
+RevocationSourceStore::reset_high_water(std::int64_t id, const HighWaterResetRequest& req) {
     if (!open_)
         return fail(Kind::kNotOpen, "revocation source store is not open");
     if (write_fault_)
         if (const auto k = write_fault_("reset_high_water"))
             return fail(*k, "injected write fault");
+    const std::string& reset_at_rfc3339 = req.reset_at_rfc3339;
+    const std::string& pin_crl_sha256 = req.pin_crl_sha256;
     if (!reset_at_rfc3339.empty() && !bindable(reset_at_rfc3339))
         return fail(Kind::kInvalidInput, "invalid reset_at");
     if (!pin_crl_sha256.empty() && !is_lower_hex(pin_crl_sha256, 64))
         return fail(Kind::kInvalidInput, "invalid pin");
+    if (req.expected_config_version < 1)
+        return fail(Kind::kInvalidInput, "invalid expected_config_version");
+    // The surviving keys (#6590): 1..kMaxCaKeys distinct cert hashes. An empty list would remove
+    // every key, leaving a source no CRL can ever verify under.
+    if (req.keep_key_sha256.empty() || req.keep_key_sha256.size() > kMaxCaKeys)
+        return fail(Kind::kInvalidInput, "keep_key_sha256 count out of range");
+    {
+        std::set<std::string> seen;
+        for (const auto& k : req.keep_key_sha256)
+            if (!is_lower_hex(k, 64) || !seen.insert(k).second)
+                return fail(Kind::kInvalidInput, "invalid keep_key_sha256");
+    }
     auto lease = pool_.try_acquire_for(timeout_);
     if (!lease) {
         warn_no_connection("reset_high_water", timeout_);
@@ -784,14 +1001,37 @@ RevocationSourceStore::reset_high_water(std::int64_t id, const std::string& rese
     pg::PgTxn txn(conn);
 
     pg::PgResult lock = pg::exec_params(
-        conn, "SELECT ca_subject_name_sha256 FROM revocation_source_store.source WHERE id = $1::bigint "
-              "FOR UPDATE",
+        conn, "SELECT ca_subject_name_sha256, config_version FROM revocation_source_store.source "
+              "WHERE id = $1::bigint FOR UPDATE",
         std::vector<std::string>{std::to_string(id)});
     if (lock.status() != PGRES_TUPLES_OK)
         return statement_error("reset lock", conn, lock, false);
     if (PQntuples(lock.get()) != 1)
         return fail(Kind::kNotFound, "no such revocation source");
     const std::string ca = PQgetvalue(lock.get(), 0, 0);
+    const std::int64_t version = to_i64(lock, 0, 1);
+    // Checked under the row lock: a reset built from a stale read must not remove a key another
+    // administrator has just added with PUT (the version that PUT bumped no longer matches).
+    if (version != req.expected_config_version)
+        return std::unexpected(RevocationSourceStoreError{
+            Kind::kVersionConflict, "config_version has moved on", version});
+
+    // Every surviving key must already be registered: an operator adds the rebuilt CA's
+    // certificates with PUT first, then names them here.
+    pg::PgResult keys = pg::exec_params(
+        conn, "SELECT cert_sha256 FROM revocation_source_store.source_ca_key WHERE source_id = "
+              "$1::bigint",
+        std::vector<std::string>{std::to_string(id)});
+    if (keys.status() != PGRES_TUPLES_OK)
+        return statement_error("reset keys", conn, keys, false);
+    std::set<std::string> registered;
+    for (int i = 0; i < PQntuples(keys.get()); ++i)
+        registered.insert(PQgetvalue(keys.get(), i, 0));
+    for (std::size_t i = 0; i < req.keep_key_sha256.size(); ++i)
+        if (!registered.contains(req.keep_key_sha256[i]))
+            return std::unexpected(RevocationSourceStoreError{
+                Kind::kUnknownKey, "a surviving key is not registered on the source",
+                static_cast<std::int64_t>(i)});
 
     // The floor: the supplied time (never later than Postgres now()) or now().
     std::vector<std::optional<std::string>> tp;
@@ -819,6 +1059,20 @@ RevocationSourceStore::reset_high_water(std::int64_t id, const std::string& rese
     out.reset_at = to_i64(when, 0, 2);
     out.pinned = !pin_crl_sha256.empty();
 
+    // Every key not named as surviving goes, in this transaction (#6590): after a rebuild under
+    // the same DN, a pre-rebuild key left registered would let an older CRL it signed verify.
+    pg::PgResult drop = pg::exec_params(
+        conn,
+        "DELETE FROM revocation_source_store.source_ca_key WHERE source_id = $1::bigint AND "
+        "cert_sha256 <> ALL($2::text[]) RETURNING cert_sha256",
+        std::vector<std::string>{std::to_string(id), hex_array_literal(req.keep_key_sha256)});
+    if (drop.status() != PGRES_TUPLES_OK)
+        return statement_error("reset drop keys", conn, drop, true);
+    out.dropped_keys = PQntuples(drop.get());
+    for (int i = 0; i < PQntuples(drop.get()); ++i)
+        out.dropped_key_sha256.emplace_back(PQgetvalue(drop.get(), i, 0));
+    std::ranges::sort(out.dropped_key_sha256);
+
     // The CA-level row (created if none) takes the floor and the optional pin; every scope row
     // loses its number and thisUpdate (a rebuilt CA restarts both) and takes the same floor. The
     // floor is permanent: a later reset only moves it.
@@ -845,10 +1099,13 @@ RevocationSourceStore::reset_high_water(std::int64_t id, const std::string& rese
     pg::PgResult bump = pg::exec_params(
         conn,
         "UPDATE revocation_source_store.source SET config_version = config_version + 1, "
-        "updated_at = now() WHERE id = $1::bigint",
+        "updated_at = now() WHERE id = $1::bigint RETURNING config_version",
         std::vector<std::string>{std::to_string(id)});
-    if (bump.status() != PGRES_COMMAND_OK)
+    if (bump.status() != PGRES_TUPLES_OK || PQntuples(bump.get()) != 1)
         return statement_error("reset version", conn, bump, true);
+    out.config_version = to_i64(bump, 0, 0);
+    // Every held CRL of the CA (a source is one CA, so its own): none survives the reset, under
+    // the removed keys or the kept ones.
     pg::PgResult crl = pg::exec_params(
         conn, "DELETE FROM revocation_source_store.crl WHERE source_id = $1::bigint RETURNING 1",
         std::vector<std::string>{std::to_string(id)});

@@ -2,18 +2,25 @@
  * test_revocation_source_store.cpp -- Unit tests for RevocationSourceStore (born-on-Postgres,
  * ADR-0070 R1, schema `revocation_source_store`).
  *
- * Covers: the migration (the WHOLE design schema, including the tables only the fetcher writes),
+ * Covers: the migration (every table the fetcher (2b-1b) uses, including those only it writes;
+ * `cert_signature_check` is 2b-2's and is not created),
  * create/get/list round trips, one source per CA, the 64-source ceiling, a full replace (equal
  * body = no version bump; a dropped URL and a dropped key delete their held rows), a changed CA
  * subject, remove (cascade, the high-water mark SURVIVES), the anti-rollback reset, the
  * crl_past_next_update count, concurrent registrations of one CA, and the closed-store /
- * held-pool failure channel (a degrade is never an empty list).
+ * held-pool failure channel (a degrade is never an empty list). Migration v2 (the #6590 rulings,
+ * 2026-11-18): the one encoded scope key and its CHECKs, the generated `crl.is_delta`, the
+ * delete-then-insert replacement under UNIQUE (source_id, scope_key, is_delta), the v1 -> v2
+ * upgrade of held rows, the canonical-URL pass at open (rewrite keeping the URL id and fetch
+ * status; a collapse refuses the open), and the reset's surviving-key list and version check.
  */
 
 #include "pg/pg_exec.hpp"
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
+#include "pg/pg_migration_runner.hpp"
 #include "revocation_source_store.hpp"
+#include "revocation_url_canonical.hpp"
 
 #include "../test_helpers.hpp"
 
@@ -22,6 +29,7 @@
 
 #include <atomic>
 #include <expected>
+#include <chrono>
 #include <optional>
 #include <set>
 #include <stdexcept>
@@ -60,9 +68,36 @@ NewRevocationSource make_source(const std::string& name, char ca_digit,
         k.spki_sha256 = hex64(d == 'a' ? '1' : d == 'b' ? '2' : '3');
         n.keys.push_back(std::move(k));
     }
-    for (const auto& u : urls)
-        n.urls.push_back({u, "crl.example.com", {"public"}});
+    // The store keeps only canonical URLs (the service canonicalises; a fixture does the same).
+    for (const auto& u : urls) {
+        const auto c = yuzu::server::revocation_source::canonical_crl_url(u);
+        n.urls.push_back({c ? c->url : u, c ? c->host : std::string("crl.example.com"), {"public"}});
+    }
     return n;
+}
+
+/// A reset that keeps every key the source holds now, read at its current config_version (an
+/// unknown id gets a well-formed request, so the store's own kNotFound answers).
+HighWaterResetRequest reset_req(RevocationSourceStore& store, std::int64_t id, std::string at = {},
+                                std::string pin = {}) {
+    HighWaterResetRequest r;
+    r.reset_at_rfc3339 = std::move(at);
+    r.pin_crl_sha256 = std::move(pin);
+    if (const auto s = store.get(id)) {
+        r.expected_config_version = s->config_version;
+        for (const auto& k : s->keys)
+            r.keep_key_sha256.push_back(k.cert_sha256);
+    } else {
+        r.expected_config_version = 1;
+        r.keep_key_sha256 = {hex64('a')};
+    }
+    return r;
+}
+
+/// An encoded scope key (#6590): `full` or `idp:<64 hex>`, then `:base` or `:delta`.
+std::string scope(char idp_digit, bool delta = false) {
+    return (idp_digit == 0 ? std::string("full") : "idp:" + hex64(idp_digit)) +
+           (delta ? ":delta" : ":base");
 }
 
 /// The caller's precondition on a changing replace (the store refuses a body without it).
@@ -104,7 +139,7 @@ create_id(RevocationSourceStore& store, const NewRevocationSource& src, const st
 }
 } // namespace
 
-TEST_CASE("RevocationSourceStore: migration creates the whole design schema",
+TEST_CASE("RevocationSourceStore: migration creates the tables the fetcher uses",
           "[revocation_source_store][pg][migration]") {
     YUZU_REQUIRE_PG_MIGRATION_DB(db);
     PgPool pool{{.conninfo = db.dsn(), .size = 2}};
@@ -119,7 +154,7 @@ TEST_CASE("RevocationSourceStore: migration creates the whole design schema",
     std::set<std::string> tables;
     for (int i = 0; i < PQntuples(r.get()); ++i)
         tables.insert(PQgetvalue(r.get(), i, 0));
-    // The tables only the fetcher (2b-1b) writes exist from this PR on: no second migration.
+    // The tables only the fetcher (2b-1b) writes exist already; 2b-2's cert_signature_check does not.
     CHECK(tables == std::set<std::string>{"crl", "crl_entry", "fetch_status",
                                           "rollback_high_water", "source", "source_ca_key",
                                           "source_url"});
@@ -188,7 +223,7 @@ TEST_CASE("RevocationSourceStore: an unknown id is not found, an empty store lis
     CHECK(got.error().kind == RKind::kNotFound);
     CHECK(store.remove(12345).error().kind == RKind::kNotFound);
     CHECK(store.replace(12345, make_source("x", '1')).error().kind == RKind::kNotFound);
-    CHECK(store.reset_high_water(12345, "").error().kind == RKind::kNotFound);
+    CHECK(store.reset_high_water(12345, reset_req(store, 12345)).error().kind == RKind::kNotFound);
 }
 
 TEST_CASE("RevocationSourceStore: one source per CA, the conflict names the existing id",
@@ -265,6 +300,17 @@ TEST_CASE("RevocationSourceStore: the store re-checks what it must to stay consi
     auto dup_url = make_source("x", '1', {'a'}, {"http://a/", "http://a/"});
     CHECK(create_id(store, dup_url, "alice").error().kind == RKind::kInvalidInput);
     CHECK(create_id(store, make_source("x", '1'), "").error().kind == RKind::kInvalidInput);
+    // Only the canonical form is ever stored (#6590): another spelling, or a host that is not
+    // the canonical URL's, is refused even though the service would never send one.
+    auto not_canonical = make_source("x", '1');
+    not_canonical.urls[0].url = "HTTP://crl.example.com:80/a.crl";
+    CHECK(create_id(store, not_canonical, "alice").error().kind == RKind::kInvalidInput);
+    auto no_path = make_source("x", '1');
+    no_path.urls[0].url = "http://crl.example.com";
+    CHECK(create_id(store, no_path, "alice").error().kind == RKind::kInvalidInput);
+    auto wrong_host = make_source("x", '1');
+    wrong_host.urls[0].host = "other.example.com";
+    CHECK(create_id(store, wrong_host, "alice").error().kind == RKind::kInvalidInput);
     // Nothing was written by any refusal.
     CHECK(store.list()->empty());
 }
@@ -321,11 +367,11 @@ TEST_CASE("RevocationSourceStore: a replace that drops a URL or a key deletes it
                         ", now())").c_str());
     RS_EXEC(rs_db_fx_, ("INSERT INTO revocation_source_store.crl (source_id, scope_key, url_id, "
                         "this_update, verified_key_sha256, der_sha256, entry_count) VALUES (" +
-                        sid + ", '*', " + std::to_string(url_a) + ", now(), '" + hex64('1') + "', '" +
+                        sid + ", '" + scope(0) + "', " + std::to_string(url_a) + ", now(), '" + hex64('1') + "', '" +
                         hex64('c') + "', 1)").c_str());
     RS_EXEC(rs_db_fx_, ("INSERT INTO revocation_source_store.crl (source_id, scope_key, url_id, "
                         "this_update, verified_key_sha256, der_sha256, entry_count) VALUES (" +
-                        sid + ", 'idp:1', " + std::to_string(url_b) + ", now(), '" + hex64('2') +
+                        sid + ", '" + scope('1') + "', " + std::to_string(url_b) + ", now(), '" + hex64('2') +
                         "', '" + hex64('d') + "', 1)").c_str());
     RS_EXEC(rs_db_fx_, "INSERT INTO revocation_source_store.crl_entry (crl_id, serial, revocation_date) "
                        "SELECT id, '01', now() FROM revocation_source_store.crl");
@@ -339,6 +385,7 @@ TEST_CASE("RevocationSourceStore: a replace that drops a URL or a key deletes it
     CHECK(r->changed);
     CHECK(r->dropped_urls == 1);
     CHECK(r->dropped_keys == 1);
+    CHECK(r->dropped_key_sha256 == std::vector<std::string>{hex64('b')});
     CHECK(r->source.held_crl_count == 1);
     REQUIRE(r->source.urls.size() == 1);
     CHECK(r->source.urls[0].id == url_a);
@@ -356,6 +403,7 @@ TEST_CASE("RevocationSourceStore: a replace that drops a URL or a key deletes it
         *id, at_version(make_source("Corp CA", '1', {'c'}, {"http://crl.example.com/a.crl"}), 2));
     REQUIRE(r2.has_value());
     CHECK(r2->dropped_keys == 1);
+    CHECK(r2->dropped_key_sha256 == std::vector<std::string>{hex64('a')});
     CHECK(r2->crls_deleted == 1);
     CHECK(r2->source.held_crl_count == 0);
 }
@@ -393,7 +441,7 @@ TEST_CASE("RevocationSourceStore: remove cascades, the high-water mark survives"
     const auto id = create_id(store, make_source("Corp CA", '1'), "alice");
     REQUIRE(id.has_value());
     // A mark exists for the CA (as the fetcher or a reset would leave it).
-    REQUIRE(store.reset_high_water(*id, "").has_value());
+    REQUIRE(store.reset_high_water(*id, reset_req(store, *id)).has_value());
     REQUIRE(store.remove(*id).has_value());
     CHECK(store.get(*id).error().kind == RKind::kNotFound);
     CHECK(store.remove(*id).error().kind == RKind::kNotFound); // a repeat is a 404, not an error
@@ -421,17 +469,19 @@ TEST_CASE("RevocationSourceStore: reset_high_water sets a floor and discards hel
     const auto src = store.get(*id);
     RS_EXEC(rs_db_fx_, ("INSERT INTO revocation_source_store.crl (source_id, scope_key, url_id, "
                         "this_update, verified_key_sha256, der_sha256, entry_count) VALUES (" +
-                        std::to_string(*id) + ", '*', " + std::to_string(src->urls[0].id) +
+                        std::to_string(*id) + ", '" + scope(0) + "', " + std::to_string(src->urls[0].id) +
                         ", now(), '" + hex64('1') + "', '" + hex64('c') + "', 0)").c_str());
     RS_EXEC(rs_db_fx_, ("INSERT INTO revocation_source_store.rollback_high_water (ca_subject_name_sha256, "
                         "scope_key, crl_number, this_update) VALUES ('" + hex64('1') +
-                        "', 'idp:7', 41, now())").c_str());
+                        "', '" + scope('7') + "', 41, now())").c_str());
     CHECK(store.get(*id)->held_crl_count == 1);
 
     // Reset to a supplied past time: echoed to the second, every scope row gets it.
-    const auto r = store.reset_high_water(*id, "2020-01-02T03:04:05Z");
+    const auto r = store.reset_high_water(*id, reset_req(store, *id, "2020-01-02T03:04:05Z"));
     REQUIRE(r.has_value());
     CHECK(r->reset_at == 1577934245);
+    CHECK(r->config_version == 2);
+    CHECK(r->dropped_keys == 0); // every key was named as surviving
     CHECK(r->crls_deleted == 1);
     CHECK(store.get(*id)->held_crl_count == 0);
     PgConn conn{PQconnectdb(rs_db_fx_.dsn().c_str())};
@@ -443,7 +493,7 @@ TEST_CASE("RevocationSourceStore: reset_high_water sets a floor and discards hel
     CHECK(std::string(PQgetvalue(marks.get(), 0, 0)) == "*");
     CHECK(std::string(PQgetvalue(marks.get(), 0, 1)) == "1577934245");
     CHECK(PQgetisnull(marks.get(), 0, 2)); // a row that only records the reset has no number
-    CHECK(std::string(PQgetvalue(marks.get(), 1, 0)) == "idp:7");
+    CHECK(std::string(PQgetvalue(marks.get(), 1, 0)) == scope('7'));
     CHECK(std::string(PQgetvalue(marks.get(), 1, 1)) == "1577934245");
     CHECK(PQgetisnull(marks.get(), 1, 2)); // a rebuilt CA restarts its numbering: the number is cleared
     // A reset is a configuration change.
@@ -451,7 +501,7 @@ TEST_CASE("RevocationSourceStore: reset_high_water sets a floor and discards hel
     CHECK(store.get(*id)->reset_at == 1577934245); // visible on the source read
 
     // NOT idempotent: a second reset (default now) sets a NEW, later floor.
-    const auto r2 = store.reset_high_water(*id, "");
+    const auto r2 = store.reset_high_water(*id, reset_req(store, *id));
     REQUIRE(r2.has_value());
     CHECK(r2->reset_at > r->reset_at);
 }
@@ -461,10 +511,10 @@ TEST_CASE("RevocationSourceStore: reset_at later than the server clock, or unpar
     RS_STORE(store);
     const auto id = create_id(store, make_source("Corp CA", '1'), "alice");
     REQUIRE(id.has_value());
-    const auto future = store.reset_high_water(*id, "2999-01-01T00:00:00Z");
+    const auto future = store.reset_high_water(*id, reset_req(store, *id, "2999-01-01T00:00:00Z"));
     REQUIRE_FALSE(future.has_value());
     CHECK(future.error().kind == RKind::kBadResetTime);
-    const auto bad = store.reset_high_water(*id, "not a time");
+    const auto bad = store.reset_high_water(*id, reset_req(store, *id, "not a time"));
     REQUIRE_FALSE(bad.has_value());
     CHECK(bad.error().kind == RKind::kInvalidInput);
     // Neither wrote a mark.
@@ -482,26 +532,27 @@ TEST_CASE("RevocationSourceStore: crl_past_next_update counts CRL scopes past ne
     CHECK(store.crl_past_next_update_count().value() == 0);
     const auto src = store.get(*id);
     // One held CRL row per call: scope, nextUpdate SQL expression, base or delta.
-    const auto hold = [&](const char* scope, const char* next_update, bool delta) {
+    // is_delta is GENERATED from the scope key's suffix (v2), so the fixture never writes it.
+    const auto hold = [&](char idp, const char* next_update, bool delta) {
+        const std::string key = scope(idp, delta);
         RS_EXEC(rs_db_fx_, (std::string("INSERT INTO revocation_source_store.crl (source_id, scope_key, "
-                                        "url_id, this_update, next_update, is_delta, "
+                                        "url_id, this_update, next_update, "
                                         "verified_key_sha256, der_sha256, entry_count) VALUES (") +
-                            std::to_string(*id) + ", '" + scope + "', " +
+                            std::to_string(*id) + ", '" + key + "', " +
                             std::to_string(src->urls[0].id) + ", now() - interval '2 days', " +
-                            next_update + ", " + (delta ? "TRUE" : "FALSE") + ", '" + hex64('1') +
-                            "', '" + hex64('c') + scope + (delta ? "d" : "") + "', 0)").c_str());
+                            next_update + ", '" + hex64('1') + "', '" + key + "', 0)").c_str());
     };
     // Two stale scopes of ONE source count twice: the count is over scopes, not sources.
-    hold("*", "now() - interval '1 day'", false);
-    hold("idp:1", "now() - interval '1 day'", false);
+    hold(0, "now() - interval '1 day'", false);
+    hold('1', "now() - interval '1 day'", false);
     CHECK(store.crl_past_next_update_count().value() == 2);
     // A fresh scope and a scope with no nextUpdate add nothing.
-    hold("idp:2", "now() + interval '1 day'", false);
-    hold("idp:3", "NULL", false);
+    hold('2', "now() + interval '1 day'", false);
+    hold('3', "NULL", false);
     CHECK(store.crl_past_next_update_count().value() == 2);
     // A stale DELTA is its own scope (design: one per (CA, IDP, base or delta)), so it counts, even
     // when that scope's base CRL is fresh.
-    hold("idp:2", "now() - interval '1 day'", true);
+    hold('2', "now() - interval '1 day'", true);
     CHECK(store.crl_past_next_update_count().value() == 3);
 }
 
@@ -584,21 +635,22 @@ TEST_CASE("RevocationSourceStore: a reset records the pin and keeps the floor pe
     const auto id = create_id(store, make_source("Corp CA", '1'), "alice");
     REQUIRE(id.has_value());
     const std::string pin(64, 'b');
-    const auto r = store.reset_high_water(*id, "2020-01-02T03:04:05Z", pin);
+    const auto r = store.reset_high_water(*id, reset_req(store, *id, "2020-01-02T03:04:05Z", pin));
     REQUIRE(r.has_value());
     CHECK(r->pinned);
     auto src = store.get(*id);
     REQUIRE(src.has_value());
     CHECK(src->pinned_crl_sha256 == pin);
     // A later reset WITHOUT a pin clears the old pin (the new window has none) and moves the floor.
-    const auto r2 = store.reset_high_water(*id, "2021-01-02T03:04:05Z");
+    const auto r2 = store.reset_high_water(*id, reset_req(store, *id, "2021-01-02T03:04:05Z"));
     REQUIRE(r2.has_value());
     CHECK_FALSE(r2->pinned);
     src = store.get(*id);
     CHECK_FALSE(src->pinned_crl_sha256.has_value());
     CHECK(src->reset_at == 1609556645);
     CHECK(src->config_version == 3);
-    CHECK(store.reset_high_water(*id, "", "not-hex").error().kind == RKind::kInvalidInput);
+    CHECK(store.reset_high_water(*id, reset_req(store, *id, "", "not-hex")).error().kind ==
+          RKind::kInvalidInput);
 }
 
 TEST_CASE("RevocationSourceStore: crl_entry.serial is pinned to the canonical byte form",
@@ -609,7 +661,7 @@ TEST_CASE("RevocationSourceStore: crl_entry.serial is pinned to the canonical by
     const auto src = store.get(*id);
     RS_EXEC(rs_db_fx_, ("INSERT INTO revocation_source_store.crl (source_id, scope_key, url_id, "
                         "this_update, verified_key_sha256, der_sha256, entry_count) VALUES (" +
-                        std::to_string(*id) + ", '*', " + std::to_string(src->urls[0].id) +
+                        std::to_string(*id) + ", '" + scope(0) + "', " + std::to_string(src->urls[0].id) +
                         ", now(), '" + hex64('1') + "', '" + hex64('c') + "', 0)").c_str());
     const auto try_serial = [&](const std::string& serial) {
         PgConn c{PQconnectdb(rs_db_fx_.dsn().c_str())};
@@ -627,4 +679,424 @@ TEST_CASE("RevocationSourceStore: crl_entry.serial is pinned to the canonical by
     CHECK_FALSE(try_serial("000A")); // a leading 00 byte: a padded spelling
     CHECK_FALSE(try_serial(""));
     CHECK_FALSE(try_serial("0G"));
+}
+
+namespace {
+// Run one statement on its own connection; the SQLSTATE it ended with ("00000" on success), so a
+// refusal is tied to its cause (23514 is a CHECK, 23505 a UNIQUE, 428C9 a generated column).
+std::string rs_state(const std::string& dsn, const std::string& sql) {
+    PgConn c{PQconnectdb(dsn.c_str())};
+    if (PQstatus(c.get()) != CONNECTION_OK)
+        return "no-connection";
+    PgResult r{PQexec(c.get(), sql.c_str())};
+    if (r.status() == PGRES_COMMAND_OK || r.status() == PGRES_TUPLES_OK)
+        return "00000";
+    const char* st = PQresultErrorField(r.get(), PG_DIAG_SQLSTATE);
+    return st ? st : "unknown";
+}
+bool rs_try(const std::string& dsn, const std::string& sql) { return rs_state(dsn, sql) == "00000"; }
+constexpr const char* kCheckViolation = "23514";
+} // namespace
+
+TEST_CASE("RevocationSourceStore v2: one encoded scope key, pinned by a CHECK on both tables",
+          "[revocation_source_store][pg]") {
+    RS_STORE(store);
+    const auto id = create_id(store, make_source("Corp CA", '1'), "alice");
+    REQUIRE(id.has_value());
+    const auto src = store.get(*id);
+    REQUIRE(src.has_value());
+    const std::string sid = std::to_string(*id);
+    const std::string uid = std::to_string(src->urls[0].id);
+    const auto crl_sql = [&](const std::string& key, char der) {
+        return "INSERT INTO revocation_source_store.crl (source_id, scope_key, url_id, this_update, "
+               "verified_key_sha256, der_sha256, entry_count) VALUES (" + sid + ", '" + key +
+               "', " + uid + ", now(), '" + hex64('1') + "', '" + hex64(der) + "', 0)";
+    };
+    const auto crl = [&](const std::string& key, char der) {
+        return rs_try(rs_db_fx_.dsn(), crl_sql(key, der));
+    };
+    // Refused by the scope-key CHECK and nothing else (each uses a fresh scope and digest).
+    const auto crl_check = [&](const std::string& key, char der) {
+        INFO(key);
+        return rs_state(rs_db_fx_.dsn(), crl_sql(key, der)) == kCheckViolation;
+    };
+    CHECK(crl(scope(0), 'a'));
+    CHECK(crl(scope('1', true), 'b'));
+    CHECK(crl_check("*", 'c'));                           // the CA-level key is rollback_high_water's alone
+    CHECK(crl_check("full", 'c'));                        // no base-or-delta suffix
+    CHECK(crl_check("FULL:base", 'c'));                   // one spelling only
+    CHECK(crl_check("idp:1:base", 'c'));                  // the IDP part is a 64-hex digest
+    CHECK(crl_check("idp:" + hex64('A') + ":base", 'c')); // lowercase hex only
+    CHECK(crl_check("full:base:x", 'c'));
+    CHECK(crl_check("full:both", 'c'));
+
+    // is_delta is generated from the suffix: it agrees with the key, and cannot be written.
+    PgConn conn{PQconnectdb(rs_db_fx_.dsn().c_str())};
+    REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+    PgResult rows{PQexec(conn.get(), "SELECT scope_key, is_delta FROM revocation_source_store.crl "
+                                     "ORDER BY scope_key")};
+    REQUIRE(rows.status() == PGRES_TUPLES_OK);
+    REQUIRE(PQntuples(rows.get()) == 2);
+    CHECK(std::string(PQgetvalue(rows.get(), 0, 0)) == scope(0));
+    CHECK(std::string(PQgetvalue(rows.get(), 0, 1)) == "f");
+    CHECK(std::string(PQgetvalue(rows.get(), 1, 0)) == scope('1', true));
+    CHECK(std::string(PQgetvalue(rows.get(), 1, 1)) == "t");
+    CHECK(rs_state(rs_db_fx_.dsn(),
+                       "INSERT INTO revocation_source_store.crl (source_id, scope_key, url_id, "
+                       "this_update, is_delta, verified_key_sha256, der_sha256, entry_count) VALUES (" +
+                           sid + ", '" + scope('2') + "', " + uid + ", now(), TRUE, '" + hex64('1') +
+                           "', '" + hex64('e') + "', 0)") == "428C9");
+
+    // One held CRL per scope: a second insert is refused, and the fetcher's replacement (delete
+    // then insert inside one transaction) leaves exactly the new CRL.
+    CHECK(rs_state(rs_db_fx_.dsn(), crl_sql(scope(0), 'f')) == "23505");
+    CHECK(rs_try(rs_db_fx_.dsn(),
+                 "BEGIN; DELETE FROM revocation_source_store.crl WHERE source_id = " + sid +
+                     " AND scope_key = '" + scope(0) + "'; " + crl_sql(scope(0), 'f') + "; COMMIT"));
+    PgResult held{PQexec(conn.get(), ("SELECT der_sha256 FROM revocation_source_store.crl WHERE "
+                                      "scope_key = '" + scope(0) + "'").c_str())};
+    REQUIRE(held.status() == PGRES_TUPLES_OK);
+    REQUIRE(PQntuples(held.get()) == 1);
+    CHECK(std::string(PQgetvalue(held.get(), 0, 0)) == hex64('f'));
+
+    // rollback_high_water: the same encoding, plus '*' for the CA-level row.
+    const auto mark_state = [&](const std::string& key) {
+        INFO(key);
+        return rs_state(rs_db_fx_.dsn(),
+                        "INSERT INTO revocation_source_store.rollback_high_water "
+                        "(ca_subject_name_sha256, scope_key) VALUES ('" + hex64('9') + "', '" + key +
+                            "')");
+    };
+    const auto mark = [&](const std::string& key) { return mark_state(key) == "00000"; };
+    CHECK(mark("*"));
+    CHECK(mark(scope(0)));
+    CHECK(mark(scope('2', true)));
+    CHECK(mark_state("full") == kCheckViolation);
+    CHECK(mark_state("idp:7") == kCheckViolation);
+    CHECK(mark_state("**") == kCheckViolation);
+}
+
+TEST_CASE("RevocationSourceStore v2: a v1 database upgrades its held rows in place",
+          "[revocation_source_store][pg][migration]") {
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
+    const auto& all = revocation_source_store_migrations();
+    REQUIRE(all.size() == 2);
+    std::string sid, uid;
+    {
+        PgConn c{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(c.get()) == CONNECTION_OK);
+        REQUIRE(pg::PgMigrationRunner::run(c.get(), "revocation_source_store", {all.front()}));
+        const auto one = [&](const std::string& sql) {
+            PgResult r{PQexec(c.get(), sql.c_str())};
+            INFO(PQresultErrorMessage(r.get()));
+            REQUIRE((r.status() == PGRES_COMMAND_OK || r.status() == PGRES_TUPLES_OK));
+            return PQntuples(r.get()) == 1 ? std::string(PQgetvalue(r.get(), 0, 0)) : std::string();
+        };
+        sid = one("INSERT INTO revocation_source_store.source (name, ca_subject_name_sha256, "
+                  "created_by) VALUES ('Corp CA', '" + hex64('1') + "', 'alice') RETURNING id");
+        one("INSERT INTO revocation_source_store.source_ca_key (source_id, cert_sha256, cert_der, "
+            "spki_sha256) VALUES (" + sid + ", '" + hex64('a') + "', '\\x300302010101'::bytea, '" +
+            hex64('1') + "')");
+        // A v1 URL in a spelling v2 does not keep, with fetch state that must survive the rewrite.
+        uid = one("INSERT INTO revocation_source_store.source_url (source_id, url, host, "
+                  "confirmed_address_classes) VALUES (" + sid +
+                  ", 'HTTP://CRL.Example.COM:0080', 'crl.example.com', 'public') RETURNING id");
+        one("INSERT INTO revocation_source_store.fetch_status (url_id, last_attempt_at) VALUES (" +
+            uid + ", now())");
+        // v1 held CRLs: the scope without a suffix, base or delta in is_delta.
+        one("INSERT INTO revocation_source_store.crl (source_id, scope_key, url_id, this_update, "
+            "is_delta, verified_key_sha256, der_sha256, entry_count) VALUES (" + sid + ", 'full', " +
+            uid + ", now(), FALSE, '" + hex64('1') + "', '" + hex64('c') + "', 0), (" + sid +
+            ", 'idp:" + hex64('9') + "', " + uid + ", now(), TRUE, '" + hex64('1') + "', '" +
+            hex64('d') + "', 0)");
+        one("INSERT INTO revocation_source_store.rollback_high_water (ca_subject_name_sha256, "
+            "scope_key, reset_at) VALUES ('" + hex64('1') + "', '*', now())");
+    }
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    REQUIRE(pool.valid());
+    RevocationSourceStore store{pool};
+    REQUIRE(store.is_open());
+
+    PgConn conn{PQconnectdb(db.dsn().c_str())};
+    PgResult rows{PQexec(conn.get(), "SELECT scope_key, is_delta FROM revocation_source_store.crl "
+                                     "ORDER BY scope_key")};
+    REQUIRE(rows.status() == PGRES_TUPLES_OK);
+    REQUIRE(PQntuples(rows.get()) == 2);
+    CHECK(std::string(PQgetvalue(rows.get(), 0, 0)) == "full:base");
+    CHECK(std::string(PQgetvalue(rows.get(), 0, 1)) == "f");
+    CHECK(std::string(PQgetvalue(rows.get(), 1, 0)) == "idp:" + hex64('9') + ":delta");
+    CHECK(std::string(PQgetvalue(rows.get(), 1, 1)) == "t");
+
+    // The URL is rewritten in place: the same id, so its fetch status and held CRLs are kept.
+    const auto got = store.get(std::stoll(sid));
+    REQUIRE(got.has_value());
+    REQUIRE(got->urls.size() == 1);
+    CHECK(got->urls[0].id == std::stoll(uid));
+    CHECK(got->urls[0].url == "http://crl.example.com/");
+    CHECK(got->urls[0].host == "crl.example.com");
+    CHECK(got->urls[0].fetch.present);
+    CHECK(got->held_crl_count == 2);
+    CHECK(got->reset_at.has_value()); // the CA-level mark is untouched
+}
+
+TEST_CASE("RevocationSourceStore v2: a v1 scope key that cannot take the v2 form fails the open",
+          "[revocation_source_store][pg][migration]") {
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
+    const auto& all = revocation_source_store_migrations();
+    {
+        PgConn c{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(c.get()) == CONNECTION_OK);
+        REQUIRE(pg::PgMigrationRunner::run(c.get(), "revocation_source_store", {all.front()}));
+        PgResult r{PQexec(c.get(), ("INSERT INTO revocation_source_store.rollback_high_water "
+                                    "(ca_subject_name_sha256, scope_key, crl_number, this_update) "
+                                    "VALUES ('" + hex64('1') + "', 'idp:7', 41, now())").c_str())};
+        REQUIRE(r.status() == PGRES_COMMAND_OK);
+    }
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    REQUIRE(pool.valid());
+    RevocationSourceStore store{pool};
+    // An anti-rollback mark is never silently dropped: the CHECK fails the migration, the store
+    // stays closed (boot is fail-closed), and the mark is still there to be fixed by hand.
+    CHECK_FALSE(store.is_open());
+    PgConn conn{PQconnectdb(db.dsn().c_str())};
+    PgResult left{PQexec(conn.get(), "SELECT crl_number FROM revocation_source_store.rollback_high_water "
+                                     "WHERE scope_key = 'idp:7'")};
+    REQUIRE(left.status() == PGRES_TUPLES_OK);
+    REQUIRE(PQntuples(left.get()) == 1);
+    CHECK(std::string(PQgetvalue(left.get(), 0, 0)) == "41");
+}
+
+TEST_CASE("RevocationSourceStore v2: a v1 held CRL whose scope cannot take the v2 form fails the open",
+          "[revocation_source_store][pg][migration]") {
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
+    const auto& all = revocation_source_store_migrations();
+    {
+        PgConn c{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(c.get()) == CONNECTION_OK);
+        REQUIRE(pg::PgMigrationRunner::run(c.get(), "revocation_source_store", {all.front()}));
+        const auto one = [&](const std::string& sql) {
+            PgResult r{PQexec(c.get(), sql.c_str())};
+            INFO(PQresultErrorMessage(r.get()));
+            REQUIRE((r.status() == PGRES_COMMAND_OK || r.status() == PGRES_TUPLES_OK));
+            return PQntuples(r.get()) == 1 ? std::string(PQgetvalue(r.get(), 0, 0)) : std::string();
+        };
+        const auto sid = one("INSERT INTO revocation_source_store.source (name, "
+                             "ca_subject_name_sha256, created_by) VALUES ('Corp CA', '" +
+                             hex64('1') + "', 'alice') RETURNING id");
+        const auto uid = one("INSERT INTO revocation_source_store.source_url (source_id, url, host, "
+                             "confirmed_address_classes) VALUES (" + sid +
+                             ", 'http://crl.example.com/', 'crl.example.com', 'public') RETURNING id");
+        one("INSERT INTO revocation_source_store.crl (source_id, scope_key, url_id, this_update, "
+            "is_delta, verified_key_sha256, der_sha256, entry_count) VALUES (" + sid +
+            ", 'idp:7', " + uid + ", now(), TRUE, '" + hex64('1') + "', '" + hex64('c') + "', 0)");
+    }
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    REQUIRE(pool.valid());
+    RevocationSourceStore store{pool};
+    CHECK_FALSE(store.is_open());
+    // The migration rolled back whole: the v1 row is untouched, its column still writable.
+    PgConn conn{PQconnectdb(db.dsn().c_str())};
+    PgResult left{PQexec(conn.get(), "SELECT scope_key, is_delta FROM revocation_source_store.crl")};
+    REQUIRE(left.status() == PGRES_TUPLES_OK);
+    REQUIRE(PQntuples(left.get()) == 1);
+    CHECK(std::string(PQgetvalue(left.get(), 0, 0)) == "idp:7");
+    CHECK(std::string(PQgetvalue(left.get(), 0, 1)) == "t");
+}
+
+TEST_CASE("RevocationSourceStore: a stored URL that cannot be canonicalised keeps the store closed",
+          "[revocation_source_store][pg]") {
+    RS_STORE(store);
+    const auto id = create_id(store, make_source("Corp CA", '1'), "alice");
+    REQUIRE(id.has_value());
+    const auto uid = store.get(*id)->urls[0].id;
+    RS_EXEC(rs_db_fx_, ("UPDATE revocation_source_store.source_url SET url = 'ftp://crl.example.com/' "
+                        "WHERE id = " + std::to_string(uid)).c_str());
+    CHECK_FALSE(store.canonicalise_stored_urls_for_test().has_value());
+    RevocationSourceStore again{rs_pool_fx_};
+    CHECK_FALSE(again.is_open());
+    // Nothing was rewritten.
+    PgConn conn{PQconnectdb(rs_db_fx_.dsn().c_str())};
+    PgResult left{PQexec(conn.get(), ("SELECT url FROM revocation_source_store.source_url WHERE id = " +
+                                      std::to_string(uid)).c_str())};
+    REQUIRE(left.status() == PGRES_TUPLES_OK);
+    CHECK(std::string(PQgetvalue(left.get(), 0, 0)) == "ftp://crl.example.com/");
+}
+
+TEST_CASE("RevocationSourceStore: a steady-state open takes no lock, so a held source row does not "
+          "block it",
+          "[revocation_source_store][pg]") {
+    RS_STORE(store);
+    const auto id = create_id(store, make_source("Corp CA", '1'), "alice");
+    REQUIRE(id.has_value());
+    // Another session holds the source row (an open psql transaction, a reset in flight).
+    PgConn holder{PQconnectdb(rs_db_fx_.dsn().c_str())};
+    REQUIRE(PQstatus(holder.get()) == CONNECTION_OK);
+    PgResult b{PQexec(holder.get(), "BEGIN")};
+    REQUIRE(b.status() == PGRES_COMMAND_OK);
+    PgResult held{PQexec(holder.get(), ("SELECT id FROM revocation_source_store.source WHERE id = " +
+                                        std::to_string(*id) + " FOR UPDATE").c_str())};
+    REQUIRE(held.status() == PGRES_TUPLES_OK);
+    // Every stored URL is already canonical: the open needs nothing, waits for nothing.
+    RevocationSourceStore again{rs_pool_fx_};
+    CHECK(again.is_open());
+    CHECK(again.canonicalise_stored_urls_for_test() == std::optional<std::int64_t>(0));
+    PgResult end{PQexec(holder.get(), "ROLLBACK")};
+    CHECK(end.status() == PGRES_COMMAND_OK);
+}
+
+TEST_CASE("RevocationSourceStore: a pass with work waits a bounded time for a held source row",
+          "[revocation_source_store][pg]") {
+    RS_STORE(store);
+    const auto id = create_id(store, make_source("Corp CA", '1'), "alice");
+    REQUIRE(id.has_value());
+    const auto uid = store.get(*id)->urls[0].id;
+    RS_EXEC(rs_db_fx_, ("UPDATE revocation_source_store.source_url SET url = "
+                        "'HTTP://CRL.EXAMPLE.COM/a.crl' WHERE id = " + std::to_string(uid)).c_str());
+    PgConn holder{PQconnectdb(rs_db_fx_.dsn().c_str())};
+    REQUIRE(PQstatus(holder.get()) == CONNECTION_OK);
+    PgResult b{PQexec(holder.get(), "BEGIN")};
+    REQUIRE(b.status() == PGRES_COMMAND_OK);
+    PgResult held{PQexec(holder.get(), ("SELECT id FROM revocation_source_store.source WHERE id = " +
+                                        std::to_string(*id) + " FOR UPDATE").c_str())};
+    REQUIRE(held.status() == PGRES_TUPLES_OK);
+    // A store on a pool with NO session timeouts (as a DSN `options` setting leaves it), so only
+    // the pass's own per-transaction lock_timeout can bound the wait: it gives up, changing
+    // nothing, rather than hanging the boot. (Constructed with the row free of work-blocking
+    // locks would not test this, so the open itself is expected to refuse here too.)
+    PgPool untimed{{.conninfo = rs_db_fx_.dsn(), .size = 2, .statement_timeout_ms = 0, .lock_timeout_ms = 0}};
+    REQUIRE(untimed.valid());
+    const auto t0 = std::chrono::steady_clock::now();
+    RevocationSourceStore bounded{untimed};
+    CHECK_FALSE(bounded.is_open());
+    CHECK_FALSE(bounded.canonicalise_stored_urls_for_test().has_value());
+    CHECK(std::chrono::steady_clock::now() - t0 < std::chrono::seconds(40));
+    PgResult end{PQexec(holder.get(), "ROLLBACK")};
+    REQUIRE(end.status() == PGRES_COMMAND_OK);
+    CHECK(store.get(*id)->urls[0].url == "HTTP://CRL.EXAMPLE.COM/a.crl");
+    // With the row free, the same pass completes.
+    CHECK(bounded.canonicalise_stored_urls_for_test() == std::optional<std::int64_t>(1));
+    CHECK(store.get(*id)->urls[0].url == "http://crl.example.com/a.crl");
+}
+
+TEST_CASE("RevocationSourceStore: a replace refuses a URL that is not canonical",
+          "[revocation_source_store][pg]") {
+    RS_STORE(store);
+    const auto id = create_id(store, make_source("Corp CA", '1'), "alice");
+    REQUIRE(id.has_value());
+    auto body = at_version(make_source("Corp CA", '1'), 1);
+    body.urls[0].url = "HTTP://crl.example.com:80/a.crl";
+    CHECK(store.replace(*id, body).error().kind == RKind::kInvalidInput);
+    CHECK(store.get(*id)->config_version == 1);
+}
+
+TEST_CASE("RevocationSourceStore: the open-time pass rewrites a stored URL and refuses a collapse",
+          "[revocation_source_store][pg]") {
+    RS_STORE(store);
+    const auto id = create_id(store, make_source("Corp CA", '1', {'a'}, {"http://crl.example.com/a.crl"}),
+                              "alice");
+    REQUIRE(id.has_value());
+    const auto uid = store.get(*id)->urls[0].id;
+    // A spelling the canonical form does not keep, as a v1 row could hold, with fetch state.
+    RS_EXEC(rs_db_fx_, ("UPDATE revocation_source_store.source_url SET url = "
+                        "'HTTP://CRL.EXAMPLE.COM:80/a.crl' WHERE id = " + std::to_string(uid)).c_str());
+    RS_EXEC(rs_db_fx_, ("INSERT INTO revocation_source_store.fetch_status (url_id, last_attempt_at) "
+                        "VALUES (" + std::to_string(uid) + ", now())").c_str());
+    CHECK(store.canonicalise_stored_urls_for_test() == std::optional<std::int64_t>(1));
+    auto got = store.get(*id);
+    REQUIRE(got.has_value());
+    CHECK(got->urls[0].id == uid);
+    CHECK(got->urls[0].url == "http://crl.example.com/a.crl");
+    CHECK(got->urls[0].fetch.present);
+    CHECK(store.canonicalise_stored_urls_for_test() == std::optional<std::int64_t>(0)); // idempotent
+
+    // A second URL of the SAME source that is one URL in the canonical form: the pass refuses,
+    // rewrites nothing, and a fresh open stays closed.
+    RS_EXEC(rs_db_fx_, ("INSERT INTO revocation_source_store.source_url (source_id, url, host, "
+                        "confirmed_address_classes) VALUES (" + std::to_string(*id) +
+                        ", 'http://crl.example.com:00080/a.crl', 'crl.example.com', 'public')").c_str());
+    CHECK_FALSE(store.canonicalise_stored_urls_for_test().has_value());
+    RevocationSourceStore again{rs_pool_fx_};
+    CHECK_FALSE(again.is_open());
+    PgConn conn{PQconnectdb(rs_db_fx_.dsn().c_str())};
+    PgResult left{PQexec(conn.get(), "SELECT count(*) FROM revocation_source_store.source_url WHERE "
+                                     "url = 'http://crl.example.com:00080/a.crl'")};
+    REQUIRE(left.status() == PGRES_TUPLES_OK);
+    CHECK(std::string(PQgetvalue(left.get(), 0, 0)) == "1");
+
+    // The same canonical URL under two DIFFERENT sources is no collapse.
+    RS_EXEC(rs_db_fx_, "DELETE FROM revocation_source_store.source_url WHERE url = "
+                       "'http://crl.example.com:00080/a.crl'");
+    const auto other = create_id(store, make_source("Other CA", '2', {'a'}, {"http://crl.example.com/a.crl"}),
+                                 "alice");
+    REQUIRE(other.has_value());
+    CHECK(store.canonicalise_stored_urls_for_test() == std::optional<std::int64_t>(0));
+}
+
+TEST_CASE("RevocationSourceStore: a reset keeps only the named keys, at the version it was read from",
+          "[revocation_source_store][pg]") {
+    RS_STORE(store);
+    const auto id = create_id(store, make_source("Corp CA", '1', {'a', 'b', 'c'}), "alice");
+    REQUIRE(id.has_value());
+    const auto src = store.get(*id);
+    RS_EXEC(rs_db_fx_, ("INSERT INTO revocation_source_store.crl (source_id, scope_key, url_id, "
+                        "this_update, verified_key_sha256, der_sha256, entry_count) VALUES (" +
+                        std::to_string(*id) + ", '" + scope(0) + "', " + std::to_string(src->urls[0].id) +
+                        ", now(), '" + hex64('2') + "', '" + hex64('c') + "', 0)").c_str());
+
+    HighWaterResetRequest r;
+    r.keep_key_sha256 = {hex64('b')};
+    // A stale read: refused under the row lock, carrying the stored version.
+    r.expected_config_version = 5;
+    auto e = store.reset_high_water(*id, r);
+    REQUIRE_FALSE(e.has_value());
+    CHECK(e.error().kind == RKind::kVersionConflict);
+    CHECK(e.error().existing_id == 1);
+    // A surviving key the source does not hold: refused, naming the entry's index.
+    r.expected_config_version = 1;
+    // (index 2, so it cannot be mistaken for the stored version 1)
+    r.keep_key_sha256 = {hex64('b'), hex64('c'), hex64('d')};
+    e = store.reset_high_water(*id, r);
+    REQUIRE_FALSE(e.has_value());
+    CHECK(e.error().kind == RKind::kUnknownKey);
+    CHECK(e.error().existing_id == 2);
+    // The list is required, distinct, lowercase hex; the version must be a real one.
+    r.keep_key_sha256 = {};
+    CHECK(store.reset_high_water(*id, r).error().kind == RKind::kInvalidInput);
+    r.keep_key_sha256 = {hex64('b'), hex64('b')};
+    CHECK(store.reset_high_water(*id, r).error().kind == RKind::kInvalidInput);
+    r.keep_key_sha256 = {hex64('B')};
+    CHECK(store.reset_high_water(*id, r).error().kind == RKind::kInvalidInput);
+    r.keep_key_sha256 = {hex64('b')};
+    r.expected_config_version = 0;
+    CHECK(store.reset_high_water(*id, r).error().kind == RKind::kInvalidInput);
+    // No refusal changed anything.
+    auto now = store.get(*id);
+    REQUIRE(now.has_value());
+    CHECK(now->keys.size() == 3);
+    CHECK(now->config_version == 1);
+    CHECK(now->held_crl_count == 1);
+    CHECK_FALSE(now->reset_at.has_value());
+
+    // Keep 'b' only: 'a' and 'c' are removed with every held CRL (even one 'b' verified) in the
+    // reset's transaction, and the version moves.
+    r.expected_config_version = 1;
+    const auto ok = store.reset_high_water(*id, r);
+    REQUIRE(ok.has_value());
+    CHECK(ok->dropped_keys == 2);
+    CHECK(ok->dropped_key_sha256 == std::vector<std::string>{hex64('a'), hex64('c')});
+    CHECK(ok->crls_deleted == 1);
+    CHECK(ok->config_version == 2);
+    now = store.get(*id);
+    REQUIRE(now.has_value());
+    REQUIRE(now->keys.size() == 1);
+    CHECK(now->keys[0].cert_sha256 == hex64('b'));
+    CHECK(now->held_crl_count == 0);
+    CHECK(now->config_version == 2);
+    CHECK(now->reset_at == ok->reset_at);
+    // A retry from the same read (an outcome-unknown reset retried) is a conflict, not a second
+    // reset.
+    e = store.reset_high_water(*id, r);
+    REQUIRE_FALSE(e.has_value());
+    CHECK(e.error().kind == RKind::kVersionConflict);
+    CHECK(e.error().existing_id == 2);
 }

@@ -1,6 +1,7 @@
 #include "revocation_source_service.hpp"
 
 #include "oidc_egress_policy.hpp"
+#include "revocation_url_canonical.hpp"
 #include "utf8_sanitize.hpp"
 
 #include <yuzu/log_token.hpp>
@@ -83,11 +84,18 @@ std::unexpected<ServiceError> map_store_error(const RevocationSourceStoreError& 
         return std::unexpected(ServiceError{
             Kind::kVersionConflict,
             "the source's config_version is " + std::to_string(e.existing_id) +
-                ", not the expected one; another change was applied since you read it. Read the "
-                "source and resend against its current config_version",
+                ", not the expected one; another change was applied since you read it (possibly your own "
+                "earlier call, if its outcome was unknown). Read the source first: if it already "
+                "shows the change you meant (for a reset, high_water.reset_at and the kept "
+                "ca_certificates), do not resend; otherwise resend against its current config_version",
             "expected_config_version", e.existing_id});
     case SK::kBadResetTime:
         return invalid("reset_at", "reset_at must be no later than the server clock");
+    case SK::kUnknownKey:
+        return invalid("keep_key_sha256[" + std::to_string(e.existing_id) + "]",
+                       "keep_key_sha256 names a key that is not registered on this source; each "
+                       "entry must be a ca_certificates[].cert_sha256 the source holds now. To keep a "
+                       "rebuilt CA's new certificate, add it with PUT first, then reset");
     case SK::kInvalidInput:
         return invalid("", "the request cannot be stored");
     case SK::kOutcomeUnknown:
@@ -387,38 +395,6 @@ std::expected<UrlParts, std::string> parse_url_syntax(const std::string& url) {
     return parts;
 }
 
-// The identity two registered URLs are compared by: the scheme and the authority lowercased (both
-// are case-insensitive, RFC 3986 section 6.2.2.1; userinfo is refused, so the authority is host and
-// port only) and the scheme's default port dropped (`https://h:443/a` is `https://h/a`, section
-// 6.2.3); the path and query are kept byte for byte (they are case-sensitive). Only called on a URL
-// parse_url_syntax accepted, so "://" is present and a name host has no trailing root dot (an empty
-// last label fails host validation, so `h.` is refused before this runs).
-std::string url_identity_key(std::string_view url) {
-    const auto sep = url.find("://");
-    const auto auth_end = url.find_first_of("/?", sep + 3);
-    const auto head_len = auth_end == std::string_view::npos ? url.size() : auth_end;
-    std::string head(url.substr(0, head_len));
-    std::transform(head.begin(), head.end(), head.begin(),
-                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-    const std::string scheme = head.substr(0, sep);
-    std::string authority = head.substr(sep + 3);
-    // A port follows the last ':' unless that ':' is inside an IPv6 literal's brackets.
-    std::string host = authority;
-    std::string port;
-    if (const auto colon = authority.rfind(':');
-        colon != std::string::npos && authority.find(']', colon) == std::string::npos) {
-        host = authority.substr(0, colon);
-        port = authority.substr(colon + 1);
-    }
-    if ((scheme == "https" && port == "443") || (scheme == "http" && port == "80"))
-        port.clear();
-    std::string key = scheme + "://" + host;
-    if (!port.empty())
-        key += ":" + port;
-    key.append(url.substr(head_len));
-    return key;
-}
-
 // ---------------------------------------------------------------------------------------------
 // Addresses.
 
@@ -685,9 +661,14 @@ validate_url_entry(const nlohmann::json& entry, std::size_t index, Ctx& ctx) {
                            "confirmed_address_classes: [" +
                            all + "]");
     }
+    // The canonical form (#6590) is what is stored, compared and returned, so a cosmetic variant
+    // of a registered URL is that URL, with its id and fetch state.
+    const auto canonical = canonical_crl_url(url);
+    if (!canonical)
+        return invalid(at + ".url", "url cannot be put in the canonical form");
     NewRevocationSource::Url out;
-    out.url = url;
-    out.host = parts->host;
+    out.url = canonical->url;
+    out.host = canonical->host;
     out.confirmed_address_classes.assign(classes->begin(), classes->end());
     return out;
 }
@@ -992,8 +973,10 @@ RevocationSourceService::validate_registration(const nlohmann::json& body, BodyM
         auto u = validate_url_entry((*uit)[i], i, ctx);
         if (!u)
             return std::unexpected(u.error());
-        if (!seen_urls.insert(url_identity_key(u->url)).second)
-            return invalid("crl_urls[" + std::to_string(i) + "].url", "duplicate url");
+        // u->url is canonical, so two spellings of one URL are caught here as one.
+        if (!seen_urls.insert(u->url).second)
+            return invalid("crl_urls[" + std::to_string(i) + "].url",
+                           "duplicate url (the same URL as an earlier entry in the canonical form)");
         out.urls.push_back(std::move(*u));
     }
     return out;
@@ -1102,31 +1085,65 @@ bool valid_rfc3339_utc(const std::string& s) {
 } // namespace
 
 namespace {
-struct ResetArgs {
-    std::string reset_at;
-    std::string pin;
-};
-std::expected<ResetArgs, ServiceError> parse_reset(const nlohmann::json& body) {
+bool lower_hex64(const nlohmann::json& v) {
+    if (!v.is_string())
+        return false;
+    const auto& s = v.get_ref<const std::string&>();
+    return s.size() == 64 && std::ranges::all_of(s, [](char c) {
+               return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
+           });
+}
+
+std::expected<HighWaterResetRequest, ServiceError> parse_reset(const nlohmann::json& body) {
     if (!body.is_object())
         return invalid("", "the body must be a JSON object");
-    if (auto k = only_keys(body, "the body", {"reset_at", "pin_crl_sha256"}); !k)
+    if (auto k = only_keys(body, "the body",
+                           {"keep_key_sha256", "expected_config_version", "reset_at",
+                            "pin_crl_sha256"});
+        !k)
         return std::unexpected(k.error());
-    ResetArgs out;
+    HighWaterResetRequest out;
+    // Required (#6590): the keys that survive. A CA rebuilt under the same DN can reuse nothing
+    // from before the rebuild, so the reset removes every key it is not told to keep.
+    const auto kit = body.find("keep_key_sha256");
+    if (kit == body.end() || !kit->is_array() || kit->empty() ||
+        kit->size() > RevocationSourceStore::kMaxCaKeys)
+        return invalid("keep_key_sha256",
+                       "keep_key_sha256 is required: an array of 1.." +
+                           std::to_string(RevocationSourceStore::kMaxCaKeys) +
+                           " ca_certificates[].cert_sha256 values of this source (the keys that "
+                           "survive the reset; every other key is removed). Add a rebuilt CA's "
+                           "certificates with PUT first");
+    std::set<std::string> seen;
+    for (std::size_t i = 0; i < kit->size(); ++i) {
+        const auto& e = (*kit)[i];
+        const std::string at = "keep_key_sha256[" + std::to_string(i) + "]";
+        if (!lower_hex64(e))
+            return invalid(at, "each entry must be 64 lowercase hex characters (a "
+                               "ca_certificates[].cert_sha256 value)");
+        if (!seen.insert(e.get<std::string>()).second)
+            return invalid(at, "duplicate key");
+        out.keep_key_sha256.push_back(e.get<std::string>());
+    }
+    // Required, as on PUT: a reset built from a stale read must not remove a key another
+    // administrator has just added.
+    const auto vit = body.find("expected_config_version");
+    if (vit == body.end() || !vit->is_number_integer() || vit->get<std::int64_t>() < 1)
+        return invalid("expected_config_version",
+                       "expected_config_version is required: an integer >= 1, the source's "
+                       "config_version as you last read it (read the source, then reset)");
+    out.expected_config_version = vit->get<std::int64_t>();
     if (const auto it = body.find("reset_at"); it != body.end()) {
         if (!it->is_string() || !valid_rfc3339_utc(it->get<std::string>()))
             return invalid("reset_at", "reset_at must be a real RFC 3339 UTC time from 1970 on, "
                                        "such as 2026-10-23T09:00:00Z");
-        out.reset_at = it->get<std::string>();
+        out.reset_at_rfc3339 = it->get<std::string>();
     }
     if (const auto it = body.find("pin_crl_sha256"); it != body.end()) {
-        const auto ok = it->is_string() && it->get<std::string>().size() == 64 &&
-                        std::ranges::all_of(it->get<std::string>(), [](char c) {
-                            return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
-                        });
-        if (!ok)
+        if (!lower_hex64(*it))
             return invalid("pin_crl_sha256", "pin_crl_sha256 must be 64 lowercase hex characters "
                                              "(the SHA-256 of the first CRL to accept)");
-        out.pin = it->get<std::string>();
+        out.pin_crl_sha256 = it->get<std::string>();
     }
     return out;
 }
@@ -1145,7 +1162,7 @@ RevocationSourceService::reset_high_water(std::int64_t id, const nlohmann::json&
     auto args = parse_reset(body);
     if (!args)
         return std::unexpected(args.error());
-    auto r = store_.reset_high_water(id, args->reset_at, args->pin);
+    auto r = store_.reset_high_water(id, *args);
     if (!r)
         return map_store_error(r.error());
     return *r;
@@ -1244,6 +1261,8 @@ nlohmann::json reset_json(const HighWaterReset& r) {
     // reset_at - 5 minutes is accepted again, whatever its number.
     j["replay_window_opens_at"] = rfc3339_utc(r.reset_at);
     j["pinned"] = r.pinned;
+    j["dropped_ca_certificates"] = r.dropped_keys;
+    j["config_version"] = r.config_version;
     return j;
 }
 
@@ -1290,15 +1309,47 @@ std::string audit_detail_source(std::string_view cid, const RevocationSourceReco
            " name=" + ::yuzu::log_token(r.name);
 }
 
+namespace {
+// The removed keys by cert_sha256 (at most 8, each 64 hex), so the audit row names which keys
+// stopped being trusted, not only how many.
+std::string dropped_keys_part(const std::vector<std::string>& keys) {
+    if (keys.empty())
+        return {};
+    std::string out = " dropped_key_sha256=";
+    for (std::size_t i = 0; i < keys.size(); ++i) {
+        if (i)
+            out += '|';
+        out += ::yuzu::log_token(keys[i]);
+    }
+    return out;
+}
+} // namespace
+
 std::string audit_detail_update(std::string_view cid, const RevocationSourceUpdate& u) {
     return audit_detail_source(cid, u.source) + " changed=" + (u.changed ? "true" : "false") +
            " dropped_urls=" + std::to_string(u.dropped_urls) +
            " dropped_ca_certificates=" + std::to_string(u.dropped_keys) +
+           dropped_keys_part(u.dropped_key_sha256) +
            " crls_deleted=" + std::to_string(u.crls_deleted);
 }
 
 std::string audit_detail_reset(std::string_view cid, const nlohmann::json& body) {
     std::string out = cid_part(cid);
+    // The surviving keys are the evidence of what the reset kept; every other key it removes.
+    if (body.is_object())
+        if (const auto it = body.find("keep_key_sha256"); it != body.end() && it->is_array()) {
+            out += " keep_key_sha256=";
+            for (std::size_t i = 0; i < it->size(); ++i) {
+                if (i)
+                    out += '|';
+                const auto& e = (*it)[i];
+                out += e.is_string() ? ::yuzu::log_token(e.get<std::string>()) : std::string("?");
+            }
+        }
+    if (body.is_object())
+        if (const auto it = body.find("expected_config_version");
+            it != body.end() && it->is_number_integer())
+            out += " expected_config_version=" + std::to_string(it->get<std::int64_t>());
     if (body.is_object())
         if (const auto it = body.find("reset_at"); it != body.end() && it->is_string())
             out += " reset_at=" + ::yuzu::log_token(it->get<std::string>());
@@ -1308,9 +1359,13 @@ std::string audit_detail_reset(std::string_view cid, const nlohmann::json& body)
     return out;
 }
 
+
 std::string audit_detail_reset_result(std::string_view cid, const HighWaterReset& r) {
     return cid_part(cid) + " reset_at=" + rfc3339_utc(r.reset_at) +
-           " crls_deleted=" + std::to_string(r.crls_deleted);
+           " crls_deleted=" + std::to_string(r.crls_deleted) +
+           " dropped_ca_certificates=" + std::to_string(r.dropped_keys) +
+           dropped_keys_part(r.dropped_key_sha256) +
+           " config_version=" + std::to_string(r.config_version);
 }
 
 std::string audit_detail_error(std::string_view cid, const ServiceError& e) {

@@ -20,7 +20,10 @@
 ///     loopback, and every address the server itself is bound to or listening on. Any other
 ///     class must be named in `confirmed_address_classes` - the administrator is shown the
 ///     classes in the 400 and resends with them - and is stored; the fetcher (2b-1b) refuses an
-///     address outside the confirmed classes on every fetch.
+///     address outside the confirmed classes on every fetch. Each URL is then put in the ONE
+///     canonical form of `revocation_url_canonical.hpp` (#6590): that form is what is stored,
+///     compared for duplicates and by `PUT`'s replace, and returned, so a cosmetic variant of a
+///     registered URL keeps its id and fetch state.
 ///
 /// The address classifier is `oidc_egress_policy.hpp`'s, included as is (a pure header with no
 /// OIDC state), not copied. The resolver and the "own addresses" set are injected (`EgressEnv`)
@@ -175,7 +178,9 @@ public:
     [[nodiscard]] std::expected<RevocationSourceUpdate, ServiceError>
     update_validated(std::int64_t id, const NewRevocationSource& v);
     [[nodiscard]] std::expected<void, ServiceError> remove(std::int64_t id);
-    /// Body `{}` or `{"reset_at": "<RFC 3339 UTC>", "pin_crl_sha256": "<64 hex>"}`.
+    /// Body `{"keep_key_sha256": ["<64 hex cert_sha256>", ...], "expected_config_version": <n>}`
+    /// plus optional `"reset_at": "<RFC 3339 UTC>"` and `"pin_crl_sha256": "<64 hex>"` (#6590).
+    /// Both required members are refused when absent; `{}` is no longer a valid reset.
     [[nodiscard]] std::expected<HighWaterReset, ServiceError>
     reset_high_water(std::int64_t id, const nlohmann::json& body);
     /// Validate a reset body without touching the store (so a transport can reject it BEFORE
