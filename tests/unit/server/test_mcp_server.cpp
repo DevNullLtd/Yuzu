@@ -10,6 +10,7 @@
  * CRITICAL C6: "No integration test through HTTP dispatch."
  */
 
+#include "access_review_model.hpp" // kScopeGroupIdMaxLen (record_attestation schema pin)
 #include "access_review_store.hpp" // kHistoryJustificationPreviewChars (description drift pin)
 #include "mcp_input_schema.hpp" // #2405: input-schema subset compiler
 #include "mcp_jsonrpc.hpp"
@@ -2736,7 +2737,11 @@ TEST_CASE("MCP 4752: record_attestation keeps destructiveHint and states the app
              "until the grant reaches its limit of 100 decisions", "at most 100 recorded decisions",
              "refused with invalid params and records nothing", "returns decision_seq",
              "previous_decision", "retry_after_ms can mean the decision was recorded anyway",
-             "before retrying, call get_access_review, compare decision_seq",
+             "before retrying, call get_access_review, find the row with the same "
+             "principal_type, principal_id, role_name AND scope, compare its decision_seq",
+             // #6969: the grant is identified by five parts, and the scope is stated as required.
+             "(campaign_id, principal_type, principal_id, role_name, scope)",
+             "scope is required: 'fleet' or 'management_group'",
              "match reviewer, justification and decided_at_ms",
              "an earlier entry shows at most its " + first_n,
              "a blind retry appends another identical decision"})
@@ -2768,6 +2773,26 @@ TEST_CASE("MCP 4752: record_attestation keeps destructiveHint and states the app
     const auto required = items["required"];
     CHECK(std::find(required.begin(), required.end(), "decision_seq") != required.end());
     CHECK(std::find(required.begin(), required.end(), "history") != required.end());
+
+    // #6969: every attestation row names its scope, always present and required; the request
+    // schema requires `scope` (the handler enforces it too, the schema is discovery metadata).
+    for (const char* k : {"scope", "scope_group_id", "scope_group_name"}) {
+        CHECK(items["properties"].contains(k));
+        CHECK(std::find(required.begin(), required.end(), k) != required.end());
+    }
+    CHECK(items["properties"]["scope"]["enum"] ==
+          nlohmann::json::array({"fleet", "management_group"}));
+    CHECK(gdesc.find("scope_group_name") != std::string::npos);
+    const auto& in = (*record)["inputSchema"];
+    CHECK(in["properties"]["scope"]["enum"] == nlohmann::json::array({"fleet", "management_group"}));
+    CHECK(in["properties"]["scope"]["type"] == "string");
+    CHECK(in["properties"]["scope_group_id"]["type"] == "string");
+    // The exact bound, as a literal: the management-group id contract (kMgmtGroupIdMaxBytes).
+    CHECK(in["properties"]["scope_group_id"]["maxLength"] == 256);
+    CHECK(yuzu::server::kScopeGroupIdMaxLen == 256);
+    const auto& in_required = in["required"];
+    CHECK(std::find(in_required.begin(), in_required.end(), "scope") != in_required.end());
+    CHECK(std::find(in_required.begin(), in_required.end(), "scope_group_id") == in_required.end());
 }
 
 // #4752: the history preview length appears as a literal number in many description strings.
@@ -36360,7 +36385,7 @@ TEST_CASE("MCP 2444: item 2 minLength:1 sweep — one field per tool family reje
         {"get_access_review", "campaign_id", ""},
         {"close_access_review", "campaign_id", ""},
         {"record_attestation", "campaign_id",
-         R"("principal_type":"user","principal_id":"p","role_name":"r","decision":"attested")"},
+         R"("principal_type":"user","principal_id":"p","role_name":"r","scope":"fleet","decision":"attested")"},
     };
     for (const auto& c : kCases) {
         INFO("tool: " << c.tool << " field: " << c.field);

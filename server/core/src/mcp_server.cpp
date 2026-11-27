@@ -4094,7 +4094,7 @@ static const ToolDef kTools[] = {
      "tool ONLY records evidence — it never itself mutates any RBAC/EnginePrincipal grant. "
      "Acting on a flagged_revoke decision is a separate, explicit role-unassignment or "
      "engine-principal-revoke call an operator makes after reading this evidence. Calling it "
-     "again for the same (campaign_id, principal_type, principal_id, role_name) makes the new "
+     "again for the same (campaign_id, principal_type, principal_id, role_name, scope) makes the new "
      "decision the CURRENT one and it can never return the grant to pending, so "
      "destructiveHint:true; the earlier decision is NOT lost, every decision is kept in the "
      "grant's history (get_access_review returns the latest 100 entries per grant, with an "
@@ -4105,7 +4105,11 @@ static const ToolDef kTools[] = {
      "permission-denied result, 'the reviewer must differ from the subject of this grant; ask "
      "another reviewer to record this decision', and records nothing. principal_id and "
      "role_name are at most 1024 bytes each and justification at most 4096 bytes (a "
-     "justification that is present and not a string is refused with invalid params). Each grant "
+     "justification that is present and not a string is refused with invalid params). scope is "
+     "required: 'fleet' or 'management_group', copied with scope_group_id from the grant's row in "
+     "get_access_review (scope_group_id is absent or empty for fleet, and a nonempty id of at most "
+     "256 bytes for management_group); a missing or contradictory scope is refused with invalid "
+     "params and records nothing. Each grant "
      "keeps at most 100 recorded decisions, the 100th is final: a further one is refused with "
      "invalid params and records nothing, and the way to review that grant again is to open a "
      "new campaign. A successful call returns decision_seq (this "
@@ -4113,8 +4117,9 @@ static const ToolDef kTools[] = {
      "(the decision it superseded, 'pending' for the first), so you can see when you replaced "
      "another reviewer's decision. "
      "An internal error that carries retry_after_ms can mean the decision was recorded anyway "
-     "(a lost commit acknowledgement): before retrying, call get_access_review, compare "
-     "decision_seq with the value you last saw and look for your own entry (match reviewer, "
+     "(a lost commit acknowledgement): before retrying, call get_access_review, find the row with the "
+     "same principal_type, principal_id, role_name AND scope, compare its decision_seq with the "
+     "value you last saw and look for your own entry (match reviewer, "
      "justification and decided_at_ms; an earlier entry shows at most its first 64 "
      "characters), because a blind retry appends another identical "
      "decision, which is kept and visible, not an error, until the grant reaches its limit of "
@@ -4127,9 +4132,11 @@ static const ToolDef kTools[] = {
      R"j("principal_type":{"type":"string","enum":["user","group","engine"],"description":"Type of the principal that holds the grant"},)j"
      R"j("principal_id":{"type":"string","minLength":1,"maxLength":1024,"description":"Id of the principal that holds the grant, as listed in get_access_review (at most 1024 bytes)"},)j"
      R"j("role_name":{"type":"string","minLength":1,"maxLength":1024,"description":"Role of the grant being decided (at most 1024 bytes)"},)j"
+     R"j("scope":{"type":"string","enum":["fleet","management_group"],"description":"Where the grant is held, copied from the same attestation row in get_access_review. Always required"},)j"
+     R"j("scope_group_id":{"type":"string","maxLength":256,"description":"The management group's id, copied from the attestation row. Required (nonempty, at most 256 bytes, no NUL) when scope is management_group; absent or empty when scope is fleet"},)j"
      R"j("decision":{"type":"string","enum":["attested","flagged_revoke"],"description":"attested records that the grant is still appropriate; flagged_revoke records evidence that it should be revoked. Neither changes any grant"},)j"
      R"j("justification":{"type":"string","maxLength":4096,"description":"Reviewer's reason (at most 4096 bytes). Only the latest entry of a grant's history is returned whole"})j"
-     R"j(},"required":["campaign_id","principal_type","principal_id","role_name","decision"]})j",
+     R"j(},"required":["campaign_id","principal_type","principal_id","role_name","scope","decision"]})j",
      R"j({"type":"object","properties":{"recorded":{"type":"boolean"},"decision_seq":{"type":"integer"},"previous_decision":{"type":"string","enum":["pending","attested","flagged_revoke"]},)j"
      R"j("audit_persisted":{"type":"boolean","description":"Present, and false, only when the operation succeeded but its audit row was not saved"}},"required":["recorded","decision_seq","previous_decision"]})j"},
 
@@ -4146,6 +4153,10 @@ static const ToolDef kTools[] = {
      "carries its whole justification; an earlier entry carries at most its first 64 "
      "characters, with justification_truncated true when text was cut (the full text stays "
      "in the database). "
+     "Every attestation carries scope (fleet|management_group), scope_group_id and "
+     "scope_group_name, always present: a fleet-wide grant is fleet, \"\", \"\"; the name is the "
+     "group's name when the campaign opened, \"\" when unavailable. Pass scope and scope_group_id "
+     "to record_attestation exactly as listed here. "
      "campaign.rbac_enforcement (enabled|disabled|degraded) is the fleet's RBAC state frozen "
      "AT OPEN (empty string for a campaign opened before this field existed). Mirrors GET "
      "/api/v1/access-reviews/{id}. Self-audited as access_review.get. Requires "
@@ -4153,7 +4164,7 @@ static const ToolDef kTools[] = {
      R"j({"type":"object","properties":{)j"
      R"j("campaign_id":{"type":"string","minLength":1,"maxLength":64,"pattern":"^[A-Za-z0-9_-]{1,64}$","description":"Campaign id as returned by open_access_review: 1 to 64 characters from A-Z, a-z, 0-9, underscore and hyphen"})j"
      R"j(},"required":["campaign_id"]})j",
-     R"j({"type":"object","properties":{"campaign":{"type":"object","properties":{"campaign_id":{"type":"string"},"title":{"type":"string"},"status":{"type":"string","enum":["open","closed"]},"created_by":{"type":"string"},"created_at_ms":{"type":"integer","description":"Database clock, epoch ms, at the start of the transaction that opened the campaign"},"closed_by":{"type":"string"},"closed_at_ms":{"type":"integer","description":"0 while open; otherwise the database clock, epoch ms, at the start of the closing transaction. A decision that overlapped the close can carry a later decided_at_ms: order decisions by seq"},"rbac_enforcement":{"type":"string","enum":["","enabled","disabled","degraded"]}}},"attestations":{"type":"array","items":{"type":"object","properties":{"principal_type":{"type":"string","enum":["user","group","engine"]},"principal_id":{"type":"string"},"role_name":{"type":"string"},"decision":{"type":"string","enum":["pending","attested","flagged_revoke"]},"reviewer":{"type":"string"},"decided_at_ms":{"type":"integer"},"justification":{"type":"string"},"grant_snapshot":{"type":["object","null"]},"decision_seq":{"type":"integer"},"history":{"type":"array","items":{"type":"object","properties":{"seq":{"type":"integer"},"decision":{"type":"string","enum":["attested","flagged_revoke"]},"previous_decision":{"type":"string","enum":["","pending","attested","flagged_revoke"]},"reviewer":{"type":"string"},"justification":{"type":"string"},"justification_truncated":{"type":"boolean"},"decided_at_ms":{"type":"integer"}},"required":["seq","decision","previous_decision","reviewer","justification","justification_truncated","decided_at_ms"]}}},"required":["principal_type","principal_id","role_name","decision","reviewer","decided_at_ms","justification","grant_snapshot","decision_seq","history"]}},"pending_count":{"type":"integer"}},"required":["campaign","attestations","pending_count"]})j"},
+     R"j({"type":"object","properties":{"campaign":{"type":"object","properties":{"campaign_id":{"type":"string"},"title":{"type":"string"},"status":{"type":"string","enum":["open","closed"]},"created_by":{"type":"string"},"created_at_ms":{"type":"integer","description":"Database clock, epoch ms, at the start of the transaction that opened the campaign"},"closed_by":{"type":"string"},"closed_at_ms":{"type":"integer","description":"0 while open; otherwise the database clock, epoch ms, at the start of the closing transaction. A decision that overlapped the close can carry a later decided_at_ms: order decisions by seq"},"rbac_enforcement":{"type":"string","enum":["","enabled","disabled","degraded"]}}},"attestations":{"type":"array","items":{"type":"object","properties":{"principal_type":{"type":"string","enum":["user","group","engine"]},"principal_id":{"type":"string"},"role_name":{"type":"string"},"scope":{"type":"string","enum":["fleet","management_group"]},"scope_group_id":{"type":"string"},"scope_group_name":{"type":"string"},"decision":{"type":"string","enum":["pending","attested","flagged_revoke"]},"reviewer":{"type":"string"},"decided_at_ms":{"type":"integer"},"justification":{"type":"string"},"grant_snapshot":{"type":["object","null"]},"decision_seq":{"type":"integer"},"history":{"type":"array","items":{"type":"object","properties":{"seq":{"type":"integer"},"decision":{"type":"string","enum":["attested","flagged_revoke"]},"previous_decision":{"type":"string","enum":["","pending","attested","flagged_revoke"]},"reviewer":{"type":"string"},"justification":{"type":"string"},"justification_truncated":{"type":"boolean"},"decided_at_ms":{"type":"integer"}},"required":["seq","decision","previous_decision","reviewer","justification","justification_truncated","decided_at_ms"]}}},"required":["principal_type","principal_id","role_name","scope","scope_group_id","scope_group_name","decision","reviewer","decided_at_ms","justification","grant_snapshot","decision_seq","history"]}},"pending_count":{"type":"integer"}},"required":["campaign","attestations","pending_count"]})j"},
 
     {"list_access_reviews",
      "List every review campaign's metadata (NOT its attestations — use get_access_review "
@@ -7759,15 +7770,16 @@ int mcp_error_for_store_msg(const std::string& msg) {
 // population, or an already-closed campaign: client input, not a server
 // fault, so it maps to kInvalidParams like the REST twin's 404. The
 // "bad_request: " prefix (campaign_id shape, an embedded NUL, an oversized
-// justification) is client input the store refused before touching the pool,
+// justification or scope_group_id) is client input the store refused before touching the pool,
 // so it is kInvalidParams too, like the REST twin's 400. The "forbidden: "
 // prefix (the reviewer is the subject of the grant) is kPermissionDenied, like
 // the REST twin's 403. Any other message is a genuine read/write failure ->
 // kInternalError (retryable).
 //
 // Contract pin: every tool handler above pre-validates its own required
-// fields (title/decision/campaign_id/principal_type/principal_id/role_name)
-// BEFORE calling into AccessReviewStore, so the store's other
+// fields (title/decision/campaign_id/principal_type/principal_id/role_name,
+// and scope with scope_group_id, which record_attestation reads through
+// parse_attest_scope) BEFORE calling into AccessReviewStore, so the store's other
 // input-validation strings never actually reach this function today; an
 // unprefixed one would land in the `else -> kInternalError` arm, which is
 // wrong (client error, not retryable). Callers MUST keep pre-validating, and
@@ -33777,26 +33789,10 @@ McpServer::HandlerFn McpServer::build_handler(
                 // the REST twin's comment, not byte-identical.
                 const std::string rbac_enforcement = access_review_rbac_enforcement(rbac_store);
 
-                // Expand each row to one GrantRef per (principal, role) — the shape
-                // access_review_store.hpp's open_campaign requires — carrying an
-                // opaque JSON snapshot of the row's non-role fields as observed right
-                // now (freeze-time evidence; matches the REST twin exactly).
-                std::vector<GrantRef> frozen;
-                for (const auto& r : *rows_res) {
-                    std::string snapshot =
-                        JObj()
-                            .add("display_name", r.display_name)
-                            .add(kSnapshotOwnerKey, r.owner_or_email)
-                            .add("effective_permission_count", r.effective_permission_count)
-                            .add("last_activity_ms", r.last_activity_ms)
-                            .add("last_activity_kind", r.last_activity_kind)
-                            .add("classification", r.classification)
-                            .add("lifecycle_state", r.lifecycle_state)
-                            .add("source", r.source)
-                            .str();
-                    for (const auto& role : r.roles)
-                        frozen.push_back(GrantRef{r.principal_type, r.principal_id, role, snapshot});
-                }
+                // One GrantRef per (principal, role) pair, each carrying the freeze-time
+                // snapshot of the row's non-role fields: the single builder shared with the
+                // REST twin.
+                const std::vector<GrantRef> frozen = freeze_population(*rows_res);
                 auto open_res = access_review_store->open_campaign(title, session->username, frozen,
                                                                     rbac_enforcement);
                 if (!open_res) {
@@ -33884,11 +33880,24 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
+                // The scope of the grant (#6969): the SAME parser as the REST twin, on the parsed
+                // arguments. Required, so a caller that omits it is refused, never read as
+                // fleet-wide. The input schema's `required` and enum are discovery metadata (the
+                // validator runs only for approval-gated tools); this is the enforcement. A
+                // refusal here writes no access_review.* row and offers no retry hint.
+                auto scope_res = parse_attest_scope(args);
+                if (!scope_res) {
+                    res.set_content(a4_error(kInvalidParams, scope_res.error()),
+                                    "application/json");
+                    return;
+                }
+                const std::string scope_group_id = std::move(*scope_res);
                 // Bound the grant tuple BEFORE the gate (the REST twin does the same): the gate's
                 // refusal rows and the failure row embed it, so an unbounded or NUL-bearing id
                 // would write a forged, oversized audit row per call. The schema's maxLength is
                 // discovery metadata only; this is the enforcement.
-                if (!attest_grant_fields_within_bounds(principal_type, principal_id, role_name)) {
+                if (!attest_grant_fields_within_bounds(principal_type, principal_id, role_name,
+                                                      scope_group_id)) {
                     res.set_content(a4_error(kInvalidParams, kGrantFieldInvalidMessage),
                                     "application/json");
                     return;
@@ -33901,7 +33910,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     access_review_sod::attest_audit_action(decision);
                 const std::string tuple_detail =
                     access_review_sod::attest_tuple_detail(principal_type, principal_id,
-                                                           role_name);
+                                                           role_name, scope_group_id);
                 // One refusal path for the gate's verdict and for the store's in-write
                 // `forbidden:` backstop. The domain row is written first, then the
                 // `mcp.<tool>` wrapper row; either failing to persist is surfaced as
@@ -33932,7 +33941,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 }
                 auto rec_res = access_review_store->record_attestation(
-                    campaign_id, principal_type, principal_id, role_name, decision,
+                    campaign_id, principal_type, principal_id, role_name, scope_group_id, decision,
                     session->username, justification);
                 if (!rec_res) {
                     if (const auto sod =
@@ -34077,6 +34086,12 @@ McpServer::HandlerFn McpServer::build_handler(
                             .add("principal_type", a.principal_type)
                             .add("principal_id", a.principal_id)
                             .add("role_name", a.role_name)
+                            // The scope comes from the row's COLUMN; only the group NAME is read
+                            // from the frozen snapshot ("" when the key is absent). All three are
+                            // always present (the REST twin does the same).
+                            .add("scope", std::string(scope_kind(a.scope_group_id)))
+                            .add("scope_group_id", a.scope_group_id)
+                            .add("scope_group_name", snapshot_scope_group_name(a.grant_snapshot))
                             .add("decision", a.decision)
                             .add("reviewer", a.reviewer)
                             .add("decided_at_ms", a.decided_at_ms)

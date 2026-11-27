@@ -2196,7 +2196,8 @@
     "changelog": [
       "changelog.d/7173-echo-registry-live-etw-skip.fixed.md",
       "changelog.d/8016-spark-registry-rename-deaf-watch.fixed.md",
-      "changelog.d/8687-wp06-registry-hku-reads.security.md"
+      "changelog.d/8687-wp06-registry-hku-reads.security.md",
+      "changelog.d/8845-registry-rename-recreate-detect.security.md"
     ],
     "definitions": [
       "content/definitions/registry.yaml"

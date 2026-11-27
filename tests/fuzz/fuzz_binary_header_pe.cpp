@@ -18,7 +18,8 @@ extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t* data, std::size_t size
     const bh::Source src = bh::span_source(bytes);
 
     // 1. Default limits and budget.
-    (void)bh::read_pe_version(src);
+    std::optional<std::uint16_t> characteristics;
+    (void)bh::read_pe_version(src, {}, {}, &characteristics);
 
     // 2. Tiny limits and a tiny budget: every cap and the budget are reachable on small inputs.
     bh::PeLimits tiny;

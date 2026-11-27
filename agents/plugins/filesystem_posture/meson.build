@@ -6,14 +6,11 @@
 filesystem_posture_deps = [yuzu_sdk_dep, yuzu_agent_core_dep, spdlog_dep]
 
 if host_machine.system() == 'windows'
-  # vssapi: IVssBackupComponents / CreateVssBackupComponents /
-  # VssFreeSnapshotProperties for the snapshots leg. ole32+oleaut32 were
-  # already required by the IDiskQuotaControl quota path; VSS is COM too and
-  # needs no additional runtime, only this import library.
+  # ole32+oleaut32: the IDiskQuotaControl quota path. The VSS walk of the
+  # snapshots leg lives in agent-core, which links vssapi.
   filesystem_posture_deps += [
     cxx.find_library('ole32'),
     cxx.find_library('oleaut32'),
-    cxx.find_library('vssapi'),
   ]
 endif
 
