@@ -1181,14 +1181,18 @@ private:
     /// abandon (row-lock contention) or a lease-acquire failure; `true`
     /// otherwise, including the ordinary "nothing changed" case. See
     /// `refresh_counts`'s retry-and-log wrapper for why this is split out.
-    bool refresh_counts_once(const std::string& execution_id);
+    bool refresh_counts_once(const std::string& execution_id, const std::string* only_agent);
+    /// `refresh_counts` with the retry. `only_agent` non-null settles early target rows for that
+    /// agent only (the per-reply path); null checks the whole run.
+    void refresh_counts_retrying(const std::string& execution_id, const std::string* only_agent);
     /// Events a recount appended to the outbox, to publish in-process after commit (defined in
     /// the .cpp, which keeps the JSON type out of this header).
     struct RefreshEvents;
     /// The recount, terminal transition and outbox appends on the CALLER's transaction.
     /// (`pg_conn` is libpq's `PGconn`, named by its struct tag to keep libpq out of here.)
     bool refresh_counts_in_txn(pg_conn* conn, const std::string& execution_id,
-                               RefreshEvents& events);
+                               RefreshEvents& events,
+                               const std::string* only_agent = nullptr);
     void publish_refresh_events(const std::string& execution_id, const RefreshEvents& events);
 
     /// One attempt at `update_agent_status`'s upsert + agent-transition SSE

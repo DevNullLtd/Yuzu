@@ -5375,6 +5375,33 @@ TEST_CASE("ExecutionTracker coverage: a reply that beats the target record is re
     CHECK(coverage_of(t, *id).responded == 1);
 }
 
+TEST_CASE("ExecutionTracker coverage: recording alone settles replies that came first and "
+          "finishes the run",
+          "[pg][execution_tracker][coverage]") {
+    StuckExecPg db;
+    auto& t = db.tracker();
+    auto id = t.create_execution(make_execution());
+    REQUIRE(id.has_value());
+    REQUIRE(t.set_agents_targeted(*id, 3));
+    report(t, *id, "a", "success");
+    report(t, *id, "b", "success");
+    CHECK(status_of(t, *id) == "running");
+
+    // No later reply and no explicit recount: the record itself must settle both early rows.
+    REQUIRE(t.record_dispatch_targets(*id,
+                                      {{"a", TargetDisposition::Contacted},
+                                       {"b", TargetDisposition::Contacted},
+                                       {"c", TargetDisposition::Contacted}},
+                                      false));
+    CHECK(coverage_of(t, *id).responded == 2);
+    CHECK(coverage_of(t, *id).pending == 1);
+    CHECK(t.get_execution(*id)->agents_responded == 2);
+    CHECK(status_of(t, *id) == "running");
+
+    report(t, *id, "c", "success");
+    CHECK(status_of(t, *id) == "succeeded");
+}
+
 TEST_CASE("ExecutionTracker coverage: a later record raises a target to contacted, never lowers it",
           "[pg][execution_tracker][coverage]") {
     StuckExecPg db;
