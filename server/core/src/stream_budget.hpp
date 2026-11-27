@@ -141,6 +141,21 @@ inline constexpr std::size_t kPerPrincipalMcpPost = 4;
 /// meaningful share of the 128 held-open workers (owner ruling D3, 2026-11-04).
 inline constexpr std::size_t kPerPrincipalWorkflowRun = 2;
 
+/// Max concurrent per-device live reads one principal may hold (`POST
+/// /api/v1/dex/devices/{id}/live`, MCP `get_device_live`, and the quarantine release-confirm
+/// wait). A live read holds its worker for up to the poll budget (about 20 s, never past the
+/// 25 s poll deadline plus one interval and one read) while the device
+/// does real work, so the per-principal share is small: two lets a client overlap one read
+/// behind another while one principal cannot take a meaningful share of the pool.
+inline constexpr std::size_t kPerPrincipalLiveRead = 2;
+
+/// Max concurrent per-device live reads across ALL principals (a SURFACE cap, passed as the
+/// `surface_cap` argument of `StreamBudget::try_acquire`). Distinct from the global cap, which
+/// is shared by every surface and is the only protection of the pool as a whole: this one stops
+/// live reads, which drive device CPU, from crowding out the other held-open surfaces even
+/// when the global cap still has room. It replaces the old process-wide REST in-flight guard.
+inline constexpr std::size_t kLiveReadSurfaceCap = 4;
+
 /// The key every `SseSurface::kSoftwareExport` lease is counted under. It is NOT a principal. The
 /// export's cap (`--inventory-export-concurrency`) is SERVER-WIDE, so the leases are keyed by this
 /// one constant and the caller's per-key cap IS that flag: one counter, atomic under the budget's
@@ -163,6 +178,10 @@ enum class SseSurface {
     kSoftwareExport,  ///< GET /api/v1/inventory/software/export: a streamed file, not an SSE stream; the
                       ///< chunked response pins a worker for up to 900 s (software_export::kExportMaxSeconds).
                       ///< Counted under kSoftwareExportSurfaceKey, not a principal.
+    kLiveRead,        ///< a SYNCHRONOUS per-device live read (REST v1 `POST /api/v1/dex/devices/{id}/live`, MCP
+                      ///< `get_device_live`, the quarantine release-confirm wait): not an SSE stream, but
+                      ///< the response is held open and a worker pinned for up to the poll budget.
+                      ///< Counted per principal with a SURFACE cap (`kLiveReadSurfaceCap`).
 };
 
 inline const char* to_string(SseSurface s) {
@@ -181,6 +200,8 @@ inline const char* to_string(SseSurface s) {
         return "workflow_run";
     case SseSurface::kSoftwareExport:
         return "software_export";
+    case SseSurface::kLiveRead:
+        return "live_read";
     }
     return "unknown";
 }
@@ -290,6 +311,9 @@ public:
     /// cardinality; never derive a label from caller-controlled input).
     static constexpr const char* kRejectPerPrincipal = "per_principal_stream_cap";
     static constexpr const char* kRejectGlobal = "global_stream_cap";
+    /// The caller's per-SURFACE cap (`surface_cap` of `try_acquire`) was reached: live reads
+    /// across every principal. Checked after the global and per-principal caps.
+    static constexpr const char* kRejectSurface = "surface_stream_cap";
 
     enum class Admission {
         kEnforceCaps,  ///< a NEW stream: subject to both caps
@@ -307,9 +331,13 @@ public:
     /// limit — the global cap still applies, and it is the only thing the worker pool
     /// actually needs). Counting is keyed by (surface, principal), so an operator's
     /// dashboard tabs and their MCP streams do not compete for the same allowance.
+    /// `surface_cap` is the CALLER's cap on this surface summed over every principal (0 = no
+    /// surface cap, the default, so every existing caller is unchanged). It is evaluated under
+    /// the same mutex as the other two caps, after them, and answers `kRejectSurface`.
     AcquireResult try_acquire(SseSurface surface, const std::string& principal,
                               std::size_t per_principal_cap,
-                              Admission mode = Admission::kEnforceCaps) {
+                              Admission mode = Admission::kEnforceCaps,
+                              std::size_t surface_cap = 0) {
         const Key key{surface, principal};
         std::lock_guard<std::mutex> lk(mu_);
         auto it = per_principal_.find(key);
@@ -320,6 +348,16 @@ public:
             }
             if (per_principal_cap > 0 && held >= per_principal_cap) {
                 return {Lease{}, kRejectPerPrincipal};
+            }
+            if (surface_cap > 0) {
+                std::size_t on_surface = 0;
+                for (const auto& [k, n] : per_principal_) {
+                    if (k.surface == surface)
+                        on_surface += n;
+                }
+                if (on_surface >= surface_cap) {
+                    return {Lease{}, kRejectSurface};
+                }
             }
         }
         // Every ALLOCATING step happens before any counter moves; every step after the

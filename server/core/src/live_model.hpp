@@ -6,7 +6,7 @@
 ///
 /// The feature has two surfaces: the dashboard HTML path (device_routes.cpp
 /// render_live_result + the device_ui.cpp renderers) and the agentic-first REST JSON
-/// path (rest_api_v1.cpp live_result_json). Both dispatch the SAME read-only
+/// path (live_result_json.cpp, shared with the MCP tool get_device_live). Both dispatch the SAME read-only
 /// instructions and parse the SAME wire formats, so the kind->(plugin, action,
 /// audit verb) table and every wire-format parser live here and nowhere else: a
 /// wire-format change on the agent moves this unit, not two translation units in
@@ -21,7 +21,7 @@
 /// resolve_dashboard_kind() and resolve_rest_kind() are the only two ways to look a
 /// kind up, so widening the REST surface never needs a second table. It is NOT a
 /// one-flag change, though: it takes flipping `rest_v1` on the row AND teaching
-/// live_result_json (rest_api_v1.cpp) the kind, because that function renders every
+/// live_result_json (live_result_json.cpp) the kind, because that function renders every
 /// kind other than `uptime` as the processes shape.
 
 #include <cstddef>
@@ -117,7 +117,7 @@ struct LiveKind {
     std::string row_prefix;
     std::vector<std::string> columns;
     /// True iff the REST route /api/v1/dex/devices/{id}/live accepts this kind. Exactly
-    /// the rows that rest_api_v1.cpp's live_result_json can render; widening the REST
+    /// the rows that `live::live_result_json` (live_result_json.cpp) can render; widening the REST
     /// surface means flipping this flag AND teaching that function the kind.
     bool rest_v1{false};
     /// True only for a kind whose producing action writes every free-text field of the row through

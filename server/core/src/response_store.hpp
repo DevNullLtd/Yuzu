@@ -207,6 +207,29 @@ struct ResponseQuery {
     /// tied timestamp, or a row reaped between two pages, never skips or repeats a row (an
     /// `offset` walk can do both). The other reads do not honour it.
     std::optional<std::pair<int64_t, int64_t>> continue_after;
+    /// `query_bounded` only: rank candidate rows by `id DESC` alone instead of `timestamp DESC,
+    /// id DESC`. The live poll sets it because ids are the one order its reducer trusts (the
+    /// stored timestamp is the server's receipt time in epoch seconds, and it can step backwards
+    /// on a server clock step or across replicas), so the newest ROW (a separately inserted
+    /// terminal row, when the chunks were not finalized in place) survives the row limit and the
+    /// byte cut. Only the ranking changes: the WHERE
+    /// clause, the scope clause and the tier clause are untouched. For a fresh per-command poll
+    /// only: on a very large, old `instruction_id` the planner can pick a backward primary-key
+    /// scan, which is slow (measured 267 ms warm over 1.9 M rows) though still correct. The
+    /// other reads do not honour it.
+    bool order_by_id{false};
+    /// `query_bounded` only: also return `BoundedResponses::facts`, four facts computed over EVERY
+    /// row the query's WHERE admits (the same predicates, scope clause and tier clause as the row
+    /// read, so a `status`, `since` or `until` filter narrows the facts exactly as it narrows the
+    /// rows), not only over the rows that survive the row limit and the byte cut. The live poll
+    /// sets it so a stored device failure, a terminal row and an `error|` head chunk are still seen
+    /// when later rows push the older ones out of the bounded read. Facts are PER AGENT: with an
+    /// empty `agent_id` the WHERE would span every agent, so the store returns no facts then.
+    /// Cost: three scans of the (instruction_id, agent_id) pair, so O(rows of the pair), bounded by
+    /// `--response-max-rows-per-agent` (default 256: about 1 ms a read; measured about 110 ms at
+    /// the 65536 maximum). Other callers, and every caller that leaves it false, get byte-identical
+    /// SQL and no facts.
+    bool with_decision_facts{false};
 };
 
 /// Management-group scope filter for `aggregate()`, `query()`, and
@@ -232,6 +255,28 @@ struct ResponseQuery {
 ///                           sink for a corrupt RBAC store / a store-read error).
 using AggregateScope = std::optional<std::vector<std::string>>;
 
+/// Text longer than this many CHARACTERS is cut by the store in `BoundedFacts` (a decision fact
+/// needs a bounded prefix, never a whole row).
+inline constexpr int kBoundedFactsTextChars = 256;
+
+/// Decision facts over every row the query's WHERE admits (see `ResponseQuery::with_decision_facts`).
+/// The row limit and the byte cut never change them: each is computed in SQL before the cut, over
+/// the rows the scope and tier clauses admit, so a row the caller may not read cannot affect them.
+struct BoundedFacts {
+    /// Some permitted row has status >= 2 (a failure).
+    bool any_failed{false};
+    /// Some permitted row has status >= 1 (a success or a failure: the command finished). The poll's
+    /// rule on purpose: the store's own cap probe treats `status <> 0` as terminal, so a negative
+    /// status is terminal there and not here.
+    bool any_terminal{false};
+    /// `error_detail` of the NEWEST failing row by id, cut to `kBoundedFactsTextChars` characters;
+    /// empty when none failed.
+    std::string failed_detail;
+    /// `output` of the OLDEST permitted row whose output is non-empty, cut to
+    /// `kBoundedFactsTextChars` characters; empty when no row has output.
+    std::string head_output;
+};
+
 /// Result of `ResponseStore::query_bounded()`: the kept rows plus WHY any rows were
 /// left out. Both flags can be true at once (a byte cut inside a result that also
 /// exceeded the row limit); a caller that needs one cause reports `byte_cap_hit`
@@ -250,6 +295,8 @@ struct BoundedResponses {
     /// `meta` columns). Observability and a test seam for the byte bound; not a request
     /// limit. 0 when the query returned no rows.
     std::size_t result_bytes{0};
+    /// Set only when `ResponseQuery::with_decision_facts` was true.
+    std::optional<BoundedFacts> facts;
 };
 
 enum class AggregateOp { Count, Sum, Avg, Min, Max };
@@ -424,9 +471,12 @@ public:
     ///   2. only rows whose PRECEDING cumulative size is still below the cap are joined
     ///      back to fetch the full columns (the first row is always kept, so a single row
     ///      larger than the cap still makes progress).
-    /// Export order is `timestamp DESC, id DESC` (the id tiebreak makes the cut
-    /// deterministic; `query()` orders by timestamp alone, so rows with equal timestamps can come
-    /// back in a different order from the list routes). `q.offset` is ignored. A
+    /// Export order is `timestamp DESC, id DESC` (the id tiebreak makes the cut deterministic),
+    /// or `id DESC` alone when `q.order_by_id` is set. `query()` orders by timestamp alone, so
+    /// rows with equal timestamps can come back in a different order from the list routes.
+    /// With `q.with_decision_facts` (and a non-empty `q.agent_id`) the same statement also computes
+    /// `BoundedResponses::facts` over all rows the WHERE admits, before the cut.
+    /// `q.offset` is ignored. A
     /// concurrent delete between the two steps is one statement, so the snapshot is
     /// consistent. Returns nullopt on store-degraded, exactly like `query()`.
     [[nodiscard]] std::optional<BoundedResponses>
