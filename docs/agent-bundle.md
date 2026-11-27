@@ -109,7 +109,7 @@ does not gate the build. Registry owner is derived from `origin` (override with
 ### Version pinning
 
 The default version (`scripts/build-agent-bundle.sh`) tracks the current GA
-release line — currently **`0.16.0`** — and must equal the version of the demo
+release line — currently **`0.16.0`**, not yet published until the v0.16.0 GA tag (before then a default build fails; pass `--version 0.16.0-rc1` for the release candidate) — and must equal the version of the demo
 server/gateway the agents enroll into. The bundle can only be built for a version
 whose GitHub release has published the Windows/macOS archives, so when the next
 release ships, bump the `VERSION` default **and** the `docker-compose.demo.yml`

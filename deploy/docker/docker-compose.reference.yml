@@ -46,13 +46,13 @@
 ##   docker compose -f docker-compose.reference.yml logs -f server
 ##   # trust the CA, then browse https://localhost:8443/
 ##
-## Upgrading from an earlier build: not supported by 0.15.0. This release is a
+## Upgrading from an earlier build: not supported by this release. This release is a
 ## HARD CUTOVER: it supports initial deployment into a FRESH database only.
 ## Do not point it at a `postgres-data`, `server-data` or `certs` volume written
 ## by an earlier build, and do not run an earlier image against this stack's
 ## database; the server does not detect either. Recreating the containers of
 ## THIS deployment is fine (the volumes survive container replacement). Restore
-## only a backup taken from THIS deployment on 0.15.0 or later: a dump or a
+## only a backup taken from THIS deployment running this build: a dump or a
 ## keys/data archive from an earlier build is the same unsupported act, and the
 ## server will not detect it. See "Deployment contract (hard cutover)" in
 ## docs/user-manual/upgrading.md.

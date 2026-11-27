@@ -39,6 +39,15 @@ def _definition() -> dict:
     return docs[0]
 
 
+def _shares_entry() -> str:
+    """The assembled CHANGELOG entry for the macOS shares reading, and only that entry, so the
+    disclosure phrases cannot be satisfied by any other part of the changelog."""
+    text = CHANGELOG.read_text(encoding="utf-8")
+    start = text.index("- **The shares plugin now reads what a macOS host shares.")
+    end = text.find("\n- **", start + 1)
+    return _flat(text[start:end if end != -1 else len(text)])
+
+
 def _flat(text: str) -> str:
     """Lower-cased with every whitespace run collapsed, so re-wrapping a folded or hard-wrapped
     sentence can neither hide a phrase nor fake one."""
@@ -122,7 +131,7 @@ class SharesMacosBestEffortDisclosure(unittest.TestCase):
     def test_changelog_carries_the_disclosure(self):
         self._require(
             "changelog fragment",
-            _text(CHANGELOG),
+            _shares_entry(),
             ["best-effort", "would drop", "would keep", "uid-0"],
         )
 
