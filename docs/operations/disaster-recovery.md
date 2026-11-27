@@ -12,13 +12,13 @@
 > (HA WS-6 6.2, `auth.enrollment_tokens` / `auth.pending_agents`) — back them
 > up via the same `pg_dump`/`pg_restore` procedure as the rest of the `auth`
 > schema, not as local files. `enrollment-tokens.cfg`/`pending-agents.cfg` are
-> no longer written by the 0.15.0 server; a copy found at any boot where the database holds no import record for it (a fresh database never does) is imported
+> no longer written by the server; a copy found at any boot where the database holds no import record for it (a fresh database never does) is imported
 > exactly once as live credentials, without any check of where it came from (the
 > marker+fingerprint mechanics that refuse a later file with different content
 > are in
 > `docs/adr/2002-high-availability-architecture.md` §8).
 >
-> 0.15.0 supports initial deployment into a fresh database only: restore a backup
+> This release supports initial deployment into a fresh database only: restore a backup
 > taken from this deployment, not one written by an earlier build (the released v0.15.0 included), and start
 > with no leftover `enrollment-tokens.cfg` or `pending-agents.cfg` in `--data-dir` or the
 > directory holding `yuzu-server.cfg` (the server imports them without checking where
@@ -43,7 +43,7 @@
 
 ### Pre-Upgrade Backup
 
-Back up a 0.15.0 deployment before changing it (0.15.0 itself has no supported upgrade from an earlier build):
+Back up a deployment before changing it (this release has no supported upgrade from an earlier build):
 ```bash
 yuzu-backup.sh --output /backup/yuzu-pre-upgrade-$(date +%Y%m%d)
 ```
@@ -65,7 +65,7 @@ The script:
 
 ## Restore Procedure
 
-Use only a backup taken from this 0.15.0 deployment; restore the Postgres dump and the keys directory together (see Key management in [Server Administration](../user-manual/server-admin.md)).
+Use only a backup taken from this deployment running this build; restore the Postgres dump and the keys directory together (see Key management in [Server Administration](../user-manual/server-admin.md)).
 
 ```bash
 # 1. Stop the server

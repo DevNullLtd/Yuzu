@@ -1,1 +1,0 @@
-- **An agent that repeats a plugin entry casts one vote for the plugin catalogue, not one per copy.** Registration keeps the first entry for each plugin name and drops the rest, counted in `yuzu_server_agent_registry_plugin_meta_dropped_total{field="duplicate"}`; the agent's plugin name list holds only valid names, each once, and at most 128 of them.

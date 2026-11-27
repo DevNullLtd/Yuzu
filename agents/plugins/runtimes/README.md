@@ -243,5 +243,4 @@ python|unmodelled|3.14|/usr/bin/python3.14|-
 - Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_runtimes.hpp`
 - Tests: `tests/test_runtimes_definition.py` · `tests/unit/test_runtimes_linux_parsers.cpp` · `tests/unit/test_runtimes_local_dispatcher.cpp` · `tests/unit/test_runtimes_macos_dotnet_jvm.cpp` · `tests/unit/test_runtimes_parsers.cpp` · `tests/unit/test_runtimes_python_parsers.cpp` · `tests/unit/test_runtimes_win_walk.cpp`
 - Privilege row: `docs/agent-privilege-model.md`
-- Changelog: `changelog.d/2026-10-28-runtimes-python.added.md` · `changelog.d/2026-11-04-runtimes-dotnet-jvm-drivers-inventory.added.md`
 <!-- END GENERATED -->

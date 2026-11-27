@@ -23,7 +23,7 @@ import yaml
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFINITION = REPO_ROOT / "content" / "definitions" / "shares.yaml"
 README = REPO_ROOT / "agents" / "plugins" / "shares" / "README.md"
-CHANGELOG = REPO_ROOT / "changelog.d" / "2026-10-29-shares-macos-leg.added.md"
+CHANGELOG = REPO_ROOT / "CHANGELOG.md"  # the fragment is promoted at release; the disclosure lives in the assembled entry
 PLUGIN_SOURCE = REPO_ROOT / "agents" / "plugins" / "shares" / "src" / "shares_plugin.cpp"
 
 # One stream, rows discriminated by field 0 (row_kind); the YAML names the shared tail fields
@@ -37,6 +37,15 @@ def _definition() -> dict:
     docs = [d for d in yaml.safe_load_all(DEFINITION.read_text(encoding="utf-8")) if d]
     assert len(docs) == 1, "shares.yaml defines exactly one action (list)"
     return docs[0]
+
+
+def _shares_entry() -> str:
+    """The assembled CHANGELOG entry for the macOS shares reading, and only that entry, so the
+    disclosure phrases cannot be satisfied by any other part of the changelog."""
+    text = CHANGELOG.read_text(encoding="utf-8")
+    start = text.index("- **The shares plugin now reads what a macOS host shares.")
+    end = text.find("\n- **", start + 1)
+    return _flat(text[start:end if end != -1 else len(text)])
 
 
 def _flat(text: str) -> str:
@@ -122,7 +131,7 @@ class SharesMacosBestEffortDisclosure(unittest.TestCase):
     def test_changelog_carries_the_disclosure(self):
         self._require(
             "changelog fragment",
-            _text(CHANGELOG),
+            _shares_entry(),
             ["best-effort", "would drop", "would keep", "uid-0"],
         )
 

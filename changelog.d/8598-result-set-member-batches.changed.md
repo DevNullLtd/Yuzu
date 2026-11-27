@@ -1,1 +1,0 @@
-- Large result sets write their members to PostgreSQL in batches of up to 1,000 devices. Creating or filling a set remains atomic across all batches.

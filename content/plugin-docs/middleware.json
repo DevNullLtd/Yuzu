@@ -268,10 +268,7 @@
     "capability_rows": [
       "server/core/src/capability_decls/plugin_action_catalogue_middleware.hpp"
     ],
-    "changelog": [
-      "changelog.d/2026-10-29-middleware-ibm-mq.added.md",
-      "changelog.d/sam47-middleware-mq-windows.added.md"
-    ],
+    "changelog": [],
     "definitions": [
       "content/definitions/middleware.yaml"
     ],
