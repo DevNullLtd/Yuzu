@@ -882,6 +882,9 @@ bool mark_target_signal(PGconn* conn, const std::string& execution_id,
     return false;
 }
 
+/// Agents settled per statement.
+constexpr std::size_t kReconcileChunk = 500;
+
 /// #2673: settle open target rows from agent status rows that committed before the target row
 /// existed (a reply can beat `record_dispatch_targets`). A no-op for an unrecorded run. With
 /// `only_agents` set, only those agents' rows are looked at (the per-reply path: a whole-run
@@ -898,18 +901,28 @@ bool reconcile_targets(PGconn* conn, const std::string& execution_id,
         "  AND s.execution_id = t.execution_id "
         "  AND s.agent_id = t.agent_id "
         "  AND s.status IN ('success','failure','timeout','rejected')";
-    std::vector<std::string> binds{execution_id};
-    if (only_agents) {
-        std::vector<std::string_view> views(only_agents->begin(), only_agents->end());
-        sql += " AND t.agent_id = ANY($2::text[]) AND s.agent_id = ANY($2::text[])";
-        binds.push_back(pg::to_text_array(views));
+    // The agent filter is on the target side only: repeating it on the status side makes the
+    // statement take seconds on a run the planner has no statistics for yet.
+    if (only_agents)
+        sql += " AND t.agent_id = ANY($2::text[])";
+    const auto apply = [&](const std::vector<std::string>& binds) {
+        pg::PgResult res = pg::exec_params(conn, sql.c_str(), binds);
+        if (res.status() == PGRES_COMMAND_OK)
+            return true;
+        spdlog::warn("ExecutionTracker: execution_target reconcile failed: {}",
+                     PQresultErrorMessage(res.get()));
+        return false;
+    };
+    if (!only_agents)
+        return apply({execution_id});
+    for (std::size_t at = 0; at < only_agents->size(); at += kReconcileChunk) {
+        const std::size_t end = (std::min)(only_agents->size(), at + kReconcileChunk);
+        const std::vector<std::string_view> chunk(only_agents->begin() + at,
+                                                  only_agents->begin() + end);
+        if (!apply({execution_id, pg::to_text_array(chunk)}))
+            return false;
     }
-    pg::PgResult res = pg::exec_params(conn, sql.c_str(), binds);
-    if (res.status() == PGRES_COMMAND_OK)
-        return true;
-    spdlog::warn("ExecutionTracker: execution_target reconcile failed: {}",
-                 PQresultErrorMessage(res.get()));
-    return false;
+    return true;
 }
 
 // Appends the #3789 `ExecutionListScope` admission predicate to `sql`
@@ -1658,59 +1671,22 @@ void ExecutionTracker::refresh_counts(const std::string& execution_id) {
     refresh_counts_retrying(execution_id, nullptr);
 }
 
-namespace {
-/// Bound on replies' agents queued for the next recount of a run; past it the whole run is
-/// checked instead.
-constexpr std::size_t kMaxPendingRecountAgents = 1000;
-} // namespace
-
 void ExecutionTracker::recount_after_reply(const std::string& execution_id,
                                            const std::string& agent_id) {
-    // #2673: one recount per run at a time on this replica. A reply that finds one running leaves
-    // its agent behind and returns; the runner counts again before it stops. So every reply is
-    // followed by a recount that STARTED after its status committed, and a burst costs a few
-    // recounts instead of one queued behind the run's row lock per reply (each holding a pooled
-    // connection while it waits). The runner keeps counting while replies keep arriving.
-    {
-        std::lock_guard lock(recount_mu_);
-        const auto [it, started] = recounts_.try_emplace(execution_id);
-        if (!started) {
-            it->second.dirty = true;
-            if (it->second.agents.size() < kMaxPendingRecountAgents)
-                it->second.agents.push_back(agent_id);
-            else
-                it->second.whole_run = true;
-            return;
-        }
-    }
-    // Releases the run even if a recount throws: a left-behind entry would stop every later
-    // recount of this run.
-    struct Release {
-        ExecutionTracker& self;
-        const std::string& id;
-        bool armed{true};
-        ~Release() {
-            if (armed) {
-                std::lock_guard lock(self.recount_mu_);
-                self.recounts_.erase(id);
-            }
-        }
-    } release{*this, execution_id};
-
-    std::vector<std::string> agents{agent_id};
-    bool whole_run = false;
-    for (;;) {
-        refresh_counts_retrying(execution_id, whole_run ? nullptr : &agents);
-        std::lock_guard lock(recount_mu_);
-        auto& pending = recounts_[execution_id];
-        if (!pending.dirty) {
-            recounts_.erase(execution_id);
-            release.armed = false;
-            return;
-        }
-        agents = std::move(pending.agents);
-        whole_run = pending.whole_run;
-        pending = {};
+    // #2673: one recount per run at a time on this replica, so a burst costs a few recounts
+    // instead of one queued behind the run's row lock per reply (each holding a pooled
+    // connection while it waits). Every reply is followed by a recount that STARTED after its
+    // status committed. The runner is bounded: see `RecountCoalescer`.
+    auto turn = recounts_.join(execution_id, agent_id);
+    if (!turn)
+        return;
+    try {
+        do {
+            refresh_counts_retrying(execution_id, &turn->agents);
+        } while (recounts_.next(*turn));
+    } catch (...) {
+        recounts_.abandon(*turn); // a left-behind turn would stop every later recount
+        throw;
     }
 }
 

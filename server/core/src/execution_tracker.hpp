@@ -38,6 +38,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "recount_coalescer.hpp"
 #include "dispatch_position.hpp"    // DispatchPosition (#3678)
 #include "response_provenance.hpp" // CommandRecord
 
@@ -1257,14 +1258,7 @@ private:
                                  const std::vector<std::string>* only_agents);
     /// The per-reply recount, coalesced per run (see the definition).
     void recount_after_reply(const std::string& execution_id, const std::string& agent_id);
-    /// What arrived for a run while its recount was running.
-    struct PendingRecount {
-        bool dirty{false};
-        bool whole_run{false};
-        std::vector<std::string> agents;
-    };
-    std::mutex recount_mu_;
-    std::unordered_map<std::string, PendingRecount> recounts_; ///< present = being recounted
+    RecountCoalescer recounts_;
     /// Events a recount appended to the outbox, to publish in-process after commit (defined in
     /// the .cpp, which keeps the JSON type out of this header).
     struct RefreshEvents;

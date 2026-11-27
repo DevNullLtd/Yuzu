@@ -15102,6 +15102,7 @@ private:
     /// #2673: sweep audit rows awaiting a write. Touched only by the maintenance thread.
     static constexpr std::size_t kMaxPendingSweepAudits = 1000;
     std::deque<AuditEvent> pending_sweep_audits_;
+    std::size_t announced_sweep_audits_{0}; ///< front rows already logged as unwritten
 
     void count_target_record_failure() {
         metrics_
@@ -15253,7 +15254,9 @@ private:
         const bool tracked = !execution_id.empty() && execution_tracker_;
         // #2673: said BEFORE the send, so a run whose list is never recorded cannot read
         // `succeeded`.
-        if (tracked && !execution_tracker_->mark_targets_expected(execution_id))
+        const bool announced =
+            tracked && execution_tracker_->mark_targets_expected(execution_id);
+        if (tracked && !announced)
             spdlog::warn("software sync: could not mark execution_id={} as awaiting its target "
                          "list",
                          execution_id);
@@ -15273,7 +15276,7 @@ private:
             },
             /*collect_targets=*/!execution_id.empty());
         out.sent = static_cast<std::size_t>(result.sent);
-        if (tracked && result.intended.empty() && result.sent == 0 &&
+        if (announced && result.intended.empty() && result.sent == 0 &&
             !execution_tracker_->close_empty_attempt(execution_id))
             spdlog::warn("software sync: could not close the empty send of execution_id={}",
                          execution_id);
@@ -15299,7 +15302,7 @@ private:
             }
             if (!execution_tracker_->record_dispatch_targets(
                     execution_id, targets, run && run->connected_only,
-                    /*complete=*/!(run && run->partial_list)))
+                    /*complete=*/announced && !(run && run->partial_list)))
                 count_target_record_failure();
         }
         if (out.sent > 0)
@@ -21149,13 +21152,19 @@ private:
                                 count("degraded", 1);
                             }
                             const auto flushed = yuzu::server::flush_audit_queue(
-                                pending_sweep_audits_,
+                                pending_sweep_audits_, announced_sweep_audits_,
                                 [this](const AuditEvent& ev) {
                                     return audit_store_ && audit_store_->is_open() &&
                                            audit_store_->log(ev);
                                 },
                                 [this] { return stop_requested_.load(std::memory_order_acquire); },
-                                kMaxPendingSweepAudits, [](const AuditEvent& ev) {
+                                kMaxPendingSweepAudits,
+                                [](const AuditEvent& ev) {
+                                    spdlog::error("deadline sweep: audit row not yet written for "
+                                                  "execution_id={} ({})",
+                                                  ev.target_id, ev.detail);
+                                },
+                                [](const AuditEvent& ev) {
                                     spdlog::error("deadline sweep: audit row dropped for "
                                                   "execution_id={} ({})",
                                                   ev.target_id, ev.detail);

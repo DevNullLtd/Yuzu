@@ -10636,6 +10636,8 @@ genuinely matches nothing is still `200` with an empty `data` array.
 
 Get per-agent execution statistics.
 
+These count the results **devices reported**. A device the server gave up on (`timed_out` or `unknown` in a run's `coverage`) adds nothing here, and a late `success` from it counts as a success although the run's own counts do not change. Use a run's `coverage` for what the run concluded.
+
 **Permission:** `Execution:Read`, through the fleet-read chokepoint (ADR-0017 admit-then-filter, #3526): a management-group-confined caller is admitted and sees only the rows of the agents it can see (filtered in SQL before the `limit`), while a global grant sees every agent. A caller holding only a management-group-scoped grant, refused with `403` before, is admitted as a confined view. A service-scoped API token, also refused before, is admitted as a confined view only when RBAC enforcement is on (it must clear the `ITServiceOwner` authority ceiling, which holds `Execution:Read`, and the rows are then intersected with the token's service tag scope); with RBAC off it is refused with `403`. With RBAC off (the shipped default) the rollup is unfiltered for every authenticated non-service, non-engine caller. The sibling `/definitions` route and the fleet summary carry no agent identity and keep the plain `Execution:Read` gate. A malformed `since` or `limit` is `400`, and so is a negative `since`.
 
 **Query parameters:**

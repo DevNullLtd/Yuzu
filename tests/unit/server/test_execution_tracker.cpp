@@ -13,6 +13,7 @@
 #include "command_outbox_store.hpp" // #4982 Part B: reap_stuck_running_executions' cross-schema tests
 #include "execution_event_bus.hpp"
 #include "sweep_audit_queue.hpp"
+#include "recount_coalescer.hpp"
 #include "pg/pg_exec.hpp"
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
@@ -5863,10 +5864,14 @@ TEST_CASE("ExecutionTracker coverage: a reply does not queue behind a running re
         INFO(PQresultErrorMessage(res.get()));
         REQUIRE((res.status() == PGRES_COMMAND_OK || res.status() == PGRES_TUPLES_OK));
     };
+    // Hold the first recount AFTER it has counted and before it writes: the trigger waits on a
+    // lock this connection owns. Only a further recount can then see `b`.
+    sql(db.pool(), "CREATE FUNCTION public.yuzu_test_gate() RETURNS trigger LANGUAGE plpgsql "
+                   "AS $$ BEGIN PERFORM pg_advisory_xact_lock(2673); RETURN NEW; END $$");
+    sql(db.pool(), "CREATE TRIGGER yuzu_test_gate BEFORE UPDATE ON execution_tracker.executions "
+                   "FOR EACH ROW EXECUTE FUNCTION public.yuzu_test_gate()");
     run("BEGIN");
-    // Blocks the recount's lock, not the reply's own insert (which only checks the key).
-    run("SELECT 1 FROM execution_tracker.executions WHERE id = '" + id +
-        "' FOR NO KEY UPDATE");
+    run("SELECT pg_advisory_xact_lock(2673)");
     const auto success = [&](const std::string& agent) {
         AgentExecStatus s;
         s.agent_id = agent;
@@ -5887,17 +5892,18 @@ TEST_CASE("ExecutionTracker coverage: a reply does not queue behind a running re
     std::atomic<bool> first_ok{false};
     std::atomic<bool> second_ok{false};
     std::atomic<bool> second_done{false};
-    std::thread first([&] { first_ok = success("a"); });
+    // jthread: a failing REQUIRE joins instead of terminating the test binary.
+    std::jthread first([&] { first_ok = success("a"); });
     for (int i = 0; i < 400 && lock_waiters() == 0; ++i)
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     CHECK(lock_waiters() == 1);
-    std::thread second([&] {
+    std::jthread second([&] {
         second_ok = success("b");
         second_done = true;
     });
     for (int i = 0; i < 150 && !second_done; ++i)
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    CHECK(second_done.load()); // returned while the run row is still held
+    CHECK(second_done.load()); // returned while the first recount is still held
     run("COMMIT");
     first.join();
     second.join();
@@ -5907,28 +5913,82 @@ TEST_CASE("ExecutionTracker coverage: a reply does not queue behind a running re
     CHECK(t.get_execution(id)->agents_success == 2);
 }
 
+TEST_CASE("recount coalescer: one runner per run, and every reply gets a later recount",
+          "[execution_tracker][coverage]") {
+    RecountCoalescer c;
+    auto turn = c.join("run", "a");
+    REQUIRE(turn.has_value());
+    CHECK(turn->agents == std::vector<std::string>{"a"});
+    CHECK_FALSE(c.join("run", "b").has_value());
+    CHECK(c.join("other", "z").has_value());
+    REQUIRE(c.next(*turn));
+    CHECK(turn->agents == std::vector<std::string>{"b"});
+    CHECK_FALSE(c.next(*turn));
+    CHECK(c.join("run", "c").has_value()); // released
+}
+
+TEST_CASE("recount coalescer: a runner under constant traffic is relieved after a few rounds",
+          "[execution_tracker][coverage]") {
+    RecountCoalescer c;
+    auto first = c.join("run", "r0");
+    REQUIRE(first.has_value());
+    int recounts = 1;
+    std::optional<RecountCoalescer::Turn> successor;
+    // A reply arrives during every recount.
+    for (int i = 1; i < 50; ++i) {
+        auto joined = c.join("run", "r" + std::to_string(i));
+        if (joined) {
+            successor = std::move(joined);
+            break;
+        }
+        REQUIRE(c.next(*first));
+        ++recounts;
+    }
+    REQUIRE(successor.has_value());
+    CHECK(recounts == RecountCoalescer::kRoundsBeforeHandoff + 1);
+    CHECK(successor->agents ==
+          std::vector<std::string>{"r" + std::to_string(recounts)});
+    CHECK_FALSE(c.next(*first)); // relieved
+    c.abandon(*first);           // and cannot release its successor's run
+    CHECK_FALSE(c.join("run", "late").has_value());
+    REQUIRE(c.next(*successor));
+    CHECK(successor->agents == std::vector<std::string>{"late"});
+    CHECK_FALSE(c.next(*successor));
+    auto fresh = c.join("run", "again");
+    REQUIRE(fresh.has_value());
+    CHECK_FALSE(c.next(*first)); // a stale turn stays stale after the run is re-entered
+    c.abandon(*fresh);
+    CHECK(c.join("run", "after").has_value());
+}
+
 TEST_CASE("deadline sweep audit queue: a failed write is retried, one attempt per pass",
           "[execution_tracker][coverage]") {
     std::deque<int> queue{1, 2, 3};
     std::vector<int> written;
     std::vector<int> gone;
+    std::vector<int> announced_rows;
+    std::size_t announced = 0;
     bool healthy = false;
     int attempts = 0;
     const auto flush = [&](std::size_t cap) {
         return flush_audit_queue(
-            queue,
+            queue, announced,
             [&](int row) {
                 ++attempts;
                 if (healthy)
                     written.push_back(row);
                 return healthy;
             },
-            [] { return false; }, cap, [&](int row) { gone.push_back(row); });
+            [] { return false; }, cap, [&](int row) { announced_rows.push_back(row); },
+            [&](int row) { gone.push_back(row); });
     };
     auto out = flush(10);
     CHECK(out.write_failed);
     CHECK(attempts == 1);
     CHECK(queue.size() == 3);
+    CHECK(announced_rows == std::vector<int>{1, 2, 3}); // every waiting row, logged
+    static_cast<void>(flush(10));
+    CHECK(announced_rows.size() == 3); // once each
     healthy = true;
     out = flush(10);
     CHECK_FALSE(out.write_failed);
@@ -5939,6 +5999,8 @@ TEST_CASE("deadline sweep audit queue: a failed write is retried, one attempt pe
     out = flush(2);
     CHECK(out.dropped == 1);
     CHECK(gone == std::vector<int>{4}); // the oldest goes first
+    CHECK(announced_rows == std::vector<int>{1, 2, 3, 4, 5, 6});
+    CHECK(announced == 2);
 }
 
 TEST_CASE("execution coverage JSON: a confined caller gets no run-wide value",

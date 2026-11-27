@@ -5,8 +5,10 @@
 // server's maintenance thread owns the queue).
 //
 // A flush stops at the first failed write, so a degraded audit store holds the shared thread for
-// one attempt and no longer; the rows stay queued, in order, for the next pass. The queue is
-// bounded: past `cap` the OLDEST rows are dropped and handed to `dropped` so they can be logged.
+// one attempt and no longer; the rows stay queued, in order, for the next pass. After a failure
+// every row still waiting is handed to `unwritten` ONCE, so the log holds it even if the process
+// dies before the row is written. The queue is bounded: past `cap` the OLDEST rows are dropped
+// and handed to `dropped`.
 
 #include <cstddef>
 #include <deque>
@@ -19,21 +21,33 @@ struct AuditFlush {
     std::size_t dropped{0};
 };
 
-template <class Event, class Write, class Stop, class Dropped>
-AuditFlush flush_audit_queue(std::deque<Event>& queue, Write&& write, Stop&& stop,
-                             std::size_t cap, Dropped&& dropped) {
+/// `announced` counts the rows at the front already handed to `unwritten`; the caller keeps it
+/// beside the queue.
+template <class Event, class Write, class Stop, class Unwritten, class Dropped>
+AuditFlush flush_audit_queue(std::deque<Event>& queue, std::size_t& announced, Write&& write,
+                             Stop&& stop, std::size_t cap, Unwritten&& unwritten,
+                             Dropped&& dropped) {
     AuditFlush out;
+    const auto pop = [&] {
+        queue.pop_front();
+        if (announced > 0)
+            --announced;
+    };
     while (!queue.empty() && !stop()) {
         if (!write(queue.front())) {
             out.write_failed = true;
             break;
         }
-        queue.pop_front();
+        pop();
         ++out.written;
+    }
+    if (out.write_failed) {
+        for (; announced < queue.size(); ++announced)
+            unwritten(queue[announced]);
     }
     while (queue.size() > cap) {
         dropped(queue.front());
-        queue.pop_front();
+        pop();
         ++out.dropped;
     }
     return out;
