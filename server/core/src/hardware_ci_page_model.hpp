@@ -14,7 +14,9 @@
 /// walk below is this surface's own.
 ///
 /// Scope: the caller's `authz::VisibleSet` is the SOLE filter. TOP (nullopt) reads everything, in
-/// any number of pages; an engaged-empty set reads nothing and runs no SQL; a set of at most
+/// any number of pages; an engaged-empty set reads no rows and `read_page` runs no SQL for it (a
+/// FIRST page still takes the one watermark read of `with_watermark`; a cursor page and a point read
+/// take none, so for those two no SQL runs at all); a set of at most
 /// `kMaxPushdownScopeIds` ids is applied in SQL as `agent_ids`, so no page is filtered after the
 /// read. A walk is still NOT a snapshot: a device registered, removed or newly in scope while it
 /// runs can be missed or can vanish, so a client confirms a device with `agent_id` before retiring
@@ -30,7 +32,7 @@
 /// Cursors are OPAQUE and not authenticated (the same posture as the software catalogue's): a
 /// hand-made well-formed cursor is accepted, which is harmless because the scope is applied to
 /// every page and every served page is audited. A cursor carries the last served `agent_id` and
-/// nothing else, and is bound to the `agent_id` filter, never to the scope or the limit.
+/// nothing else, and is bound to the `agent_id` and `changed_since` filters, never to the scope or the limit.
 
 #include "authz_model.hpp"
 #include "bulk_read_slots.hpp"
@@ -62,6 +64,14 @@ inline constexpr std::size_t kMaxPushdownScopeIds = 10000;
 /// `read_error_message`, the MCP tool description and the user manual all spell this number.
 static_assert(kMaxPushdownScopeIds == 10000,
                "update read_error_message, the MCP description and the docs");
+/// How far past the server's own clock a `changed_since` may sit before it is refused as a
+/// future-dated value (a client clock that runs ahead of the server's by a few seconds is not an
+/// error; one that runs an hour ahead is a defect worth a 400). The check reads the replica's
+/// clock (the same one the sibling `limit` and `await_since` validators in this layer use), not the
+/// database's: a client that keeps `next_changed_since` (database clock minus 300 s) is refused
+/// only when the replica's clock runs more than 360 s behind the database's, and the refusal
+/// message says so (`kChangedSinceFutureMessage`).
+inline constexpr std::int64_t kChangedSinceFutureSkewSecs = 60;
 /// The MCP default page size, smaller than the REST default: each page lands in an agentic
 /// worker's context. The input schema's `default` and `request_from_args` both read this.
 inline constexpr std::int64_t kMcpDefaultLimit = 20;
@@ -84,9 +94,28 @@ struct Request {
     std::string agent_id; ///< empty = every device in scope
     std::string cursor;   ///< empty = the first page
     int limit{static_cast<int>(kDefaultLimit)};
+    /// Delta filter: only rows whose `changed_at` is at or after this (epoch seconds). Unset = the
+    /// full read, byte-identical to before the filter existed (same SQL, same cursor fingerprint).
+    /// Needs a global-read caller (`ReadError::kDeltaNeedsGlobalRead`).
+    std::optional<std::int64_t> changed_since;
 };
 
-/// REST parsing. Keys: `limit`, `cursor`, `agent_id`. A repeated key keeps its FIRST value and an
+/// The 400 / -32602 messages of a refused `changed_since`, one spelling for REST and MCP. They name
+/// the parameter and the rule, never the value.
+inline constexpr std::string_view kChangedSinceInvalidMessage =
+    "invalid changed_since (expected epoch seconds as a non-negative integer)";
+inline constexpr std::string_view kChangedSinceFutureMessage =
+    "invalid changed_since (it is in the future, or this server's clock is behind the database "
+    "clock)";
+
+/// The wall clock the parsers judge a `changed_since` against, in epoch seconds.
+[[nodiscard]] std::int64_t wall_clock_secs();
+
+/// REST parsing. Keys: `limit`, `cursor`, `agent_id`, `changed_since`. `changed_since` is decimal
+/// digits only (epoch seconds; an EMPTY value (`changed_since=`) is treated as NOT GIVEN, as for
+/// `limit` and `cursor`, and so reads the full set); a malformed one, one too large for 64 bits, or
+/// one more than `kChangedSinceFutureSkewSecs` past `now_secs` (compared without overflow) is
+/// refused. A repeated key keeps its FIRST value and an
 /// unknown key is ignored (the software devices parser's rule). A `limit` that is not a plain
 /// decimal integer (an optional leading `-` and digits) is refused; any such integer outside
 /// [1, kPageMax], including one too large for 64 bits, is clamped. A cursor over
@@ -95,6 +124,10 @@ struct Request {
 /// valid text gets the same message as every other refused cursor). An empty `cursor` means the
 /// first page; an `agent_id` that is present but empty is refused (it would otherwise read the
 /// whole fleet where the caller meant one device), the same refusal MCP makes. The error is the 400 message.
+/// `now_secs` is injected so the future bound is testable to the second; the one-argument form
+/// reads `wall_clock_secs()`.
+[[nodiscard]] std::expected<Request, std::string> parse_params(const Params& p,
+                                                               std::int64_t now_secs);
 [[nodiscard]] std::expected<Request, std::string> parse_params(const Params& p);
 
 /// Which refusal an MCP argument error is, where the caller's remedy differs. `kCursorRefused` is
@@ -118,8 +151,11 @@ inline constexpr std::string_view kCursorRefusedAuditDetail = "invalid arguments
 /// MCP's STRICT argument read (REST clamps, MCP refuses): `args` that is neither null nor an
 /// object, a wrong JSON type, a `limit` outside [1, kPageMax], an empty or unsafe `agent_id`, an
 /// over-long cursor or text that cannot be bound is refused. An absent `limit` is
-/// `kMcpDefaultLimit`. Unknown names are ignored. The error carries the kInvalidParams message and, for
-/// a cursor refused before decoding, `ArgFault::kCursorRefused`.
+/// `kMcpDefaultLimit`. `changed_since` must be a JSON integer (not a string, float or boolean) from 0
+/// to `now_secs + kChangedSinceFutureSkewSecs`. Unknown names are ignored. The error carries the
+/// kInvalidParams message and, for a cursor refused before decoding, `ArgFault::kCursorRefused`.
+[[nodiscard]] std::expected<Request, ArgError> request_from_args(const nlohmann::json& args,
+                                                                 std::int64_t now_secs);
 [[nodiscard]] std::expected<Request, ArgError> request_from_args(const nlohmann::json& args);
 
 // ── Cursors ──────────────────────────────────────────────────────────────────
@@ -136,7 +172,11 @@ struct Position {
     std::string after;
 };
 
-/// Binds a cursor to the `agent_id` filter (16 lowercase hex digits).
+/// Binds a cursor to the request's filters (16 lowercase hex digits): `agent_id` and, when set,
+/// `changed_since`, so a cursor from a walk with one value is refused for another. With no
+/// `changed_since` the fingerprint is BYTE-IDENTICAL to the one issued before the delta filter
+/// existed (`fnv1a("agent_id=" + id)`), so a cursor already in a client's hands still decodes (the
+/// `h1` cursor format is frozen); pinned by a literal in the tests, not only against the function.
 [[nodiscard]] std::string filter_fingerprint(const Request& rq);
 
 /// `h1:<fp16>:<b64url(length-prefixed {after})>`. A payload with any other field count is refused.
@@ -171,6 +211,13 @@ struct Page {
     /// must not outlive `ServerImpl::hardware_ci_read_slots_` and is request-local by design.
     std::optional<BulkReadSlots::Slot> hold;
     void release_slot() noexcept { hold.reset(); }
+    /// The watermark a delta client keeps for its NEXT pull (the database clock minus
+    /// `kChangedSinceMarginSecs`, epoch seconds), set by `with_watermark` ONLY on a FIRST page (a
+    /// request with no cursor and no `agent_id`). A cursor page and a point read leave it empty, and
+    /// `page_json` then omits the key entirely (absent, not null and not 0), so a client cannot take
+    /// a later page's value by mistake. Empty is also the value of a page that never passed through
+    /// `with_watermark` (pinned lexically: both transports wrap their `read_page` in it).
+    std::optional<std::int64_t> next_changed_since;
 };
 
 /// Why a page could not be produced.
@@ -190,6 +237,13 @@ struct Page {
 ///    read or served, so it writes NO audit row on either transport (a refusal holds no slot, so a
 ///    row would be an audit writer outside the cap, #7951). The
 ///    `yuzu_hardware_ci_read_busy_total` counter is the record of every refusal.
+///  - `kDeltaNeedsGlobalRead`: TERMINAL (a 400 / -32602, no retry hint). The request carries
+///    `changed_since` and the caller's read is confined to a scope (a management-group or
+///    service-scoped credential: `scope` is present). A device entering a scope does not change its
+///    record, so a scoped delta would silently omit it. Decided from the request and the scope
+///    alone, FIRST, before the cursor, before any `agent_id` scope test and before any read, so the
+///    answer cannot vary with a device's existence or membership; its text names no device, count
+///    or scope.
 ///  - `kCount`: NOT an error. A sentinel one past the last real enumerator, so a test can walk
 ///    every value and a `static_assert` can tie a table to the enumerator count; it is answered
 ///    like any out-of-range value. A new enumerator MUST be inserted BEFORE it: the
@@ -201,12 +255,17 @@ enum class ReadError {
     kScopeTooWide,
     kOrderingUnverified,
     kBusy,
+    kDeltaNeedsGlobalRead,
     kCount
 };
 
 /// The REST `retry_after_ms` (and, rounded to seconds, `Retry-After`) and the MCP hint of `kBusy`.
 /// Derivation: the 500 ms slot wait plus one typical page read. A slot can be held for the store
-/// call plus the audit write(s) (about 62 s on REST in the worst case), so 2 s is a
+/// call plus the audit write(s) (about 62 s on REST in the worst case, before the watermark read)
+/// and, on a FIRST page only, the one watermark read (a second pool lease: up to 3 s to acquire,
+/// up to 10 s to connect, then its single-row statement capped at 5 s by `SET LOCAL
+/// statement_timeout`, so up to 18 s more on a first page, the same bound the page read's own
+/// lease and statement have; a cursor page and a point read take none), so 2 s is a
 /// typical-contention hint, not a guarantee.
 inline constexpr std::int64_t kBusyRetryAfterMs = 2000;
 
@@ -221,6 +280,11 @@ inline constexpr std::int64_t kBusyRetryAfterMs = 2000;
 inline constexpr std::string_view kScopeTooWideRemediation =
     "use a credential with global read, pass agent_id, or ask an administrator to narrow the "
     "caller's scope";
+
+/// The A4 `remediation` hint for a `kDeltaNeedsGlobalRead` refusal, the same text on REST and MCP.
+inline constexpr std::string_view kDeltaNeedsGlobalReadRemediation =
+    "use a credential holding a fleet-wide Inventory:Read grant (a management-group or "
+    "service-scoped token cannot), or omit changed_since and walk the full set";
 
 /// The A4 `remediation` hint for a `kBusy` refusal, the same text on REST and MCP.
 inline constexpr std::string_view kBusyRemediation =
@@ -271,6 +335,28 @@ struct ReadFailure {
 /// The answer to a failed read. One `switch` over `ReadError` with no `default`.
 [[nodiscard]] ReadFailure describe_read_error(ReadError e, Surface surface);
 
+/// The source of the watermark: `DeviceInventoryStore::device_ci_watermark` in production (the
+/// database clock minus the margin, `nullopt` on any failure, never a guess). An EMPTY function is
+/// an unwired provider and fails the page closed exactly like a `nullopt`.
+using Watermark = std::function<std::optional<std::int64_t>()>;
+
+/// Stamps `Page::next_changed_since` on a page `read_page` served, and is the ONLY place that does
+/// (both transports wrap their one `read_page` call in it). Owner ruling 2026-11-24: ONLY a FIRST
+/// page is stamped, that is a request with NO cursor and NO `agent_id` (`rq`, the request the page
+/// answered). A cursor page and a point read are passed through untouched and the watermark
+/// provider is NOT called for them (no second lease, no new 503 dependency). An error from
+/// `read_page` passes through untouched too. On a first page a null provider or a `nullopt` answer
+/// replaces the served page with `ReadError::kDegraded` (a 503 / store-unreadable answer, never a
+/// page with the field omitted or guessed); the dropped `Page` releases its bulk-read slot, also
+/// when the provider THROWS (the exception propagates and the `Page` unwinds). It runs while the
+/// slot is STILL HELD (`Page::hold`), so the watermark read is inside the concurrency cap. The value
+/// is read AFTER the page, a few milliseconds later than the rows, which the 300 s margin absorbs.
+/// The empty first page is stamped like any other, so a first page's body shape never depends on
+/// what the caller may see.
+[[nodiscard]] std::expected<Page, ReadError> with_watermark(std::expected<Page, ReadError> read,
+                                                            const Request& rq,
+                                                            const Watermark& watermark);
+
 /// The byte length of `row_json(rec)` exactly as both surfaces serve it (compact dump with
 /// `error_handler_t::replace`). The ONE measure the byte budget is applied in: the sum over a page's
 /// rows plus one comma between neighbours plus the two array brackets is the byte length of the
@@ -318,11 +404,15 @@ read_page(const Reader& read, const Request& rq, const authz::VisibleSet& scope,
 /// One device: `agent_id`; `hostname` (the CI record's, null when empty or the literal
 /// "unknown"; it is the last daily-sync value, not the live roster's); `ci` (the scalar block
 /// of `GET /api/v1/hardware/{id}`, byte for byte, without `sections`); `content_hash` (the stored
-/// hash, null when empty, so a caller can diff client-side); `blob_version`.
+/// hash, null when empty, so a caller can diff client-side); `blob_version`; `changed_at` (epoch
+/// seconds of the record's last content change, the database clock; a row-level field, NOT part of
+/// the `ci` block, so the per-id route's `ci` bytes are unchanged).
 [[nodiscard]] nlohmann::json row_json(const DeviceCiRecord& rec);
 
-/// `{"devices": [...], "next_cursor": "<cursor or empty>"}`, plus `"page_bytes_capped": true` only
-/// when the byte budget ended the page (an absent key means it did not).
+/// `{"devices": [...], "next_cursor": "<cursor or empty>"}`, plus `"next_changed_since": <epoch
+/// seconds>` only on a first page (`Page::next_changed_since` engaged: the key is ABSENT on a cursor
+/// page and on a point read), plus `"page_bytes_capped": true` only when the byte budget ended the
+/// page (an absent key means it did not).
 [[nodiscard]] nlohmann::json page_json(const Page& page);
 
 /// The status for a CONFINED caller (the gate's VisibleSet was a present set), applied to a
@@ -348,6 +438,11 @@ void apply_scope_disclosure(nlohmann::json& body, bool confined);
 /// `hardware CI records (<surface>) state=scope too wide`: the detail of the `denied` row written
 /// when a read is refused with `ReadError::kScopeTooWide`. No count.
 [[nodiscard]] std::string audit_detail_scope_too_wide(std::string_view surface);
+
+/// `hardware CI records (<surface>) state=changed_since needs global read`: the detail of the
+/// `denied` row written when a scope-confined caller sends `changed_since`
+/// (`ReadError::kDeltaNeedsGlobalRead`). No count, no device.
+[[nodiscard]] std::string audit_detail_delta_needs_global_read(std::string_view surface);
 
 /// `hardware CI records (<surface>) state=agent_id outside the caller's scope`: the detail of the
 /// `denied` row written when the request named an `agent_id` outside the caller's scope

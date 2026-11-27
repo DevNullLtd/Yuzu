@@ -118,7 +118,10 @@ Caveats, all of which bound how these numbers may be used:
 
 - Migration `device_inventory_store` v4 adds `device_ci_agent_id_c_idx ON device_ci ((agent_id
   COLLATE "C"))`, additive and idempotent (`IF NOT EXISTS`, not `CONCURRENTLY`, because the runner
-  applies a migration in a transaction).
+  applies a migration in a transaction). Migration v6 (the changed_since change) later replaces it
+  with `device_ci_agent_id_c_changed_idx ON device_ci (agent_id COLLATE "C", changed_at)`: the same
+  byte-order key as its first column, so this fix is unchanged, with `changed_at` second so a delta
+  is tested inside the index.
 - Every `agent_id` comparison in the read is spelled `COLLATE "C"`: the cursor bound, the scope
   membership test, the single-device filter and the `ORDER BY`. The result is the byte order of
   `agent_id`, which no library upgrade can change. Correctness comes from the `COLLATE` spelling; the index makes
@@ -204,8 +207,8 @@ process started).
   missing.
 - Residual 4, the gate: this read (`GET /api/v1/hardware-ci`, MCP `list_hardware_ci_records`) is
   refused with a retryable `503` (`retry_after_ms` 60000) while the gate is not Trusted, with no
-  override flag. The keyset SQL, its `COLLATE "C"` spellings and the `device_ci_agent_id_c_idx`
-  expression are unchanged, and the cursor prefix stays `h1` (no epoch is bound into the cursor).
+  override flag. The keyset SQL, its `COLLATE "C"` spellings and the `agent_id COLLATE "C"`
+  index expression (as it stood when this record was written: `device_ci_agent_id_c_idx`) are unchanged, and the cursor prefix stays `h1` (no epoch is bound into the cursor).
 
 **What stays.**
 

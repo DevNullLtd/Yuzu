@@ -3,7 +3,7 @@
 /// @file test_fake_ci_keyset_store.hpp
 /// An in-memory stand-in for `DeviceInventoryStore::list_device_ci_after`, shared by the model,
 /// route and MCP tests of the bulk CI page. Same keyset semantics as the SQL: `agent_id > after`,
-/// the optional `agent_id` / `agent_ids` narrowing, then up to `limit` rows, ordered by `agent_id`.
+/// the optional `agent_id` / `agent_ids` / `changed_since` (`changed_at >= n`) narrowing, then up to `limit` rows, ordered by `agent_id`.
 /// The order is BYTE order (`std::string`'s comparison is unsigned-byte lexicographic), which is
 /// the SAME contract as the store's `agent_id COLLATE "C"`, not a stand-in for locale order: a
 /// test that adds ids the two orders would arrange differently (upper and lower case, `-` and `_`,
@@ -111,6 +111,10 @@ struct FakeCiKeysetStore {
             if (q.agent_id && r.agent_id != *q.agent_id)
                 continue;
             if (q.agent_ids && !ids.contains(r.agent_id))
+                continue;
+            // The delta filter, the SAME rule as the SQL (`changed_at >= $n`, inclusive: a row stamped
+            // exactly at the watermark is delivered again).
+            if (q.changed_since && r.changed_at < *q.changed_since)
                 continue;
             if (static_cast<int>(out.size()) >= eff)
                 break;
