@@ -34,6 +34,8 @@ This describes the build in a fresh deployment (see "Deployment contract (hard c
 
 **Dispatch that reaches no devices.** `POST /api/command`, `POST /api/v1/commands`, `POST /api/instructions/{id}/execute`, `POST /api/v1/instructions/{id}/execute` and the diagnostic dispatch routes (`POST /api/chargen/start`, `POST /api/chargen/stop`, `POST /api/procfetch/fetch`) answer `422` with `reason: "no_targets"` where they answered `503`. The MCP execute tools return status `no_targets`. v1 workflow execute stays `503`, with `error.reason: "no_targets"` and no retry hint. A target list that cannot be read answers `503` `target_resolution_failed` with `retry_after_ms: 5000`, and the scheduler delivers such an occurrence again. A caller whose dispatch is not confined and who names a device id that does not exist still gets the "no agents reached" answer, not `no_targets`; so does a caller who can see no device at all. `POST /api/command` and the diagnostic routes still answer `503` `no agent connected`, without a `reason`, when no agent is reachable at all. The dashboard console says when nothing matched.
 
+**Health figure.** `executions.completed_last_hour` on `/health` and `/api/health` now counts `succeeded` runs as well as `completed` ones, so it rises: it counted only `completed`.
+
 **Success rates.** The fleet and per-definition success rates divide successes by contacted devices (`agents_targeted`) over finished runs. Devices that were never reached are not in the figure, so a run with one success and 99 offline devices contributes 100%. Runs with silent devices now finish and enter the rates.
 
 **Known limits.**

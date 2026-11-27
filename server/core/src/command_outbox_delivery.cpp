@@ -462,6 +462,16 @@ void CommandOutboxDelivery::deliver(const OutboxCommand& c, const std::string& l
     const auto outcome = d_.dispatch_fn(c.plugin, c.action, agent_ids, c.scope_expr, params,
                                         c.execution_id, caller, c.command_id);
 
+    // #2673: this attempt's device list was not saved. If it could not announce itself either,
+    // nothing else says the run's saved list (from an earlier attempt) is short, and the run
+    // could finish `succeeded` without this attempt's devices. Store that BEFORE anything below
+    // lets the run finish; if it cannot be stored, leave the occurrence pending (not finishable)
+    // and re-drive it, exactly as a degraded mark does.
+    const bool list_unsaved =
+        outcome.targets_record_failed && d_.execution_tracker && !c.execution_id.empty();
+    const bool unsaved_stored =
+        !list_unsaved || d_.execution_tracker->mark_targets_incomplete(c.execution_id);
+
     // 5. A systemic transient gate/directory failure — a degraded containment
     //    read, OR (WS-4 4.2b Task D) a degraded gateway routing-directory read
     //    (`route_unreadable`), OR (#5294) a degraded presence read while a
@@ -551,6 +561,13 @@ void CommandOutboxDelivery::deliver(const OutboxCommand& c, const std::string& l
     //    harmless (both converge on `cancelled`; `mark_cancelled`'s
     //    own terminal-exclusion guard makes a second cancel a clean, event-
     //    free no-op).
+    if (!unsaved_stored) {
+        count("yuzu_server_command_outbox_deliver_degrade_total");
+        spdlog::warn("command_outbox_delivery: occurrence '{}' — could not store that its device "
+                     "list is incomplete; will re-drive",
+                     c.occurrence_id);
+        return;
+    }
     const bool bookkeep_target = d_.execution_tracker && !c.execution_id.empty();
     bool owns_delivery = false;
     if (bookkeep_target && outcome.sent > 0) {

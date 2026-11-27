@@ -666,6 +666,11 @@ public:
     /// for a send that threw. False on a store failure.
     [[nodiscard]] bool close_empty_attempt(const std::string& execution_id);
 
+    /// #2673: a send's device list was not saved. Sticky: the run cannot read `succeeded`. For
+    /// the caller that makes the run able to finish, to store BEFORE it does so (the send's own
+    /// announcement may have failed too). False on a store failure.
+    [[nodiscard]] bool mark_targets_incomplete(const std::string& execution_id);
+
     /// #2673: a dispatch for this run could not store its command correlation record, so its
     /// replies cannot be matched: targets still silent at the deadline read `unknown`.
     void mark_correlation_lost(const std::string& execution_id);

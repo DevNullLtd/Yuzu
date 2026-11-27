@@ -882,6 +882,7 @@ TEST_CASE("wire_and_dispatch_confined: the Ids arm intersects exec_visible again
 // ═══════════════════════════════════════════════════════════════════════════
 
 #include "test_execution_tracker_pg_helper.hpp"
+#include "pg/pg_exec.hpp"
 
 TEST_CASE("wire_and_dispatch_confined: concurrency_mode=\"per-device\" with a live "
           "ExecutionTracker excludes an already-claimed agent",
@@ -1026,6 +1027,85 @@ TEST_CASE("wire_and_dispatch_confined: a send that resolves nobody does not stop
     const auto done = tracker.get_execution(*id);
     REQUIRE(done.has_value());
     CHECK(done->status == "succeeded");
+}
+
+TEST_CASE("wire_and_dispatch_confined: a send that could not announce itself neither closes an "
+          "earlier open send nor saves a complete list over it",
+          "[server][dispatch][scope][integration][pg][coverage]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    yuzu::server::ExecutionTracker& tracker = *tracker_bundle;
+
+    EventBus bus;
+    yuzu::MetricsRegistry metrics;
+    AgentRegistry registry(bus, metrics);
+    (void)registry.register_agent(make_wiring_test_info("dev-A"));
+    REQUIRE(registry.set_gateway_route(
+        "dev-A", /*session_id=*/{}, "test-gateway",
+        {std::string(yuzu::server::detail::kGatewayWireCapabilityDispatchTagV1)}));
+
+    yuzu::agent::v1::CommandRequest cmd;
+    cmd.set_command_id("wiring-unannounced-cmd");
+    cmd.set_plugin("os_info");
+    cmd.set_action("version");
+    cmd.set_dispatch_tag("v1|ro|none|0123456789abcdef0123456789abcdef");
+    auto classified = ClassifiedCommandTestAccess::make(cmd);
+
+    auto noop_audit = [](const std::string&, const std::string&, const std::string&,
+                         const std::string&) {};
+    std::vector<std::string> agent_ids{"dev-A"};
+
+    yuzu::server::Execution exec;
+    exec.definition_id = "def-unannounced-test";
+    exec.dispatched_by = "admin";
+    exec.status = "running";
+    exec.expects_targets = true;
+    const auto id = tracker.create_execution(exec);
+    REQUIRE(id.has_value());
+    REQUIRE(tracker.mark_targets_expected(*id)); // an earlier send that never saved its list
+
+    // Refuse exactly the next announcement: the one that would mark the run incomplete while
+    // leaving the send open.
+    const auto sql = [&](const std::string& statement) {
+        auto conn = tracker_bundle.pool().acquire();
+        REQUIRE(conn);
+        auto res =
+            yuzu::server::pg::exec_params(conn.get(), statement.c_str(), std::vector<std::string>{});
+        INFO(PQresultErrorMessage(res.get()));
+        REQUIRE(res.status() == PGRES_COMMAND_OK);
+    };
+    sql("CREATE FUNCTION public.yuzu_test_refuse() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN "
+        "RAISE EXCEPTION 'refused'; END $$");
+    sql("CREATE TRIGGER yuzu_test_refuse BEFORE UPDATE ON execution_tracker.executions "
+        "FOR EACH ROW WHEN (OLD.attempt_open AND NEW.attempt_open AND NEW.targets_incomplete "
+        "AND NOT OLD.targets_incomplete) EXECUTE FUNCTION public.yuzu_test_refuse()");
+
+    const auto flag = [&](const char* column) {
+        auto conn = tracker_bundle.pool().acquire();
+        REQUIRE(conn);
+        const std::string query = std::string("SELECT ") + column +
+                                  " FROM execution_tracker.executions WHERE id = $1";
+        auto res = yuzu::server::pg::exec_params(conn.get(), query.c_str(),
+                                                 std::vector<std::string>{*id});
+        REQUIRE(res.status() == PGRES_TUPLES_OK);
+        REQUIRE(PQntuples(res.get()) == 1);
+        return std::string(PQgetvalue(res.get(), 0, 0)) == "t";
+    };
+    const auto dispatch = [&](yuzu::server::authz::VisibleSet visible) {
+        return yuzu::server::wire_and_dispatch_confined(
+            registry, nullptr, nullptr, nullptr, nullptr, &tracker, noop_audit, noop_audit,
+            "wiring-unannounced-cmd-1", *id, /*principal_role=*/"", agent_ids, /*scope_expr=*/"",
+            visible, /*broadcast_on_none=*/false, kNoContainment, classified);
+    };
+
+    const auto empty = dispatch(
+        yuzu::server::authz::VisibleSet{std::unordered_set<std::string>{}});
+    REQUIRE(empty.sent == 0);
+    CHECK(flag("attempt_open")); // not closed: the open send is somebody else's
+
+    const auto full = dispatch(yuzu::server::authz::VisibleSet{std::nullopt});
+    REQUIRE(full.sent == 1);
+    CHECK_FALSE(full.targets_record_failed);
+    CHECK(flag("targets_incomplete"));
 }
 
 // ADR-1007 fix round (PR #3784 external review, important-finding-#1, converged on

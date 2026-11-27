@@ -4506,6 +4506,17 @@ bool ExecutionTracker::close_empty_attempt(const std::string& execution_id) {
     });
 }
 
+bool ExecutionTracker::mark_targets_incomplete(const std::string& execution_id) {
+    if (!open_)
+        return false;
+    return pool_.with_txn_for(kWriteTimeout, [&](PGconn* conn) -> bool {
+        pg::PgResult res = pg::exec_params(
+            conn, "UPDATE execution_tracker.executions SET targets_incomplete = true WHERE id = $1",
+            std::vector<std::string>{execution_id});
+        return res.status() == PGRES_COMMAND_OK;
+    });
+}
+
 void ExecutionTracker::mark_correlation_lost(const std::string& execution_id) {
     if (!open_ || execution_id.empty())
         return;
@@ -5031,6 +5042,12 @@ ExecutionTracker::sweep_response_deadlines(const std::function<bool()>& should_s
         publish_refresh_events(id, events);
         if (run.timed_out == 0 && run.unknown == 0 && run.finished_status.empty())
             continue; // nothing changed: nothing to report or audit
+        // Said as soon as the change is committed: the audit row is written later, and a crash
+        // before then must still leave the run named in the log.
+        spdlog::info("ExecutionTracker::sweep_response_deadlines: execution_id={} timed_out={} "
+                     "unknown={} finished={}",
+                     id, run.timed_out, run.unknown,
+                     run.finished_status.empty() ? std::string("no") : run.finished_status);
         out.timed_out_targets += run.timed_out;
         out.unknown_targets += run.unknown;
         out.execution_ids.push_back(id);

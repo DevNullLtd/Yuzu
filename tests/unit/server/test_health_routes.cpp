@@ -36,6 +36,8 @@
 #include "principal_class.hpp"
 #include "raw_close_probe.hpp"
 #include "test_route_sink.hpp"
+#include "test_execution_tracker_pg_helper.hpp"
+#include "pg/pg_exec.hpp"
 
 #include "../test_helpers.hpp"
 
@@ -113,6 +115,7 @@ struct Harness {
     NvdDatabase* nvd_db{nullptr}; // null unless a case wires one
     EnablementStore* enablement_store{nullptr}; // null unless a case wires one
     CaStore* ca_store{nullptr}; // #6527: null unless a case wires one
+    ExecutionTracker* execution_tracker{nullptr}; // null unless a case wires one
 
     bool session_present{true};
     std::string session_username{"alice"};
@@ -215,6 +218,7 @@ struct Harness {
         deps.nvd_db = nvd_db;
         deps.enablement_store = enablement_store;
         deps.ca_store = ca_store;
+        deps.execution_tracker = execution_tracker;
         deps.plaintext_probe_sink =
             plain_override ? plain_override : (plain_wired ? &plain_sink : nullptr);
         deps.main_listener_serving_fn = [this] { return main_serving.load(); };
@@ -1304,6 +1308,36 @@ TEST_CASE("health_routes: GET /health with a session gets the heavier "
     CHECK(body["agents"]["pending"].is_null());
     CHECK(body.contains("executions"));
     CHECK(body.contains("system"));
+}
+
+TEST_CASE("health_routes: /health counts succeeded and completed runs as completed in the last "
+          "hour",
+          "[server][routes][health_routes][pg]") {
+    yuzu::test::ExecutionTrackerPg bundle;
+    for (const char* status : {"succeeded", "completed", "failed"}) {
+        Execution exec;
+        exec.definition_id = "def-health";
+        exec.dispatched_by = "admin";
+        exec.status = "running";
+        const auto id = bundle->create_execution(exec);
+        REQUIRE(id.has_value());
+        auto conn = bundle.pool().acquire();
+        REQUIRE(conn);
+        auto res = pg::exec_params(
+            conn.get(),
+            "UPDATE execution_tracker.executions SET status = $2, "
+            "completed_at = extract(epoch FROM now())::bigint WHERE id = $1",
+            std::vector<std::string>{*id, status});
+        REQUIRE(res.status() == PGRES_COMMAND_OK);
+    }
+    Harness h;
+    h.execution_tracker = bundle.get();
+    h.wire();
+    auto r = h.sink.Get("/health", {{"Cookie", "yuzu_session=abc"}});
+    REQUIRE(r);
+    const auto body = json::parse(r->body);
+    CHECK(body["executions"]["completed_last_hour"] == 2);
+    CHECK(body["executions"]["failed_last_hour"] == 1);
 }
 
 TEST_CASE("health_routes: /health and /api/health resolve a session only for a request that "
