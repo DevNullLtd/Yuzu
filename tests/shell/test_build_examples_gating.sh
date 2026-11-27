@@ -25,6 +25,8 @@
 # unhappy-path UP-6). Checking the full discovered set, not a fixed
 # sample, closes that gap regardless of which plugin a future mistake
 # targets.
+# SKIPs (exit 77): no vcpkg_installed/<triplet> dir, or a tree without
+# share/cli11/CLI11Config.cmake (host-tools-only, #6719). Both report as a meson SKIP, not a failure, so a leg can go green without exercising the #4262 guard.
 set -euo pipefail
 
 ROOT="$(git rev-parse --show-toplevel 2>/dev/null || { cd "$(dirname "$0")/../.." && pwd; })"
@@ -47,6 +49,21 @@ esac
 VCPKG_INSTALLED="$ROOT/vcpkg_installed/$TRIPLET"
 if [ ! -d "$VCPKG_INSTALLED" ]; then
   echo "test_build_examples_gating: SKIP — no populated vcpkg_installed/$TRIPLET (run scripts/setup.sh first)"
+  exit 77
+fi
+
+# A directory that exists is not a populated one (#6719). The sanitizer legs'
+# `vcpkg install --triplet x64-linux-asan|tsan` also install the HOST-tool
+# packages (abseil, protobuf, grpc, ...) into vcpkg_installed/x64-linux, but
+# the build's own dependencies (CLI11 among them) only into the instrumented
+# triplet. Such a host-only tree passes the directory check, and meson then
+# fails on `Dependency "CLI11" not found`. CLI11 is what the top-level
+# meson.build requires on every host, so its config file is the marker that
+# this tree can configure the build at all. Without it the configure smoke
+# test has nothing to test, so SKIP honestly instead of failing for a reason
+# that has nothing to do with build_examples gating.
+if [ ! -f "$VCPKG_INSTALLED/share/cli11/CLI11Config.cmake" ]; then
+  echo "test_build_examples_gating: SKIP — vcpkg_installed/$TRIPLET has no share/cli11/CLI11Config.cmake (a host-tools-only tree, e.g. left by a sanitizer-triplet install; #6719)"
   exit 77
 fi
 

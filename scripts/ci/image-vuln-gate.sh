@@ -27,8 +27,8 @@
 #     cosign signature or attestation on aquasecurity/trivy-db, checked
 #     2026-11-18): TLS to the registry and the recorded digest are the only
 #     evidence of what was used;
-#   - Trivy found no OS package in the image (a FROM-scratch or chiselled image
-#     has no package database it can read), unless the image is listed, in
+#   - Trivy found no OS package in the image (a FROM-scratch image with no
+#     package database it can read), unless the image is listed, in
 #     force, in scripts/ci/image-vuln-gate-not-covered.txt; a listed image is
 #     printed as NOT COVERED on every run;
 #   - the image's OS release is one Trivy has no advisory data for: Trivy marks
