@@ -6081,6 +6081,19 @@ TEST_CASE("dispatch announcement: every fan-out that records targets goes throug
         CHECK(src.find("close_empty_attempt(") == std::string::npos);
         CHECK(src.find("record_dispatch_targets(") == std::string::npos);
     }
+    // The software-sync push: announced before it sends, and its partial-list fact reaches the
+    // record.
+    const std::string& server = yuzu::test::source_scan::comment_free_source("server.cpp");
+    const auto push = server.find("push_sync_now_confined(const auth::Session&");
+    REQUIRE(push != std::string::npos);
+    const auto announce = server.find("DispatchAnnouncement announcement(", push);
+    const auto send = server.find("dispatch_system_reserved_ids(", push);
+    REQUIRE(announce != std::string::npos);
+    REQUIRE(send != std::string::npos);
+    CHECK(announce < send);
+    const auto record = server.find("announcement.record(targets, run && run->connected_only,", send);
+    REQUIRE(record != std::string::npos);
+    CHECK(server.substr(record, 200).find("run && run->partial_list))") != std::string::npos);
 }
 
 TEST_CASE("execution coverage JSON: a confined caller gets no run-wide value",
