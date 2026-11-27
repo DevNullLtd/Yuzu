@@ -10,6 +10,7 @@
  * CRITICAL C6: "No integration test through HTTP dispatch."
  */
 
+#include "access_review_model.hpp" // kScopeGroupIdMaxLen (record_attestation schema pin)
 #include "access_review_store.hpp" // kHistoryJustificationPreviewChars (description drift pin)
 #include "mcp_input_schema.hpp" // #2405: input-schema subset compiler
 #include "mcp_jsonrpc.hpp"
@@ -71,6 +72,7 @@
 #include "openapi_spec_access.hpp" // openapi_spec_json()
 #include "rbac_store.hpp"
 #include "response_store.hpp"
+#include "live_model.hpp" // resolve_rest_kind: the get_device_live kind pin
 #include "result_set_members.hpp" // kSourceNotSupportedMessage (Forensics-tier source refusal)
 #include "rest_api_v1.hpp"      // M.9 PR-2b: cross-transport cursor walk (REST + MCP)
 #include "software_collection_settings_routes.hpp" // SAM-35: REST parity for the settings tools
@@ -1561,6 +1563,11 @@ struct McpTestServer {
     /// to the global perm_fn (the pre-H1 behavior every existing test relies on).
     yuzu::server::mcp::McpServer::ScopedPermFn scoped_perm_fn_for_test{};
 
+    /// The typed twin of the per-device gate (`McpServer::set_scoped_gate_fn`): the refusal class
+    /// get_device_live's #7110 re-decision reads. Empty (the default) leaves the re-decision on
+    /// `scoped_perm_fn_for_test`, where every refusal reads as a denial.
+    yuzu::server::mcp::McpServer::ScopedGateFn scoped_gate_fn_for_test{};
+
     /// MCP Streamable HTTP transport (2f). Wire a registry to turn streaming ON
     /// (sessions minted on initialize, GET/DELETE functional). streaming_disabled_
     /// simulates --mcp-no-streaming (captured by pointer, like production).
@@ -2074,6 +2081,8 @@ private:
             mcp.set_workflow_idempotency_lookup_fn(workflow_idempotency_lookup_for_test);
         if (draining_for_test)
             mcp.set_draining_fn(draining_for_test);
+        if (scoped_gate_fn_for_test)
+            mcp.set_scoped_gate_fn(scoped_gate_fn_for_test);
         if (workflow_digest_for_test)
             mcp.set_workflow_digest_fn(workflow_digest_for_test);
         mcp.set_workflow_reauthorize_retry_delay(workflow_reauth_retry_for_test);
@@ -2544,6 +2553,14 @@ TEST_CASE("MCP 2g PR2: every tool advertises all four spec hints, coherent with 
     for (const auto& r : mcp::tool_security_rows_for_test())
         op[std::string(r.name)] = std::string(r.operation);
 
+    // The closed set of Read-class dispatch probes (a Read securable operation, but the call
+    // dispatches a command to a device and stores the result): the ONLY tools allowed to
+    // disagree with "readOnlyHint is the Read operation". Pinned by exact content below.
+    std::set<std::string> probes;
+    for (const auto sv : mcp::dispatch_probe_tool_names_for_test())
+        probes.insert(std::string(sv));
+    CHECK(probes == std::set<std::string>{"get_device_live"});
+
     std::set<std::string> listed;
     for (const auto& t : tools) {
         const auto name = t["name"].get<std::string>();
@@ -2580,8 +2597,18 @@ TEST_CASE("MCP 2g PR2: every tool advertises all four spec hints, coherent with 
         CHECK(open_world == (name == "register_revocation_source" ||
                              name == "update_revocation_source" ||
                              name == "create_offload_target"));
-        // readOnlyHint is mechanically the Read operation.
-        CHECK(read_only == (operation == "Read"));
+        // readOnlyHint is mechanically the Read operation, EXCEPT for the closed dispatch-probe
+        // set: a Read-class tool whose call dispatches to a device and stores the result is NOT
+        // read-only and NOT idempotent. Any other tool whose hint disagrees still fails here.
+        const bool probe = probes.count(name) == 1;
+        CHECK(read_only == (operation == "Read" && !probe));
+        if (probe) {
+            CHECK(operation == "Read");
+            CHECK(read_only == false);
+            CHECK(idempotent == false);
+            CHECK(destructive == false);
+            CHECK(open_world == false);
+        }
         // Coherence: a read-only tool is neither destructive, and reads are idempotent.
         if (read_only) {
             CHECK(destructive == false);
@@ -2633,6 +2660,15 @@ TEST_CASE("MCP 2g PR2: every tool advertises all four spec hints, coherent with 
         if (operation != "Read")
             non_read.insert(name);
     CHECK(write_tools == non_read);
+    // A dispatch probe keeps its Read classification (who may call it and the order of its checks
+    // are unchanged): every member is served, is a Read-class tool, and is absent from kWriteTools.
+    for (const auto& p : probes) {
+        INFO("dispatch probe = " << p);
+        CHECK(listed.count(p) == 1);
+        REQUIRE(op.count(p) == 1);
+        CHECK(op[p] == "Read");
+        CHECK(write_tools.count(p) == 0);
+    }
 
     auto ann = [&](const std::string& n) -> nlohmann::json {
         for (const auto& t : tools)
@@ -2736,7 +2772,11 @@ TEST_CASE("MCP 4752: record_attestation keeps destructiveHint and states the app
              "until the grant reaches its limit of 100 decisions", "at most 100 recorded decisions",
              "refused with invalid params and records nothing", "returns decision_seq",
              "previous_decision", "retry_after_ms can mean the decision was recorded anyway",
-             "before retrying, call get_access_review, compare decision_seq",
+             "before retrying, call get_access_review, find the row with the same "
+             "principal_type, principal_id, role_name AND scope, compare its decision_seq",
+             // #6969: the grant is identified by five parts, and the scope is stated as required.
+             "(campaign_id, principal_type, principal_id, role_name, scope)",
+             "scope is required: 'fleet' or 'management_group'",
              "match reviewer, justification and decided_at_ms",
              "an earlier entry shows at most its " + first_n,
              "a blind retry appends another identical decision"})
@@ -2768,6 +2808,26 @@ TEST_CASE("MCP 4752: record_attestation keeps destructiveHint and states the app
     const auto required = items["required"];
     CHECK(std::find(required.begin(), required.end(), "decision_seq") != required.end());
     CHECK(std::find(required.begin(), required.end(), "history") != required.end());
+
+    // #6969: every attestation row names its scope, always present and required; the request
+    // schema requires `scope` (the handler enforces it too, the schema is discovery metadata).
+    for (const char* k : {"scope", "scope_group_id", "scope_group_name"}) {
+        CHECK(items["properties"].contains(k));
+        CHECK(std::find(required.begin(), required.end(), k) != required.end());
+    }
+    CHECK(items["properties"]["scope"]["enum"] ==
+          nlohmann::json::array({"fleet", "management_group"}));
+    CHECK(gdesc.find("scope_group_name") != std::string::npos);
+    const auto& in = (*record)["inputSchema"];
+    CHECK(in["properties"]["scope"]["enum"] == nlohmann::json::array({"fleet", "management_group"}));
+    CHECK(in["properties"]["scope"]["type"] == "string");
+    CHECK(in["properties"]["scope_group_id"]["type"] == "string");
+    // The exact bound, as a literal: the management-group id contract (kMgmtGroupIdMaxBytes).
+    CHECK(in["properties"]["scope_group_id"]["maxLength"] == 256);
+    CHECK(yuzu::server::kScopeGroupIdMaxLen == 256);
+    const auto& in_required = in["required"];
+    CHECK(std::find(in_required.begin(), in_required.end(), "scope") != in_required.end());
+    CHECK(std::find(in_required.begin(), in_required.end(), "scope_group_id") == in_required.end());
 }
 
 // #4752: the history preview length appears as a literal number in many description strings.
@@ -11578,6 +11638,1550 @@ TEST_CASE("MCP DEX: get_dex_device_app_perf out-of-scope device -> 403, no provi
     REQUIRE(res);
     CHECK(res->status == 403);
     CHECK(res->body.find("service unavailable") == std::string::npos);
+}
+
+// ═══ #2146 (api-parity PR B): get_device_live, the MCP twin of POST /api/v1/dex/devices/{id}/live ═══
+//
+// The tool is a LEGACY dispatch branch (not a registry tool). Every case below drives the real
+// handler through McpTestServer. Cases that reach the dispatch need a ResponseStore (the shared
+// poll reads it), so they are Postgres-backed; the refusal cases before the dispatch are not.
+
+namespace {
+
+// The shared poll budget is a process-wide test seam: a case that reaches the poll lowers it
+// (2 polls, 1 ms) so a device that never answers costs milliseconds, and the guard puts it back.
+struct LivePollSeamGuard {
+    int saved_polls = yuzu::server::detail::live_poll_max_polls().load();
+    int saved_interval = yuzu::server::detail::live_poll_interval_ms().load();
+    LivePollSeamGuard(int polls, int interval_ms) {
+        yuzu::server::detail::live_poll_max_polls().store(polls);
+        yuzu::server::detail::live_poll_interval_ms().store(interval_ms);
+    }
+    ~LivePollSeamGuard() {
+        yuzu::server::detail::live_poll_max_polls().store(saved_polls);
+        yuzu::server::detail::live_poll_interval_ms().store(saved_interval);
+    }
+    LivePollSeamGuard(const LivePollSeamGuard&) = delete;
+    LivePollSeamGuard& operator=(const LivePollSeamGuard&) = delete;
+};
+
+// What the dispatch stub saw, and what it answers.
+struct LiveDispatchProbe {
+    int calls = 0;
+    std::string plugin, action, scope, execution_id;
+    std::vector<std::string> agent_ids;
+    std::unordered_map<std::string, std::string> params;
+    yuzu::server::DispatchCaller caller;
+    yuzu::server::ConfinedDispatchOutcome result{.sent = 1, .command_id = "live-cmd-1"};
+    std::function<void()> on_dispatch; // sampled or thrown from inside the dispatch
+
+    yuzu::server::mcp::McpServer::DispatchFn fn() {
+        return [this](const std::string& p, const std::string& a, const std::vector<std::string>& ids,
+                      const std::string& scope_expr,
+                      const std::unordered_map<std::string, std::string>& prm,
+                      const std::string& exec_id,
+                      const yuzu::server::DispatchCaller& c) -> yuzu::server::ConfinedDispatchOutcome {
+            ++calls;
+            plugin = p;
+            action = a;
+            agent_ids = ids;
+            scope = scope_expr;
+            params = prm;
+            execution_id = exec_id;
+            caller = c;
+            if (on_dispatch)
+                on_dispatch();
+            return result;
+        };
+    }
+};
+
+std::string live_req(const std::string& arguments_json, int id = 2146) {
+    return R"({"jsonrpc":"2.0","method":"tools/call","id":)" + std::to_string(id) +
+           R"(,"params":{"name":"get_device_live","arguments":)" + arguments_json + "}}";
+}
+
+std::string live_args(const std::string& agent, const std::string& kind) {
+    return R"({"agent_id":")" + agent + R"(","kind":")" + kind + R"("})";
+}
+
+// The tool payload of a success answer.
+nlohmann::json live_payload(const std::unique_ptr<httplib::Response>& res) {
+    REQUIRE(res);
+    const auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("result"));
+    return nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
+}
+
+// The JSON-RPC error object of a refused answer.
+nlohmann::json live_error(const std::unique_ptr<httplib::Response>& res) {
+    REQUIRE(res);
+    const auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    return body["error"];
+}
+
+// Every domain row of the call's own verbs, in order, as "<verb>|<result>".
+std::vector<std::string> live_domain_rows(const McpTestServer& ts) {
+    std::vector<std::string> out;
+    for (const auto& a : ts.audit_log)
+        if (a.starts_with("device.live."))
+            out.push_back(a);
+    return out;
+}
+
+double mcp_live_count(yuzu::MetricsRegistry& m, const std::string& kind, const std::string& outcome) {
+    return m.counter("yuzu_server_live_requests_total",
+                     {{"surface", "mcp"}, {"kind", kind}, {"outcome", outcome}})
+        .value();
+}
+
+// A fixture for every case that reaches the dispatch: a real ResponseStore, the ONE shared
+// budget, a metrics registry, the dispatch probe, a caller that carries its identity (and a
+// deliberately stamped approval ticket, which the tool must strip) and a scoped gate that records
+// each call and admits unless told otherwise.
+void wire_mg_session_writer(McpTestServer& ts); // defined with the management-group tests below
+
+struct LiveMcpFixture {
+    yuzu::server::pg::PgPool pool;
+    yuzu::server::ResponseStore store;
+    yuzu::MetricsRegistry metrics;
+    yuzu::server::detail::StreamBudget budget{{.global_cap = 8}};
+    LivePollSeamGuard poll_seam{2, 1};
+    LiveDispatchProbe probe;
+    std::vector<std::string> gate_calls; // "<securable>:<operation>:<agent>"
+    std::function<bool(const std::string& securable, const std::string& op)> gate_admits;
+    /// Production always wires the typed gate the #7110 re-decision reads (server.cpp). By default
+    /// it answers exactly as the bool gate above (admit, or a definitive Denied); a test of the
+    /// UNWIRED case clears this before start(), a test of a specific refusal sets
+    /// `ts.scoped_gate_fn_for_test` itself.
+    bool wire_typed_gate = true;
+    McpTestServer ts;
+
+    explicit LiveMcpFixture(const std::string& dsn)
+        : pool{{.conninfo = dsn, .size = 4}}, store{pool} {
+        REQUIRE(store.is_open());
+        ts.response_store_for_test = &store;
+        ts.metrics_for_test = &metrics;
+        ts.stream_budget_for_test = &budget;
+        ts.scoped_perm_fn_for_test = [this](const httplib::Request&, httplib::Response& res,
+                                            const std::string& securable, const std::string& op,
+                                            const std::string& agent) -> bool {
+            gate_calls.push_back(securable + ":" + op + ":" + agent);
+            if (gate_admits && !gate_admits(securable, op)) {
+                res.status = 403;
+                res.set_content(R"({"error":"forbidden"})", "application/json");
+                return false;
+            }
+            return true;
+        };
+        ts.caller_fn_for_test = [](const auth::Session& s) -> yuzu::server::DispatchCaller {
+            yuzu::server::DispatchCaller c;
+            c.principal = s.username;
+            c.principal_role = "administrator";
+            c.principal_is_admin = true;
+            c.exec_visible = yuzu::server::authz::VisibleSet{}; // unfiltered, like an admin
+            // A stamped ticket must NOT survive into a live read (the tool is not a stamping site).
+            c.approval_provenance = yuzu::server::ApprovalProvenance::Ticket;
+            return c;
+        };
+    }
+
+    void start(const std::string& tier = "operator") {
+        if (wire_typed_gate && !ts.scoped_gate_fn_for_test) {
+            ts.scoped_gate_fn_for_test =
+                [this](const httplib::Request& req, httplib::Response& res,
+                       const std::string& securable, const std::string& op,
+                       const std::string& agent) -> yuzu::server::ScopedGateOutcome {
+                return ts.scoped_perm_fn_for_test(req, res, securable, op, agent)
+                           ? yuzu::server::ScopedGateOutcome::Admitted
+                           : yuzu::server::ScopedGateOutcome::Denied;
+            };
+        }
+        ts.start_with_dispatch(probe.fn(), tier);
+    }
+
+    void put_row(const std::string& command_id, const std::string& agent, int status,
+                 const std::string& output, const std::string& error_detail = {}, int64_t ts_s = 0) {
+        yuzu::server::StoredResponse r;
+        r.instruction_id = command_id;
+        r.agent_id = agent;
+        r.status = status;
+        r.output = output;
+        r.error_detail = error_detail;
+        r.timestamp = ts_s;
+        store.store(r);
+    }
+
+    std::unique_ptr<httplib::Response> call(const std::string& agent, const std::string& kind) {
+        return ts.call(live_req(live_args(agent, kind)));
+    }
+};
+
+} // namespace
+
+TEST_CASE("MCP get_device_live uptime: dispatches os_info/uptime as the caller, audits requested then "
+          "success, serves the typed body",
+          "[pg][mcp][integration][live][2146]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    LiveMcpFixture f{db.dsn()};
+    f.put_row("live-cmd-1", "WS-1", 1, "uptime_seconds|181740\nuptime_display|2d 2h 29m");
+    // The lease is held while the dispatch runs and while the `requested` row is written.
+    std::size_t leases_in_dispatch = 99, leases_at_requested = 99;
+    f.probe.on_dispatch = [&] {
+        leases_in_dispatch =
+            f.budget.active_for(yuzu::server::detail::SseSurface::kLiveRead, "test-user");
+    };
+    f.ts.audit_succeeds_for_action_ = [&](const std::string& action) {
+        if (action == "device.live.uptime")
+            leases_at_requested =
+                f.budget.active_for(yuzu::server::detail::SseSurface::kLiveRead, "test-user");
+        return true;
+    };
+    f.start();
+
+    auto res = f.call("WS-1", "uptime");
+    const auto p = live_payload(res);
+    CHECK(p["agent_id"] == "WS-1");
+    CHECK(p["kind"] == "uptime");
+    CHECK(p["uptime_display"] == "2d 2h 29m");
+    CHECK(p["uptime_seconds"].get<int64_t>() == 181740);
+    CHECK(p["count"] == 0);
+    CHECK(p["truncated"] == false);
+    CHECK_FALSE(p.contains("audit_persisted"));
+    // structuredContent mirrors the text exactly (typed output).
+    const auto body = nlohmann::json::parse(res->body);
+    CHECK(body["result"]["structuredContent"] == p);
+
+    // Dispatched as the caller: the closed pair, one target, no scope, no params, the caller's
+    // own identity and admin bit, and NO approval provenance (the fixture stamped a Ticket).
+    CHECK(f.probe.calls == 1);
+    CHECK(f.probe.plugin == "os_info");
+    CHECK(f.probe.action == "uptime");
+    CHECK(f.probe.agent_ids == std::vector<std::string>{"WS-1"});
+    CHECK(f.probe.scope.empty());
+    CHECK(f.probe.params.empty());
+    CHECK(f.probe.caller.principal == "test-user");
+    CHECK(f.probe.caller.principal_is_admin);
+    CHECK(f.probe.caller.approval_provenance == yuzu::server::ApprovalProvenance::None);
+
+    // Two domain-order rows: the fail-closed `requested` row, then the generic success row.
+    REQUIRE(f.ts.audit_log.size() == 2);
+    CHECK(f.ts.audit_log[0] == "device.live.uptime|requested");
+    CHECK(f.ts.audit_log[1] == "mcp.get_device_live|success");
+    CHECK(f.ts.audit_target_ids[0] == "WS-1");
+    CHECK(f.ts.audit_target_types[0] == "Agent");
+    // One correlation id across the response header and the `requested` row.
+    const auto cid = res->get_header_value("X-Correlation-Id");
+    REQUIRE_FALSE(cid.empty());
+    CHECK(f.ts.audit_details[0].find("cid=" + cid) != std::string::npos);
+    CHECK(f.ts.audit_details[0].find("os_info/uptime") != std::string::npos);
+
+    // The literal gate sequence: Read, Execute, then both again after the `requested` row.
+    CHECK(f.gate_calls == std::vector<std::string>{"GuaranteedState:Read:WS-1",
+                                                   "Execution:Execute:WS-1",
+                                                   "GuaranteedState:Read:WS-1",
+                                                   "Execution:Execute:WS-1"});
+    CHECK(leases_in_dispatch == 1);
+    CHECK(leases_at_requested == 1);
+    CHECK(f.budget.active() == 0);
+    CHECK(mcp_live_count(f.metrics, "uptime", "ok") == 1.0);
+}
+
+TEST_CASE("MCP get_device_live processes: dispatches processes/list_hashed, parses full and short rows",
+          "[pg][mcp][integration][live][2146]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    LiveMcpFixture f{db.dsn()};
+    f.put_row("live-cmd-1", "WS-1", 1,
+              "proc|0|[System Process]||\n"
+              "proc|123|sh|deadbeefcafe0000111122223333444455556666777788889999aaaabbbbccccdddd|/bin/sh\n"
+              "proc|9|bash");
+    f.start();
+
+    const auto p = live_payload(f.call("WS-1", "processes"));
+    CHECK(f.probe.plugin == "processes");
+    CHECK(f.probe.action == "list_hashed");
+    CHECK(p["kind"] == "processes");
+    REQUIRE(p["processes"].is_array());
+    REQUIRE(p["processes"].size() == 3);
+    CHECK(p["count"] == 3);
+    CHECK(p["truncated"] == false);
+    CHECK(p["processes"][1]["pid"] == 123);
+    CHECK(p["processes"][1]["name"] == "sh");
+    CHECK(p["processes"][1]["path"] == "/bin/sh");
+    CHECK(p["processes"][1]["sha256"].get<std::string>().rfind("deadbeefcafe0000", 0) == 0);
+    // The short `proc|pid|name` form is accepted, with an empty hash and path.
+    CHECK(p["processes"][2]["pid"] == 9);
+    CHECK(p["processes"][2]["name"] == "bash");
+    CHECK(p["processes"][2]["sha256"] == "");
+    // The per-kind domain verb: processes is separately auditable from uptime.
+    REQUIRE(live_domain_rows(f.ts).size() == 1);
+    CHECK(live_domain_rows(f.ts)[0] == "device.live.processes|requested");
+    CHECK(f.ts.audit_log.back() == "mcp.get_device_live|success");
+    CHECK(mcp_live_count(f.metrics, "processes", "ok") == 1.0);
+}
+
+TEST_CASE("MCP get_device_live: strict arguments (object, agent_id 1..256 and never __all__, kind a "
+          "string, no other key); a refusal writes no row, sends nothing and takes no slot",
+          "[mcp][integration][live][2146]") {
+    yuzu::MetricsRegistry metrics;
+    yuzu::server::detail::StreamBudget budget{{.global_cap = 8}};
+    LiveDispatchProbe probe;
+    McpTestServer ts;
+    ts.metrics_for_test = &metrics;
+    ts.stream_budget_for_test = &budget;
+    ts.scoped_perm_fn_for_test = [](const httplib::Request&, httplib::Response&, const std::string&,
+                                    const std::string&, const std::string&) { return true; };
+    ts.start_with_dispatch(probe.fn(), "operator");
+
+    const std::string too_long(257, 'a');
+    const std::vector<std::string> bad = {
+        R"({})",
+        R"({"kind":"uptime"})",
+        R"({"agent_id":"WS-1"})",
+        R"({"agent_id":"","kind":"uptime"})",
+        R"({"agent_id":")" + too_long + R"(","kind":"uptime"})",
+        R"({"agent_id":7,"kind":"uptime"})",
+        R"({"agent_id":null,"kind":"uptime"})",
+        R"({"agent_id":"__all__","kind":"uptime"})",
+        R"({"agent_id":"WS\n1","kind":"uptime"})",
+        R"({"agent_id":"WS-1","kind":7})",
+        R"({"agent_id":"WS-1","kind":null})",
+        R"({"agent_id":"WS-1","kind":"uptime","agent_ids":["a","b"]})",
+        R"({"agent_id":"WS-1","kind":"uptime","scope":"all"})",
+        R"({"agent_id":"WS-1","kind":"uptime","sql":"select 1"})",
+        R"({"agent_id":"WS-1","kind":"uptime","params":{"x":"y"}})",
+        R"({"agent_id":"WS-1","kind":"uptime","approval_id":"a-1"})",
+        R"("a string")",
+        R"([])",
+        R"(null)",
+    };
+    for (const auto& args : bad) {
+        INFO(args);
+        auto res = ts.call(live_req(args));
+        const auto err = live_error(res);
+        CHECK(err["code"] == yuzu::server::mcp::kInvalidParams);
+        // A4 envelope: the one correlation id of the call (the response header), no retry hint.
+        REQUIRE(res);
+        CHECK_FALSE(res->get_header_value("X-Correlation-Id").empty());
+        CHECK(err["data"]["correlation_id"] == res->get_header_value("X-Correlation-Id"));
+        CHECK(err["data"]["retry_after_ms"].is_null());
+    }
+    // No `arguments` key at all.
+    auto none = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"get_device_live"}})");
+    CHECK(live_error(none)["code"] == yuzu::server::mcp::kInvalidParams);
+
+    CHECK(probe.calls == 0);
+    CHECK(ts.audit_log.empty());
+    CHECK(budget.active() == 0);
+    // An argument-shape refusal is validated before the tool arms an outcome, so it is not counted at
+    // all: not as bad_kind or internal, and never as bad_device_id (the REST route's own word for
+    // a refused device id), under any kind the call named.
+    CHECK(mcp_live_count(metrics, "unknown", "bad_kind") == 0.0);
+    CHECK(mcp_live_count(metrics, "unknown", "internal") == 0.0);
+    for (const char* kind : {"uptime", "processes", "unknown"})
+        CHECK(mcp_live_count(metrics, kind, "bad_device_id") == 0.0);
+}
+
+TEST_CASE("MCP get_device_live: agent_id is accepted at 256 characters and refused at 257",
+          "[mcp][integration][live][2146]") {
+    yuzu::MetricsRegistry metrics;
+    yuzu::server::detail::StreamBudget budget{{.global_cap = 8}};
+    LiveDispatchProbe probe;
+    McpTestServer ts; // no ResponseStore: an admitted call stops at the wiring check
+    ts.metrics_for_test = &metrics;
+    ts.stream_budget_for_test = &budget;
+    ts.scoped_perm_fn_for_test = [](const httplib::Request&, httplib::Response&, const std::string&,
+                                    const std::string&, const std::string&) { return true; };
+    ts.start_with_dispatch(probe.fn(), "operator");
+
+    // 256 characters passes argument validation and reaches the wiring check (an internal error,
+    // never invalid params); 257 is refused as invalid params before any of it.
+    auto at_limit = ts.call(live_req(live_args(std::string(256, 'a'), "uptime")));
+    CHECK(live_error(at_limit)["code"] == yuzu::server::mcp::kInternalError);
+    CHECK(mcp_live_count(metrics, "uptime", "not_configured") == 1.0);
+    auto over = ts.call(live_req(live_args(std::string(257, 'a'), "uptime")));
+    CHECK(live_error(over)["code"] == yuzu::server::mcp::kInvalidParams);
+    CHECK(mcp_live_count(metrics, "uptime", "not_configured") == 1.0); // unchanged: not counted
+    CHECK(probe.calls == 0);
+    CHECK(ts.audit_log.empty());
+}
+
+TEST_CASE("MCP get_device_live: the served description states the lease limits the budget enforces",
+          "[mcp][integration][live][2146]") {
+    McpTestServer ts;
+    ts.start("operator");
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/list","id":1})");
+    REQUIRE(res);
+    const auto body = nlohmann::json::parse(res->body);
+    std::string description;
+    for (const auto& t : body["result"]["tools"])
+        if (t["name"] == "get_device_live")
+            description = t["description"].get<std::string>();
+    REQUIRE_FALSE(description.empty());
+    // "(at most N per principal, M server-wide; ..." is the wording; a changed constant must
+    // change the text, and a changed text must change the constant.
+    const std::string expected =
+        "at most " + std::to_string(yuzu::server::detail::kPerPrincipalLiveRead) +
+        " per principal, " + std::to_string(yuzu::server::detail::kLiveReadSurfaceCap) +
+        " server-wide";
+    CHECK(description.find(expected) != std::string::npos);
+    // F1: the partial-output claim is exact. "never returned" is true only without a final row (and
+    // not for an answer already over the size cap); a chunk the server failed to store cannot be
+    // detected, so the claim must say so.
+    CHECK(description.find("partial output is never returned") == std::string::npos);
+    CHECK(description.find("partial output without a final row is never returned") !=
+          std::string::npos);
+    CHECK(description.find("failed to store cannot be detected") != std::string::npos);
+    // The over-cap exception to that claim, and the cut-to-nothing answer, are stated.
+    CHECK(description.find("never returned, except that an answer already over the size cap is "
+                           "cut and flagged truncated at once") != std::string::npos);
+    CHECK(description.find("flagged truncated at once") != std::string::npos);
+    CHECK(description.find("count 0 with truncated true means the size cap cut everything") !=
+          std::string::npos);
+    CHECK(description.find("a retry returns the same") != std::string::npos);
+    CHECK(description.find("are the start of what was read") != std::string::npos);
+    CHECK(description.find("already the newest stored output") != std::string::npos);
+    CHECK(description.find("may not be a prefix of the full answer") != std::string::npos);
+    CHECK(description.find("they come from the newest stored output") == std::string::npos); // the old wording
+    CHECK(description.find("they are the newest ones") == std::string::npos); // the ambiguous wording
+    CHECK(description.size() < 4096);
+    // F2: the reason and retry statements are the ones the handler makes. MCP stamps the denial
+    // TOKEN, never `dispatch_denied`, and says which refusals carry no reason; a quick kind's
+    // `incomplete` waits the poll deadline (25 s) rather than the timeout's 3 s (processes: 120 s).
+    CHECK(description.find("dispatch_denied") == std::string::npos);
+    CHECK(description.find("a dispatch denial token") != std::string::npos);
+    CHECK(description.find("audit_failed") != std::string::npos);
+    CHECK(description.find("render_failed") != std::string::npos);
+    CHECK(description.find("carry none") != std::string::npos);
+    CHECK(description.find("25 second deadline") != std::string::npos);
+    CHECK(yuzu::server::mcp::kLiveReadIncompleteRetryMs == 25000);
+    // PX-1: the per-OS claim is exact. No OS hashes every row, so the description must not say so.
+    CHECK(description.find("hash every row") == std::string::npos);
+    CHECK(description.find("hash_unavailable:<cause>") != std::string::npos);
+    CHECK(description.find("threads have no executable link even for a privileged agent") != std::string::npos);
+}
+
+TEST_CASE("MCP get_device_live: a kind outside the REST pair (a dashboard-only kind, an unknown name, "
+          "another case) is -32602, counted bad_kind, with no row and no dispatch",
+          "[mcp][integration][live][2146]") {
+    yuzu::MetricsRegistry metrics;
+    LiveDispatchProbe probe;
+    McpTestServer ts;
+    ts.metrics_for_test = &metrics;
+    ts.scoped_perm_fn_for_test = [](const httplib::Request&, httplib::Response&, const std::string&,
+                                    const std::string&, const std::string&) { return true; };
+    ts.start_with_dispatch(probe.fn(), "operator");
+    for (const char* kind : {"services", "hw_memory", "process_tree", "bogus", "Uptime", "uptime ", ""}) {
+        INFO(kind);
+        auto res = ts.call(live_req(live_args("WS-1", kind)));
+        const auto err = live_error(res);
+        CHECK(err["code"] == yuzu::server::mcp::kInvalidParams);
+        REQUIRE(res);
+        CHECK_FALSE(res->get_header_value("X-Correlation-Id").empty());
+        CHECK(err["data"]["correlation_id"] == res->get_header_value("X-Correlation-Id"));
+        CHECK(err["data"]["retry_after_ms"].is_null());
+    }
+    CHECK(probe.calls == 0);
+    CHECK(ts.audit_log.empty());
+    CHECK(mcp_live_count(metrics, "unknown", "bad_kind") == 7.0);
+}
+
+TEST_CASE("MCP get_device_live: the served schemas pin the kind enum to the REST pair and bound the input",
+          "[mcp][integration][live][2146]") {
+    McpTestServer ts;
+    ts.start("operator");
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/list","id":1})");
+    REQUIRE(res);
+    const auto body = nlohmann::json::parse(res->body);
+    const nlohmann::json* tool = nullptr;
+    for (const auto& t : body["result"]["tools"])
+        if (t["name"] == "get_device_live")
+            tool = &t;
+    REQUIRE(tool != nullptr);
+    const auto& in = (*tool)["inputSchema"];
+    CHECK(in["additionalProperties"] == false);
+    CHECK(in["properties"]["agent_id"]["minLength"] == 1);
+    CHECK(in["properties"]["agent_id"]["maxLength"] == 256);
+    std::set<std::string> served;
+    for (const auto& k : in["properties"]["kind"]["enum"])
+        served.insert(k.get<std::string>());
+    CHECK(served == std::set<std::string>{"uptime", "processes"});
+    // The served enum is exactly what the REST route serves: each name resolves, and the
+    // dashboard-only neighbours do not.
+    for (const auto& k : served)
+        CHECK(yuzu::server::live::resolve_rest_kind(k).has_value());
+    for (const char* k : {"services", "hw_memory", "process_tree", "disks"})
+        CHECK_FALSE(yuzu::server::live::resolve_rest_kind(k).has_value());
+    CHECK(in["required"] == nlohmann::json::array({"agent_id", "kind"}));
+    // Typed output, bounded.
+    const auto& out = (*tool)["outputSchema"];
+    CHECK(out["properties"]["processes"]["maxItems"] == 1000);
+    CHECK(out["properties"]["truncated"]["type"] == "boolean");
+    CHECK(out["required"] == nlohmann::json::array({"agent_id", "kind", "count", "truncated"}));
+    // Annotations: honest labels. The call dispatches a command to the device and stores the
+    // result, so it is neither read-only nor idempotent; it only adds rows (not destructive); the
+    // target is a managed device (not open-world, like execute_instruction).
+    const auto& ann = (*tool)["annotations"];
+    REQUIRE(ann.is_object());
+    CHECK(ann["readOnlyHint"] == false);
+    CHECK(ann["idempotentHint"] == false);
+    CHECK(ann["destructiveHint"] == false);
+    CHECK(ann["openWorldHint"] == false);
+}
+
+TEST_CASE("MCP get_device_live: a supervised token is refused (no approval ticket for a live probe) "
+          "before any slot or domain row; the operator tier is admitted",
+          "[mcp][integration][live][2146]") {
+    yuzu::MetricsRegistry metrics;
+    // A budget with no room at all: a refusal that reached the lease would answer 429, so a
+    // -32004 here proves the tier refusal comes first.
+    yuzu::server::detail::StreamBudget budget{{.global_cap = 0}};
+    LiveDispatchProbe probe;
+    McpTestServer ts;
+    ts.metrics_for_test = &metrics;
+    ts.stream_budget_for_test = &budget;
+    ts.scoped_perm_fn_for_test = [](const httplib::Request&, httplib::Response&, const std::string&,
+                                    const std::string&, const std::string&) { return true; };
+    ts.start_with_dispatch(probe.fn(), "supervised");
+    auto res = ts.call(live_req(live_args("WS-1", "uptime")));
+    CHECK(live_error(res)["code"] == yuzu::server::mcp::kTierDenied);
+    CHECK(probe.calls == 0);
+    CHECK(ts.audit_log == std::vector<std::string>{"mcp.get_device_live|denied"});
+    CHECK(mcp_live_count(metrics, "uptime", "approval_refused") == 1.0);
+    // Not -32006: that code requires a pollable approval id this tool can never mint.
+    CHECK(live_error(res)["code"] != -32006);
+}
+
+TEST_CASE("MCP get_device_live: a readonly token is refused by the Execute tier check, before any row",
+          "[mcp][integration][live][2146]") {
+    yuzu::MetricsRegistry metrics;
+    LiveDispatchProbe probe;
+    McpTestServer ts;
+    ts.metrics_for_test = &metrics;
+    ts.scoped_perm_fn_for_test = [](const httplib::Request&, httplib::Response&, const std::string&,
+                                    const std::string&, const std::string&) { return true; };
+    ts.start_with_dispatch(probe.fn(), "readonly");
+    auto res = ts.call(live_req(live_args("WS-1", "processes")));
+    CHECK(live_error(res)["code"] == yuzu::server::mcp::kTierDenied);
+    CHECK(probe.calls == 0);
+    CHECK(ts.audit_log == std::vector<std::string>{"mcp.get_device_live|denied"});
+    // H2: counted under the kind the call asked for, as the REST route labels it at entry.
+    CHECK(mcp_live_count(metrics, "processes", "tier_refused") == 1.0);
+    CHECK(mcp_live_count(metrics, "unknown", "tier_refused") == 0.0);
+    // A kind this tool does not serve is never a label value: it collapses to `unknown`.
+    auto bogus = ts.call(live_req(live_args("WS-1", "not-a-kind-and-not-a-label")));
+    CHECK(live_error(bogus)["code"] == yuzu::server::mcp::kTierDenied);
+    CHECK(mcp_live_count(metrics, "unknown", "tier_refused") == 1.0);
+    CHECK(mcp_live_count(metrics, "processes", "tier_refused") == 1.0);
+}
+
+TEST_CASE("MCP get_device_live: refused under --mcp-read-only, with a denied row and nothing sent",
+          "[mcp][integration][live][2146]") {
+    yuzu::MetricsRegistry metrics;
+    LiveDispatchProbe probe;
+    McpTestServer ts;
+    ts.metrics_for_test = &metrics;
+    ts.read_only_mode_ = true;
+    ts.scoped_perm_fn_for_test = [](const httplib::Request&, httplib::Response&, const std::string&,
+                                    const std::string&, const std::string&) { return true; };
+    ts.start_with_dispatch(probe.fn(), "operator");
+    auto res = ts.call(live_req(live_args("WS-1", "uptime")));
+    const auto err = live_error(res);
+    CHECK(err["code"] == yuzu::server::mcp::kTierDenied);
+    CHECK(err["message"].get<std::string>().find("read-only") != std::string::npos);
+    CHECK(probe.calls == 0);
+    CHECK(ts.audit_log == std::vector<std::string>{"mcp.get_device_live|denied"});
+    CHECK(mcp_live_count(metrics, "uptime", "read_only_refused") == 1.0);
+}
+
+TEST_CASE("MCP get_device_live: the scoped gates run before the supervised and read-only refusals, so "
+          "an out-of-scope device answers the gate's 403, not the mode refusal",
+          "[mcp][integration][live][scope][2146]") {
+    LiveDispatchProbe probe;
+    const auto deny_all_gate = [](const httplib::Request&, httplib::Response& res, const std::string&,
+                                  const std::string&, const std::string&) {
+        res.status = 403;
+        res.set_content(R"({"error":"forbidden"})", "application/json");
+        return false;
+    };
+    SECTION("a supervised token") {
+        McpTestServer ts;
+        ts.scoped_perm_fn_for_test = deny_all_gate;
+        ts.start_with_dispatch(probe.fn(), "supervised");
+        auto res = ts.call(live_req(live_args("WS-9", "uptime")));
+        CHECK(res->status == 403);
+        CHECK(ts.audit_log.empty()); // no `denied` mode row: the gate answered first
+    }
+    SECTION("--mcp-read-only") {
+        McpTestServer ts;
+        ts.read_only_mode_ = true;
+        ts.scoped_perm_fn_for_test = deny_all_gate;
+        ts.start_with_dispatch(probe.fn(), "operator");
+        auto res = ts.call(live_req(live_args("WS-9", "uptime")));
+        CHECK(res->status == 403);
+        CHECK(ts.audit_log.empty());
+    }
+    CHECK(probe.calls == 0);
+}
+
+TEST_CASE("MCP get_device_live: the two scoped gates are decided per device; a withheld grant, or an "
+          "unwired gate, sends nothing and writes nothing",
+          "[mcp][integration][live][scope][2146]") {
+    LiveDispatchProbe probe;
+    std::vector<std::string> calls;
+    std::string deny; // "Read", "Execute" or empty
+    {
+        McpTestServer ts;
+        ts.scoped_perm_fn_for_test = [&](const httplib::Request&, httplib::Response& res,
+                                         const std::string& sec, const std::string& op,
+                                         const std::string& agent) -> bool {
+            calls.push_back(sec + ":" + op + ":" + agent);
+            if (op == deny) {
+                res.status = 403;
+                res.set_content(R"({"error":"forbidden"})", "application/json");
+                return false;
+            }
+            return true;
+        };
+        ts.start_with_dispatch(probe.fn(), "operator");
+
+        deny = "Read";
+        auto r1 = ts.call(live_req(live_args("WS-9", "uptime")));
+        CHECK(r1->status == 403);
+        CHECK(calls == std::vector<std::string>{"GuaranteedState:Read:WS-9"}); // first gate stops it
+
+        calls.clear();
+        deny = "Execute";
+        auto r2 = ts.call(live_req(live_args("WS-9", "uptime")));
+        CHECK(r2->status == 403);
+        CHECK(calls == std::vector<std::string>{"GuaranteedState:Read:WS-9",
+                                                "Execution:Execute:WS-9"});
+        CHECK(probe.calls == 0);
+        CHECK(ts.audit_log.empty());
+    }
+    {
+        McpTestServer unwired; // scoped_perm_fn_for_test left empty: fail CLOSED
+        unwired.start_with_dispatch(probe.fn(), "operator");
+        auto res = unwired.call(live_req(live_args("WS-1", "uptime")));
+        const auto err = live_error(res);
+        CHECK(err["code"] == yuzu::server::mcp::kInternalError);
+        CHECK(err["message"].get<std::string>().find("scope gate not configured") !=
+              std::string::npos);
+        // One correlation id for the whole call: the body's equals the header's (it used to mint a
+        // second one), and a permanent refusal carries no retry hint.
+        REQUIRE(res);
+        CHECK_FALSE(res->get_header_value("X-Correlation-Id").empty());
+        CHECK(err["data"]["correlation_id"] == res->get_header_value("X-Correlation-Id"));
+        CHECK(err["data"]["retry_after_ms"].is_null());
+        CHECK(probe.calls == 0);
+        CHECK(unwired.audit_log.empty());
+    }
+}
+
+TEST_CASE("MCP get_device_live: an unwired response store or dispatch is a retryable internal error",
+          "[mcp][integration][live][2146]") {
+    yuzu::MetricsRegistry metrics;
+    McpTestServer ts; // no ResponseStore, no dispatch
+    ts.metrics_for_test = &metrics;
+    ts.scoped_perm_fn_for_test = [](const httplib::Request&, httplib::Response&, const std::string&,
+                                    const std::string&, const std::string&) { return true; };
+    ts.start("operator");
+    auto res = ts.call(live_req(live_args("WS-1", "uptime")));
+    const auto err = live_error(res);
+    CHECK(err["code"] == yuzu::server::mcp::kInternalError);
+    CHECK(err["data"]["retry_after_ms"] == yuzu::server::mcp::kMcpProviderWarmupRetryMs);
+    CHECK(ts.audit_log.empty());
+    CHECK(mcp_live_count(metrics, "uptime", "not_configured") == 1.0);
+}
+
+TEST_CASE("MCP get_device_live: an unwired Forensics plugin set is refused up front, retryable, with "
+          "no slot, no row and no dispatch",
+          "[pg][mcp][integration][live][forensics_tier][2146]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    LiveMcpFixture f{db.dsn()};
+    f.ts.forensics_unwired_for_test = true; // the response store and dispatch ARE wired
+    f.start();
+    const auto err = live_error(f.call("WS-1", "uptime"));
+    CHECK(err["code"] == yuzu::server::mcp::kInternalError);
+    CHECK(err["data"]["retry_after_ms"] == yuzu::server::mcp::kMcpProviderWarmupRetryMs);
+    CHECK(f.probe.calls == 0);
+    CHECK(f.ts.audit_log.empty());
+    CHECK(f.budget.active() == 0);
+    CHECK(mcp_live_count(f.metrics, "uptime", "not_configured") == 1.0);
+}
+
+TEST_CASE("MCP get_device_live: the in-flight gauge moves with the lease on the MCP surface and "
+          "returns to zero",
+          "[pg][mcp][integration][live][lease][metrics][2146]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    LiveMcpFixture f{db.dsn()};
+    f.put_row("live-cmd-1", "WS-1", 1, "uptime_display|1d");
+    double gauge_in_dispatch = -1.0;
+    double gauge_at_requested = -1.0;
+    f.probe.on_dispatch = [&] { gauge_in_dispatch = f.metrics.gauge("yuzu_server_live_in_flight").value(); };
+    f.ts.audit_succeeds_for_action_ = [&](const std::string& action) {
+        if (action == "device.live.uptime")
+            gauge_at_requested = f.metrics.gauge("yuzu_server_live_in_flight").value();
+        return true;
+    };
+    f.start();
+    CHECK(f.metrics.gauge("yuzu_server_live_in_flight").value() == 0.0);
+    const auto p = live_payload(f.call("WS-1", "uptime"));
+    CHECK(p["kind"] == "uptime");
+    CHECK(gauge_at_requested == 1.0);
+    CHECK(gauge_in_dispatch == 1.0);
+    CHECK(f.metrics.gauge("yuzu_server_live_in_flight").value() == 0.0);
+    CHECK(f.budget.active() == 0);
+
+    // A refused admission does not move it, and a throw from the dispatch returns it to zero.
+    f.probe.on_dispatch = [] { throw std::runtime_error("dispatch blew up"); };
+    (void)live_error(f.call("WS-1", "uptime"));
+    CHECK(f.metrics.gauge("yuzu_server_live_in_flight").value() == 0.0);
+}
+
+TEST_CASE("MCP get_device_live: the `requested` row is FAIL CLOSED (a failing or throwing sink sends "
+          "nothing and returns the slot); an unwired audit sink proceeds",
+          "[pg][mcp][integration][live][audit][2146]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    LiveMcpFixture f{db.dsn()};
+    f.put_row("live-cmd-1", "WS-1", 1, "uptime_display|1d");
+
+    SECTION("a sink that reports the row lost") {
+        f.ts.audit_fail_action_result_ = "device.live.uptime|requested";
+        f.start();
+        const auto err = live_error(f.call("WS-1", "uptime"));
+        CHECK(err["code"] == yuzu::server::mcp::kInternalError);
+        CHECK(err["data"]["retry_after_ms"] == yuzu::server::mcp::kMcpStoreFaultRetryMs);
+        CHECK(err["message"].get<std::string>().find("audit subsystem unavailable") !=
+              std::string::npos);
+        CHECK(f.probe.calls == 0);
+        CHECK(f.budget.active() == 0);
+        CHECK(mcp_live_count(f.metrics, "uptime", "audit_failed") == 1.0);
+    }
+    SECTION("a sink that throws") {
+        f.ts.audit_throw_action_result_ = "device.live.uptime|requested";
+        f.start();
+        const auto err = live_error(f.call("WS-1", "uptime"));
+        CHECK(err["code"] == yuzu::server::mcp::kInternalError);
+        CHECK(err["data"]["retry_after_ms"] == yuzu::server::mcp::kMcpStoreFaultRetryMs);
+        CHECK(f.probe.calls == 0);
+        CHECK(f.budget.active() == 0);
+        CHECK(mcp_live_count(f.metrics, "uptime", "audit_failed") == 1.0);
+    }
+    SECTION("no audit sink wired (audit off) is not a persistence failure") {
+        f.ts.audit_unwired_for_test = true;
+        f.start();
+        const auto p = live_payload(f.call("WS-1", "uptime"));
+        CHECK(p["uptime_display"] == "1d");
+        CHECK(f.probe.calls == 1);
+        CHECK(f.ts.audit_log.empty());
+        CHECK_FALSE(p.contains("audit_persisted"));
+    }
+}
+
+TEST_CASE("MCP get_device_live: a lost success row is flagged audit_persisted:false and the data is "
+          "still served",
+          "[pg][mcp][integration][live][audit][2146]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    LiveMcpFixture f{db.dsn()};
+    f.put_row("live-cmd-1", "WS-1", 1, "uptime_display|1d");
+    f.ts.audit_fail_action_result_ = "mcp.get_device_live|success";
+    f.start();
+    const auto p = live_payload(f.call("WS-1", "uptime"));
+    CHECK(p["uptime_display"] == "1d");
+    CHECK(p["audit_persisted"] == false);
+    CHECK(f.probe.calls == 1);
+}
+
+TEST_CASE("MCP get_device_live (#7110): a permission or session withdrawn while the `requested` row is "
+          "written sends nothing and leaves exactly two domain rows",
+          "[pg][mcp][integration][live][audit][2146]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    LiveMcpFixture f{db.dsn()};
+    f.put_row("live-cmd-1", "WS-1", 1, "uptime_display|1d");
+    enum class Withdraw { kNone, kExecute, kRead, kSession };
+    Withdraw withdraw = Withdraw::kNone;
+    bool revoke_execute = false, revoke_read = false;
+    f.gate_admits = [&](const std::string& securable, const std::string& op) {
+        if (revoke_execute && securable == "Execution" && op == "Execute")
+            return false;
+        if (revoke_read && securable == "GuaranteedState" && op == "Read")
+            return false;
+        return true;
+    };
+    // The withdrawal lands INSIDE the `requested` write, the exact window the second look closes.
+    wire_mg_session_writer(f.ts); // session-bound rows, so the principal on each row is visible
+    f.ts.audit_succeeds_for_action_ = [&](const std::string& action) {
+        if (action == "device.live.uptime") {
+            if (withdraw == Withdraw::kExecute)
+                revoke_execute = true;
+            else if (withdraw == Withdraw::kRead)
+                revoke_read = true;
+            else if (withdraw == Withdraw::kSession)
+                f.ts.mock_auth_enabled = false;
+        }
+        return true;
+    };
+    f.start();
+
+    const auto reset = [&](Withdraw w) {
+        f.ts.audit_log.clear();
+        f.ts.audit_details.clear();
+        f.ts.audit_principals.clear();
+        f.probe.calls = 0;
+        f.ts.mock_auth_enabled = true;
+        revoke_execute = revoke_read = false;
+        withdraw = w;
+    };
+    const auto run = [&](const char* label, Withdraw w, const char* reason) {
+        INFO(label);
+        reset(w);
+        auto res = f.call("WS-1", "uptime");
+        // A handler-rendered envelope rides HTTP 200 whatever the gate or authenticator wrote.
+        CHECK(res->status == 200);
+        const auto err = live_error(res);
+        CHECK(err["code"] == yuzu::server::mcp::kPermissionDenied);
+        CHECK(err["data"]["reason"] == reason);
+        CHECK(err["data"]["retry_after_ms"].is_null());
+        CHECK_FALSE(err["data"].contains("audit_persisted"));
+        CHECK(f.probe.calls == 0);
+        CHECK(live_domain_rows(f.ts) ==
+              std::vector<std::string>{"device.live.uptime|requested", "device.live.uptime|failure"});
+        CHECK(f.ts.audit_details.back().find(reason) != std::string::npos);
+        CHECK(f.budget.active() == 0);
+        // QE-12: the failure row names the session that made the call, whatever the cause.
+        REQUIRE(f.ts.audit_principals.size() == f.ts.audit_log.size());
+        for (std::size_t i = 0; i < f.ts.audit_log.size(); ++i)
+            if (f.ts.audit_log[i].starts_with("device.live."))
+                CHECK(f.ts.audit_principals[i] == "test-user");
+    };
+    run("execute withdrawn", Withdraw::kExecute, "permission_revoked");
+    run("read withdrawn", Withdraw::kRead, "permission_revoked");
+    run("session gone", Withdraw::kSession, "caller_unresolved");
+    CHECK(mcp_live_count(f.metrics, "uptime", "permission_revoked") == 2.0);
+    CHECK(mcp_live_count(f.metrics, "uptime", "caller_unresolved") == 1.0);
+
+    // A lost `failure` row is flagged on the answer: it is the only evidence nothing was sent.
+    reset(Withdraw::kExecute);
+    f.ts.audit_fail_action_result_ = "device.live.uptime|failure";
+    const auto err = live_error(f.call("WS-1", "uptime"));
+    CHECK(err["data"]["audit_persisted"] == false);
+    CHECK(f.probe.calls == 0);
+}
+
+// UP-8 / CO-2: a store DEGRADE between the two gate decisions is not a revocation. The refusal is a
+// retryable internal error, the failure row and the counter say `gate_unreadable`, and nothing is
+// sent. A definitive denial in the same window still says `permission_revoked`, and a lapsed
+// session still says `caller_unresolved`.
+TEST_CASE("MCP get_device_live: an unreadable gate at the re-decision is gate_unreadable and "
+          "retryable, never permission_revoked (UP-8)",
+          "[pg][mcp][integration][live][audit][2146]") {
+    using yuzu::server::ScopedGateOutcome;
+    struct Case {
+        const char* name;
+        ScopedGateOutcome refusal;
+        int code;
+        const char* token;
+        bool retryable;
+        const char* other; // the outcome that must stay at zero
+    };
+    const Case cases[] = {
+        {"the gate could not evaluate", ScopedGateOutcome::Unavailable,
+         yuzu::server::mcp::kInternalError, "gate_unreadable", true, "permission_revoked"},
+        {"an RBAC read failed", ScopedGateOutcome::RbacReadDegraded,
+         yuzu::server::mcp::kInternalError, "gate_unreadable", true, "permission_revoked"},
+        {"a management-group read failed", ScopedGateOutcome::MgmtGroupReadDegraded,
+         yuzu::server::mcp::kInternalError, "gate_unreadable", true, "permission_revoked"},
+        {"a definitive denial", ScopedGateOutcome::Denied, yuzu::server::mcp::kPermissionDenied,
+         "permission_revoked", false, "gate_unreadable"},
+        {"the session lapsed", ScopedGateOutcome::Unauthenticated,
+         yuzu::server::mcp::kPermissionDenied, "caller_unresolved", false, "gate_unreadable"},
+    };
+    for (const auto& c : cases) {
+        DYNAMIC_SECTION(c.name) {
+            YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+            LiveMcpFixture f{db.dsn()};
+            f.put_row("live-cmd-1", "WS-1", 1, "uptime_display|1d");
+            wire_mg_session_writer(f.ts);
+            bool refuse = false;
+            // The typed gate admits until the `requested` row is written, then refuses: the store
+            // degrades BETWEEN the two decisions.
+            f.ts.scoped_gate_fn_for_test = [&](const httplib::Request&, httplib::Response& res,
+                                               const std::string&, const std::string&,
+                                               const std::string&) -> ScopedGateOutcome {
+                if (!refuse)
+                    return ScopedGateOutcome::Admitted;
+                res.status = 403; // what the production gate writes; the handler replaces it
+                return c.refusal;
+            };
+            f.ts.audit_succeeds_for_action_ = [&](const std::string& action) {
+                if (action == "device.live.uptime")
+                    refuse = true;
+                return true;
+            };
+            f.start();
+            auto res = f.call("WS-1", "uptime");
+            CHECK(res->status == 200); // a handler-rendered envelope rides HTTP 200
+            const auto err = live_error(res);
+            CHECK(err["code"] == c.code);
+            CHECK(err["data"]["reason"] == c.token);
+            if (c.retryable)
+                CHECK(err["data"]["retry_after_ms"] == yuzu::server::mcp::kMcpStoreFaultRetryMs);
+            else
+                CHECK(err["data"]["retry_after_ms"].is_null());
+            CHECK(f.probe.calls == 0); // nothing sent
+            CHECK(live_domain_rows(f.ts) ==
+                  std::vector<std::string>{"device.live.uptime|requested", "device.live.uptime|failure"});
+            CHECK(f.ts.audit_details.back().find(c.token) == 0);
+            // QE-12: both rows name the session that made the call, for every refusal class.
+            REQUIRE(f.ts.audit_principals.size() == f.ts.audit_log.size());
+            for (std::size_t i = 0; i < f.ts.audit_log.size(); ++i)
+                if (f.ts.audit_log[i].starts_with("device.live."))
+                    CHECK(f.ts.audit_principals[i] == "test-user");
+            CHECK(mcp_live_count(f.metrics, "uptime", c.token) == 1.0);
+            CHECK(mcp_live_count(f.metrics, "uptime", c.other) == 0.0);
+            CHECK(f.budget.active() == 0);
+        }
+    }
+}
+
+// A4: when the typed gate was never wired, the re-decision cannot tell a withdrawal from an
+// unreadable store. It must fail CLOSED to a retryable `gate_unreadable`, never read the bool
+// gate's refusal as a revocation, and never send anything.
+TEST_CASE("MCP get_device_live: an unwired typed gate fails the re-decision closed to gate_unreadable, "
+          "never permission_revoked (A4)",
+          "[pg][mcp][integration][live][audit][2146]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    LiveMcpFixture f{db.dsn()};
+    f.wire_typed_gate = false; // the production wiring is absent; only the bool gate exists
+    f.put_row("live-cmd-1", "WS-1", 1, "uptime_display|1d");
+    f.start();
+    const auto res = f.call("WS-1", "uptime");
+    CHECK(res->status == 200);
+    const auto err = live_error(res);
+    CHECK(err["code"] == yuzu::server::mcp::kInternalError);
+    CHECK(err["data"]["reason"] == "gate_unreadable");
+    CHECK(err["data"]["retry_after_ms"] == yuzu::server::mcp::kMcpStoreFaultRetryMs);
+    CHECK(f.probe.calls == 0); // nothing was sent although the bool gate admitted both pairs
+    CHECK(live_domain_rows(f.ts) ==
+          std::vector<std::string>{"device.live.uptime|requested", "device.live.uptime|failure"});
+    CHECK(f.ts.audit_details.back().find("gate_unreadable") == 0);
+    CHECK(mcp_live_count(f.metrics, "uptime", "gate_unreadable") == 1.0);
+    CHECK(mcp_live_count(f.metrics, "uptime", "permission_revoked") == 0.0);
+    CHECK(f.budget.active() == 0);
+}
+
+// S1 / QE-4: the credential is revoked INSIDE the `requested` write. Every domain row is written
+// through the session-bound writer, so both rows name the principal who made the call; the
+// re-resolving writer would stamp no one on the failure row.
+TEST_CASE("MCP get_device_live: the requested and the failure row name the original session even when "
+          "the credential is revoked mid-call (S1)",
+          "[pg][mcp][integration][live][audit][2146]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    LiveMcpFixture f{db.dsn()};
+    f.put_row("live-cmd-1", "WS-1", 1, "uptime_display|1d");
+    wire_mg_session_writer(f.ts);
+    f.ts.audit_succeeds_for_action_ = [&](const std::string& action) {
+        if (action == "device.live.uptime")
+            f.ts.mock_auth_enabled = false; // the credential no longer resolves
+        return true;
+    };
+    f.start();
+    const auto err = live_error(f.call("WS-1", "uptime"));
+    CHECK(err["data"]["reason"] == "caller_unresolved");
+    REQUIRE(live_domain_rows(f.ts) ==
+            std::vector<std::string>{"device.live.uptime|requested", "device.live.uptime|failure"});
+    REQUIRE(f.ts.audit_principals.size() == f.ts.audit_log.size());
+    for (std::size_t i = 0; i < f.ts.audit_log.size(); ++i)
+        if (f.ts.audit_log[i].starts_with("device.live."))
+            CHECK(f.ts.audit_principals[i] == "test-user"); // never "": that is the re-resolving writer
+}
+
+// A credential that resolves to a DIFFERENT principal at the re-check is caller_unresolved: nothing
+// is sent, both rows stay attributed to the original session, and the failure row names the second
+// principal as one `audit_token`-ed value (a hostile name cannot add a field or a line).
+TEST_CASE("MCP get_device_live: a credential that resolves to a different principal at the re-check "
+          "is caller_unresolved and the failure row names the second principal as one token",
+          "[pg][mcp][integration][live][audit][2146]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    const std::vector<std::pair<std::string, std::string>> seconds = {
+        {"mallory", "mallory"}, {"evil\nx=y z", "evil_x_y_z"}};
+    for (const auto& [second, token] : seconds) {
+        INFO("second principal: " << token);
+        LiveMcpFixture f{db.dsn()};
+        f.put_row("live-cmd-1", "WS-1", 1, "uptime_display|1d");
+        wire_mg_session_writer(f.ts);
+        f.ts.audit_succeeds_for_action_ = [&](const std::string& action) {
+            if (action == "device.live.uptime")
+                f.ts.mock_username = second; // the next authentication yields someone else
+            return true;
+        };
+        f.start();
+        const auto err = live_error(f.call("WS-1", "uptime"));
+        CHECK(err["data"]["reason"] == "caller_unresolved");
+        CHECK(f.probe.calls == 0); // nothing was sent, as anyone
+        REQUIRE(live_domain_rows(f.ts) ==
+                std::vector<std::string>{"device.live.uptime|requested", "device.live.uptime|failure"});
+        REQUIRE(f.ts.audit_details.size() == f.ts.audit_log.size());
+        const auto& detail = f.ts.audit_details.back();
+        CHECK(detail.find("caller_unresolved") == 0);
+        CHECK(detail.find(" now=" + token + " ") != std::string::npos);
+        CHECK(detail.find('\n') == std::string::npos);
+        CHECK(detail.find("x=y") == std::string::npos);
+        REQUIRE(f.ts.audit_principals.size() == f.ts.audit_log.size());
+        for (std::size_t i = 0; i < f.ts.audit_log.size(); ++i)
+            if (f.ts.audit_log[i].starts_with("device.live."))
+                CHECK(f.ts.audit_principals[i] == "test-user"); // the ORIGINAL session
+        CHECK(mcp_live_count(f.metrics, "uptime", "caller_unresolved") == 1.0);
+        CHECK(f.budget.active() == 0);
+    }
+}
+
+// S3 / QE-4: the unknown-argument refusal echoes the key, cut at 64 bytes. A key whose character
+// STRADDLES the cut must not put an invalid UTF-8 sequence in the answer.
+TEST_CASE("MCP get_device_live: an unknown argument name cut inside a multi-byte character still "
+          "yields an answer that parses, cut at the boundary (S3)",
+          "[pg][mcp][integration][live][2146]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    LiveMcpFixture f{db.dsn()};
+    f.start();
+    const std::string key = std::string(63, 'k') + "\xc3\xa9" + "tail"; // the 2-byte e acute spans 63..64
+    const std::string args = std::string(R"({"agent_id":"WS-1","kind":"uptime",")") + key + R"(":1})";
+    auto res = f.ts.call(live_req(args));
+    REQUIRE(res);
+    const auto body = nlohmann::json::parse(res->body, nullptr, /*allow_exceptions=*/false);
+    REQUIRE_FALSE(body.is_discarded());
+    const auto message = body["error"]["message"].get<std::string>();
+    CHECK(message.find("unknown argument '" + std::string(63, 'k') + "'") != std::string::npos);
+    CHECK(f.probe.calls == 0);
+}
+
+// S3 / QE-4, the device-text side: the 200-byte cut of a failure text straddling a character.
+TEST_CASE("MCP get_device_live: a device failure text cut inside a multi-byte character still yields "
+          "an answer that parses, cut at the boundary (S3)",
+          "[pg][mcp][integration][live][2146]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    LiveMcpFixture f{db.dsn()};
+    f.put_row("live-cmd-1", "WS-1", 2, "", std::string(199, 'a') + "\xc3\xa9\xc3\xa9");
+    f.start();
+    auto res = f.call("WS-1", "uptime");
+    REQUIRE(res);
+    const auto body = nlohmann::json::parse(res->body, nullptr, /*allow_exceptions=*/false);
+    REQUIRE_FALSE(body.is_discarded());
+    CHECK(body["error"]["message"].get<std::string>() ==
+          "device query failed (device text): " + std::string(199, 'a'));
+}
+
+// CS-1 (c): a read that was ADMITTED before the drain began is allowed to finish: the drain waits
+// for it, and `draining` alone never aborts a poll (only the budget closing does).
+TEST_CASE("MCP get_device_live: a drain that begins while a read is held lets that read answer (CS-1)",
+          "[pg][mcp][integration][live][shutdown][2146]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    LiveMcpFixture f{db.dsn()};
+    bool draining = false;
+    f.ts.draining_for_test = [&] { return draining; };
+    f.ts.audit_succeeds_for_action_ = [&](const std::string& action) {
+        if (action == "device.live.uptime")
+            draining = true; // the drain begins while this read holds its lease
+        return true;
+    };
+    f.put_row("live-cmd-1", "WS-1", 1, "uptime_display|1d");
+    f.start();
+    const auto p = live_payload(f.call("WS-1", "uptime"));
+    CHECK(p["uptime_display"] == "1d");
+    CHECK(mcp_live_count(f.metrics, "uptime", "ok") == 1.0);
+    CHECK(mcp_live_count(f.metrics, "uptime", "shutting_down") == 0.0);
+    CHECK(f.budget.active() == 0);
+}
+
+TEST_CASE("MCP get_device_live: a dispatch that reaches no agent is classified, with the cause as the "
+          "error reason; only a retryable cause carries retry_after_ms",
+          "[pg][mcp][integration][live][zeroreach][2146]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    LiveMcpFixture f{db.dsn()};
+    f.start();
+    using yuzu::server::ConfinedDispatchOutcome;
+    using Reason = yuzu::server::detail::DispatchDenialReason;
+
+    struct Row {
+        const char* label;
+        std::function<void(ConfinedDispatchOutcome&)> set;
+        const char* reason;
+        int code;
+        bool retryable;
+    };
+    const int kPerm = yuzu::server::mcp::kPermissionDenied;
+    const int kInv = yuzu::server::mcp::kInvalidParams;
+    const int kInt = yuzu::server::mcp::kInternalError;
+    const std::vector<Row> rows = {
+        {"offline", [](ConfinedDispatchOutcome&) {}, "no_agents_reached", kInt, true},
+        {"containment unreadable", [](auto& o) { o.containment_unreadable = true; },
+         "containment_unreadable", kInt, true},
+        {"route unreadable", [](auto& o) { o.route_unreadable = true; }, "route_unreadable", kInt, true},
+        {"os gate unreadable", [](auto& o) { o.os_gate_unreadable = true; }, "os_gate_unreadable", kInt,
+         true},
+        {"quarantined", [](auto& o) { o.denied_quarantined_count = 1; }, "quarantined", kInv, false},
+        {"plugin not found", [](auto& o) { o.unknown_plugin_count = 1; }, "plugin_not_found", kInv,
+         false},
+        {"kill switched os", [](auto& o) { o.kill_switched_os_count = 1; }, "kill_switched_os", kPerm,
+         false},
+        {"invalid scope", [](auto& o) { o.scope_parse_error = "bad"; }, "invalid_scope", kInv, false},
+    };
+    for (const auto& row : rows) {
+        INFO(row.label);
+        f.ts.audit_log.clear();
+        f.ts.audit_details.clear();
+        f.probe.calls = 0;
+        f.probe.result = ConfinedDispatchOutcome{.sent = 0, .command_id = "live-cmd-z"};
+        row.set(f.probe.result);
+
+        auto res = f.call("WS-1", "uptime");
+        const auto err = live_error(res);
+        CHECK(err["code"] == row.code);
+        CHECK(err["data"]["reason"] == row.reason);
+        if (row.retryable)
+            CHECK(err["data"]["retry_after_ms"] == 5000);
+        else
+            CHECK(err["data"]["retry_after_ms"].is_null());
+        CHECK(f.probe.calls == 1);
+        // The `requested` row, then a domain `failure` row naming the cause and the call's id.
+        CHECK(live_domain_rows(f.ts) ==
+              std::vector<std::string>{"device.live.uptime|requested", "device.live.uptime|failure"});
+        CHECK(f.ts.audit_details.back().find(std::string("reason=") + row.reason) !=
+              std::string::npos);
+        CHECK(f.ts.audit_details.back().find("cid=") != std::string::npos);
+        CHECK(f.budget.active() == 0);
+        const std::string outcome_token =
+            std::string(row.reason) == "no_agents_reached" ? "unavailable" : row.reason;
+        CHECK(mcp_live_count(f.metrics, "uptime", outcome_token) == 1.0); // each cause has its own series
+    }
+    CHECK(mcp_live_count(f.metrics, "uptime", "unavailable") == 1.0); // the offline row
+
+    // A chokepoint refusal is read BEFORE the classifier and never reads as "offline".
+    struct Denial {
+        Reason reason;
+        int code;
+    };
+    for (const auto& d : {Denial{Reason::Forbidden, kPerm}, Denial{Reason::ApprovalRequired, kPerm},
+                          Denial{Reason::KillSwitched, kPerm}, Denial{Reason::AnonymousOperator, kPerm},
+                          // A server-named pair that is not in the catalogue is a server fault
+                          // (the REST route answers 500), never the caller's invalid params.
+                          Denial{Reason::Unclassified, kInt}, Denial{Reason::Ambiguous, kInt}}) {
+        const std::string token(yuzu::server::detail::to_string(d.reason));
+        INFO(token);
+        f.ts.audit_log.clear();
+        f.ts.audit_details.clear();
+        f.probe.result = ConfinedDispatchOutcome{.sent = 0, .command_id = "live-cmd-d"};
+        f.probe.result.denied = yuzu::server::detail::DispatchDenial{
+            d.reason, "Inventory", yuzu::server::authz::Operation::Read};
+        // A stale zero-reach signal alongside the denial must not win over it.
+        f.probe.result.denied_quarantined_count = 1;
+        auto res = f.call("WS-1", "uptime");
+        const auto err = live_error(res);
+        CHECK(err["code"] == d.code);
+        // The closed denial token rides as the error reason; the audit detail keeps the verb.
+        CHECK(err["data"]["reason"] == token);
+        CHECK(err["data"]["retry_after_ms"].is_null());
+        CHECK(f.ts.audit_details.back().find("dispatch_denied reason=" + token) != std::string::npos);
+        if (d.code == kInt) {
+            // The shared wording blames the caller's plugin/action name, which is not theirs.
+            CHECK(err["data"]["remediation"].get<std::string>().find("server catalogue fault") !=
+                  std::string::npos);
+            CHECK(err["data"]["remediation"].get<std::string>().find("confirm the plugin") ==
+                  std::string::npos);
+        }
+        CHECK(live_domain_rows(f.ts).back() == "device.live.uptime|failure");
+    }
+    // The wording of the common case: the caller lacks Inventory:Read (the pair's real gate).
+    f.probe.result = ConfinedDispatchOutcome{.sent = 0, .command_id = "live-cmd-d"};
+    f.probe.result.denied = yuzu::server::detail::DispatchDenial{
+        Reason::Forbidden, "Inventory", yuzu::server::authz::Operation::Read};
+    CHECK(live_error(f.call("WS-1", "uptime"))["message"].get<std::string>().find(
+              "Inventory:Read") != std::string::npos);
+    // Six refusals in the loop and the wording probe: EXACTLY seven, one per call.
+    CHECK(mcp_live_count(f.metrics, "uptime", "dispatch_denied") == 7.0);
+}
+
+TEST_CASE("MCP get_device_live: the held-open lease (per principal 2, surface 4, global, draining) "
+          "refuses with no row and no dispatch, and is returned on every exit",
+          "[pg][mcp][integration][live][lease][2146]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    LiveMcpFixture f{db.dsn()};
+    f.put_row("live-cmd-1", "WS-1", 1, "uptime_display|1d");
+    using yuzu::server::detail::SseSurface;
+    using SB = yuzu::server::detail::StreamBudget;
+
+    SECTION("per-principal cap") {
+        f.start();
+        auto a = f.budget.try_acquire(SseSurface::kLiveRead, "test-user", 2);
+        auto b = f.budget.try_acquire(SseSurface::kLiveRead, "test-user", 2);
+        REQUIRE(a.lease);
+        REQUIRE(b.lease);
+        auto res = f.call("WS-1", "uptime");
+        CHECK(res->status == 429);
+        CHECK(res->get_header_value("Retry-After") == "2");
+        const auto err = live_error(res);
+        CHECK(err["code"] == yuzu::server::mcp::kMcpStreamCap);
+        CHECK(err["data"]["reason"] == SB::kRejectPerPrincipal);
+        CHECK(err["data"]["retry_after_ms"] == yuzu::server::mcp::kMcpLiveReadCapRetryMs);
+        CHECK(f.probe.calls == 0);
+        CHECK(f.ts.audit_log.empty()); // a refusal at admission writes no audit row
+        CHECK(mcp_live_count(f.metrics, "uptime", "over_budget_principal") == 1.0);
+        CHECK(f.budget.active() == 2); // reject-not-evict: the held leases are untouched
+    }
+    SECTION("surface cap across principals") {
+        f.start();
+        std::vector<SB::Lease> held;
+        for (const char* who : {"u1", "u2", "u3", "u4"}) {
+            auto l = f.budget.try_acquire(SseSurface::kLiveRead, who, 2);
+            REQUIRE(l.lease);
+            held.push_back(std::move(l.lease));
+        }
+        auto res = f.call("WS-1", "uptime");
+        CHECK(res->status == 429);
+        const auto err = live_error(res);
+        CHECK(err["data"]["reason"] == SB::kRejectSurface);
+        CHECK(err["data"]["retry_after_ms"] == yuzu::server::mcp::kMcpLiveReadCapRetryMs);
+        CHECK(f.probe.calls == 0);
+        CHECK(f.ts.audit_log.empty());
+        CHECK(mcp_live_count(f.metrics, "uptime", "over_budget_surface") == 1.0);
+    }
+    SECTION("global cap shared with every other held-open surface") {
+        yuzu::server::detail::StreamBudget tiny{{.global_cap = 1}};
+        f.ts.stream_budget_for_test = &tiny;
+        f.start();
+        auto other = tiny.try_acquire(SseSurface::kMcpGet, "someone", 4);
+        REQUIRE(other.lease);
+        auto res = f.call("WS-1", "uptime");
+        CHECK(res->status == 429);
+        CHECK(live_error(res)["data"]["reason"] == SB::kRejectGlobal);
+        CHECK(mcp_live_count(f.metrics, "uptime", "over_budget_global") == 1.0);
+        CHECK(f.probe.calls == 0);
+    }
+    SECTION("draining refuses with 503 and no retry hint; a lease taken just before is returned") {
+        int asked = 0;
+        f.ts.draining_for_test = [&] { return ++asked > 1; }; // false at the front door, true after
+        f.start();
+        auto res = f.call("WS-1", "uptime");
+        CHECK(res->status == 503);
+        const auto err = live_error(res);
+        CHECK(err["code"] == yuzu::server::mcp::kMcpShuttingDown);
+        CHECK(err["data"]["reason"] == "shutting_down");
+        CHECK(err["data"]["retry_after_ms"].is_null());
+        CHECK(asked == 2);
+        CHECK(f.budget.active() == 0);
+        CHECK(f.probe.calls == 0);
+        CHECK(f.ts.audit_log.empty());
+        // Counted as what it is, not as the global stream cap it used to read as.
+        CHECK(mcp_live_count(f.metrics, "uptime", "shutting_down") == 1.0);
+        CHECK(mcp_live_count(f.metrics, "uptime", "over_budget_global") == 0.0);
+    }
+    SECTION("draining at the front door refuses before any lease is taken") {
+        int asked = 0;
+        f.ts.draining_for_test = [&] { ++asked; return true; };
+        f.start();
+        auto res = f.call("WS-1", "uptime");
+        CHECK(res->status == 503);
+        CHECK(live_error(res)["data"]["reason"] == "shutting_down");
+        CHECK(asked == 1); // refused at the first look: no lease was ever taken
+        CHECK(f.budget.active() == 0);
+        CHECK(f.probe.calls == 0);
+        CHECK(f.ts.audit_log.empty());
+        CHECK(mcp_live_count(f.metrics, "uptime", "shutting_down") == 1.0);
+    }
+    SECTION("returned on a throw from the dispatch, and the throw is answered with no retry hint") {
+        f.probe.on_dispatch = [] { throw std::runtime_error("dispatch blew up"); };
+        f.start();
+        const auto err = live_error(f.call("WS-1", "uptime"));
+        CHECK(err["code"] == yuzu::server::mcp::kInternalError);
+        CHECK(err["data"]["retry_after_ms"].is_null());
+        CHECK(err["data"]["reason"] == "exception");
+        CHECK(f.budget.active() == 0);
+        CHECK(live_domain_rows(f.ts) ==
+              std::vector<std::string>{"device.live.uptime|requested", "device.live.uptime|failure"});
+        CHECK(mcp_live_count(f.metrics, "uptime", "internal") == 1.0);
+    }
+    SECTION("returned on a non-standard throw too") {
+        f.probe.on_dispatch = [] { throw 42; }; // NOLINT(hicpp-exception-baseclass)
+        f.start();
+        const auto err = live_error(f.call("WS-1", "uptime"));
+        CHECK(err["code"] == yuzu::server::mcp::kInternalError);
+        CHECK(f.budget.active() == 0);
+    }
+    SECTION("returned when the poll times out") {
+        f.probe.result.command_id = "live-cmd-never-answered"; // no row is stored under this id
+        f.start();
+        const auto err = live_error(f.call("WS-1", "processes"));
+        CHECK(err["data"]["reason"] == "timeout");
+        CHECK(f.budget.active() == 0);
+    }
+}
+
+TEST_CASE("MCP get_device_live: the poll reads the device's rows only (multi-row join, a failure row "
+          "wins, a foreign agent's row is never read, degrade is not timeout)",
+          "[pg][mcp][integration][live][poll][2146]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    LiveMcpFixture f{db.dsn()};
+    f.start();
+
+    SECTION("output streamed over several rows is joined in order") {
+        f.put_row("live-cmd-1", "WS-1", 0, "uptime_seconds|5\n", {}, 100); // rows join as sent: a line ends in its own newline
+        f.put_row("live-cmd-1", "WS-1", 1, "uptime_display|5s", {}, 101);
+        const auto p = live_payload(f.call("WS-1", "uptime"));
+        CHECK(p["uptime_seconds"].get<int64_t>() == 5);
+        CHECK(p["uptime_display"] == "5s");
+    }
+    SECTION("a terminal failure row wins over a partial-output row") {
+        f.put_row("live-cmd-1", "WS-1", 0, "uptime_display|1d", {}, 100);
+        f.put_row("live-cmd-1", "WS-1", 2, "", "plugin crashed", 101);
+        const auto err = live_error(f.call("WS-1", "uptime"));
+        CHECK(err["code"] == yuzu::server::mcp::kInternalError);
+        CHECK(err["message"].get<std::string>().find("device query failed") != std::string::npos);
+        CHECK(err["message"].get<std::string>().find("plugin crashed") != std::string::npos);
+        CHECK(err["data"]["retry_after_ms"].is_null());
+        CHECK(err["data"]["reason"] == "device_failed");
+        CHECK(mcp_live_count(f.metrics, "uptime", "device_failed") == 1.0);
+    }
+    SECTION("an error| output line is a device error with no retry hint") {
+        f.put_row("live-cmd-1", "WS-1", 1, "error|disk subsystem offline");
+        const auto err = live_error(f.call("WS-1", "uptime"));
+        CHECK(err["message"].get<std::string>().find("device reported an error") !=
+              std::string::npos);
+        CHECK(err["data"]["retry_after_ms"].is_null());
+        CHECK(mcp_live_count(f.metrics, "uptime", "device_error") == 1.0);
+    }
+    SECTION("a success terminal with no output is a device_error (UP-9): neither a timeout nor a "
+            "success") {
+        f.put_row("live-cmd-1", "WS-1", 1, "");
+        const auto res = f.call("WS-1", "processes");
+        const auto err = live_error(res);
+        CHECK(err["code"] == yuzu::server::mcp::kInternalError);
+        CHECK(err["message"].get<std::string>() == "the device returned no usable live data");
+        CHECK(err["data"]["reason"] == "device_error");
+        CHECK(err["data"]["retry_after_ms"].is_null());
+        CHECK(mcp_live_count(f.metrics, "processes", "device_error") == 1.0);
+        CHECK(mcp_live_count(f.metrics, "processes", "ok") == 0.0);
+        // The success row is not written for an answer that is not one.
+        CHECK(live_domain_rows(f.ts) ==
+              std::vector<std::string>{"device.live.processes|requested"});
+        CHECK(f.ts.audit_log.back() == "device.live.processes|requested");
+    }
+    SECTION("an uptime answer with neither field is a device_error too") {
+        f.put_row("live-cmd-1", "WS-1", 1, "garbage that parses to nothing");
+        const auto err = live_error(f.call("WS-1", "uptime"));
+        CHECK(err["data"]["reason"] == "device_error");
+        CHECK(mcp_live_count(f.metrics, "uptime", "device_error") == 1.0);
+    }
+    SECTION("output with no terminal row is incomplete (UP-2): retryable, partial output discarded") {
+        f.put_row("live-cmd-1", "WS-1", 0, "proc|1|init|abc|/sbin/PARTIAL_MARKER");
+        const auto res = f.call("WS-1", "processes");
+        const auto err = live_error(res);
+        CHECK(err["code"] == yuzu::server::mcp::kInternalError);
+        CHECK(err["message"].get<std::string>() == "the device began to answer but did not finish");
+        CHECK(err["data"]["reason"] == "incomplete");
+        // The device was working, so its first run may still be hashing. A `processes` run has a
+        // 120 s budget, so a retry at the poll's 25 s deadline could start a second hash: the
+        // hint is the plugin's budget. (A quick kind keeps the 25 s deadline: see the uptime
+        // SECTION below and the unit test.)
+        CHECK(err["data"]["retry_after_ms"] == yuzu::server::mcp::kLiveReadProcessesTimeoutRetryMs);
+        CHECK(err["data"]["retry_after_ms"] == 120000);
+        CHECK(err["data"]["retry_after_ms"] != yuzu::server::mcp::kLiveReadIncompleteRetryMs);
+        CHECK(res->body.find("PARTIAL_MARKER") == std::string::npos);
+        CHECK(mcp_live_count(f.metrics, "processes", "incomplete") == 1.0);
+        CHECK(mcp_live_count(f.metrics, "processes", "timeout") == 0.0);
+    }
+    SECTION("a quick kind's incomplete keeps the poll deadline (25 s), not the processes budget") {
+        f.put_row("live-cmd-1", "WS-1", 0, "uptime_display|PARTIAL_MARKER");
+        const auto res = f.call("WS-1", "uptime");
+        const auto err = live_error(res);
+        CHECK(err["data"]["reason"] == "incomplete");
+        CHECK(err["data"]["retry_after_ms"] == yuzu::server::mcp::kLiveReadIncompleteRetryMs);
+        CHECK(err["data"]["retry_after_ms"] == 25000);
+        CHECK(res->body.find("PARTIAL_MARKER") == std::string::npos);
+        CHECK(mcp_live_count(f.metrics, "uptime", "incomplete") == 1.0);
+    }
+    SECTION("the budget closing abandons the read with shutting_down, the row stays requested-only") {
+        f.budget.begin_closing();
+        f.put_row("live-cmd-1", "WS-1", 1, "uptime_display|1d"); // an answer exists and is not read
+        const auto res = f.call("WS-1", "uptime");
+        CHECK(res->status == 503); // F5: the same status as the admission refusal and the REST route
+        const auto err = live_error(res);
+        CHECK(err["code"] == yuzu::server::mcp::kMcpShuttingDown);
+        CHECK(err["data"]["reason"] == "shutting_down");
+        CHECK(err["data"]["retry_after_ms"].is_null());
+        CHECK(f.probe.calls == 1); // the command may have been sent: the answer says so
+        CHECK(err["data"]["remediation"].get<std::string>().find("may have been sent") !=
+              std::string::npos);
+        CHECK(live_domain_rows(f.ts) == std::vector<std::string>{"device.live.uptime|requested"});
+        CHECK(mcp_live_count(f.metrics, "uptime", "shutting_down") == 1.0);
+        CHECK(mcp_live_count(f.metrics, "uptime", "ok") == 0.0);
+    }
+    SECTION("a processes timeout is priced at the plugin's action budget, not the quick-kind 3 s (S2)") {
+        const auto res = f.call("WS-1", "processes");
+        const auto err = live_error(res);
+        CHECK(err["data"]["reason"] == "timeout");
+        CHECK(err["data"]["retry_after_ms"] == yuzu::server::mcp::kLiveReadProcessesTimeoutRetryMs);
+        CHECK(err["data"]["retry_after_ms"] != yuzu::server::mcp::kMcpLiveReadDeviceTimeoutRetryMs);
+        CHECK(mcp_live_count(f.metrics, "processes", "timeout") == 1.0);
+    }
+    SECTION("a foreign agent's row under the same command id is never read") {
+        f.put_row("live-cmd-1", "WS-2", 1, "uptime_display|SECRET-OF-WS-2");
+        const auto res = f.call("WS-1", "uptime");
+        const auto err = live_error(res);
+        CHECK(res->body.find("SECRET-OF-WS-2") == std::string::npos);
+        CHECK(err["data"]["reason"] == "timeout");
+        CHECK(err["data"]["retry_after_ms"] == yuzu::server::mcp::kMcpLiveReadDeviceTimeoutRetryMs);
+        CHECK(mcp_live_count(f.metrics, "uptime", "timeout") == 1.0);
+    }
+    SECTION("every read of the store degraded is a retryable store fault, not the device's timeout") {
+        yuzu::test::SqlFault fault(f.pool,
+                                   "ALTER TABLE response_store.responses RENAME TO responses_gone",
+                                   "ALTER TABLE response_store.responses_gone RENAME TO responses");
+        fault.arm();
+        const auto err = live_error(f.call("WS-1", "uptime"));
+        fault.repair();
+        CHECK(err["data"]["reason"] == "store_degraded");
+        CHECK(err["data"]["retry_after_ms"] == yuzu::server::mcp::kMcpStoreFaultShortRetryMs);
+        CHECK(mcp_live_count(f.metrics, "uptime", "store_degraded") == 1.0);
+    }
+    SECTION("a processes store fault is priced at the run budget: a retry cannot land in a live hash") {
+        yuzu::test::SqlFault fault(f.pool,
+                                   "ALTER TABLE response_store.responses RENAME TO responses_gone",
+                                   "ALTER TABLE response_store.responses_gone RENAME TO responses");
+        fault.arm();
+        const auto err = live_error(f.call("WS-1", "processes"));
+        fault.repair();
+        CHECK(err["data"]["reason"] == "store_degraded");
+        CHECK(err["data"]["retry_after_ms"] == yuzu::server::mcp::kLiveReadProcessesTimeoutRetryMs);
+        CHECK(err["data"]["retry_after_ms"] != yuzu::server::mcp::kMcpStoreFaultShortRetryMs);
+        CHECK(mcp_live_count(f.metrics, "processes", "store_degraded") == 1.0);
+    }
+    CHECK(f.budget.active() == 0);
+}
+
+TEST_CASE("MCP get_device_live: the answer is bounded (1000 process rows, 1 MiB of device output cut "
+          "at a newline) and says so",
+          "[pg][mcp][integration][live][truncation][2146]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    LiveMcpFixture f{db.dsn()};
+    f.start();
+    const std::string sha(64, 'a');
+
+    SECTION("row cap") {
+        std::string out;
+        for (int i = 1; i <= 1005; ++i)
+            out += "proc|" + std::to_string(i) + "|p" + std::to_string(i) + "|" + sha + "|/bin/p\n";
+        f.put_row("live-cmd-1", "WS-1", 1, out);
+        const auto p = live_payload(f.call("WS-1", "processes"));
+        CHECK(p["count"] == 1000);
+        CHECK(p["processes"].size() == 1000);
+        CHECK(p["truncated"] == true);
+        CHECK(f.ts.audit_details.back().find("truncated=true") != std::string::npos);
+    }
+    SECTION("byte cap, cut at the last newline") {
+        // 12 rows of about 100 KB: over the 1 MiB cap, and few enough rows that the row cap is
+        // not what cuts.
+        std::string out;
+        for (int i = 1; i <= 12; ++i)
+            out += "proc|" + std::to_string(i) + "|big|" + sha + "|/" + std::string(100'000, 'x') + "\n";
+        f.put_row("live-cmd-1", "WS-1", 1, out);
+        const auto p = live_payload(f.call("WS-1", "processes"));
+        CHECK(p["truncated"] == true);
+        const auto n = p["count"].get<int>();
+        CHECK(n >= 1);
+        CHECK(n < 12);
+        // No partial row: every emitted path is whole.
+        for (const auto& row : p["processes"])
+            CHECK(row["path"].get<std::string>().size() == 100'001);
+    }
+    SECTION("N2: one line past the cap with no newline is cut to nothing and reported truncated, "
+            "never as a device with nothing to say") {
+        // A single 1.2 MiB row with no newline: nothing whole fits inside the 1 MiB cap, so the
+        // cut leaves an empty answer. The device DID answer; the cut is what left nothing.
+        f.put_row("live-cmd-1", "WS-1", 1,
+                  "proc|1|big|" + sha + "|/" + std::string(1'200'000, 'x'));
+        const auto res = f.call("WS-1", "processes");
+        const auto p = live_payload(res);
+        CHECK(p["truncated"] == true);
+        CHECK(p["count"] == 0);
+        CHECK(p["processes"].empty());
+        CHECK(f.ts.audit_details.back().find("truncated=true") != std::string::npos);
+        CHECK(mcp_live_count(f.metrics, "processes", "device_error") == 0.0);
+        CHECK(mcp_live_count(f.metrics, "processes", "ok") == 1.0);
+        CHECK(res->body.find("no usable live data") == std::string::npos);
+    }
+    SECTION("a normal answer is not truncated") {
+        f.put_row("live-cmd-1", "WS-1", 1, "proc|1|init|" + sha + "|/sbin/init");
+        const auto p = live_payload(f.call("WS-1", "processes"));
+        CHECK(p["truncated"] == false);
+        CHECK(p["count"] == 1);
+    }
+}
+
+TEST_CASE("MCP get_device_live: a service-scoped token through the REAL scoped gate reaches only its "
+          "own service's devices (C8 `confined`, end to end)",
+          "[pg][mcp][integration][live][scope][2146]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::response_execution_authz_tpl);
+    yuzu::test::ExecutionOwnerRig r{db.dsn()};
+    yuzu::server::ResponseStore store{r.pool};
+    REQUIRE(store.is_open());
+    LivePollSeamGuard poll_seam{2, 1};
+    LiveDispatchProbe probe;
+    McpTestServer ts;
+    r.wire_mcp(ts); // authentication (production admission), permission and fleet-read: real
+    ts.response_store_for_test = &store;
+    // The REAL per-device gate, exactly as server.cpp binds it.
+    ts.scoped_perm_fn_for_test = [&](const httplib::Request& req, httplib::Response& res,
+                                     const std::string& sec, const std::string& op,
+                                     const std::string& agent) {
+        return r.auth->require_scoped_permission(req, res, sec, op, agent);
+    };
+    // The typed twin the #7110 re-decision reads (production wires one): the same real gate.
+    ts.scoped_gate_fn_for_test = [&](const httplib::Request& req, httplib::Response& res,
+                                     const std::string& sec, const std::string& op,
+                                     const std::string& agent) -> yuzu::server::ScopedGateOutcome {
+        return r.auth->require_scoped_permission(req, res, sec, op, agent)
+                   ? yuzu::server::ScopedGateOutcome::Admitted
+                   : yuzu::server::ScopedGateOutcome::Denied;
+    };
+    ts.start_with_dispatch(probe.fn(), "operator");
+    {
+        yuzu::server::StoredResponse row;
+        row.instruction_id = "live-cmd-1";
+        row.agent_id = "a1";
+        row.status = 1;
+        row.output = "uptime_display|9d";
+        store.store(row);
+    }
+    const auto token = r.mint("mina", "A", "operator"); // service-scoped to A, operator tier
+    const auto call_as = [&](const std::string& agent) {
+        return ts.call_raw("POST", live_req(live_args(agent, "uptime")),
+                           {{"Authorization", "Bearer " + token}});
+    };
+
+    // In service A: admitted by the C8 gate, both real scoped gates, and the dispatch is reached.
+    auto in_service = call_as("a1");
+    REQUIRE(in_service);
+    CHECK(in_service->status == 200);
+    const auto p = live_payload(in_service);
+    CHECK(p["uptime_display"] == "9d");
+    CHECK(probe.calls == 1);
+    CHECK(probe.agent_ids == std::vector<std::string>{"a1"});
+
+    // Out of service A (service B's device, and an untagged one): refused by the real gate, with
+    // nothing dispatched and no domain row.
+    for (const char* agent : {"b1", "z1"}) {
+        INFO(agent);
+        probe.calls = 0;
+        ts.audit_log.clear();
+        auto out = call_as(agent);
+        REQUIRE(out);
+        CHECK(out->status == 403);
+        CHECK(probe.calls == 0);
+        CHECK(live_domain_rows(ts).empty());
+    }
 }
 
 // ═══ #4035 (api-parity #2146 Batch A): the 8 genuinely-new DEX MCP twins ═══
@@ -36360,7 +37964,7 @@ TEST_CASE("MCP 2444: item 2 minLength:1 sweep — one field per tool family reje
         {"get_access_review", "campaign_id", ""},
         {"close_access_review", "campaign_id", ""},
         {"record_attestation", "campaign_id",
-         R"("principal_type":"user","principal_id":"p","role_name":"r","decision":"attested")"},
+         R"("principal_type":"user","principal_id":"p","role_name":"r","scope":"fleet","decision":"attested")"},
     };
     for (const auto& c : kCases) {
         INFO("tool: " << c.tool << " field: " << c.field);

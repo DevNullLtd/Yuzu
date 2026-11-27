@@ -1,7 +1,7 @@
 #pragma once
 
 // Shared RAII owners for the Echo plugin's Win32 handle-like resources
-// (SC_HANDLE, HANDLE, LPVOID, PMIB_IPNET_TABLE2). Previously each collector
+// (SC_HANDLE, HANDLE, PMIB_IPNET_TABLE2). Previously each collector
 // file (echo_service_collector.cpp, echo_mapdrive_collector.cpp,
 // echo_arp_collector.cpp) hand-rolled its own near-identical guard struct,
 // each calling its real WinAPI closer directly from the destructor -- safe
@@ -22,7 +22,7 @@
 #define NOMINMAX
 #endif
 // This exact sequence (winsock2.h, ws2tcpip.h, windows.h, iphlpapi.h,
-// netioapi.h, lm.h, winsvc.h) matches echo_arp_collector.cpp's own working
+// netioapi.h, winsvc.h) matches echo_arp_collector.cpp's own working
 // include block. ws2tcpip.h is load-bearing: without it, PMIB_IPNET_TABLE2
 // fails to resolve even with iphlpapi.h + netioapi.h both included -- MSVC
 // error C2065 (found the hard way: an earlier version of this header
@@ -34,7 +34,6 @@
 
 #include <iphlpapi.h> // GetIpNetTable2 declaration
 #include <netioapi.h> // PMIB_IPNET_TABLE2 / MIB_IPNET_ROW2 / FreeMibTable
-#include <lm.h>       // NetApiBufferFree
 #include <winsvc.h>   // SC_HANDLE / CloseServiceHandle
 
 namespace yuzu::echo::win_raii {
@@ -64,7 +63,6 @@ private:
 
 inline void close_sc_handle(SC_HANDLE h) { CloseServiceHandle(h); }
 inline void close_wnet_enum(HANDLE h) { WNetCloseEnum(h); }
-inline void free_net_api_buf(LPVOID p) { NetApiBufferFree(p); }
 inline void free_mib_table(PMIB_IPNET_TABLE2 t) { FreeMibTable(t); }
 
 // Named wrappers preserve each call site's existing construction syntax
@@ -78,11 +76,6 @@ struct ScHandleGuard : ScopedWinHandle<SC_HANDLE> {
 struct WNetEnumGuard : ScopedWinHandle<HANDLE> {
     explicit WNetEnumGuard(HANDLE h, Closer closer = close_wnet_enum) noexcept
         : ScopedWinHandle(h, closer) {}
-};
-
-struct NetApiBufGuard : ScopedWinHandle<LPVOID> {
-    explicit NetApiBufGuard(LPVOID p, Closer closer = free_net_api_buf) noexcept
-        : ScopedWinHandle(p, closer) {}
 };
 
 struct MibTableGuard : ScopedWinHandle<PMIB_IPNET_TABLE2> {

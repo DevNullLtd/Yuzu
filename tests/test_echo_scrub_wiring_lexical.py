@@ -7,7 +7,10 @@ phantom pair EVERY tick unless the freshly enumerated set is first passed throug
 yuzu::echo::scrub_wire_strings (echo_wire_scrub.hpp). The per-source behaviour is unit-tested on the
 scrub helpers, but the CALL SITES live in echo_plugin.cpp's collect_fast_impl, behind anonymous
 helpers a unit test cannot reach, so deleting one stays green. This gate pins each call site
-lexically (best-effort: source text, not semantics). LIMITS: it is lexical and cannot model an
+lexically (best-effort: source text, not semantics). It also pins the user source's
+collect-or-retain skip for the same reason, and, in echo_mapdrive_collector.cpp, the guards that
+throw on an incomplete NetSessionEnum read (Windows-only code with no injectable read: without them
+an unanswered read is diffed as "no inbound sessions"). LIMITS: it is lexical and cannot model an
 `#if 0` block, a backslash-continued // comment, or a call that sits inside a string literal.
 Run: python3 tests/test_echo_scrub_wiring_lexical.py
 """
@@ -16,8 +19,10 @@ import re
 import sys
 
 SRC = pathlib.Path(__file__).resolve().parents[1] / "agents/plugins/echo/src/echo_plugin.cpp"
+MAPDRIVE = SRC.with_name("echo_mapdrive_collector.cpp")
 
 S = r"yuzu::echo::scrub_wire_strings"
+THROW = r"throw yuzu::echo::IncompleteCaptureError\([^;]*;\s*"
 PROC = r"auto current = yuzu::agent::enumerate_processes\(\);\s*"
 
 # (id, regex over the source with comments stripped). EVERY call site has its OWN pattern, anchored
@@ -53,10 +58,20 @@ REQUIRED = [
     ("arp", S + r"\(\*current\);\s*auto previous = json_to_arp"),
     ("dns", r"enumerate_dns\(\);\s*" + S + r"\(current\);\s*auto previous = json_to_dns"),
     ("services", S + r"\(\*current\);\s*const std::string svc_key"),
-    ("users",
-        r"enumerate_users\(\);\s*" + S +
-        r"\(current\);\s*auto prev_json = db_->get_state\(usr_key\)"
+    ("users", S + r"\(\*current\);\s*const std::string usr_key"),
+    # The user source's skip (EchoPlugin is TU-local, so no unit test reaches it): collected
+    # through collect_or_retain, a skip warns, records the source and its health, and the whole
+    # diff and state write sit inside the `if (current)` that follows.
+    ("users skip retains the baseline",
+        r"collect_or_retain\(\[\] \{ return yuzu::echo::enumerate_users\(\); \}\);\s*"
+        r"auto current = std::move\(res\.current\);\s*if \(!current\) \{\s*"
+        r"spdlog::warn\([^;]*;\s*if \(skipped_sources\)\s*"
+        r'skipped_sources->push_back\("user"\);\s*'
+        r'note_health\("user", "capture_incomplete"\);\s*\}\s*'
+        r"if \(current\) \{\s*" + S + r"\(\*current\);\s*const std::string usr_key"
     ),
+    # No second, unguarded collection of the user source.
+    ("users collected once", r"enumerate_users\("),
     ("mapdrive", S + r"\(\*current\);\s*const std::string md_key"),
     # fleet_snapshot: four statements, each pinned together with its neighbours so deleting or
     # commenting out any one of them leaves at least one pattern unmatched.
@@ -70,6 +85,23 @@ REQUIRED = [
     ("fleet_snapshot local_ips", S + r"\(hostname\);\s*" + S + r"\(local_ips\);\s*auto redaction"),
 ]
 FLOOR = 19  # call sites in echo_plugin.cpp (stream leg two, fleet_snapshot four, module rows four)
+
+# The same contract, over echo_mapdrive_collector.cpp.
+MAPDRIVE_REQUIRED = [
+    # An unanswered, capped or stalled read throws before anything looks at its (default) nerr.
+    ("mapdrive incomplete session read throws",
+        r"auto read = yuzu::agent::win::read_smb_sessions\([^;]*;\s*"
+        r"if \(read\.status != yuzu::agent::BoundedStatus::Completed\)\s*" + THROW +
+        r"if \(read\.truncated\)\s*" + THROW +
+        r"if \(read\.no_progress\) \{\s*spdlog::warn\([^;]*;\s*" + THROW + r"\}\s*return read;"
+    ),
+    # No second, unguarded session read (the level-10 retry goes through the guarded one).
+    ("mapdrive sessions read in one place", r"read_smb_sessions\("),
+    ("mapdrive failed session read throws",
+        r"if \(yuzu::echo::is_unexpected_enumeration_status\(read\.nerr, \{NERR_Success\}\)\)\s*" +
+        THROW + r"for \(auto& s : read\.sessions\)"
+    ),
+]
 
 
 _TOKEN = re.compile(
@@ -90,18 +122,21 @@ def strip_comments(text: str) -> str:
 
 def main() -> int:
     text = strip_comments(SRC.read_text(encoding="utf-8"))
+    mapdrive = strip_comments(MAPDRIVE.read_text(encoding="utf-8"))
     bad = []
-    for name, rx in REQUIRED:
-        n = len(re.findall(rx, text))
-        if n != 1:
-            bad.append(f"{name} (matched {n}x, want exactly 1)")
+    for path, source, patterns in ((SRC, text, REQUIRED), (MAPDRIVE, mapdrive, MAPDRIVE_REQUIRED)):
+        for name, rx in patterns:
+            n = len(re.findall(rx, source))
+            if n != 1:
+                bad.append(f"{path.name}: {name} (matched {n}x, want exactly 1)")
     calls = len(re.findall(r"scrub_wire_strings\(", text))
     if calls < FLOOR:
-        bad.append(f"live call-site count {calls} < {FLOOR}")
+        bad.append(f"{SRC.name}: live call-site count {calls} < {FLOOR}")
     for b in bad:
-        print(f"FAIL: echo_plugin.cpp lost or changed a scrub_wire_strings call: {b}")
+        print(f"FAIL: lost or changed a pinned call: {b}")
     if not bad:
-        print(f"ok: {len(REQUIRED)} Echo scrub patterns and {calls} call sites present")
+        pinned = len(REQUIRED) + len(MAPDRIVE_REQUIRED)
+        print(f"ok: {pinned} Echo wiring patterns and {calls} scrub call sites present")
     return 1 if bad else 0
 
 

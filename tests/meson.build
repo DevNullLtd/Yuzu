@@ -556,6 +556,17 @@ agent_test_exe = executable(
     'unit/test_installed_apps_registry_walk.cpp', # #4711: Uninstall-hive walk against a process-suffixed scratch key: ok/absent/failed/mixed (Windows-only; no-op TU elsewhere)
     'unit/test_bundle_id_read.cpp',            # #4710: agent-core bounded bundle-id pass driver (portable; the CF reader is injected)
     'unit/test_proc_snapshot_read.cpp',        # SRE-1: agent-core bounded libproc snapshot driver (portable; the reader is injected)
+    'unit/test_bounded_single_flight.cpp',      # the shared single-flight slot, bounded driver and status mapping (portable; the call is injected)
+    'unit/test_win_wts_sessions.cpp',           # agent-core bounded WTS session read (injected reader on every OS; one real-API case on Windows)
+    'unit/test_win_share_enum.cpp',             # agent-core bounded share enumeration
+    'unit/test_win_session_enum.cpp',           # agent-core bounded server-session enumeration
+    'unit/test_win_account_enum.cpp',           # agent-core bounded account enumeration
+    'unit/test_users_win_rows.cpp',             # users plugin Windows row formatters
+    'unit/test_users_tool_budget.cpp',          # users plugin per-account tool budget
+    'unit/test_win_vss_snapshots.cpp',          # agent-core bounded VSS snapshot enumeration
+    'unit/test_win_join_registry.cpp',          # agent-core bounded join-information and registry reads
+    'unit/test_device_identity_win.cpp',        # device_identity Windows decisions
+    'unit/test_win_adapter_list.cpp',           # agent-core bounded network adapter list
     'unit/test_msi_packages_actions.cpp',     # Wave 4 PR4.3a remediation: real msi_packages.dylib driven
                                                 # end to end via LocalDispatcher (macOS and Windows, self-gated)
     'unit/test_msi_packages_inventory.cpp',   # pure list_inventory builder over the committed Kingsley REAL CAPTURE (fixture via YUZU_TEST_FIXTURE_DIR; runs on every OS)
@@ -830,7 +841,10 @@ agent_test_exe = executable(
   # backslashes either fail to compile or silently mangle the path (see that define's
   # own comment for the full reasoning).
   cpp_args: test_partial_init_args + agent_platform_args + agent_test_native_args +
-            ['-DYUZU_AGENT_SRC_DIR="' +
+            # This image is never unloaded, and its tests instantiate the bounded
+            # single-flight driver over their own slots.
+            ['-DYUZU_BOUNDED_DRIVER_TEST_IMAGE',
+             '-DYUZU_AGENT_SRC_DIR="' +
              (meson.project_source_root() / 'agents' / 'core' / 'src').replace('\\', '/') +
              '"',
              # Wave 7 PR7.1: committed fixture root; autoruns' REAL CAPTURE tests
@@ -1190,7 +1204,7 @@ endif
 # 2026-10-04 re-balance below.)
 # The carve uses only tags with >=25 cases (hand-pruned from a simulated-annealing
 # fit that used tiny tags and was 1-3% tighter): A is guarded by [ack],[actions],
-# [browser_policy],[drain],[execution_artifacts],[guard],[runtime]; B by [agent],
+# [browser_policy],[drain],[execution_artifacts],[guard],[runtime],[7877]; B by [agent],
 # [liveness],[mechanism],[trigger_engine] plus the tags the 2026-10-04 re-balance below added.
 # agent_shard_a_tags / agent_shard_b_tags below are authoritative. Re-balance by moving a tag
 # between the two variables, never by hand-editing a spec string.
@@ -1205,6 +1219,14 @@ endif
 # uploads meson-logs/progress.log with a RED run's artifact), take each case's tags from
 # `yuzu_agent_tests --list-tests -r xml '~[.]~[tsan-heavy]~[flaky-4086]'`, place it by the
 # partition rule above, and sum per shard. Count is not time: use the sums, not the counts.
+#
+# RE-BALANCE 2026-11-26 (#7877 item 31, R1): tag [7877] (the Spark Registry rename-plus-recreate
+# cases, 39 of them, all also tagged [mechanism]) is placed in shard A. The [mechanism] tag had
+# put them in shard B, which on Windows then ran past its 50% budget
+# (docs/testing/unit-test-conventions.md); [7877] is in A's tag list, so they run there instead
+# and B drops back. A dedicated shard is the longer-term answer; a follow-up issue is filed when
+# the item 31 PR opens. The measured figures are not kept here because they rot: they are in the
+# message of commit 689215c1bd and in docs/spark-flip-gate.md (R1 final rig run).
 #
 # The real-DISM cases ([actions][windows_optional_features] in
 # test_windows_optional_features_local_dispatcher.cpp ~157-237) stay in ONE shard
@@ -1256,7 +1278,7 @@ endif
 # check-pg-shard-partition.py pins this same literal as AGENT_REF_SPEC and fails if any
 # shard spec does not end with it, so edit both together (an edit to only one is caught).
 agent_shard_suffix = '~[.]~[tsan-heavy]~[flaky-4086]'
-agent_shard_a_tags = ['ack', 'actions', 'browser_policy', 'drain', 'execution_artifacts', 'guard', 'runtime']
+agent_shard_a_tags = ['ack', 'actions', 'browser_policy', 'drain', 'execution_artifacts', 'guard', 'runtime', '7877']
 agent_shard_b_tags = ['agent', 'liveness', 'mechanism', 'trigger_engine', 'log_handoff', 'posix_actions']
 _agent_a_terms = []
 _agent_a_excl = ''
@@ -1293,7 +1315,8 @@ agent_shard_deps = [reserved_name_fixture_plugin, invalid_name_fixture_plugin, r
 # attempt 4, job 126911227871); both passed on the rerun with no code change, so the box was
 # loaded, not hung. #7135 records ~222s for C alone on a 16-thread host. The worst case is at
 # least 240s (a timeout is a floor, not a measurement) and the limit is 2x that. Shards A
-# (98-102s) and B (70s) are well under. Do not shorten tests to fit; split the shard instead
+# and B are under their 240s limits; their current figures are in docs/spark-flip-gate.md (the
+# 2026-11-26 R1 rig record) because they rot here. Do not shorten tests to fit; split the shard instead
 # (#7177). Side effect to know about: flake-retry.py's 80%-of-timeout warning mark for C moves
 # from 192s to 384s, so C can grow ~80% before it warns; #7177 restores an early warning. The
 # one other measured contention figure is for SERVER `~[pg]` (c0 289s -> c4 603s, ~2.1x,
@@ -1461,7 +1484,6 @@ if host_machine.system() == 'windows'
   echo_test_deps += cxx.find_library('wevtapi')  # echo_netconn_win.cpp EvtQuery/EvtRender
   echo_test_deps += cxx.find_library('ws2_32')   # winsock2 symbols the iphlpapi/netioapi headers in echo_netqual_boot.cpp pull in
   echo_test_deps += cxx.find_library('mpr')      # echo_mapdrive_collector.cpp WNet outbound
-  echo_test_deps += cxx.find_library('netapi32') # echo_mapdrive_collector.cpp NetSessionEnum inbound
   echo_test_deps += cxx.find_library('powrprof') # echo_power_collector.cpp PowerRegisterSuspendResumeNotification
 elif host_machine.system() == 'linux'
   # echo_power_collector.cpp is compiled DIRECTLY into this exe, and its Linux
@@ -1775,6 +1797,7 @@ if build_server
       'unit/server/test_command_replay_horizon.cpp', # #3678: outbox redelivery horizon < agent dedup ring (compile-time cross-component pin)
       'unit/server/test_gateway_route_store.cpp', # HA WS-4 4.1: fenced agent->cluster routing directory
       'unit/server/test_gateway_route_reap_rules.cpp', # HA WS-4 4.2a: PURE decide_reap decision set (PR #4299 round-3 decide/apply split)
+      'unit/server/test_guardian_directory_route.cpp', # HA WS-5 #5685: the route-directory decision behind the Guardian reconcile send (real registry + real GatewayRouteStore)
       'unit/server/test_gateway_route_wiring.cpp', # HA WS-4 4.1: GatewayUpstreamServiceImpl wiring onto GatewayRouteStore (re-announce-vs-fresh, connect/disconnect/heartbeat, fail-open)
       'unit/server/test_gateway_mgmt_stub_pool.cpp', # HA WS-4 4.3: parse_gateway_cluster_addrs + GatewayMgmtStubPool resolution (cross-cluster fan-out)
       'unit/server/test_gateway_forward_guard.cpp', # #2146 D7: forward_gateway_pending spawn/setup guard seam (resolve-once, flag ordering, loop continues)
@@ -1958,6 +1981,9 @@ if build_server
       'unit/server/test_echo_tree_routes.cpp',
       'unit/server/test_dex_perf_model.cpp',
       'unit/server/test_live_model.cpp', # #2146: pure live-read kind table + parsers (live_model)
+      'unit/server/test_live_outcome.cpp', # live read: closed outcome/surface/kind token vocabulary
+      'unit/server/test_live_result_json.cpp', # live read: the shared REST+MCP `data` JSON builder
+      'unit/server/test_live_read_poll.cpp', # live read: pure reduce_rows + the poll loop seams
       # #1845 registry tripwire: pins detail::dex_perf_os_collects to the echo plugin's
       # capture_sources() perf row. Registry TU compiled in here; NO echo include dir
       # (see the include-path constraint below) - the test includes the header by
@@ -4012,6 +4038,16 @@ test('enablement os applicability',
   timeout: 30,
 )
 
+# docs/os-capability-matrix.md has one row per key in each table, and no .md/.json/.yaml/.yml
+# file under docs/, agents/plugins/ or content/ carries a leftover merge-conflict marker.
+# Hermetic - reads sources only.
+test('matrix duplicate rows',
+  _python3_test,
+  args: [files('test_matrix_duplicate_rows.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
 # Wave 11 PR11.2-a: the network_config `routes` instruction definition exists and matches the
 # row the plugin emits (id, dispatch pair, approval mode, platforms, ordered columns). Hermetic.
 test('network_config routes definition',
@@ -4773,12 +4809,32 @@ test('agent httplib clients disable response decompression lexical gate (WP14-A)
   timeout: 30,
 )
 
+# ADR-3008: plugin code makes no direct call to the Windows APIs agent-core bounds, never includes
+# the single-flight driver or names a win_*.hpp test seam, and its bounded_call sites are frozen
+# file by file. Lexical; carries its own mutation self-test.
+test('plugin bounded OS call lexical gate (ADR-3008)',
+  _python3_test,
+  args: [files('test_bounded_os_call_lexical.py')],
+  suite: 'agent',
+  timeout: 30,
+)
+
 # #7035: static lexical gate over the Windows callers of the checked HKEY_USERS listing -- each
 # call tests `hku.error.empty()` before it reads `hku.names` and reports `hku_list_incomplete`, and
 # a new caller must be listed. Source text only (the callers cannot run in the unit suites).
 test('HKEY_USERS listing callers refuse a failed listing lexical gate (#7035)',
   _python3_test,
   args: [files('test_hku_listing_pin_lexical.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
+# Pins kLiveReadProcessesTimeoutRetryMs (mcp_retry.hpp) to the processes plugin's kActionBudget,
+# which no static_assert can link (the plugin is a separate DSO). Carries its own in-memory self-test.
+# No build required; one process, well under a second.
+test('live-read processes timeout hint equals the plugin action budget (#2146)',
+  _python3_test,
+  args: [files('test_live_retry_budget_lexical.py')],
   suite: 'docs',
   timeout: 30,
 )

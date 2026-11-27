@@ -161,6 +161,7 @@
 #include "baseline_store.hpp"
 #include "guardian_push_builder.hpp"
 #include "guardian_rule_scope_preflight.hpp"
+#include "guardian_directory_route.hpp" // HA WS-5 (#5685) the route-directory decision for the reconcile send
 #include "guardian_reconcile_flow.hpp" // #5513 the heartbeat reconcile control flow (unit tested)
 #include "guardian_generation_cache.hpp" // #5513 short-TTL generation read
 #include "guardian_reconcile_gate.hpp" // #5513 claim map + admission budget
@@ -327,6 +328,7 @@
 #include "integrations_routes.hpp" // System "Integrations" page + its page script
 #include "viz_routes.hpp"
 #include "webhook_routes.hpp"
+#include "live_outcome.hpp" // #2146: kLiveInFlightMetric (the live-read gauge refreshed at the maintenance tick)
 #include "workflow_execute.hpp" // #2146: kWorkflowRun metric names, admit_workflow_run budget
 #include "workflow_routes.hpp"
 #include "runtime_config_store.hpp"
@@ -1110,7 +1112,8 @@ public:
         metrics_.describe("yuzu_http_held_open_responses",
                           "Responses held open right now across ALL surfaces (MCP GET, "
                           "MCP streamed POST, /api/v1/events, dashboard drawer, legacy /events, "
-                          "synchronous workflow runs) - each pins one HTTP worker thread",
+                          "synchronous workflow runs, per-device live reads) - each pins one HTTP "
+                          "worker thread",
                           "gauge");
         metrics_.describe(yuzu::server::kWorkflowRunsInFlightMetric,
                           "Synchronous workflow runs holding an HTTP worker right now (REST v1 "
@@ -7323,9 +7326,13 @@ public:
                               "dispatched), rate_limited (per-agent 25 s slot), shed (admission "
                               "budget or per-second ceiling exhausted, or in-flight cap reached, "
                               "nothing sent, no audit row), degraded "
-                              "(a store read failed, re-push aborted), no_session",
+                              "(a store read failed, re-push aborted, incl. the route directory), "
+                              "no_session, sent_remote (queued through the route directory "
+                              "for the cluster owning the agent's session), undelivered "
+                              "(no delivery path, nothing queued)",
                               "counter");
-            for (auto result : {"sent", "rate_limited", "shed", "degraded", "no_session"})
+            for (auto result : {"sent", "rate_limited", "shed", "degraded", "no_session",
+                                "sent_remote", "undelivered"})
                 metrics_.counter("yuzu_server_guardian_reconciles_total", {{"result", result}});
             metrics_.describe("yuzu_server_guardian_reconcile_invalidated_total",
                               "Guardian heartbeat reconciles withheld because a rule or policy "
@@ -7432,18 +7439,13 @@ public:
                 // not operator instruction dispatch - deliberately NOT
                 // quarantine-gated (see dispatch_confined_arms.hpp).
                 .send_push = [this](const std::string& agent_id, const std::string& command_id,
-                                    const std::string& push_bytes) -> bool {
+                                    const std::string& push_bytes) -> GuardianPushOutcome {
                     auto classified = build_classified_command(
                         yuzu::server::DispatchCaller{.system = true}, "__guard__", "push_rules",
                         command_id, /*parameters=*/{}, push_bytes);
-                    if (classified &&
-                        send_system_reserved(
-                            agent_id, *classified,
-                            yuzu::server::SystemReservedPush::guardian_push_rules)) {
-                        forward_gateway_pending();
-                        return true;
-                    }
-                    return false;
+                    if (!classified)
+                        return GuardianPushOutcome::undelivered;
+                    return send_guardian_push(agent_id, *classified);
                 },
                 .audit = [this](const AuditEvent& ev) {
                     if (audit_store_ && audit_store_->is_open())
@@ -10939,6 +10941,13 @@ public:
                     metrics_.gauge(yuzu::server::kWorkflowRunsInFlightMetric)
                         .set(static_cast<double>(stream_budget_->active_for_surface(
                             yuzu::server::detail::SseSurface::kWorkflowRun)));
+                    // The live-read share (REST route, MCP tool, quarantine release wait). The
+                    // handlers also publish it at every acquire and release; this refresh keeps a
+                    // racing publish from leaving the gauge stale (it is set outside the budget's
+                    // lock).
+                    metrics_.gauge(yuzu::server::live::kLiveInFlightMetric)
+                        .set(static_cast<double>(stream_budget_->active_for_surface(
+                            yuzu::server::detail::SseSurface::kLiveRead)));
                 }
                 // #6079: two atomic flag reads. The flags flip only when a request-driven
                 // validation observes the fault (AuthDB::mfa_status, SessionStore::find).
@@ -12245,13 +12254,22 @@ public:
                     stream_budget_ ? stream_budget_->active_for_surface(
                                          yuzu::server::detail::SseSurface::kWorkflowRun)
                                    : 0);
+                // Per-device live reads (REST, MCP, the quarantine release wait) hold a worker
+                // for about 20 s typical, never past the 25 s poll deadline plus one interval
+                // and one read, and the same cap bounds the wait: a lease that leaked would
+                // cost at most kExecutionDrainCap, never wedge the shutdown. New
+                // reads are refused once draining_ is set, so this count only falls.
+                const std::size_t live_reads =
+                    stream_budget_ ? stream_budget_->active_for_surface(
+                                         yuzu::server::detail::SseSurface::kLiveRead)
+                                   : 0;
                 if (!shutdown_drain::keep_draining_for_work(elapsed, min_grace, running,
-                                                            workflow_runs))
+                                                            workflow_runs, live_reads))
                     break;
-                if (running > 0 || workflow_runs > 0) {
-                    spdlog::info("Draining: {} executions and {} workflow runs in flight, "
-                                 "waiting...",
-                                 running, workflow_runs);
+                if (running > 0 || workflow_runs > 0 || live_reads > 0) {
+                    spdlog::info("Draining: {} executions, {} workflow runs and {} live reads in "
+                                 "flight, waiting...",
+                                 running, workflow_runs, live_reads);
                 } else if (steady_clock::now() - last_log >= seconds(10)) {
                     // A countdown, so a long grace does not read as a hang and invite
                     // the second signal that hard-exits (UP-11).
@@ -14938,6 +14956,67 @@ private:
                       {"result", ok ? "sent" : "undelivered"}})
             .increment();
         return ok;
+    }
+
+    /// HA WS-5 (#5685): the Guardian reconcile's send, with the route-directory consult
+    /// `send_system_reserved` deliberately lacks (see its KNOWN LIMITATION above).
+    ///
+    /// A local session with no delivery path of its own (`needs_directory_consult`: empty
+    /// `gateway_node` and no stream, the shape a replay-adopted session has until its
+    /// re-announced CONNECTED lands on THIS replica) cannot take a push through `send_to`.
+    /// For that shape, and only that shape, read the agent's durable route once and queue the
+    /// push for the cluster that owns it. Every guard fails CLOSED:
+    ///  - a degraded directory read sends nothing (`route_unreadable`);
+    ///  - the row must be `routable` (session present, lease live, cluster set);
+    ///  - the row's `session_id` must equal this replica's session id for the agent, or the
+    ///    push would go to a superseded registration's cluster. The session id is read
+    ///    before the directory read and re-checked after it (a change during the read is
+    ///    `no_route`), and the flow withholds the push if the session changed since it
+    ///    started. A re-registration after that, before the send, can still queue rules built
+    ///    for the old session for the old cluster; they carry the same generation, so no
+    ///    later heartbeat repairs it until the generation moves (accepted). If a
+    ///    CONNECTED lands in that gap `send_via_directory` hands the push to `send_to`, and
+    ///    the outcome is still labelled `sent_remote`.
+    /// A direct-connected agent never has a route row, so it stays `undelivered` here exactly
+    /// as before. This path does not repeat `send_to`'s gateway-capability check (the session
+    /// has no advertised capabilities yet). `send_via_directory` also applies the per-OS kill
+    /// switch, but `__guard__.push_rules` is a protective action (`is_protective_action`), so it
+    /// is exempt and nothing is ever withheld here: do not count on a kill switch to stop this
+    /// push. Both replicas may push one agent: the claim and budget are per replica.
+    [[nodiscard]] GuardianPushOutcome send_guardian_push(const std::string& agent_id,
+                                                         const detail::ClassifiedCommand& cmd) {
+        constexpr auto kPush = yuzu::server::SystemReservedPush::guardian_push_rules;
+        auto count = [&](const char* result) {
+            metrics_
+                .counter("yuzu_server_system_reserved_push_total",
+                         {{"capability", std::string(yuzu::server::system_reserved_push_label(kPush))},
+                          {"result", result}})
+                .increment();
+        };
+        const auto route =
+            yuzu::server::resolve_guardian_directory_route(registry_, gateway_route_store_.get(),
+                                                           agent_id);
+        switch (route.kind) {
+        case yuzu::server::GuardianDirectoryRoute::Kind::not_needed:
+            if (send_system_reserved(agent_id, cmd, kPush)) {
+                forward_gateway_pending();
+                return GuardianPushOutcome::sent;
+            }
+            return GuardianPushOutcome::undelivered;
+        case yuzu::server::GuardianDirectoryRoute::Kind::unreadable:
+            return GuardianPushOutcome::route_unreadable;
+        case yuzu::server::GuardianDirectoryRoute::Kind::routed:
+            if (registry_.send_via_directory(agent_id, cmd, route.cluster_id)) {
+                count("sent");
+                forward_gateway_pending();
+                return GuardianPushOutcome::sent_remote;
+            }
+            break;
+        case yuzu::server::GuardianDirectoryRoute::Kind::no_route:
+            break;
+        }
+        count("undelivered");
+        return GuardianPushOutcome::undelivered;
     }
 
     [[nodiscard]] static std::string mint_sync_now_command_id() {
@@ -24559,6 +24638,15 @@ private:
         // it stamps the principal, the effective role the route captured per binding, the
         // engine class and the session correlator. MUST run BEFORE register_routes().
         rest_api_v1_->set_audit_as_session_fn(auth_routes_->audit_as_session_fn());
+        // #2146: the per-device live read (POST /dex/devices/{id}/live) and the quarantine
+        // release-confirm wait refuse a NEW wait once the server is draining or stopping, the
+        // same predicate MCP's set_draining_fn reads below. The poll's abort is NOT this
+        // predicate: draining flips at drain start and would abort reads the drain is waiting
+        // for; the poll watches StreamBudget::closing(), which flips when the drain ends.
+        rest_api_v1_->set_draining_fn([this] {
+            return draining_.load(std::memory_order_acquire) ||
+                   stop_requested_.load(std::memory_order_acquire);
+        });
         // #6086: GET/PUT/DELETE /api/v1/dex/score-policy. The reader and the two conditional
         // writes borrow runtime_config_store_ by reference. stop() waits for and joins the
         // listener thread(s) before it resets the store, so no handler is running when the
@@ -25581,6 +25669,9 @@ private:
                 return draining_.load(std::memory_order_acquire) ||
                        stop_requested_.load(std::memory_order_acquire);
             });
+            // get_device_live's #7110 re-decision tells a withdrawn permission from an
+            // unreadable gate: the SAME typed gate the REST purge and live routes hold.
+            mcp_server_->set_scoped_gate_fn(scoped_gate_fn);
             // ADR-0031 WS-A4 (ninth family): the SAME Guardian-read API seam
             // instance the REST GET /api/v1/guaranteed-state/* handlers use
             // (constructed unconditionally above), so the 8 seamed MCP Guardian

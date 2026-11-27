@@ -315,7 +315,9 @@ using DriveClassTest = std::function<DriveClass(char drive)>;
 /// disk RIGHT NOW. The shell asks it before every directory open and every file open, not once at
 /// planning, because a drive letter can be re-pointed (SUBST, a disk swap, hot-plug) inside the scan
 /// window (the `runtimes` plugin re-checks DRIVE_FIXED on every read for the same reason). Anything
-/// but a fixed answer, `unknown` included, refuses the open.
+/// but a fixed answer, `unknown` included, refuses the open. The check and the open are two calls:
+/// re-pointing the drive in that gap takes privilege or physical access (`runtimes` has the same
+/// residual).
 [[nodiscard]] inline bool volume_is_fixed(std::string_view walk_path, const DriveClassTest& drive_class) {
     const auto drive = drive_of_walk_path(walk_path);
     return drive && drive_class(*drive) == DriveClass::fixed;
@@ -443,7 +445,7 @@ enum class BatchResult {
             DirEntry e;
             e.name = wtf8_from_utf16(units);
             e.type = entry_type_from_attributes(attributes);
-            e.file_id = load64(at + kDirInfoFileId);
+            e.file_id = load64(at + kDirInfoFileId); // unique per volume only: dev stays 0 on this leg
             out.entries.push_back(std::move(e));
         }
         if (next == 0)

@@ -4,18 +4,26 @@
 #include "data_export.hpp"
 #include "directory_sync.hpp"
 #include "engine_principal_store.hpp"
+#include "mgmt_group_limits.hpp"
 #include "rbac_store.hpp"
 
 #include <yuzu/server/auth_db.hpp>
+
+#include <nlohmann/json.hpp>
 
 #include <algorithm>
 #include <locale>
 #include <map>
 #include <sstream>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 
 namespace yuzu::server {
+
+// The scope id cap is the management-group id contract (see kScopeGroupIdMaxLen), so a group id the
+// group store accepts can always be frozen and attested.
+static_assert(kScopeGroupIdMaxLen == kMgmtGroupIdMaxBytes);
 
 namespace {
 
@@ -309,8 +317,145 @@ std::string to_csv(const std::vector<AccessReviewRow>& rows, const std::string& 
     return ss.str();
 }
 
+std::expected<std::string, std::string> parse_attest_scope(const nlohmann::json& body) {
+    if (!body.is_object() || !body.contains("scope") || !body["scope"].is_string())
+        return std::unexpected(std::string(kAttestScopeInvalidMessage));
+    const auto scope = body["scope"].get<std::string>();
+    const bool has_id = body.contains("scope_group_id");
+    if (scope == "fleet") {
+        if (has_id) {
+            const auto& id = body["scope_group_id"];
+            if (!id.is_string() || !id.get<std::string>().empty())
+                return std::unexpected(std::string(kAttestScopeFleetIdMessage));
+        }
+        return std::string{};
+    }
+    if (scope == "management_group") {
+        if (!has_id || !body["scope_group_id"].is_string())
+            return std::unexpected(std::string(kAttestScopeGroupIdMessage));
+        auto id = body["scope_group_id"].get<std::string>();
+        if (id.empty() || !scope_group_id_within_bounds(id))
+            return std::unexpected(std::string(kAttestScopeGroupIdMessage));
+        return id;
+    }
+    return std::unexpected(std::string(kAttestScopeInvalidMessage));
+}
+
+std::string snapshot_scope_group_name(std::string_view grant_snapshot_json) {
+    if (grant_snapshot_json.empty())
+        return {};
+    const auto j = nlohmann::json::parse(grant_snapshot_json.begin(), grant_snapshot_json.end(),
+                                         nullptr, /*allow_exceptions=*/false);
+    if (j.is_discarded() || !j.is_object())
+        return {};
+    const auto it = j.find("scope_group_name");
+    if (it == j.end() || !it->is_string())
+        return {};
+    return it->get<std::string>();
+}
+
+ScopeCell scope_cell(std::string_view scope_group_id, std::string_view scope_group_name) {
+    if (scope_group_id.empty())
+        return {"Fleet-wide", {}};
+    if (scope_group_name.empty())
+        return {"Group: name unavailable (" + std::string(scope_group_id) + ")", {}};
+    return {"Group: " + std::string(scope_group_name), std::string(scope_group_id)};
+}
+
 std::string access_review_rbac_enforcement(const RbacStore* rbac) {
     return std::string(to_string(rbac_enforcement_label(rbac)));
+}
+
+namespace {
+
+/// Append `sv` as a JSON string body (no surrounding quotes): the double quote, the backslash and
+/// the C0 controls escaped, every other byte copied. It escapes exactly as the file-local
+/// `json_escape` in rest_api_v1.cpp and mcp_server.cpp does (those stay, for their other JSON
+/// builders); this is a separate copy so the snapshot the freeze builds is the one those
+/// handlers used to build.
+void append_json_escaped(std::string& out, std::string_view sv) {
+    for (char c : sv) {
+        switch (c) {
+        case '"':
+            out += "\\\"";
+            break;
+        case '\\':
+            out += "\\\\";
+            break;
+        case '\b':
+            out += "\\b";
+            break;
+        case '\f':
+            out += "\\f";
+            break;
+        case '\n':
+            out += "\\n";
+            break;
+        case '\r':
+            out += "\\r";
+            break;
+        case '\t':
+            out += "\\t";
+            break;
+        default:
+            if (static_cast<unsigned char>(c) < 0x20) {
+                // A C0 control is below 0x20, so the escape is always \u00 plus two lowercase hex
+                // digits (the high digit is 0 or 1).
+                constexpr std::string_view kHexDigits = "0123456789abcdef";
+                const auto b = static_cast<unsigned char>(c);
+                out += "\\u00";
+                out += kHexDigits[b >> 4];
+                out += kHexDigits[b & 0x0F];
+            } else {
+                out += c;
+            }
+        }
+    }
+}
+
+void append_json_string_member(std::string& out, std::string_view key, std::string_view value) {
+    out += '"';
+    append_json_escaped(out, key);
+    out += "\":\"";
+    append_json_escaped(out, value);
+    out += '"';
+}
+
+/// The freeze-time snapshot of a row's non-role fields. Key order is part of the stored evidence.
+std::string freeze_snapshot(const AccessReviewRow& r) {
+    std::string out = "{";
+    append_json_string_member(out, "display_name", r.display_name);
+    out += ',';
+    append_json_string_member(out, kSnapshotOwnerKey, r.owner_or_email);
+    out += ",\"effective_permission_count\":" + std::to_string(r.effective_permission_count);
+    out += ",\"last_activity_ms\":" + std::to_string(r.last_activity_ms);
+    out += ',';
+    append_json_string_member(out, "last_activity_kind", r.last_activity_kind);
+    out += ',';
+    append_json_string_member(out, "classification", r.classification);
+    out += ',';
+    append_json_string_member(out, "lifecycle_state", r.lifecycle_state);
+    out += ',';
+    append_json_string_member(out, "source", r.source);
+    out += ',';
+    append_json_string_member(out, "scope_group_name", r.scope_group_name);
+    out += '}';
+    return out;
+}
+
+} // namespace
+
+std::vector<GrantRef> freeze_population(const std::vector<AccessReviewRow>& rows) {
+    std::vector<GrantRef> frozen;
+    for (const auto& r : rows) {
+        if (r.roles.empty())
+            continue;
+        const std::string snapshot = freeze_snapshot(r);
+        for (const auto& role : r.roles)
+            frozen.push_back(
+                GrantRef{r.principal_type, r.principal_id, role, snapshot, r.scope_group_id});
+    }
+    return frozen;
 }
 
 } // namespace yuzu::server

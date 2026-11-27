@@ -17,7 +17,8 @@ extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t* data, std::size_t size
     const bh::Source src = bh::span_source(bytes);
 
     // 1. Defaults.
-    (void)bh::read_macho(src);
+    std::optional<std::uint32_t> thin_file_type;
+    (void)bh::read_macho(src, {}, {}, &thin_file_type);
 
     // 2. Tight caps: every limit_exceeded exit is one byte away.
     bh::MachoLimits tight;

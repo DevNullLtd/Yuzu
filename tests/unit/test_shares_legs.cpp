@@ -610,6 +610,28 @@ TEST_CASE("shares windows: a failing later page discards every earlier row", "[s
     CHECK(l.rows == std::vector<std::string>{"source|netshareenum|failed|-"});
 }
 
+TEST_CASE("shares windows: an unanswered page names its cause and reports no rows",
+          "[shares][bounded_os_call]") {
+    for (const std::string cause :
+         {"deadline_exceeded", "call_in_progress", "abandoned_call_pending"}) {
+        CAPTURE(cause);
+        WinPage unanswered; // status 0 is the default: it must not read as a clean empty page
+        unanswered.unanswered = cause;
+        for (const bool after_good_page : {false, true}) {
+            CAPTURE(after_good_page);
+            FakeWinPages f;
+            if (after_good_page)
+                f.pages[2] = {page_of(kWinMoreData, disks("a", 3)), unanswered};
+            else
+                f.pages[2] = {unanswered};
+            const auto l = f.run();
+            CHECK(l.status == StatusState::constrained);
+            CHECK(l.reason == "windows:shares:netshareenum:" + cause);
+            CHECK(l.rows == std::vector<std::string>{"source|netshareenum|failed|-"});
+        }
+    }
+}
+
 TEST_CASE("shares windows: level 2 refused falls back to level 1 names without paths", "[shares]") {
     FakeWinPages f;
     f.pages[2] = {page_of(kWinAccessDenied)};

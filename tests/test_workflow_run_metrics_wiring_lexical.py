@@ -18,7 +18,13 @@ the C++ source:
   * the run-table size gauges are described and the failure counter pre-seeded in server.cpp, and
     the maintenance tick calls `refresh_table_size_metrics` exactly once, outside a comment;
   * the five alerts, the outcome counter and the three run-table series are named in the metrics
-    manual, and every alert carries a runbook_url.
+    manual, and every alert carries a runbook_url;
+  * the per-device live read's three production wirings in server.cpp, each outside a comment: the
+    REST route's `set_draining_fn` (without it a draining server admits new live reads on REST),
+    the MCP tool's `set_scoped_gate_fn` (without it the re-decision cannot tell a revocation from an
+    unreadable gate and fails closed on every call), and the maintenance tick's refresh of the
+    `yuzu_server_live_in_flight` gauge from the `kLiveRead` lease count (without it a racing
+    publish leaves the gauge stale). A unit test that wires the seam itself cannot see any of these.
 
 Not checked: that a (metric, label, value) triple is seeded TOGETHER. A value is only matched
 against the flat literal corpus (the closed sets are spread over several files, some built from
@@ -55,6 +61,14 @@ SIZE_CONSTANTS = (
 DESCRIBE = r"metrics_\s*\.\s*describe\s*\(\s*yuzu::server::%s\b"
 SEED_FAILURES = re.compile(
     r"metrics_\s*\.\s*counter\s*\(\s*yuzu::server::kWorkflowExecutionsStatsUnavailableMetric\b")
+REST_DRAINING = re.compile(r"\brest_api_v1_\s*->\s*set_draining_fn\s*\(")
+REST_SCOPED_GATE = re.compile(r"\brest_api_v1_\s*->\s*set_scoped_gate_fn\s*\(")
+MCP_DRAINING = re.compile(r"\bmcp_server_\s*->\s*set_draining_fn\s*\(")
+MCP_SCOPED_GATE = re.compile(r"\bmcp_server_\s*->\s*set_scoped_gate_fn\s*\(")
+LIVE_GAUGE_REFRESH = re.compile(
+    r"metrics_\s*\.\s*gauge\s*\(\s*yuzu::server::live::kLiveInFlightMetric\s*\)\s*\.\s*set\s*\("
+    r"\s*static_cast<double>\s*\(\s*stream_budget_\s*->\s*active_for_surface\s*\("
+    r"\s*yuzu::server::detail::SseSurface::kLiveRead\s*\)\s*\)\s*\)\s*;")
 REFRESH_CALL = re.compile(r"\bworkflow_engine_\s*->\s*refresh_table_size_metrics\s*\(\s*\)\s*;")
 SEED_CALL = re.compile(r"\bseed_workflow_run_metrics\s*\(\s*metrics_\s*\)\s*;")
 BIND = re.compile(r"count_run_outcome\s*=\s*make_workflow_run_outcome_counter\s*\(")
@@ -80,6 +94,11 @@ def code_lines(src):
 
 def count_matches(src, pattern):
     return sum(len(pattern.findall(line)) for line in code_lines(src))
+
+
+def count_in_code(src, pattern):
+    """Matches of a pattern that may span lines, over the source with its comments removed."""
+    return len(pattern.findall("\n".join(code_lines(src))))
 
 
 def rule_exprs(alerts_text, names):
@@ -159,6 +178,31 @@ class WorkflowRunMetricsWiring(unittest.TestCase):
     def test_maintenance_tick_samples_the_table_once(self):
         server = (SRC / "server.cpp").read_text(encoding="utf-8")
         self.assertEqual(count_matches(server, REFRESH_CALL), 1)
+
+    def test_live_read_production_wirings_are_present_once(self):
+        server = (SRC / "server.cpp").read_text(encoding="utf-8")
+        for name, pattern in (("REST set_draining_fn", REST_DRAINING),
+                              ("REST set_scoped_gate_fn", REST_SCOPED_GATE),
+                              ("MCP set_draining_fn", MCP_DRAINING),
+                              ("MCP set_scoped_gate_fn", MCP_SCOPED_GATE)):
+            self.assertEqual(count_matches(server, pattern), 1, name)
+        self.assertEqual(count_in_code(server, LIVE_GAUGE_REFRESH), 1,
+                         "the maintenance tick must refresh yuzu_server_live_in_flight from the "
+                         "kLiveRead lease count")
+
+    def test_gate_sees_a_removed_live_wiring(self):
+        self.assertEqual(count_matches("rest_api_v1_->set_draining_fn([this] { return true; });", REST_DRAINING), 1)
+        self.assertEqual(count_matches("// rest_api_v1_->set_draining_fn([this] { return true; });", REST_DRAINING), 0)
+        self.assertEqual(count_matches("mcp_server_->set_scoped_gate_fn(scoped_gate_fn);", MCP_SCOPED_GATE), 1)
+        self.assertEqual(count_matches("mcp_server_->set_scoped_gate_fn(scoped_gate_fn);", REST_SCOPED_GATE), 0)
+        self.assertEqual(count_matches("/*\n mcp_server_->set_scoped_gate_fn(f);\n*/", MCP_SCOPED_GATE), 0)
+        live = ("metrics_.gauge(yuzu::server::live::kLiveInFlightMetric)\n"
+                "    .set(static_cast<double>(stream_budget_->active_for_surface(\n"
+                "        yuzu::server::detail::SseSurface::kLiveRead)));")
+        self.assertEqual(count_in_code(live, LIVE_GAUGE_REFRESH), 1)
+        self.assertEqual(count_in_code("// " + live.replace("\n", "\n// "), LIVE_GAUGE_REFRESH), 0)
+        # The wrong surface (or a dropped refresh) must not satisfy the pin.
+        self.assertEqual(count_in_code(live.replace("kLiveRead", "kWorkflowRun"), LIVE_GAUGE_REFRESH), 0)
 
     def test_gate_sees_a_removed_call_a_renamed_metric_and_a_unknown_label_value(self):
         self.assertEqual(count_matches("void f() {\n// seed_workflow_run_metrics(metrics_);\n}", SEED_CALL), 0)

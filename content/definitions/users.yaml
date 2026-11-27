@@ -187,8 +187,8 @@ spec:
         example: jsmith
         platforms: [windows, linux, darwin]
       - name: enabled
-        type: bool
-        description: 'Whether the account is enabled. Values: true, false.'
+        type: string
+        description: 'Whether the account is enabled; macOS reports unknown when the login-shell read failed or was cut off. Values: true, false, unknown.'
         example: "true"
         platforms: [windows, linux, darwin]
       - name: last_logon
@@ -198,7 +198,7 @@ spec:
         platforms: [windows, linux, darwin]
       - name: description
         type: string
-        description: "The account's comment/description text (Windows comment, macOS RealName, Linux GECOS field), or \"-\" when empty. Values: free text or \"-\"."
+        description: "The account's comment/description text (Windows comment, macOS RealName, Linux GECOS field), or \"-\" when empty or, on macOS, not read. Values: free text or \"-\"."
         example: Built-in account for administering the computer/domain
         platforms: [windows, linux, darwin]
       - name: console_state

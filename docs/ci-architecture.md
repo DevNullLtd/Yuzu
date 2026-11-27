@@ -2235,7 +2235,7 @@ of reading as NOT TESTED.
   crypto NIF needs OpenSSL SM4 symbols that Red Hat's OpenSSL lacks. The
   same defect is waiting behind #5143 on rockylinux:9.
 
-**Known nondeterministic test.** `tests/unit/test_echo_local_dispatcher.cpp`'s byte-budget rollup case (the `[budget]` test, `budget_evicted_raw_rows_total`) fails on one Linux workstation while CI passes; it is tracked as #7039 and is not a regression of the change under test. It is not in `tests/known-flaky.json`, so a red on it is not retried.
+**Known environment-dependent test.** In `tests/unit/test_echo_local_dispatcher.cpp`, the case "echo plugin: a rollup pass on an over-budget legacy database evicts to the byte target, converts it to incremental auto_vacuum and publishes the result" (one of the `[budget]`-tagged cases) fails intermittently on one Linux workstation, not always on the same check, while the Linux and macOS CI legs pass it. Its cause is unknown and it is tracked as #7039. It is not in `tests/known-flaky.json`, so a red on it is not retried.
 
 **Gateway-upstream peer authorization and the rigs.** The server refuses to start with
 `--gateway-upstream` unless gateway peer authorization is configured or acknowledged as disabled
@@ -2683,7 +2683,10 @@ label still fails loud.
 
 `Test (non-pg suites)` also carries the registry plugin's real-registry cases (#6488). It sets
 `YUZU_REQUIRE_WINDOWS_REGISTRY_TESTS=1`, so a case that would skip (no `registry.dll`, or a process that
-cannot write `HKLM`) fails instead. The one exception is the Echo bam live case (#6898): a runner account can be refused
+cannot write `HKLM`) fails instead. The flag is honoured by `test_registry_win_internals.cpp` and, for the Spark
+Registry `[7877]` cases (the HKCR pair, the link case, the deny-ACE cases, the deep-name case, the log-capture cases and the
+root-key case), by `test_spark_mechanism.cpp` through its `skip_or_fail_registry` helper; a leg whose token cannot write
+`HKLM\SOFTWARE\Classes`, create a registry link or set a DACL therefore FAILS those cases rather than skipping them. The one exception is the Echo bam live case (#6898): a runner account can be refused
 (error 5) creating its scratch keys under `HKLM\SYSTEM\CurrentControlSet\Services\bam` (measured on one test host as an elevated non-SYSTEM
 user: a key directly under `bam` was allowed, `bam\State\UserSettings` was refused; LOCAL SYSTEM could write both on that host; the Windows CI leg's own account is not LOCAL SYSTEM and was refused at `bam\State\UserSettings` in CI run 43294719354, #7637), and then
 the case SKIPs even with the flag set. The exclusion is proven live only where the account may write (e.g. a LOCAL SYSTEM

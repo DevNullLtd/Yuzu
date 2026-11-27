@@ -330,7 +330,12 @@ std::vector<ServiceInfo> enumerate_services_impl(
         const std::vector<std::string>&, const yuzu::agent::SubprocessOptions&)>& run);
 #endif
 
-/** Enumerate active user sessions on the current host. */
+/**
+ * Enumerate active user sessions on the current host.
+ * Completeness contract (Windows): THROWS yuzu::echo::IncompleteCaptureError rather than
+ * returning a partial vector when the session read did not answer, failed or hit the session cap
+ * (echo_wts_sessions.hpp) -- callers MUST NOT diff or persist a caught tick.
+ */
 std::vector<UserSession> enumerate_users();
 
 /**

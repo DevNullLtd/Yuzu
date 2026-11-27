@@ -56,12 +56,13 @@ struct MachoBuildVersion {
 struct MachoSlice {
     std::uint64_t offset{0};
     std::uint64_t size{0};
-    std::optional<ParseError> error; // set: only the fat_arch fields hold (offset, size, cpu_type, cpu_subtype); byte_order is the table's, the rest defaults
+    std::optional<ParseError> error; // set: only the fat_arch fields hold (offset, size, cpu_type, cpu_subtype), plus file_type and header_read when the slice header was read; byte_order is the table's, the rest defaults
     bool is64{false};
     std::endian byte_order{std::endian::little};
     std::uint32_t cpu_type{0};
     std::uint32_t cpu_subtype{0};
     std::uint32_t file_type{0};
+    bool header_read{false}; // the slice header was read, so file_type is what the file states
     std::uint32_t flags{0};
     std::uint32_t load_command_count{0};
     std::optional<MachoDylibId> id_dylib;
@@ -135,7 +136,7 @@ slice_read(Reader& r, std::uint64_t base, std::uint64_t slice_size, std::uint64_
 // The first min(size, 32) bytes of the slice, already read by the caller.
 [[nodiscard]] inline std::expected<MachoSlice, ParseError>
 parse_thin(Reader& r, std::uint64_t base, std::uint64_t size, std::string_view head,
-           const MachoLimits& lim) {
+           const MachoLimits& lim, std::optional<std::uint32_t>* header_file_type) {
     if (head.size() < 4)
         return std::unexpected(ParseError::truncated);
     const std::uint32_t magic = u32(head, 0, std::endian::big);
@@ -159,6 +160,9 @@ parse_thin(Reader& r, std::uint64_t base, std::uint64_t size, std::string_view h
     s.cpu_type = u32(head, 4, o);
     s.cpu_subtype = u32(head, 8, o);
     s.file_type = u32(head, 12, o);
+    s.header_read = true;
+    if (header_file_type)
+        *header_file_type = s.file_type;
     const std::uint32_t ncmds = u32(head, 16, o);
     const std::uint32_t sizeofcmds = u32(head, 20, o);
     s.flags = u32(head, 24, o);
@@ -253,9 +257,15 @@ parse_thin(Reader& r, std::uint64_t base, std::uint64_t size, std::string_view h
 
 } // namespace macho_detail
 
+// `thin_file_type`, when given, is cleared on entry and set to a THIN file's filetype as soon as its
+// header is read, so a caller can still classify a file whose load commands do not parse. A universal
+// file leaves it empty: each slice carries its own file_type.
 [[nodiscard]] inline std::expected<MachoInfo, ParseError>
-read_macho(const Source& src, const MachoLimits& lim = {}, ReadBudget budget = {}) {
+read_macho(const Source& src, const MachoLimits& lim = {}, ReadBudget budget = {},
+           std::optional<std::uint32_t>* thin_file_type = nullptr) {
     using namespace macho_detail;
+    if (thin_file_type)
+        thin_file_type->reset();
     if (src.size < 4)
         return std::unexpected(ParseError::not_this_format);
     Reader r(src, budget);
@@ -268,7 +278,7 @@ read_macho(const Source& src, const MachoLimits& lim = {}, ReadBudget budget = {
 
     MachoInfo info;
     if (!is_fat_magic(magic)) {
-        auto thin = parse_thin(r, 0, src.size, head, lim);
+        auto thin = parse_thin(r, 0, src.size, head, lim, thin_file_type);
         if (!thin)
             return std::unexpected(thin.error());
         info.slices.push_back(std::move(*thin));
@@ -296,6 +306,7 @@ read_macho(const Source& src, const MachoLimits& lim = {}, ReadBudget budget = {
     const std::string_view table = *table_read;
 
     info.fat = true;
+    info.slices.reserve(nfat); // so keeping a slice cannot fail after its type was read
     for (std::uint32_t i = 0; i < nfat; ++i) {
         const std::size_t at = static_cast<std::size_t>(i) * entry;
         MachoSlice s;
@@ -315,15 +326,26 @@ read_macho(const Source& src, const MachoLimits& lim = {}, ReadBudget budget = {
         } else {
             const std::size_t n =
                 s.size < kHeader64Bytes ? static_cast<std::size_t>(s.size) : kHeader64Bytes;
-            auto sh = slice_read(r, s.offset, s.size, 0, n);
-            if (!sh) {
-                s.error = sh.error();
-            } else {
-                auto parsed = parse_thin(r, s.offset, s.size, *sh, lim);
-                if (parsed)
-                    s = std::move(*parsed);
-                else
-                    s.error = parsed.error();
+            std::optional<std::uint32_t> seen;
+            // One slice's failure, a thrown read or allocation included, stays that slice's error,
+            // so a type its header stated is not lost with it.
+            try {
+                auto sh = slice_read(r, s.offset, s.size, 0, n);
+                if (!sh) {
+                    s.error = sh.error();
+                } else {
+                    auto parsed = parse_thin(r, s.offset, s.size, *sh, lim, &seen);
+                    if (parsed)
+                        s = std::move(*parsed);
+                    else
+                        s.error = parsed.error();
+                }
+            } catch (...) {
+                s.error = ParseError::io;
+            }
+            if (s.error && seen) {
+                s.file_type = *seen;
+                s.header_read = true;
             }
         }
         info.slices.push_back(std::move(s));

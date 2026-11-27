@@ -98,6 +98,10 @@
 #include <string_view>
 #include <vector>
 
+#include <nlohmann/json_fwd.hpp>
+
+#include "access_review_store.hpp" // GrantRef, the element type freeze_population builds
+
 namespace yuzu::server {
 
 class AuthDB;
@@ -131,7 +135,23 @@ struct AccessReviewRow {
     std::string source; ///< "local" | "scim" | "idp" | "engine" | "orphan" — best-effort
                         ///< normalisation of the principal's provenance ("orphan" = grant with no
                         ///< matching roster row, UP-1); see the .cpp for the exact mapping
+    /// The scope the row's grants are held at (#6969): `""` is fleet-wide, any other value is a
+    /// management group's id. Always empty today: `build_access_review` lists fleet-wide grants
+    /// only, so the population is unchanged. Part of the identity a campaign freezes and an
+    /// attestation names (`GrantRef::scope_group_id`).
+    std::string scope_group_id;
+    /// The group's name when the row was built (freeze-time evidence), `""` for a fleet-wide row
+    /// or when the name is unavailable. Written into the frozen snapshot as `scope_group_name`; a
+    /// snapshot written before that key existed has none, and a reader treats it as `""`.
+    std::string scope_group_name;
 };
+
+/// The wire word for a scope id: `""` (fleet-wide) is `"fleet"`, any other id is
+/// `"management_group"`. The ONE mapping, so no surface re-derives it.
+[[nodiscard]] constexpr std::string_view scope_kind(std::string_view scope_group_id) noexcept {
+    return scope_group_id.empty() ? std::string_view{"fleet"}
+                                  : std::string_view{"management_group"};
+}
 
 /// Build the full cross-principal access-review export. `users`, `rbac`, and
 /// `engines` are REQUIRED — a null pointer, or a store that reports itself
@@ -147,6 +167,15 @@ struct AccessReviewRow {
 [[nodiscard]] std::expected<std::vector<AccessReviewRow>, std::string>
 build_access_review(AuthDB* users, RbacStore* rbac, EnginePrincipalStore* engines,
                     ApiTokenStore* tokens, DirectorySync* dirsync);
+
+/// Expand export rows into the grants a campaign freezes at open: one `GrantRef` per (row, role)
+/// pair, in row order then role order, each carrying the row's non-role fields as an opaque JSON
+/// snapshot (freeze-time evidence; a later grant revoke does not change it). A row with no roles
+/// yields nothing. Pure. The ONE builder for both open-campaign handlers (REST and MCP): the
+/// snapshot key set and order are what the store's frozen-owner backstop and the stored evidence
+/// depend on (the engine owner is written under `kSnapshotOwnerKey`), so never hand-build a
+/// `GrantRef` in a handler.
+[[nodiscard]] std::vector<GrantRef> freeze_population(const std::vector<AccessReviewRow>& rows);
 
 /// Serialize rows to CSV (leading metadata line + header + one row per
 /// principal). `roles` is semicolon-joined within a field. RFC 4180-style
@@ -258,9 +287,9 @@ inline constexpr std::string_view kStoreForbiddenEngineOwner =
     "forbidden: reviewer owned the engine principal named by this grant when the campaign opened";
 
 /// The key under which a frozen grant snapshot carries the engine principal's owner
-/// (`owner_username` for an engine row). The two open-campaign builders (REST, MCP) WRITE it and
-/// the store's frozen-owner backstop READS it: one name, so a rename cannot silently disable the
-/// backstop.
+/// (`owner_username` for an engine row). `freeze_population` (the one open-campaign builder) WRITES
+/// it and the store's frozen-owner backstop READS it: one name, so a rename cannot silently
+/// disable the backstop.
 inline constexpr const char* kSnapshotOwnerKey = "owner_or_email";
 
 /// The `bad_request: ` prefix the store puts on a refusal it classifies as the caller's.
@@ -278,18 +307,89 @@ decision_cap_wire_message(std::string_view store_error) noexcept {
     return std::nullopt;
 }
 
-/// True when `principal_type`, `principal_id` and `role_name` are each within their cap and free of
-/// a NUL byte (emptiness is the caller's own check). `pg/pg_exec.hpp` binds `c_str()`, so a NUL
-/// would truncate the bound value and name a different grant than the one audited.
+/// Longest scope group id, in bytes (a real management-group id is 12). It matches the
+/// management-group id contract, `kMgmtGroupIdMaxBytes` (256, `mgmt_group_limits.hpp`), so a group
+/// id the group store accepts can always be frozen and attested; access_review_model.cpp pins the
+/// two equal. Enforced by ONE helper, `scope_group_id_within_bounds`, at freeze (`open_campaign`
+/// refuses a `GrantRef` over it, so a campaign can never hold a row its attest endpoint would
+/// always refuse) and at attest.
+inline constexpr std::size_t kScopeGroupIdMaxLen = 256;
+
+/// The store's refusal text (prefixed `bad_request: `) for a scope id over the cap or holding a
+/// NUL byte. It spells out 256, pinned below. The empty id is valid: it is fleet-wide.
+inline constexpr std::string_view kScopeGroupIdInvalidMessage =
+    "scope_group_id must be at most 256 bytes without NUL";
+static_assert(kScopeGroupIdMaxLen == 256,
+              "kScopeGroupIdInvalidMessage spells out 256: update the text with the constant");
+
+/// True when a scope id is within `kScopeGroupIdMaxLen` and free of a NUL byte (`pg/pg_exec.hpp`
+/// binds `c_str()`, so a NUL would truncate the bound value and name a different scope). The empty
+/// id (fleet-wide) passes; whether a scope is REQUIRED is the caller's own rule.
+[[nodiscard]] inline bool scope_group_id_within_bounds(std::string_view scope_group_id) noexcept {
+    return scope_group_id.size() <= kScopeGroupIdMaxLen &&
+           scope_group_id.find('\0') == std::string_view::npos;
+}
+
+/// True when `principal_type`, `principal_id`, `role_name` and `scope_group_id` are each within
+/// their cap and free of a NUL byte (emptiness is the caller's own check; an empty scope is
+/// fleet-wide). `pg/pg_exec.hpp` binds `c_str()`, so a NUL would truncate the bound value and name
+/// a different grant than the one audited.
 [[nodiscard]] inline bool attest_grant_fields_within_bounds(std::string_view principal_type,
                                                             std::string_view principal_id,
-                                                            std::string_view role_name) noexcept {
+                                                            std::string_view role_name,
+                                                            std::string_view scope_group_id) noexcept {
     const auto ok = [](std::string_view s, std::size_t cap) {
         return s.size() <= cap && s.find('\0') == std::string_view::npos;
     };
     return ok(principal_type, kPrincipalIdMaxLen) && ok(principal_id, kPrincipalIdMaxLen) &&
-           ok(role_name, kRoleNameMaxLen);
+           ok(role_name, kRoleNameMaxLen) && scope_group_id_within_bounds(scope_group_id);
 }
+
+/// The refusal texts of `parse_attest_scope`, shared by REST (400) and MCP (invalid-params) so the
+/// two transports cannot drift. Each ends with the same action: a dashboard page opened before the
+/// scope field existed sends none, so the fix there is to reload it, and an API caller must send
+/// `scope` itself. None promises the caller can read the campaign: Attest without Read is a
+/// separate, known gap (#7183). 256 is spelled out and pinned to `kScopeGroupIdMaxLen`.
+inline constexpr std::string_view kAttestScopeInvalidMessage =
+    "scope is required and must be \"fleet\" or \"management_group\"; reload the page so it sends "
+    "the scope (a page opened before this field existed sends none); API callers must send scope";
+inline constexpr std::string_view kAttestScopeFleetIdMessage =
+    "scope_group_id must be absent or empty when scope is \"fleet\"; reload the page so it sends "
+    "the scope (a page opened before this field existed sends none); API callers must send scope";
+inline constexpr std::string_view kAttestScopeGroupIdMessage =
+    "scope_group_id is required when scope is \"management_group\" and must be a nonempty string "
+    "of at most 256 bytes without NUL; reload the page so it sends the scope (a page opened before "
+    "this field existed sends none); API callers must send scope";
+static_assert(kScopeGroupIdMaxLen == 256,
+              "kAttestScopeGroupIdMessage spells out 256: update the text with the constant");
+
+/// The ONE parser of the scope of an attestation request, used by REST and MCP (#6969). It reads
+/// the PARSED body, because the string helpers of both transports turn a missing or non-string
+/// value into "" and so cannot tell "fleet" from "forgot". Rules: `scope` is REQUIRED, a string,
+/// `"fleet"` or `"management_group"` (missing, null, any other type or value is refused). `"fleet"`
+/// takes a `scope_group_id` that is absent or `""` (anything else, including null and a non-string,
+/// is a contradiction and refused). `"management_group"` requires a nonempty string
+/// `scope_group_id` within `scope_group_id_within_bounds`. `scope_group_name` is output only and is
+/// never read. On success the value is the scope group id (`""` for fleet), which is what
+/// `AccessReviewStore::record_attestation` takes; on refusal it is the wire text. A parse refusal is
+/// the caller's to correct and offers no retry hint.
+[[nodiscard]] std::expected<std::string, std::string> parse_attest_scope(const nlohmann::json& body);
+
+/// The group name a frozen `grant_snapshot` carries as `scope_group_name`, or `""` when the key is
+/// absent (a snapshot written before it existed), not a string, or the snapshot is not JSON. It is
+/// the NAME only: the scope itself always comes from the attestation row's column, never from the
+/// snapshot.
+[[nodiscard]] std::string snapshot_scope_group_name(std::string_view grant_snapshot_json);
+
+/// What a Scope table cell shows, plain text (the caller HTML-escapes both fields): `Fleet-wide`
+/// for a fleet-wide grant; `Group: <name>` with the id as the tooltip for a group; `Group: name
+/// unavailable (<id>)` when the name is empty. Never empty, never "not found".
+struct ScopeCell {
+    std::string text;
+    std::string title; ///< the group id for a named group, else ""
+};
+[[nodiscard]] ScopeCell scope_cell(std::string_view scope_group_id,
+                                   std::string_view scope_group_name);
 
 /// The single shared campaign id validator: 1..kCampaignIdMaxLen bytes, each in `[A-Za-z0-9_-]`.
 /// REST, MCP, the Access page and the Settings campaign fragment all call this;

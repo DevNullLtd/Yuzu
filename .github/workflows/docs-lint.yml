@@ -158,6 +158,12 @@ jobs:
           YUZU_REQUIRE_PWSH_TEST: '1'
         run: python3 -I tests/test_windows_payload_imports.py
 
+      # A "keep both sides" conflict resolution can leave two rows for one plugin
+      # in the OS capability matrix, which plugin_doc_gen.py --check does not see.
+      # Also fails on leftover conflict markers.
+      - name: Matrix duplicate-row and conflict-marker lint
+        run: python3 -I tests/test_matrix_duplicate_rows.py
+
       # Code-to-docs fact parity (docs/docs-drift-gate.md): every /api/vN/
       # route, MCP tool and server/agent CLI flag is named in the user manual,
       # ratcheted against a by-name baseline that only

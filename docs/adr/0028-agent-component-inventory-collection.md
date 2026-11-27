@@ -1542,7 +1542,7 @@ deadline would break the one-deadline bound). Reported but not blocking
 (informational tokens on a `supported` row): `root_link_skipped` (a root dropped for a link),
 `link_skipped` (a link met inside a tree, not entered and not listed), `network_fs_skipped` and
 `version_unreadable` (a row whose version no source gives is listed with `version_source` `unreadable`).
-A missing root is skipped silently. A `constrained` answer names its cause alone; the informational
+A missing root is skipped silently (on Linux and macOS; see *Correction, 2026-11-26* under the Windows update). A `constrained` answer names its cause alone; the informational
 tokens ride a `supported` row only.
 
 **Fuzz harness.** `tests/fuzz/fuzz_component_zip.cpp` drives the ZIP central-directory reader
@@ -1593,7 +1593,7 @@ result to three outcomes: `not_this_format` is not a library (no row); `io`, `tr
 and `limit_exceeded` are unreadable (a row from the file name, `version_source` `unreadable`, an
 item-level gap; the scan stays complete). An ELF is a library only when its type is `ET_DYN`; a Mach-O
 file only through the first slice that has no error and is an `MH_DYLIB`, and a slice that could not be
-read is never an answer. The consumer obligations of the shared readers are met here: the file's
+read is never an answer (narrowed by *Correction, 2026-11-26* below). The consumer obligations of the shared readers are met here: the file's
 `unchanged()` is checked after every parse (`archive_changed`), each read is wrapped in the scan
 deadline, one `catch(...)` per file read keeps every exception inside the plugin, and every string
 taken from a reader passes the name sanitiser before it reaches a row. A name or version a file
@@ -1628,6 +1628,11 @@ or a bound is reached; the descriptor says so.
 written. `scan` answered `constrained` with `dir_unreadable` at a refused system directory; `native`
 returned exactly 5,000 rows, the row limit.
 
+*Capture, 2026-11-26.* On the same host, elevated, with the `IMAGE_FILE_DLL` filter of the correction
+below: `native` answered 4,992 rows (4,159 with a `pe` version), `constrained` with `dir_unreadable`.
+Of 10,138 `.dll` files under the two trees, 14 were not marked as DLLs and none of them was listed.
+The committed Windows sample is the 2026-11-24 capture and predates the filter.
+
 **Roots (Decision 1).** The 64-bit and 32-bit Program Files directories, named by the shell's
 known-folder lookup and never by an environment variable, on fixed local drives only. A root on a UNC
 path, a mapped network drive, removable or optical media or a RAM drive is dropped and counted in
@@ -1638,6 +1643,9 @@ an empty one. A lookup that fails walks nothing and answers the same: a failed r
 host. The drive type is asked again before every directory and every file is opened, not only when the
 roots are planned, so a drive that stops being a fixed local disk during a scan is refused from then on.
 Per-user locations are not read. Python and Node components on Windows are a later change.
+
+*Correction, 2026-11-26.* The Windows leg skips no root silently: a root it names but cannot list, or
+one that is a reparse point, answers `constrained` with `dir_unreadable`.
 
 **No reparse point is followed (Decision 4).** Every directory and file is opened relative to its
 volume root in one kernel name resolution that refuses a reparse point at any path component
@@ -1656,9 +1664,16 @@ under either root and need no exclusion.
 **`native` on Windows.** A candidate is a file whose leaf ends `.dll`, compared without regard to case
 (`.dll.mui` is not one). The version is the fixed file version of the PE's `VS_VERSIONINFO` resource,
 read by the shared bounded PE reader (`agents/shared/binary_header_pe.hpp`) through the same file view;
-`version_source` is `pe`. A PE with no version resource, or a fixed version of 0.0.0.0, is a row with
-an empty version and `version_source` `unreadable`; a file named `.dll` that has no PE header gives no
-row. The 5,000-row cap and the default-off kill switch are unchanged.
+`version_source` is `pe`. A DLL with no version resource, or a fixed version of 0.0.0.0, is a row with
+an empty version and `version_source` `unreadable`; a file named `.dll` without the MZ and PE
+signatures gives no row. The 5,000-row cap and the default-off kill switch are unchanged.
+
+*Correction, 2026-11-26.* A candidate whose COFF header is read and does not set `IMAGE_FILE_DLL`
+gives no row (a renamed executable, or a .NET application entry assembly built without the flag, such as `pwsh.dll`), whatever fails after
+that header; it still counts toward the section caps. One cut short before its COFF header is a
+file-name row with `unreadable`. The same rule holds on the other legs: an ELF `e_type` other than
+`ET_DYN`, or a thin Mach-O `filetype` other than `MH_DYLIB`, gives no row once the whole file header has stated
+it; a universal file still gets a file-name row when an unreadable slice is, or may be, a dylib.
 
 **Known limits.** The open, listing and read calls carry no deadline of their own, so the 45 second
 budget is checked between operations and a dead fixed volume can park one call, as it can for the
