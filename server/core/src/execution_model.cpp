@@ -37,8 +37,7 @@ nlohmann::json execution_agent_status_json(const AgentExecStatus& a) {
 
 namespace {
 
-// Matches execution_scope_rules.hpp::confined_projection's definition of
-// "responded" — running must never count as terminal.
+// The statuses an agent or the server treats as final. running must never count.
 bool is_terminal_status(const std::string& status) {
     // `timed_out` and `unknown` are the server's own final outcomes (#2673); they reach this
     // only through `overlay_server_outcomes`.

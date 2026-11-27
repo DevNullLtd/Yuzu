@@ -5695,8 +5695,9 @@ static const ToolDef kTools[] = {
     {"get_software_sync_status",
      "How one software sync run is going: the execution record that sync_hardware_software "
      "returns the id of. Returns state, targeted (the frames the registry accepted), acknowledged "
-     "(agents that armed the sync) and failed (agents that answered with a failure), dispatched_at, "
-     "plus, once the run's targets are recorded, timed_out, not_delivered and unknown (no device "
+     "(agents that armed the sync) and failed (agents that answered with a failure; when the run's "
+     "target list was not saved in full, every unsuccessful result), dispatched_at, "
+     "plus, once the run's target list is saved in full, timed_out, not_delivered and unknown (no device "
      "answer) and not_reached (selected but offline, not sent or unable to run it), "
      "delay_max_s and estimated_completion_at (dispatch time plus the spread, an estimate). An "
      "agent answers when it ARMS the sync, not when its report lands, so these count requests "

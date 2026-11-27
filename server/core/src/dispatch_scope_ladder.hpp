@@ -678,6 +678,14 @@ inline ConfinedDispatchOutcome wire_and_dispatch_confined(
                                                  plugin_missing, *os_kill_switched, collect_targets);
     outcome.command_id = command_id;
 
+    // #2673: returned normally with nothing sent and nobody named: there is no list to save, and
+    // leaving the send open would make a later, successful re-drive read as incomplete.
+    if (collect_targets && outcome.intended.empty() && outcome.sent == 0 &&
+        !execution_tracker->close_empty_attempt(execution_id))
+        spdlog::warn("wire_and_dispatch_confined: could not close the empty send of "
+                     "execution_id={}",
+                     execution_id);
+
     // #2673: record who this dispatch was meant for. Best effort: a failure never fails the
     // dispatch (the frames are already sent), and leaves the run on the count-only rules.
     if (collect_targets && !outcome.intended.empty()) {

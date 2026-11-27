@@ -67,8 +67,8 @@ nlohmann::json execution_agent_status_json(const AgentExecStatus& a);
 
 /// KPI summary (succeeded/failed counts + p50/p95 duration in ms) computed
 /// from a set of already-fetched, already-confined `AgentExecStatus` rows.
-/// Only TERMINAL rows (success/failure/timeout/rejected — matches
-/// `execution_scope_rules.hpp::confined_projection`'s definition of
+/// Only TERMINAL rows (success/failure/timeout/rejected, plus the server's timed_out/unknown;
+/// matches `execution_scope_rules.hpp::confined_projection`'s definition of
 /// "responded") with a usable `completed_at >= dispatched_at` contribute a
 /// duration sample; an agent still `running` has no duration yet and must
 /// not skew the percentile.

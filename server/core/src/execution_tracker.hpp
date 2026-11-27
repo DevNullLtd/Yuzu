@@ -188,7 +188,7 @@ struct ResponseDeadlineSweepOutcome {
     bool held{false}; ///< expiry held back after missed passes, a restart or a clock change
     bool skipped{false};       ///< another replica held the sweep lock
     bool clock_anomaly{false}; ///< declined on an implausible database clock reading
-    bool capped{false};        ///< more runs were eligible than one pass handles
+    bool capped{false};        ///< the pass left eligible runs: limit, time budget or stop
 };
 
 struct ExecutionQuery {
@@ -659,6 +659,11 @@ public:
     [[nodiscard]] bool record_dispatch_targets(const std::string& execution_id,
                                                const std::vector<DispatchTarget>& targets,
                                                bool connected_only, bool complete = true);
+
+    /// #2673: a send announced by `mark_targets_expected` returned normally having sent nothing
+    /// and named nobody (an unreadable or empty target list), so there is no list to save. Not
+    /// for a send that threw. False on a store failure.
+    [[nodiscard]] bool close_empty_attempt(const std::string& execution_id);
 
     /// #2673: a dispatch for this run could not store its command correlation record, so its
     /// replies cannot be matched: targets still silent at the deadline read `unknown`.
@@ -1244,10 +1249,22 @@ private:
     /// abandon (row-lock contention) or a lease-acquire failure; `true`
     /// otherwise, including the ordinary "nothing changed" case. See
     /// `refresh_counts`'s retry-and-log wrapper for why this is split out.
-    bool refresh_counts_once(const std::string& execution_id, const std::string* only_agent);
-    /// `refresh_counts` with the retry. `only_agent` non-null settles early target rows for that
-    /// agent only (the per-reply path); null checks the whole run.
-    void refresh_counts_retrying(const std::string& execution_id, const std::string* only_agent);
+    bool refresh_counts_once(const std::string& execution_id,
+                             const std::vector<std::string>* only_agents);
+    /// `refresh_counts` with the retry. `only_agents` non-null settles early target rows for
+    /// those agents only (the per-reply path); null checks the whole run.
+    void refresh_counts_retrying(const std::string& execution_id,
+                                 const std::vector<std::string>* only_agents);
+    /// The per-reply recount, coalesced per run (see the definition).
+    void recount_after_reply(const std::string& execution_id, const std::string& agent_id);
+    /// What arrived for a run while its recount was running.
+    struct PendingRecount {
+        bool dirty{false};
+        bool whole_run{false};
+        std::vector<std::string> agents;
+    };
+    std::mutex recount_mu_;
+    std::unordered_map<std::string, PendingRecount> recounts_; ///< present = being recounted
     /// Events a recount appended to the outbox, to publish in-process after commit (defined in
     /// the .cpp, which keeps the JSON type out of this header).
     struct RefreshEvents;
@@ -1255,7 +1272,7 @@ private:
     /// (`pg_conn` is libpq's `PGconn`, named by its struct tag to keep libpq out of here.)
     bool refresh_counts_in_txn(pg_conn* conn, const std::string& execution_id,
                                RefreshEvents& events,
-                               const std::string* only_agent = nullptr,
+                               const std::vector<std::string>* only_agents = nullptr,
                                bool force_incomplete = false);
     /// A final status write failed twice: remembered so the sweep says `unknown`.
     void note_lost_reply(const std::string& execution_id, const std::string& agent_id);
@@ -1268,8 +1285,10 @@ private:
     std::mutex lost_replies_mu_;
     std::unordered_map<std::string, std::unordered_set<std::string>> lost_replies_;
     std::size_t lost_reply_agents_{0};
-    /// Runs whose sweep transaction failed: swept after the others until one succeeds.
-    std::unordered_set<std::string> failed_sweeps_;
+    /// Runs whose sweep transaction failed, with the order of their last attempt: swept after
+    /// the others, least recently attempted first, until one succeeds.
+    std::unordered_map<std::string, std::uint64_t> failed_sweeps_;
+    std::uint64_t sweep_attempt_{0};
     void publish_refresh_events(const std::string& execution_id, const RefreshEvents& events);
 
     /// One attempt at `update_agent_status`'s upsert + agent-transition SSE

@@ -968,6 +968,66 @@ TEST_CASE("wire_and_dispatch_confined: a non-\"per-device\" concurrency_mode lea
     }
 }
 
+TEST_CASE("wire_and_dispatch_confined: a send that resolves nobody does not stop a later "
+          "re-drive from succeeding",
+          "[server][dispatch][scope][integration][pg][coverage]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    yuzu::server::ExecutionTracker& tracker = *tracker_bundle;
+
+    EventBus bus;
+    yuzu::MetricsRegistry metrics;
+    AgentRegistry registry(bus, metrics);
+    (void)registry.register_agent(make_wiring_test_info("dev-A"));
+    REQUIRE(registry.set_gateway_route(
+        "dev-A", /*session_id=*/{}, "test-gateway",
+        {std::string(yuzu::server::detail::kGatewayWireCapabilityDispatchTagV1)}));
+
+    yuzu::agent::v1::CommandRequest cmd;
+    cmd.set_command_id("wiring-redrive-cmd");
+    cmd.set_plugin("os_info");
+    cmd.set_action("version");
+    cmd.set_dispatch_tag("v1|ro|none|0123456789abcdef0123456789abcdef");
+    auto classified = ClassifiedCommandTestAccess::make(cmd);
+
+    auto noop_audit = [](const std::string&, const std::string&, const std::string&,
+                         const std::string&) {};
+    std::vector<std::string> agent_ids{"dev-A"};
+
+    yuzu::server::Execution exec;
+    exec.definition_id = "def-redrive-test";
+    exec.dispatched_by = "admin";
+    exec.status = "running";
+    exec.expects_targets = true;
+    const auto id = tracker.create_execution(exec);
+    REQUIRE(id.has_value());
+
+    const auto dispatch = [&](yuzu::server::authz::VisibleSet visible) {
+        return yuzu::server::wire_and_dispatch_confined(
+            registry, nullptr, nullptr, nullptr, nullptr, &tracker, noop_audit, noop_audit,
+            "wiring-redrive-cmd-1", *id, /*principal_role=*/"", agent_ids, /*scope_expr=*/"",
+            visible, /*broadcast_on_none=*/false, kNoContainment, classified);
+    };
+
+    // Nobody is visible: nothing intended, nothing sent.
+    const auto first = dispatch(
+        yuzu::server::authz::VisibleSet{std::unordered_set<std::string>{}});
+    REQUIRE(first.sent == 0);
+    REQUIRE(first.intended.empty());
+
+    const auto second = dispatch(yuzu::server::authz::VisibleSet{std::nullopt});
+    REQUIRE(second.sent == 1);
+    REQUIRE(tracker.set_agents_targeted(*id, 1));
+    yuzu::server::AgentExecStatus reply;
+    reply.agent_id = "dev-A";
+    reply.status = "success";
+    reply.completed_at = 1;
+    REQUIRE(tracker.update_agent_status(*id, reply));
+
+    const auto done = tracker.get_execution(*id);
+    REQUIRE(done.has_value());
+    CHECK(done->status == "succeeded");
+}
+
 // ADR-1007 fix round (PR #3784 external review, important-finding-#1, converged on
 // independently by security-guardian/cpp-expert/architect/quality-engineer in the
 // governance re-review of the fix itself): a per-device claim is taken in

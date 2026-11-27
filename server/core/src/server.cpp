@@ -22,6 +22,7 @@
 
 #include <yuzu/log_token.hpp>
 #include <yuzu/metrics.hpp>
+#include "sweep_audit_queue.hpp"
 #include "response_export_metrics.hpp"
 #include <yuzu/secure_zero.hpp>
 #include <yuzu/tls_policy.hpp> // #4722: shared TLS 1.2 cipher allow-list
@@ -4426,12 +4427,14 @@ public:
         metrics_.counter("yuzu_exec_tracker_conflicting_final_total");
         metrics_.describe("yuzu_exec_tracker_deadline_sweep_total",
                           "sweep_response_deadlines() results (#2673), by outcome: timed_out "
-                          "and unknown (count targets marked), run_failed and audit_failed "
-                          "(count runs), capped, skipped, held, clock_anomaly and degraded "
-                          "(count passes)",
+                          "and unknown (count targets marked), run_failed (counts runs), "
+                          "audit_dropped (counts audit rows given up), audit_failed (counts "
+                          "failed audit writes, retried next pass), capped, skipped, held, "
+                          "clock_anomaly and degraded (count passes)",
                           "counter");
-        for (auto outcome : {"timed_out", "unknown", "run_failed", "audit_failed", "capped",
-                             "skipped", "held", "clock_anomaly", "degraded"})
+        for (auto outcome : {"timed_out", "unknown", "run_failed", "audit_failed",
+                             "audit_dropped", "capped", "skipped", "held", "clock_anomaly",
+                             "degraded"})
             metrics_.counter("yuzu_exec_tracker_deadline_sweep_total", {{"outcome", outcome}});
         // #4982 Part B — the recovery side of the counter above:
         // reap_stuck_running_executions() (execution_tracker.cpp) cancels an
@@ -15096,6 +15099,10 @@ private:
         return yuzu::server::software_sync::fleet_admin_answer(facts);
     }
 
+    /// #2673: sweep audit rows awaiting a write. Touched only by the maintenance thread.
+    static constexpr std::size_t kMaxPendingSweepAudits = 1000;
+    std::deque<AuditEvent> pending_sweep_audits_;
+
     void count_target_record_failure() {
         metrics_
             .counter("yuzu_exec_tracker_bookkeeping_failed_total",
@@ -15266,6 +15273,10 @@ private:
             },
             /*collect_targets=*/!execution_id.empty());
         out.sent = static_cast<std::size_t>(result.sent);
+        if (tracked && result.intended.empty() && result.sent == 0 &&
+            !execution_tracker_->close_empty_attempt(execution_id))
+            spdlog::warn("software sync: could not close the empty send of execution_id={}",
+                         execution_id);
         // #2673: this fan-out bypasses `wire_and_dispatch_confined`, so it records its own
         // targets, before the gateway flush so a reply finds them.
         if (tracked && !result.intended.empty()) {
@@ -21112,48 +21123,50 @@ private:
                                     count("skipped", 1);
                                 if (swept->clock_anomaly)
                                     count("clock_anomaly", 1);
-                                // A background writer changing run results is audited. After
-                                // the first failed write the pass stops writing: this thread is
-                                // shared, and a degraded audit pool would hold it for every
-                                // run. Each unwritten row is counted and logged in full.
-                                if (audit_store_ && audit_store_->is_open()) {
-                                    bool audit_down = false;
-                                    for (const auto& run : swept->runs) {
-                                        AuditEvent ev;
-                                        ev.timestamp =
-                                            std::chrono::duration_cast<std::chrono::seconds>(
-                                                std::chrono::system_clock::now().time_since_epoch())
-                                                .count();
-                                        ev.principal = "system";
-                                        ev.action = "execution.deadline_sweep";
-                                        ev.target_type = "execution";
-                                        ev.target_id = run.execution_id;
-                                        ev.detail =
-                                            "timed_out=" + std::to_string(run.timed_out) +
-                                            " unknown=" + std::to_string(run.unknown) +
-                                            " finished=" +
-                                            (run.finished_status.empty() ? std::string("no")
-                                                                         : run.finished_status);
-                                        ev.result = "success";
-                                        if (audit_down ||
-                                            stop_requested_.load(std::memory_order_acquire) ||
-                                            !audit_store_->log(ev)) {
-                                            audit_down = true;
-                                            count("audit_failed", 1);
-                                            spdlog::warn("deadline sweep: audit write failed for "
-                                                         "execution_id={} ({})",
-                                                         run.execution_id, ev.detail);
-                                        }
-                                    }
-                                } else if (!swept->runs.empty()) {
-                                    count("audit_failed", static_cast<double>(swept->runs.size()));
-                                    spdlog::warn("deadline sweep: audit store unavailable, {} "
-                                                 "changed run(s) unaudited",
-                                                 swept->runs.size());
+                                // A background writer changing run results is audited. The
+                                // rows are queued and written below, so a failed write costs
+                                // this shared thread one attempt and is retried next pass.
+                                for (const auto& run : swept->runs) {
+                                    AuditEvent ev;
+                                    ev.timestamp =
+                                        std::chrono::duration_cast<std::chrono::seconds>(
+                                            std::chrono::system_clock::now().time_since_epoch())
+                                            .count();
+                                    ev.principal = "system";
+                                    ev.action = "execution.deadline_sweep";
+                                    ev.target_type = "execution";
+                                    ev.target_id = run.execution_id;
+                                    ev.detail =
+                                        "timed_out=" + std::to_string(run.timed_out) +
+                                        " unknown=" + std::to_string(run.unknown) + " finished=" +
+                                        (run.finished_status.empty() ? std::string("no")
+                                                                     : run.finished_status);
+                                    ev.result = "success";
+                                    pending_sweep_audits_.push_back(std::move(ev));
                                 }
                             } else {
                                 spdlog::warn("response deadline sweep failed: {}", swept.error());
                                 count("degraded", 1);
+                            }
+                            const auto flushed = yuzu::server::flush_audit_queue(
+                                pending_sweep_audits_,
+                                [this](const AuditEvent& ev) {
+                                    return audit_store_ && audit_store_->is_open() &&
+                                           audit_store_->log(ev);
+                                },
+                                [this] { return stop_requested_.load(std::memory_order_acquire); },
+                                kMaxPendingSweepAudits, [](const AuditEvent& ev) {
+                                    spdlog::error("deadline sweep: audit row dropped for "
+                                                  "execution_id={} ({})",
+                                                  ev.target_id, ev.detail);
+                                });
+                            if (flushed.dropped > 0)
+                                count("audit_dropped", static_cast<double>(flushed.dropped));
+                            if (flushed.write_failed) {
+                                count("audit_failed", 1);
+                                spdlog::warn("deadline sweep: audit write failed; {} row(s) "
+                                             "will be retried",
+                                             pending_sweep_audits_.size());
                             }
                         }
 
@@ -21343,6 +21356,11 @@ private:
                         spdlog::error("result_set_maint: tick threw unknown — thread continuing");
                     }
                 }
+                // #2673: the queue is in memory, so say what is lost with it.
+                for (const auto& ev : pending_sweep_audits_)
+                    spdlog::error("deadline sweep: audit row not written before shutdown for "
+                                  "execution_id={} ({})",
+                                  ev.target_id, ev.detail);
             });
         }
 
