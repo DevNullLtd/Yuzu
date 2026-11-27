@@ -593,6 +593,9 @@ routes.
 - (c) *Worker hold time on DELETE*: **keep the shared budget.** `LiveInflightGuard` is the whole-server
   bound on workers pinned by a poll, and a second budget for DELETE would raise that bound. A request over
   the budget skips the wait and answers `202`, never `429`.
+  *Update 2026-11-24 (#2146):* the guard cited here (`LiveInflightGuard`) was replaced by the
+  `SseSurface::kLiveRead` share of the shared held-open budget, which this wait now leases from; the
+  ruling to keep one shared budget stands, and the wait is also skipped while the server is draining.
 - (d) *Test allowlist width*: **narrowed.** `tests/test_legacy_quarantine_plugin_removed_lexical.py` now
   exempts nine named sections of `docs/user-manual/upgrading.md`, matched by heading prefix, instead of
   the whole file; a line under any other heading is scanned.

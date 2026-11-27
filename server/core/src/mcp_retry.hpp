@@ -107,6 +107,67 @@ inline constexpr std::int64_t kMcpResultPollRetryMs = 2000;
 /// round trips. Bounded above by the ticket's own TTL (7 days).
 inline constexpr std::int64_t kMcpApprovalPollRetryMs = 30000;
 
+/// `retry_after_ms` for `get_device_live` refused at admission because the live-read lease cap
+/// (per principal or across the server) is reached. Anchor: the REST twin's 429 answers
+/// `Retry-After: 2` / `retry_after_ms: 2000` for the same condition, so the two surfaces tell a
+/// worker the same thing. A held lease frees when a live read ends, which is bounded by the
+/// 25 s poll deadline; 2 s is the cheapest interval at which a lease could plausibly have freed
+/// and costs one admission pass to learn it has not. Equal in value to `kMcpStoreFaultShortRetryMs`
+/// by REST parity, not by shared derivation: they are free to diverge.
+inline constexpr std::int64_t kMcpLiveReadCapRetryMs = 2000;
+
+/// `retry_after_ms` for a live read of a QUICK kind (`uptime`) when the device was reached but did
+/// not answer inside the poll budget. Anchor: the REST twin's 504 `retry_after_ms: 3000`. A quick
+/// kind that has not answered in 25 s is most plausibly not running at all, so the next attempt is
+/// worth making soon; 3 s is the REST route's own pricing of that trade, kept identical so the two
+/// surfaces agree. NOT the hint for `processes`: see `live_read_timeout_retry_ms`.
+inline constexpr std::int64_t kMcpLiveReadDeviceTimeoutRetryMs = 3000;
+
+/// `retry_after_ms` for a `processes` live read that ended `timeout`. A `processes` run hashes every
+/// executable image under the plugin's own 120 s action budget (`kActionBudget` in
+/// agents/plugins/processes/src/processes_plugin.cpp), and a retry is a fresh `command_id` that
+/// executes for real, so a retry inside the first run starts a second hash of every image on the
+/// same device. The hint is that budget. The two constants are not linked by a `static_assert`
+/// (the plugin is a separate DSO); the pairing is pinned by tests/test_live_retry_budget_lexical.py, which reads both numbers.
+inline constexpr std::int64_t kLiveReadProcessesTimeoutRetryMs = 120000;
+
+/// The `retry_after_ms` a live read answers when it ends `timeout`, by the allowlist-resolved kind
+/// token. `processes` is the only slow kind either surface serves; every other token gets the
+/// quick-kind price. REST and MCP both call this, so the two cannot disagree.
+[[nodiscard]] inline constexpr std::int64_t live_read_timeout_retry_ms(std::string_view kind) noexcept {
+    return kind == "processes" ? kLiveReadProcessesTimeoutRetryMs : kMcpLiveReadDeviceTimeoutRetryMs;
+}
+
+/// `retry_after_ms` for a live read that ended `incomplete` (REST and MCP alike): the device sent
+/// output but never a terminal row inside the poll budget, so its first run may STILL be hashing
+/// when the caller retries. A retry that lands inside that run only adds device load and starts a
+/// second read of every executable image, so the hint is the poll's own wall deadline (the same
+/// 25 s as `LivePollLimits::deadline`, pinned equal by a `static_assert` in live_read_poll.hpp):
+/// by then a quick kind's first run has finished. This is the QUICK-KIND price: a `processes` run has
+/// a 120 s budget, so `live_read_incomplete_retry_ms` answers `kLiveReadProcessesTimeoutRetryMs` for
+/// it. Deliberately NOT the quick-kind timeout hint above, which fits a device that never answered at
+/// all.
+inline constexpr std::int64_t kLiveReadIncompleteRetryMs = 25000;
+
+/// The `retry_after_ms` a live read answers when it ends `incomplete`, by the allowlist-resolved
+/// kind token. A `processes` run can hash for up to 120 s and its first run may still be going when
+/// a 25 s retry arrives, which would start a second hash of every image; it gets the same price as
+/// its `timeout` hint. Every other token gets `kLiveReadIncompleteRetryMs`. REST and MCP both call
+/// this, so the two cannot disagree.
+[[nodiscard]] inline constexpr std::int64_t live_read_incomplete_retry_ms(std::string_view kind) noexcept {
+    return kind == "processes" ? kLiveReadProcessesTimeoutRetryMs : kLiveReadIncompleteRetryMs;
+}
+
+/// The `retry_after_ms` a live read answers when every read of the response store degraded
+/// (`store_degraded`), by the allowlist-resolved kind token. The device may well have answered, so
+/// a quick kind gets the short store-fault price (`kMcpStoreFaultShortRetryMs`, REST parity). A
+/// `processes` read is different: its first run can still be hashing for up to 120 s, and a retry
+/// is a fresh `command_id` that executes for real, so it gets the same price as its `timeout` and
+/// `incomplete` hints. REST and MCP both call this, so the two cannot disagree.
+[[nodiscard]] inline constexpr std::int64_t live_read_store_degraded_retry_ms(std::string_view kind) noexcept {
+    return kind == "processes" ? kLiveReadProcessesTimeoutRetryMs : kMcpStoreFaultShortRetryMs;
+}
+
 /// Metric-name symbol for the poll-rate counter (#3344), so the `describe`/
 /// pre-seed site (`server.cpp`) and the increment site (`mcp_server.cpp`)
 /// cannot silently diverge into a shadow series — same precedent as

@@ -184,7 +184,7 @@ Reference: [plugin README](../../agents/plugins/app_usage/README.md).
 
 ## Plugins a DEX drill dispatches
 
-On the REST route, "Get live info" sends a read-only instruction through the
+On the REST route and the MCP tool `get_device_live`, "Get live info" sends a read-only instruction through the
 normal dispatch path and waits for the answer. The route supports the two kinds
 below; the device page offers more, described in
 [device management](../user-manual/device-management.md#get-live-info). DEX
