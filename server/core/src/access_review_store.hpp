@@ -44,14 +44,17 @@
 /// Three tables (schema-qualified at runtime, unqualified in the migration —
 /// the runner sets `search_path` for the migration transaction):
 ///   * access_review_campaign    — one row per opened review campaign.
-///   * access_review_attestation — one row per (campaign, principal, role)
-///     grant frozen at open; PK is the full 4-tuple so a decision can only
+///   * access_review_attestation: one row per (campaign, principal, role, scope)
+///     grant frozen at open; PK is the full 5-tuple (schema v4 added `scope_group_id`,
+///     `''` = fleet-wide, else a management group's id) so a decision can only
 ///     ever be recorded against a grant that was actually in the frozen
 ///     population (an unknown/foreign key never matches — see
 ///     `record_attestation`). Holds the CURRENT decision and `decision_seq`,
 ///     the count of decisions recorded for the grant (0 while pending).
 ///   * access_review_attestation_history: one row per recorded decision,
-///     keyed by the 4-tuple and `seq` (schema v3, #4752). Every decision is
+///     keyed by the 5-tuple and `seq` (schema v3, #4752; scope since v4). A history row
+///     references the state row for the SAME scope, so a decision on one scope's grant can
+///     never be recorded as, or backed by, another scope's. Every decision is
 ///     kept: a later decision for the same grant appends at seq+1 and never
 ///     replaces the earlier one, and a reviewer cannot decide a `user` grant
 ///     that names them. Ordering is by `seq`, never by time.
@@ -94,6 +97,11 @@
 /// lock_timeout` of the write transactions) and answer a write failure (503).
 /// Nothing was committed on that path. Retry it.
 ///
+/// Schema v4 (#6969) appends `scope_group_id` to both attestation tables and to both primary keys,
+/// re-creates the history foreign key as `access_review_history_grant_fk` over the five columns
+/// and replaces the two guard functions so scope joins every identity comparison. Fresh-database
+/// only (docs/user-manual/upgrading.md, "Deployment contract").
+///
 /// Schema v3 REFUSES a database that holds a decision recorded by the
 /// subject of the grant (an earlier build allowed it): the store is
 /// `!is_open()`, naming the cause and the number of rows, and the version stays 2. Fresh-database
@@ -107,6 +115,7 @@
 
 namespace yuzu::server::pg {
 class PgPool;
+struct PgMigration;
 }
 
 namespace yuzu::server {
@@ -135,9 +144,18 @@ struct GrantRef {
     /// that instant), stored and returned verbatim and immutable once written.
     /// Free-form (typically JSON) EXCEPT for one key: for an ENGINE grant,
     /// `record_attestation` parses the snapshot and reads `kSnapshotOwnerKey`
-    /// (the owner frozen at open) for its frozen-owner refusal. Both open-campaign
-    /// builders (REST, MCP) must keep writing it under that name.
+    /// (the owner frozen at open) for its frozen-owner refusal. The one builder,
+    /// `freeze_population` (access_review_model.cpp, called by REST and MCP campaign open), must keep
+    /// writing it under that name.
     std::string grant_snapshot;
+    /// The scope the grant is held at: `""` is fleet-wide, any other value is the id of the
+    /// management group the role was assigned on. Part of the grant's identity (the fifth key
+    /// column of both attestation tables). Declared LAST on purpose: every member is a string, so
+    /// an existing four-value initialiser keeps compiling and keeps meaning fleet-wide, whereas a
+    /// field placed before `grant_snapshot` would silently take the snapshot JSON as the scope.
+    /// At most `kScopeGroupIdMaxLen` bytes and no NUL (`open_campaign` refuses a longer one, so a
+    /// campaign never holds a row its attest endpoint would always refuse).
+    std::string scope_group_id{};
 };
 
 /// One persisted campaign metadata row.
@@ -189,6 +207,7 @@ struct AccessReviewAttestationRow {
     std::string principal_type; ///< "user" | "group" | "engine"
     std::string principal_id;
     std::string role_name;
+    std::string scope_group_id; ///< "" = fleet-wide, else the management group's id
     std::string decision; ///< "pending" | "attested" | "flagged_revoke"
     std::string reviewer; ///< "" until decided
     std::int64_t decided_at_ms{0}; ///< 0 until decided
@@ -222,6 +241,12 @@ public:
 
     [[nodiscard]] bool is_open() const noexcept { return open_; }
 
+    /// The schema migrations for this store (versions 1 through 4), the very vector the
+    /// constructor runs. Exposed for tests only: a migration test slices it to build a database
+    /// at an earlier shipped version under the REAL store name, so the recorded migration hashes
+    /// are the real ones (a hand-copied vector is refused as drift). Never mutate or reorder.
+    [[nodiscard]] static const std::vector<pg::PgMigration>& migrations();
+
     /// R3 — freeze at open (see file header). Mints a fresh `campaign_id`,
     /// inserts the campaign row (`status='open'`), and inserts one
     /// `decision='pending'` attestation row per entry in
@@ -247,7 +272,10 @@ public:
                  const std::vector<GrantRef>& frozen_population,
                  std::string rbac_enforcement);
 
-    /// Record a reviewer's decision for one frozen grant. A later decision for
+    /// Record a reviewer's decision for one frozen grant. A grant is identified by the five-part key
+    /// (campaign_id, principal_type, principal_id, role_name, scope_group_id): the same principal
+    /// and role held fleet-wide (`scope_group_id == ""`) and on a management group are two grants,
+    /// each with its own decision count and history. A later decision for
     /// the same grant is APPENDED to the grant's history (seq+1, with the
     /// decision it superseded), never an overwrite; an identical repeat appends
     /// too. `decision` must be `"attested"` or `"flagged_revoke"`, NEVER
@@ -261,16 +289,17 @@ public:
     /// without parsing prose, in this precedence:
     /// `unexpected("bad_request: ...")` (400) when `campaign_id` fails
     /// `valid_campaign_id` (`access_review_model.hpp`; an empty id included),
-    /// when `principal_type`/`principal_id`/`role_name`/`justification`/
+    /// when `principal_type`/`principal_id`/`role_name`/`scope_group_id`/`justification`/
     /// `reviewer` holds an embedded NUL (libpq binds `c_str()`, so a NUL would
     /// silently truncate the value), when `reviewer` is empty, when
     /// `principal_type`/`principal_id`/`role_name` exceeds its cap
-    /// (`kPrincipalIdMaxLen`/`kRoleNameMaxLen`), or when `justification` exceeds
+    /// (`kPrincipalIdMaxLen`/`kRoleNameMaxLen`), when `scope_group_id` exceeds
+    /// `kScopeGroupIdMaxLen`, or when `justification` exceeds
     /// `kMaxJustificationBytes`, all checked before the pool is touched;
     /// `unexpected("forbidden: ...")` (403) when `principal_type == "user"` and
     /// `principal_id == reviewer` (byte-exact), also decided before the pool is
     /// touched, so it precedes `not_found`; `unexpected("not_found: ...")` (404)
-    /// when the (campaign_id, principal_type, principal_id, role_name) tuple is
+    /// when the (campaign_id, principal_type, principal_id, role_name, scope_group_id) tuple is
     /// not in the frozen population, OR the campaign is not open (the
     /// application refuses further decisions on a closed campaign, see
     /// `close_campaign`; the campaign row itself has no database guard);
@@ -288,7 +317,8 @@ public:
     [[nodiscard]] std::expected<AttestationOutcome, std::string>
     record_attestation(const std::string& campaign_id, const std::string& principal_type,
                        const std::string& principal_id, const std::string& role_name,
-                       std::string decision, std::string reviewer, std::string justification);
+                       const std::string& scope_group_id, std::string decision,
+                       std::string reviewer, std::string justification);
 
     /// Full evidentiary state for one campaign: metadata + every frozen
     /// attestation row + `pending_count`. With `include_history` each row also

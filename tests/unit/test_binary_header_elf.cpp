@@ -392,6 +392,27 @@ TEST_CASE("elf: not-this-format and header faults", "[binary_header][elf]") {
     }
 }
 
+TEST_CASE("elf: the header type is handed back when the program headers do not parse",
+          "[binary_header][elf]") {
+    const auto c = canonical(kShapes[1]);
+    const auto img = build(c.spec);
+    std::optional<std::uint16_t> type{std::uint16_t{99}};
+    const auto whole = bh::read_elf(bh::span_source(std::as_bytes(std::span<const std::uint8_t>(img))), {}, {}, &type);
+    REQUIRE(whole.has_value());
+    CHECK(type == whole->type);
+
+    const Bytes cut(img.begin(), img.begin() + 70); // the file header, not its program-header table
+    type = std::uint16_t{99};
+    REQUIRE_FALSE(bh::read_elf(bh::span_source(std::as_bytes(std::span<const std::uint8_t>(cut))), {}, {}, &type)
+                      .has_value());
+    CHECK(type == whole->type);
+
+    const Bytes none(img.begin(), img.begin() + 20); // ends inside the file header: cleared
+    REQUIRE_FALSE(bh::read_elf(bh::span_source(std::as_bytes(std::span<const std::uint8_t>(none))), {}, {}, &type)
+                      .has_value());
+    CHECK_FALSE(type.has_value());
+}
+
 TEST_CASE("elf: program-header count, size and table placement", "[binary_header][elf]") {
     for (const auto& sh : kShapes) {
         INFO(sh.name);

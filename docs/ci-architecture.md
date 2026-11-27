@@ -1232,8 +1232,8 @@ that could not mean anything:
   as covered (`verdict=covered`), prints a `warning:` that the listing is stale, runs the OS-family,
   end-of-life and advisory-canary checks, and refuses on a fixable CRITICAL from Trivy or grype like
   any other image; the listing's expiry is not consulted in that case (the release skill's
-  `pending` pre-flight does report an expired listing). Four images are listed: the three chisel
-  images and the agent bundle. They are assembled FROM scratch from chisel slices: all four
+  `pending` pre-flight does report an expired listing). No image is listed. The three chisel
+  images and the agent bundle are assembled FROM scratch from chisel slices: all four
   Dockerfiles cut `base-files_{base,etc,var,tmp,release-info,chisel}`, run
   `deploy/docker/chisel-emit-status.py` on the same slice list, then `COPY --from=chisel /rootfs /`.
   The scanners read a dpkg package database, including `/var/lib/dpkg/status.d` (the distroless
@@ -1252,11 +1252,10 @@ that could not mean anything:
   Reading these records with Trivy was checked by hand on one image (not reproducible from the
   repository, and not a CI check); the gate behaviour above is covered by
   `tests/test_image_vuln_gate.py` and the script's behaviour and call sites by
-  `tests/test_chisel_emit_status.py`. The four listings remain in the file until a change removes
-  them together with a test pinning each Dockerfile's `SLICES` to what the scanner reads (#8415),
-  and their `reason=` text describes the state before the records existed. They expire 2027-02-15
-  and are not to be renewed. If the records regress to zero OS packages, a still-present listing
-  turns the gate back to `NOT COVERED` and passes: that is the gap the removal closes.
+  `tests/test_chisel_emit_status.py`. None of the four is listed, so if the records regress to
+  zero OS packages the gate refuses the image as unscanned (`tests/test_image_vuln_gate.py`
+  pins that for each of the four names). The gate does not compare the packages Trivy reads
+  with the Dockerfile's `SLICES`: it refuses zero packages, not a missing one.
   The gate learns an image's name from
   `NAME=IMAGE` (release.yml) or the tag (pre-release.yml); a bare image ID can never match the list.
 - an ignore file that `scripts/ci/image-vuln-gate-checks.py` does not accept (below).
@@ -1303,8 +1302,8 @@ after Trivy:
   multi-platform image succeeds, and grype reads it).
 - **OS cross-check.** When Trivy scanned the image's OS packages (`coverage: covered`), grype must
   have detected the same OS family; otherwise it matched none of those packages and the image
-  fails (`grype did not detect the OS (<family>)`). An image listed as not covered has no OS
-  packages Trivy could see, so there is nothing to cross-check. This check can only refuse an
+  fails (`grype did not detect the OS (<family>)`). An image listed as not covered (no image is listed)
+  has no OS packages Trivy could see, so there is nothing to cross-check. This check can only refuse an
   image; Trivy's report stays the only coverage reader.
 - **Required components.** grype's JSON lists matches only, so a runtime grype did not recognise
   would read as clean. For `yuzu-gateway` and `yuzu-gateway-chisel`, whose Erlang/OTP runtime is
@@ -1784,7 +1783,7 @@ decoy line cannot satisfy it), the gate refuses a file that breaks any rule, and
 the checker's canonical copy of the entries in force. It warns 21 days before an entry expires. An
 expired entry is not in force, so the next release fails on that finding again. Today there is one
 entry: the Go standard library CVE-2025-68121 in the upstream postgres image's `gosu` (gosu does not
-link `crypto/tls`); it and the four not-covered listings record their approval as `"#8315"`. An
+link `crypto/tls`); it records its approval as `"#8315"`. An
 entry is a commit, so it is in the tag a release builds: it can only help a release cut after it.
 
 A grype finding is accepted in `.grypeignore.yaml`, which the same checker parses with the same
@@ -1950,9 +1949,11 @@ except the agent bundle:
   the mirror normally lags by under a day, so wait and "Re-run failed jobs"; if it stays stale,
   check whether the mirror or Trivy's DB publishing is broken before anything else.
 - **OS packages not scanned** (an image newly showing 0 OS packages): something removed the
-  package database from an image that used to have one. Fix the image; listing it in
-  `image-vuln-gate-not-covered.txt` is a reviewed decision that its OS packages ship unscanned by
-  Trivy.
+  package database from an image that used to have one. For a chisel image, check that
+  `deploy/docker/chisel-emit-status.py` ran in its Dockerfile and that `/var/lib/dpkg/status.d`
+  holds records; after a Trivy version bump, scan one chisel image and confirm it reports more than
+  zero OS packages. Fix the image; listing it in `image-vuln-gate-not-covered.txt` is a reviewed
+  decision that its OS packages ship unscanned by Trivy, and it needs its own reviewed pull request.
   Either is a commit, so re-tag. On a listed image the log says why the listing is not in force:
   it expired (re-review it), or its `approval_ref` is `pending` (record the approval, above).
 - **An acceptance `NOT IN FORCE`**: its `approval_ref` is `pending`. Record the approval as
@@ -2070,10 +2071,10 @@ published images (a tracked gap).
   read one `status.d` record per cut package (above), not a file list: a slice is recorded as its
   whole package, so a finding in a file the slice does not ship can be reported, and no finding is
   hidden by that. Unfixed MEDIUM and lower findings in these Ubuntu packages are reported and not
-  gated, as everywhere else. The records exist only if the build ran the script; the four
-  not-covered listings still in the file would turn a regression to zero packages into a passing
-  `NOT COVERED` result until #8415 removes them. The gate does not check what grype matched in
-  these images beyond the gateway images' `erlang` component.
+  gated, as everywhere else. The records exist only if the build ran the script. The gate
+  refuses an image with no OS package at all, but not one that lost some of them. The gate
+  does not check what grype matched in these images beyond the gateway images' `erlang`
+  component.
 - **PostgreSQL itself.** In `yuzu-postgres` Trivy lists `postgresql-18`, `libpq5` and
   `postgresql-common` as packages but matches no vulnerability to them: they come from the PGDG
   repository, and Trivy's Debian advisories cover Debian's own packages only. And the image holds

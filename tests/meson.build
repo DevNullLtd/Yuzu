@@ -4025,6 +4025,16 @@ test('enablement os applicability',
   timeout: 30,
 )
 
+# docs/os-capability-matrix.md has one row per key in each table, and no .md/.json/.yaml/.yml
+# file under docs/, agents/plugins/ or content/ carries a leftover merge-conflict marker.
+# Hermetic - reads sources only.
+test('matrix duplicate rows',
+  _python3_test,
+  args: [files('test_matrix_duplicate_rows.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
 # Wave 11 PR11.2-a: the network_config `routes` instruction definition exists and matches the
 # row the plugin emits (id, dispatch pair, approval mode, platforms, ordered columns). Hermetic.
 test('network_config routes definition',
@@ -4557,7 +4567,8 @@ if _bash_test.found()
   )
   # #4262: -Dbuild_examples=false must keep configuring a real build.
   # Configure-only smoke test (no compile) so it stays cheap on every leg;
-  # SKIPs cleanly when vcpkg_installed/<triplet> isn't populated yet.
+  # SKIPs cleanly when vcpkg_installed/<triplet> isn't populated yet, or holds only
+  # host tools with no CLI11 (e.g. a sanitizer-triplet install, #6719).
   # platform: OS-contract test, runs on every leg (docs is OS-independent and Linux-only since 2026-10-21);
   # it selects the per-OS vcpkg triplet (`uname -s`).
   test('build_examples=false gating smoke test',

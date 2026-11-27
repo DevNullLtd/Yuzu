@@ -665,3 +665,46 @@ TEST_CASE("reviews render: no Attest or Flag on a user grant that names the view
     // A viewer without Attest sees no hint at all.
     CHECK_THAT(render_campaign(v, false, {}, "carol"), !ContainsSubstring("Another reviewer"));
 }
+
+// ── Scope (#6969): a Scope column in the campaign table, and the scope on the row the script reads ──
+
+TEST_CASE("reviews render: the campaign table has a Scope column; fleet reads Fleet-wide and a "
+          "group reads its name with the id as the title, or says the name is unavailable",
+          "[access-reviews][render][6969]") {
+    auto fleet = att("user", "bob", "Operator", "pending");
+    auto named = att("user", "bob", "Operator", "pending");
+    named.scope_group_id = "g-1";
+    named.grant_snapshot = R"({"scope_group_name":"Ops <team>"})";
+    auto unnamed = att("user", "bob", "Operator", "pending");
+    unnamed.scope_group_id = "g-2";
+    unnamed.grant_snapshot = R"({"display_name":"bob"})"; // frozen before the name key existed
+    auto blank = att("user", "bob", "Operator", "pending");
+    blank.scope_group_id = "g-3";
+    blank.grant_snapshot = R"({"scope_group_name":""})";
+    const auto out = campaign_html(view(camp("c1", "T"), {fleet, named, unnamed, blank}), true);
+
+    CHECK_THAT(out, ContainsSubstring("<th>Role</th><th>Scope</th><th>Decision</th>"));
+    CHECK(count_of(out, "<td>Fleet-wide</td>") == 1);
+    // A named group: the name (escaped) in the cell, the id as the tooltip.
+    CHECK_THAT(out, ContainsSubstring("<td title=\"g-1\">Group: Ops &lt;team&gt;</td>"));
+    CHECK_THAT(out, !ContainsSubstring("<team>"));
+    // An unavailable name is said so, with the id; never an empty cell and never "not found".
+    CHECK_THAT(out, ContainsSubstring("<td>Group: name unavailable (g-2)</td>"));
+    CHECK_THAT(out, ContainsSubstring("<td>Group: name unavailable (g-3)</td>"));
+    CHECK_THAT(out, !ContainsSubstring("not found"));
+    CHECK_THAT(out, !ContainsSubstring("<td></td>"));
+}
+
+TEST_CASE("reviews render: the row carries data-scope and data-scope-group-id, escaped, for fleet "
+          "and group rows alike",
+          "[access-reviews][render][6969]") {
+    auto fleet = att("user", "bob", "Operator", "pending");
+    auto group = att("user", "bob", "Operator", "pending");
+    group.scope_group_id = "g\"<1>";
+    const auto out = campaign_html(view(camp("c1", "T"), {fleet, group}), true);
+    CHECK_THAT(out, ContainsSubstring("data-role-name=\"Operator\" data-scope=\"fleet\" "
+                                      "data-scope-group-id=\"\"><td"));
+    CHECK_THAT(out, ContainsSubstring("data-scope=\"management_group\" "
+                                      "data-scope-group-id=\"g&quot;&lt;1&gt;\""));
+    CHECK_THAT(out, !ContainsSubstring("g\"<1>"));
+}
