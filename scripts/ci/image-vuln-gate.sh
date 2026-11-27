@@ -929,7 +929,7 @@ grype_scan() {
     dver="$(printf '%s\n' "$ginfo" | sed -n 's/^distro_version=//p')"
     # OS packages grype catalogued (CycloneDX of the same scan). Read for every
     # image; judged only where Trivy scanned OS packages (want_family set).
-    gos="$("${CHECKS[@]}" grype-os-packages "$gcdx" 2>/dev/null | sed -n 's/^os_packages=//p')" || gos="?"
+    gos="$("${CHECKS[@]}" grype-os-packages "$gcdx" 2>"$WORK/grype-os.err" | sed -n 's/^os_packages=//p')" || gos="?"
     [ -n "$gos" ] || gos="?"
     # The components grype must have catalogued in this image (see
     # GRYPE_REQUIRED_COMPONENTS), from its CycloneDX output of the same scan.
@@ -1000,17 +1000,18 @@ grype_scan() {
                err "$img: grype's gate scan passed but its record lists $fcrit fixable CRITICAL not accepted (treated as a failure)"
                gres="FAIL: grype's record and gate scans disagree"
                failed=1
+           elif [ -n "$want_family" ] && [ "$distro" != "$want_family" ]; then
+               err "$img: grype did not detect the OS ($want_family): it detected distro '${distro:-none}', so it matched none of the OS packages Trivy scanned (treated as a failure)"
+               gres="FAIL: grype did not detect the OS ($want_family)"
+               failed=1
            elif [ -n "$want_family" ] && [ "$gos" != "?" ] && [ "$gos" -eq 0 ]; then
                err "$img: grype catalogued no OS package, though Trivy scanned OS packages ($want_family): a grype or package-database change stopped it reading them, so it matched none (treated as a failure)"
                gres="FAIL: grype catalogued no OS package"
                failed=1
            elif [ -n "$want_family" ] && [ "$gos" = "?" ]; then
+               cat "$WORK/grype-os.err" >&2 || true
                err "$img: grype's CycloneDX output could not be read for its OS packages (treated as a failure)"
                gres="FAIL: grype OS packages unreadable"
-               failed=1
-           elif [ -n "$want_family" ] && [ "$distro" != "$want_family" ]; then
-               err "$img: grype did not detect the OS ($want_family): it detected distro '${distro:-none}', so it matched none of the OS packages Trivy scanned (treated as a failure)"
-               gres="FAIL: grype did not detect the OS ($want_family)"
                failed=1
            else
                gres="pass"

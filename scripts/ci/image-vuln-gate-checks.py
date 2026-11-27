@@ -1418,9 +1418,12 @@ def cmd_grype_os_packages(path):
     """Count the OS-package components (pkg:apk/, pkg:deb/, pkg:rpm/) in grype's CycloneDX."""
     try:
         d = _load_json_object(path, "grype CycloneDX output")
-        comps = d.get("components")
+        if d.get("bomFormat") != "CycloneDX":
+            raise ValueError(f"{path} is not CycloneDX output (no bomFormat)")
+        # CycloneDX omits the key when there are no components: that is a count of 0.
+        comps = d.get("components", [])
         if not isinstance(comps, list):
-            raise ValueError(f"{path} has no components list")
+            raise ValueError(f"{path}: components is not a list")
     except (OSError, ValueError, RecursionError) as e:
         print(f"grype os packages: cannot read {e}", file=sys.stderr)
         return 1

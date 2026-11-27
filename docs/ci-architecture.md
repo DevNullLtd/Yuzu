@@ -1292,7 +1292,7 @@ after Trivy:
   fixable CRITICAL no acceptance covers (`grype's record and gate scans disagree`), so a pass is
   never published beside a report that contradicts it. grype's `.gate.txt` records the grype
   version, the DB (below), the image ID (as the gate resolved it and as grype read it), the distro
-  grype detected, the matches not accepted and the accepted ones (`ignoredMatches`, as the record
+  grype detected, the OS packages grype catalogued (a count), the matches not accepted and the accepted ones (`ignoredMatches`, as the record
   scan applies the acceptances) with the fixable CRITICALs among each, the required components
   (below), the provider waivers it used (or `provider waiver: none used`), the acceptance file's
   hash and what was in force, and the result. The two IDs are recorded, not
@@ -1997,9 +1997,14 @@ except the agent bundle:
 - **The image could not be exported for grype** (`could not export ... for grype`, `not an image in
   the local Docker daemon`): `docker save` failed, usually a full disk under `RUNNER_TEMP` or a
   daemon fault. "Re-run failed jobs"; if it recurs, check the runner's free disk.
-- **grype catalogued no OS package** (`grype catalogued no OS package`): grype's cataloguer read
-  none of the packages Trivy scanned, so it matched none. Find the grype or package-database
-  change that did it; a fix is a commit, so re-tag.
+- **grype catalogued no OS package** (`grype catalogued no OS package`): grype's CycloneDX holds no
+  OS-package component for an image whose OS packages Trivy scanned, so grype matched none. Open
+  `grype-<image>.attempt-<N>.json` and `.txt` in the report directory and compare with the Trivy
+  report's OS package count. Find the grype or package-database change that did it; a fix is a
+  commit, so re-tag.
+- **grype OS packages unreadable** (`FAIL: grype OS packages unreadable`): grype's CycloneDX output
+  was missing, malformed or had no components list. The log shows the reason. Re-run the failed
+  jobs once; a repeat is a grype or export fault to find before re-tagging.
 - **grype did not detect the OS** (`grype did not detect the OS`): the image's OS release is one
   the pinned grype does not recognise; a newer grype or a supported OS release is a commit, so re-tag.
 - **grype did not catalogue erlang** (`grype did not catalogue erlang`, or `erlang <version>

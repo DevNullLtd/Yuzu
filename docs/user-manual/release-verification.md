@@ -152,6 +152,9 @@ The release scan also refuses to push, rather than report a clean scan, when:
   does not report the imported database as that one);
 - grype does not detect the operating-system release whose packages Trivy scanned (it would then
   match none of them);
+- grype catalogued no operating-system package in an image whose operating-system packages Trivy
+  scanned, or its package list could not be read (it would then match none of them). The check is
+  for at least one package, not a comparison with Trivy's count;
 - one of the grype database's providers that the image needs (NVD for every image, and the Alpine,
   Debian or Ubuntu feed for an image on that release) is missing, or was last captured more than 72
   hours ago, unless a provider waiver for it is in force (next paragraph).
@@ -249,7 +252,7 @@ every package), `trivy-<image>.attempt-<N>.txt` (the same as a table) and
 date, the OS, the OS package count, the coverage, the advisory-data check, the accepted-findings
 file's hash and the result), and grype's `grype-<image>.attempt-<N>.json`, `.txt` and `.gate.txt`
 (the grype version, the database's archive, checksum and build time, the image ID, the detected
-distribution, the matches not accepted and the accepted ones with the fixable CRITICALs among each,
+distribution, the number of operating-system packages grype catalogued, the matches not accepted and the accepted ones with the fixable CRITICALs among each,
 the components grype was required to find, the provider waivers it used (`provider waiver: none used`
 when none), the accepted-findings file's hash and grype's result). `<N>` is the
 release workflow's run attempt; every attempt's reports are

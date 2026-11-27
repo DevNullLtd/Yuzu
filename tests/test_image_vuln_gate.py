@@ -277,8 +277,13 @@ GRYPE_STUB = textwrap.dedent(
         comps.append({"name": "libc6", "version": "2.36", "purl": "pkg:deb/debian/libc6@2.36"})
     if mode == "cdx-unreadable":
         comps = None
+    if mode == "cdx-no-components-key":
+        comps = False
     if "cyclonedx-json" in outs:
-        open(outs["cyclonedx-json"], "w").write(json.dumps({"bomFormat": "CycloneDX", "components": comps}))
+        cdx = {"bomFormat": "CycloneDX"}
+        if comps is not False:
+            cdx["components"] = comps
+        open(outs["cyclonedx-json"], "w").write(json.dumps(cdx))
     sys.exit(0)
     """
 )
@@ -1357,8 +1362,16 @@ class GateBehaviour(unittest.TestCase):
         self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
         self.assertIn("gate: FAIL: grype catalogued no OS package",
                       (rep / "grype-yuzu-server.gate.txt").read_text(encoding="utf-8"))
-        r = self.run_gate("yuzu-server=img:1", grype_mode="cdx-unreadable")
+        rep = self.tmp / "rep-nokey"
+        r = self.run_gate("yuzu-server=img:1", grype_mode="cdx-no-components-key", extra=("--report-dir", str(rep)))
         self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("gate: FAIL: grype catalogued no OS package",
+                      (rep / "grype-yuzu-server.gate.txt").read_text(encoding="utf-8"))
+        rep = self.tmp / "rep-cdxbad"
+        r = self.run_gate("yuzu-server=img:1", grype_mode="cdx-unreadable", extra=("--report-dir", str(rep)))
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("gate: FAIL: grype OS packages unreadable",
+                      (rep / "grype-yuzu-server.gate.txt").read_text(encoding="utf-8"))
 
     def test_a_stale_os_provider_refuses_only_images_on_that_os(self):
         rep = self.tmp / "rep-deb"
