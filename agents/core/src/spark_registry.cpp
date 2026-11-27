@@ -58,21 +58,63 @@
  *     runs through the ordinary probe lane, F3-counted: no new long-lived
  *     thread, but one short-lived detached worker per watched key per check. A
  *     result that resolves in Ancestor mode (the path no longer names a key)
- *     faults the watch and re-opens the path on the ordinary backend retry; a
- *     Target result or an undecided one (open refused, probe threw) leaves the
- *     live handle in place. Residuals, none fixed here (the rename-plus-recreate
- *     family is an ACCEPTED residual, tracked as #7877 item 31): a rename followed
- *     by a re-creation of the path is not noticed (the fresh open succeeds and is
- *     not compared with the held key); a rename away and back inside one interval
- *     is not noticed; an undecided verification keeps the old handle, so a rename
- *     it saw but could not conclude on is missed until the next verification that
- *     decides; an Ancestor-mode watch is never verified, including one a verdict
- *     just re-committed in Ancestor mode, so a later rename of its shelter ancestor
- *     is missed; a persistent access-denied on the verification open leaves the
- *     watch unverified with no fault (counted as undecided); HKCR is a merged
- *     view, so a user-hive key appearing later changes what the path resolves to,
- *     and a registry link re-pointed to another target is the same class (the
- *     verification open follows links; both are rename-plus-recreate sub-cases);
+ *     faults the watch and re-opens the path on the ordinary backend retry. A
+ *     Target result is also checked by NAME (#7877 item 31, R1; see resolve_verify_
+ *     locked): the probe records the canonical NT name of every key it commits, and
+ *     a verification compares the HELD handle's current name (NtQueryKey on a
+ *     duplicate of it, taken under mu_ and closed on the worker) with that
+ *     commit-time name, whether or not its own fresh open succeeded, and then the
+ *     fresh open's name with the held one. A parent renamed away with a key
+ *     re-created at the original path is therefore detected on the first
+ *     verification after the rename (the held name has moved), including a re-creation
+ *     the agent can no longer open; it faults the watch like the Ancestor verdict
+ *     and recovers on the same backend retry. An undecided result (open refused,
+ *     probe threw, a name that could not be read) leaves the live handle in place: it
+ *     is counted (test-only counters until #7658) and warned once per watch per blind
+ *     episode in the agent log, which says the watch is not protected until a check
+ *     decides. A name past the buffer (the 4096-byte stack buffer holds a 4-byte header, so
+ *     one call covers names up to about 4092 bytes, 2046 UTF-16 units; a deep path of
+ *     255-character components is longer) is read
+ *     through a one-time retry up to 64 KiB, and one past that cap is a proven mismatch
+ *     against a recorded name. With the check ON, a commit (establishment, re-arm, retry) is
+ *     accepted only when a second by-path read of the name agrees with the first (a rename
+ *     landing between the open and the first read is retried on the admission backoff,
+ *     never recorded), and a verification that a concurrent fire converts into the re-arm is
+ *     retried as an ordinary re-arm so that it gets the same confirmation. Both were
+ *     residuals before the governance fix rounds and are closed in R1 (the confirmation
+ *     narrows the window to a flip between two back-to-back reads; the next verification
+ *     catches that one). With the check OFF (the default) none of this runs: see below.
+ *     Residuals, the family is NOT closed by R1 (register: docs/spark-flip-gate.md; the
+ *     decisions below are Dave, no independent adjudicator, 2026-11-26): a rename away
+ *     and back inside one interval is not noticed (the held name is back at its
+ *     commit-time value; the same class as the File residual, left to the spike outcome and
+ *     R3); an undecided verification keeps the old handle, so a rename it saw but could not
+ *     conclude on is missed until the next verification that decides, and an administrator
+ *     can FORCE the persistent case (UP-1: a link re-pointed, or an HKCR key shadowed, onto a
+ *     target that denies only KEY_NOTIFY to the agent, so the fresh open is refused while the
+ *     held name is unmoved; also an unreadable name, a failed duplicate, handle exhaustion):
+ *     inherited, not fixed in R1, closed by R2 item 32 (undecided becomes a visible fault
+ *     after 3 results); the verification phase is deterministic (commit time plus a fixed
+ *     interval), so an attacker who observes one sample can schedule a decoy between two
+ *     (UP-3): jitter is deferred to a follow-up; an Ancestor-mode watch is never verified,
+ *     including one a verdict just re-committed in Ancestor mode, so a later rename of its
+ *     shelter ancestor is missed (R2 item 33); a flip of the name between the two
+ *     back-to-back reads of the commit confirmation is not caught by it (the next
+ *     verification does); HKCR is a
+ *     merged view, so a user-hive key appearing later changes what the path resolves
+ *     to, and a registry link re-pointed to another target is the same class (the
+ *     verification open follows links): the fresh-versus-held compare catches both.
+ *     Measured on the rig (2026-11-26): NtQueryKey on a key opened through HKCR
+ *     reports the underlying key's canonical name (a per-user `_Classes` key where
+ *     one exists, a machine `SOFTWARE\Classes` key otherwise), not an HKCR spelling.
+ *     A per-user key appearing over a machine one while a watch holds the machine key
+ *     leaves the held name and the held notify unchanged (no signal) while a fresh open
+ *     names the per-user key; a link re-pointed from one target to another does the
+ *     same. Both are pinned through the real mechanism by committed cases in
+ *     test_spark_mechanism.cpp (titles ending "(#7877 item 31, HKCR)" and "(#7877 item
+ *     31, link)"): one "re-pointed" fault, recovery onto the new key. A per-user key
+ *     deleted while held answers 0xC000017C on the held name and fires the notify, so
+ *     it settles without a fault (also a committed HKCR case);
  *     every watch commits at about the same time at startup, so a large fleet of
  *     watches launches its verifications together (probe lane cap, refusals
  *     defer without demoting coverage); a registry open that hangs pins one slot
@@ -86,7 +128,17 @@
  *     OFF BY DEFAULT (REG-15-I2, owner ruling 2026-11-16): each verification
  *     opens the watched key by path, and on a key carrying an auditing SACL
  *     that open can write a Security-log event, so an open per key per
- *     interval can evict older events (irreversible, not measured here). The
+ *     interval can evict older events (irreversible; one peer measurement on one key,
+ *     docs/spark-flip-gate.md: 1 event per check with Registry auditing alone, 6 with
+ *     Handle Manipulation also on). With the check ON, every establishment, re-arm and
+ *     retry of a non-root Target watch (not a verification) whose first name read succeeds
+ *     also opens the key by path a second time for the commit-capture confirmation (one
+ *     more event with Registry auditing alone, four more with Handle Manipulation also on:
+ *     DERIVED from that peer measurement of the by-path open, not measured for the
+ *     confirming read itself). With
+ *     the check OFF (the default) the only addition of the name check is ONE NtQueryKey
+ *     per establishment or re-arm on the handle the probe already holds (a peer measured
+ *     no audit event for a name query): no second open, no duplicate, no warn. The
  *     interval is seeded once, at construction, by make_registry_mechanism()'s
  *     path_verify argument (zero = off), which production fills from
  *     --spark-registry-path-verify-interval via clamp_registry_path_verify().
@@ -178,6 +230,8 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <cstdio>
+#include <cstring>
 #include <functional>
 #include <map>
 #include <memory>
@@ -341,6 +395,150 @@ std::string parent_path(const std::string& key) {
     return pos == std::string::npos ? std::string{} : key.substr(0, pos);
 }
 
+// -- Canonical key names (#7877 item 31, R1) ---------------------------------
+// Local, distinctly-named NTSTATUS values, NOT <ntstatus.h> (which needs the
+// WIN32_NO_STATUS dance next to <windows.h>). Each is a static_cast<LONG> because a bare
+// 0xC... literal is an unsigned int and narrows into a signed LONG. The decision table in
+// resolve_verify_locked names the rows; the status verdicts are:
+//   0xC0000425 hive unloaded                  -> LOST (the held handle's hive is gone);
+//   0x80000005 buffer overflow, on the HELD   -> a name past the 64 KiB cap while the commit
+//              query                            recorded one that fit: a PROVEN move;
+//   0x80000005 buffer overflow, on the FRESH  -> a path name past the cap while the held name
+//              query                            was readable: the path names another key;
+//   everything else (0xC0000008 invalid handle, 0xC0000022 access denied, 0xC0000023 buffer
+//   too small, 0xC000017C key deleted, the local sentinels below) -> UNDECIDED.
+// [[maybe_unused]]: a named undecided row need not have a branch of its own.
+constexpr LONG kStatusBufferOverflow = static_cast<LONG>(0x80000005);
+constexpr LONG kStatusInvalidHandle [[maybe_unused]] = static_cast<LONG>(0xC0000008);
+constexpr LONG kStatusAccessDenied [[maybe_unused]] = static_cast<LONG>(0xC0000022);
+constexpr LONG kStatusBufferTooSmall [[maybe_unused]] = static_cast<LONG>(0xC0000023);
+constexpr LONG kStatusKeyDeleted [[maybe_unused]] = static_cast<LONG>(0xC000017C);
+constexpr LONG kStatusHiveUnloaded = static_cast<LONG>(0xC0000425);
+// LOCAL sentinels, not values the kernel returns for this query; each lands in "any other
+// failure" (undecided). 0xC0000017 is STATUS_NO_MEMORY (the catches below); 0xC000007A is
+// STATUS_PROCEDURE_NOT_FOUND (ntdll export missing). The two 0xE... values carry the
+// NTSTATUS customer bit (bit 29), which the kernel never sets, so they cannot be mistaken
+// for a real status: the length the kernel wrote is malformed, and the name changed length
+// between the two calls of the overflow retry.
+constexpr LONG kStatusNoMemory = static_cast<LONG>(0xC0000017);
+constexpr LONG kStatusProcNotFound = static_cast<LONG>(0xC000007A);
+constexpr LONG kStatusNameMalformed = static_cast<LONG>(0xE0000001);
+constexpr LONG kStatusNameUnstable = static_cast<LONG>(0xE0000002);
+// KEY_INFORMATION_CLASS value; the buffer is { ULONG NameLength (bytes); WCHAR Name[]; }.
+constexpr int kKeyNameInformation = 3;
+// The most NtQueryKey output (header included) the helper will allocate for: 64 KiB, i.e. a
+// name of at most 32766 UTF-16 units, about 128 levels of 255-character components (each level
+// adds its separator). A name past it is answered with the raw STATUS_BUFFER_OVERFLOW instead
+// of an ever larger allocation. Whether the Configuration Manager lets a real path grow that
+// long has NOT been tried: the real-name test builds 9 levels (a name past the single-call
+// limit of the 4096-byte stack buffer, about 4092 bytes of name), and the cap branch is
+// exercised with an injected status. The verdict reads the raw
+// overflow as a proven mismatch only when the commit recorded a name (which then fit under the
+// cap) and as undecided otherwise (see name_verdict_locked).
+constexpr std::size_t kMaxKeyNameInfoBytes = 64 * 1024;
+using NtQueryKeyFn = LONG(NTAPI*)(HANDLE, int, PVOID, ULONG, PULONG);
+
+/// Validate a KeyNameInformation answer held in `buf` (`size` bytes, at least the 4-byte
+/// header) and copy the name out as UTF-16. 0 on success; kStatusNameMalformed when the length
+/// is zero, odd, or does not fit `size`; kStatusNoMemory when the copy cannot allocate (`out`
+/// is left empty on every failure). The name is memcpy'd (not read through a wchar_t pointer),
+/// so no alignment or aliasing question arises for either the stack or the heap buffer.
+[[nodiscard]] LONG parse_key_name_info(const unsigned char* buf, std::size_t size,
+                                       std::wstring& out) noexcept {
+    ULONG name_bytes = 0;
+    // The bound is written `name_bytes > size - header`, never `header + name_bytes > size`:
+    // the sum of a kernel-supplied length and the header is the form that can wrap. Every
+    // caller passes at least the header (4096 or more); the first test keeps that explicit.
+    if (size < sizeof name_bytes) {
+        out.clear();
+        return kStatusNameMalformed;
+    }
+    std::memcpy(&name_bytes, buf, sizeof name_bytes);
+    if (name_bytes == 0 || name_bytes % sizeof(wchar_t) != 0 ||
+        static_cast<std::size_t>(name_bytes) > size - sizeof name_bytes) {
+        out.clear();
+        return kStatusNameMalformed;
+    }
+    try {
+        out.resize(name_bytes / sizeof(wchar_t));
+        std::memcpy(out.data(), buf + sizeof name_bytes, name_bytes);
+    } catch (...) { // std::bad_alloc is the only throwing step
+        out.clear();
+        return kStatusNoMemory;
+    }
+    return 0;
+}
+
+/// NtQueryKey(KeyNameInformation) of an open key into `out` as UTF-16 (the units the
+/// kernel wrote: no NUL, no conversion). Returns the raw NTSTATUS, 0 on success; on ANY
+/// failure `out` is left EMPTY, so a half name is never stored or compared. Failures:
+/// the import is missing, a non-zero status, a length that is zero, odd or past the buffer
+/// (kStatusNameMalformed, a local sentinel: the kernel's own 0xC0000023 stays 0xC0000023),
+/// an allocation failure. A name past the stack buffer (4096 bytes including the 4-byte
+/// header, so about 4092 bytes of name, 2046 UTF-16 units, fit one call) is answered once
+/// more into a
+/// worker-local heap buffer sized from the length the kernel reported (STATUS_BUFFER_OVERFLOW
+/// carries it), up to kMaxKeyNameInfoBytes; past that cap the RAW 0x80000005 is returned. A
+/// second overflow whose reported size is within the cap means the name changed length
+/// between the two calls (kStatusNameUnstable: undecided, the next verification re-reads).
+/// noexcept with an internal catch: this runs on the probe worker for EVERY establishment
+/// and re-arm, so nothing in it may turn into WorkerThrew; the heap allocation sits inside
+/// the try.
+///
+/// Shape copied from the registry plugin's query_key_name() (agents/plugins/registry/
+/// src/registry_win.cpp; not linked into agent-core), with these stated differences:
+/// the raw NTSTATUS is kept (the verdict needs 0xC0000425 and 0x80000005 apart from the
+/// rest; the plugin folds them to a Win32 code), the name stays UTF-16 (the compare is exact
+/// on units, so there is no lossy conversion that a lone-surrogate or NUL check would have
+/// to guard, and refusing such a name here would let a renamed ancestor that carries one
+/// read as undecided and hide the move), the overflow is retried, and ntdll is resolved here.
+[[nodiscard]] LONG query_key_name_w(HKEY key, std::wstring& out) noexcept {
+    out.clear();
+    static const NtQueryKeyFn fn = []() noexcept -> NtQueryKeyFn {
+        const HMODULE ntdll = ::GetModuleHandleW(L"ntdll.dll");
+        if (ntdll == nullptr)
+            return nullptr;
+        return reinterpret_cast<NtQueryKeyFn>(
+            reinterpret_cast<void*>(::GetProcAddress(ntdll, "NtQueryKey")));
+    }();
+    if (fn == nullptr)
+        return kStatusProcNotFound; // fail closed: undecided
+    alignas(8) unsigned char buf[4096];
+    ULONG got = 0;
+    const LONG status =
+        fn(reinterpret_cast<HANDLE>(key), kKeyNameInformation, buf, sizeof buf, &got);
+    if (status == 0)
+        return parse_key_name_info(buf, sizeof buf, out);
+    if (status != kStatusBufferOverflow)
+        return status;
+    // Overflow: `got` is the size the kernel needs (header included). One that does not exceed
+    // what was offered contradicts the status; a size of zero is the same lie.
+    if (got <= sizeof buf)
+        return kStatusNameMalformed;
+    if (got > kMaxKeyNameInfoBytes)
+        return status; // the raw 0x80000005: a name past the cap
+    std::vector<unsigned char> heap;
+    try {
+        heap.resize(got);
+    } catch (...) { // std::bad_alloc (or length_error): no memory for the retry
+        return kStatusNoMemory;
+    }
+    ULONG got2 = 0;
+    const LONG status2 = fn(reinterpret_cast<HANDLE>(key), kKeyNameInformation, heap.data(),
+                            static_cast<ULONG>(heap.size()), &got2);
+    if (status2 == 0)
+        return parse_key_name_info(heap.data(), heap.size(), out);
+    if (status2 == kStatusBufferOverflow)
+        return got2 > kMaxKeyNameInfoBytes ? status2 : kStatusNameUnstable;
+    return status2;
+}
+
+// The three fault reasons of the name verdicts (static strings: a registry path never
+// appears in a reason or a log line). The path-level verdict keeps its own string.
+constexpr const char* kReasonKeyMoved = "registry watch key moved from its path";
+constexpr const char* kReasonRepointed = "registry watch path re-pointed to another key";
+constexpr const char* kReasonHiveUnloaded = "registry watch hive unloaded";
+
 /// The private pool + its callback environment, shared by lease: the mechanism
 /// holds one reference for its started lifetime, every probe worker that must
 /// call CreateThreadpoolWait(&env) holds another for the duration of its call
@@ -385,14 +583,51 @@ struct ProbeResult {
     bool ok{false};
     DWORD err{0};
     const char* stage{""}; ///< which step failed, for the log / fault reason
+    /// Canonical names (#7877 item 31, R1), captured on the worker after the fresh step
+    /// whatever its outcome, never under a lock. `key_name` is the fresh key the probe
+    /// armed (captured only when `ok`), `held_name` the watch's HELD handle as seen
+    /// through the duplicate the job was given (captured on every exit path that returns a
+    /// result, including a failed fresh open; a `probe_hook` throw unwinds before any
+    /// capture and yields no result, so the verdict is then undecided). `*_status` is the raw
+    /// NTSTATUS (0 = the name is valid; on any other value the name is empty), `*_queried`
+    /// says a query was attempted at all.
+    /// `held_queried` is false for an establishment, a re-arm, a root-key (empty subkey)
+    /// watch and a failed DuplicateHandle. Plain strings, nothrow-moved like the handles.
+    std::wstring key_name;
+    LONG key_name_status{0};
+    bool key_name_queried{false};
+    std::wstring held_name;
+    LONG held_name_status{0};
+    bool held_queried{false};
+    /// Commit-capture confirmation (#7877 item 31, R1): set by the worker on an `ok` Target
+    /// result of a job that ran the confirming read (ProbeJob::confirm_commit: the check was
+    /// on at launch and the job is not a verification) when that second by-path read of the
+    /// key's name did not agree with the first, or could not be made. `ok` stays true (a
+    /// caller still waiting in watch() must not see an establishment failure): the COMMIT
+    /// sites refuse to accept such a result and defer the watch on the admission schedule
+    /// instead (defer_commit_unconfirmed_locked). Never set for a verification job (its
+    /// result is judged) nor when the check was off at launch (no second read is made then).
+    /// A verification result that a concurrent fire converted into the re-arm carries no
+    /// confirmation either; resolve_probe_locked retries that one instead of committing it.
+    bool commit_unconfirmed{false};
 };
 static_assert(std::is_nothrow_move_constructible_v<ProbeResult>);
+
+/// True when `r` is a result whose name a commit would record and whose name is worth a second
+/// read: a Target result of a non-root watch whose first name read succeeded. (An Ancestor
+/// commit has no name that guards anything; a failed first read records nothing to confirm.)
+[[nodiscard]] bool name_worth_confirming(const ProbeResult& r, bool non_root) noexcept {
+    return non_root && r.ok && r.mode == WatchMode::Target && r.key_name_queried &&
+           r.key_name_status == 0;
+}
 
 class WindowsRegistryMechanism;
 struct RegWatch;
 void CALLBACK reg_on_wait_cb(PTP_CALLBACK_INSTANCE, PVOID ctx, PTP_WAIT, TP_WAIT_RESULT);
 
 using ProbeHook = std::function<void(std::string_view subkey)>;
+/// Test seam: see RegistryMechanismTestControls::name_hook.
+using NameHook = decltype(RegistryMechanismTestControls::name_hook);
 
 /// The detached probe: reconcile()'s old body minus the final SetThreadpoolWait,
 /// run on a counted worker off every lock. Owns its own auto-reset event, and
@@ -401,6 +636,17 @@ using ProbeHook = std::function<void(std::string_view subkey)>;
 /// path. `wait_ctx` is an opaque RegWatch* handed to CreateThreadpoolWait and
 /// NEVER dereferenced here (the watch may already be retired by the time this
 /// runs; an uncommitted wait is never armed, so that context is never used).
+///
+/// `held_dup` (#7877 item 31, R1) is a DUPLICATE of the watch's held notify handle,
+/// handed to a VERIFICATION job only (null for an establishment, a re-arm, a root-key
+/// watch, or a failed DuplicateHandle). It has exactly one owner at a time: the sweeper
+/// takes it under mu_ and moves it in (after the job is staged), and operator() moves it
+/// into a local FIRST, so every exit of the call - a return or an exception, including a
+/// probe_hook throw that unwinds before any query - closes it on the worker, off every
+/// lock, inside the F3-counted call. A job that is never launched hands it to
+/// SweepWork::old_keys (reconcile_probe_launches_locked); a refused launch hands the job
+/// back to run_off_lock, which drops it off-lock. Nothing off-lock ever touches the
+/// watch's own `open_key` value, which is what makes a recycled handle value harmless.
 struct ProbeJob {
     HKEY root{nullptr};
     std::wstring subkey_w; ///< pre-widened on the launching thread
@@ -410,24 +656,127 @@ struct ProbeJob {
     bool create_wait{false};
     std::shared_ptr<const ProbeHook> hook; ///< test seam; may be null
     std::chrono::milliseconds traversal_budget{kRegProbeTraversalBudget};
+    std::shared_ptr<const NameHook> name_hook; ///< test seam; may be null
+    RegKeyHandle held_dup;                     ///< see the struct doc; null unless verifying
+    /// Run the commit-capture confirmation (confirm_fresh_name): the path-verification check
+    /// was ON when this job was launched (`path_verify_interval() > 0`) and the job is not a
+    /// verification (`!w.verify_probe`). Fixed at launch under mu_, so a test that raises the
+    /// interval after establishment does not change what an in-flight job does. With the check
+    /// off nothing ever compares a recorded name, so the confirming read (a second by-path
+    /// open, an audit event on a SACL'd key) is not made: the cost of a default agent stays
+    /// one NtQueryKey on the already-open handle per establishment or re-arm.
+    bool confirm_commit{false};
+    /// This job is a periodic verification (`w.verify_probe` at launch), with or without its
+    /// duplicate (a failed DuplicateHandle leaves a verification without one). A verification
+    /// is judged, never committed, so it never runs the confirming read.
+    bool is_verification{false};
 
     ProbeResult operator()() {
+        RegKeyHandle dup = std::move(held_dup); // FIRST: every exit below closes it, here
         ProbeResult r;
         r.core = core;
+        probe_once(r); // the body below: nine early returns, each leaving `r` as it stood
+        // Names, AFTER the fresh step whatever its outcome (the held query must run on the
+        // failure paths too: a deny-ACE re-creation fails the fresh open yet moves the
+        // held name) and fresh BEFORE held, so a held name is never older than the fresh
+        // one: a delete-plus-case-variant-recreate between the two queries then answers
+        // STATUS_KEY_DELETED on the held side instead of a case-only mismatch.
+        if (r.ok)
+            capture_name(r.key.get(), /*held=*/false, r.key_name, r.key_name_status,
+                         r.key_name_queried);
+        if (dup)
+            capture_name(dup.get(), /*held=*/true, r.held_name, r.held_name_status, r.held_queried);
+        // A result that may be COMMITTED (not a judged verification) names the key the watch
+        // will hold for its life, so, with the check on, the name just read must be right.
+        // See confirm_fresh_name. With the check off (or for a verification, with or without
+        // its duplicate) this read is not made.
+        if (confirm_commit && !is_verification && !dup && name_worth_confirming(r, !subkey.empty()))
+            r.commit_unconfirmed = !confirm_fresh_name(r.key_name);
+        return r; // `dup` closes here, on the worker
+    }
+
+    /// The commit-capture confirmation (#7877 item 31, R1). The fresh handle was opened and
+    /// armed BEFORE its name was read, so a rename of an ancestor (with the path re-created)
+    /// landing between the open and the read would record the MOVED name as the committed one
+    /// while the handle follows the renamed tree: held == committed for ever, and every later
+    /// verification would call that healthy. This reads the path's name once more, by a SECOND
+    /// by-path open (KEY_NOTIFY, never notify-armed, never stored in the result, closed by RAII
+    /// on every exit, no lock held) and accepts the commit only when it names the same key:
+    /// true when the second read agrees with `first`; false when the second open is refused or
+    /// fails, the second read is not a clean name, or the names differ (the path moved or was
+    /// re-created between the open and the read, or is being flipped right now).
+    ///
+    /// Order for the name_hook seam: the fresh read, then THIS read (`held == false` both
+    /// times). The hook for this read runs BEFORE its by-path open, so a test parked here
+    /// lands a change after the first read and before the second open; a hook that returns a
+    /// value supplies the second name and skips the open (a refused open is not modelled).
+    /// The window is not removed, only narrowed to a flip between the two back-to-back reads,
+    /// which the next verification then catches. A false answer is never a fault by itself: the
+    /// commit sites retry on the admission schedule (defer_commit_unconfirmed_locked), and the
+    /// ordinary grace reports a watch that stays unestablished. Runs only when
+    /// `confirm_commit` (the check was on at launch, the job is not a verification).
+    /// noexcept: every step is a noexcept call or sits in the try.
+    [[nodiscard]] bool confirm_fresh_name(const std::wstring& first) const noexcept {
+        try {
+            if (name_hook && *name_hook) {
+                if (auto injected = (*name_hook)(subkey, /*held=*/false))
+                    return injected->first == 0 && injected->second == first;
+            }
+            HKEY h = nullptr;
+            if (::RegOpenKeyExW(root, subkey_w.c_str(), 0, KEY_NOTIFY, &h) != ERROR_SUCCESS)
+                return false;
+            RegKeyHandle second; // closes on every exit below
+            second.reset(h);
+            std::wstring name;
+            if (query_key_name_w(second.get(), name) != 0)
+                return false;
+            return name == first;
+        } catch (...) { // a throwing hook or a failed copy: not confirmed
+            return false;
+        }
+    }
+
+    /// The hook (if any), then the real query, all inside try/catch: a capture failure
+    /// is a status with an empty name, never a failed establishment and never
+    /// WorkerThrew. The hook runs IMMEDIATELY before the query so a test can land a
+    /// rename between the fresh open and the fresh-name query.
+    void capture_name(HKEY key, bool held, std::wstring& name, LONG& status,
+                      bool& queried) const noexcept {
+        queried = true;
+        name.clear();
+        status = kStatusNoMemory; // what a throw below leaves behind
+        try {
+            if (name_hook && *name_hook) {
+                if (auto injected = (*name_hook)(subkey, held)) {
+                    status = static_cast<LONG>(injected->first);
+                    if (status == 0)
+                        name = std::move(injected->second);
+                    return;
+                }
+            }
+            status = query_key_name_w(key, name);
+        } catch (...) {
+            status = kStatusNoMemory;
+            name.clear();
+        }
+    }
+
+    /// Today's probe body (the original operator()), unchanged apart from taking `r`.
+    void probe_once(ProbeResult& r) {
         if (hook && *hook)
             (*hook)(subkey); // test seam: may park (a "hung hive") or throw
         r.event.reset(::CreateEventW(nullptr, FALSE, FALSE, nullptr)); // auto-reset
         if (!r.event) {
             r.err = ::GetLastError();
             r.stage = "CreateEventW";
-            return r;
+            return;
         }
         if (create_wait) {
             r.wait.reset(::CreateThreadpoolWait(&reg_on_wait_cb, wait_ctx, &core->env));
             if (!r.wait) {
                 r.err = ::GetLastError();
                 r.stage = "CreateThreadpoolWait";
-                return r;
+                return;
             }
         }
         // Prefer the target key. KEY_NOTIFY is all RegNotifyChangeKeyValue needs
@@ -446,7 +795,7 @@ struct ProbeJob {
             if (nrc == ERROR_SUCCESS) {
                 r.mode = WatchMode::Target;
                 r.ok = true;
-                return r;
+                return;
             }
             // The key EXISTS and refused a notify: that is a backend failure to be
             // reported and retried, never a fall-back to the ancestor watch (which
@@ -454,7 +803,7 @@ struct ProbeJob {
             r.key.reset();
             r.err = static_cast<DWORD>(nrc);
             r.stage = "RegNotifyChangeKeyValue(target)";
-            return r;
+            return;
         }
         if (trc != ERROR_FILE_NOT_FOUND && trc != ERROR_PATH_NOT_FOUND) {
             // Same rule for the open: only ABSENCE means "watch the ancestor for its
@@ -464,7 +813,7 @@ struct ProbeJob {
             // fell through here too).
             r.err = static_cast<DWORD>(trc);
             r.stage = "RegOpenKeyExW(target, KEY_NOTIFY)";
-            return r;
+            return;
         }
         // Target absent: watch the nearest existing ancestor for its (re)creation.
         // The hive root opens for every caller that reached this far, so the walk
@@ -479,7 +828,7 @@ struct ProbeJob {
             if (Clock::now() - t0 > traversal_budget) {
                 r.err = ERROR_TIMEOUT;
                 r.stage = "ancestor walk exceeded its traversal budget";
-                return r;
+                return;
             }
             HKEY a = nullptr;
             const std::wstring wp = to_wide(p);
@@ -493,17 +842,17 @@ struct ProbeJob {
                 if (nrc == ERROR_SUCCESS) {
                     r.mode = WatchMode::Ancestor;
                     r.ok = true;
-                    return r;
+                    return;
                 }
                 r.key.reset();
                 r.err = static_cast<DWORD>(nrc);
                 r.stage = "RegNotifyChangeKeyValue(ancestor)";
-                return r;
+                return;
             }
             if (p.empty()) {
                 r.err = static_cast<DWORD>(rc);
                 r.stage = "RegOpenKeyExW(hive root, KEY_NOTIFY)";
-                return r;
+                return;
             }
             p = parent_path(p);
         }
@@ -525,6 +874,33 @@ struct RegWatch {
     RegKeyHandle open_key;      ///< target in Target mode, ancestor in Ancestor mode
     PTP_WAIT wait{nullptr};     ///< armed at least once => drain before destroy
     WatchMode mode{WatchMode::Target};
+    /// Canonical NT name of `open_key` (#7877 item 31, R1): the PROBE-TIME name of the
+    /// handle commit_locked() installed (captured on the probe worker, moved here at
+    /// commit - not an atomic snapshot taken at commit). Set for a Target and an Ancestor
+    /// commit alike (`mode` says which key it names); EMPTY when the capture failed or the
+    /// watch is a root key (empty subkey). READ by the verification's primary compare,
+    /// which is disabled while it is empty. Replaced only by commit_locked (nothrow move
+    /// assignment: commit_locked runs under mu_ and must not allocate for it).
+    std::wstring committed_name;
+    /// Per-watch "already warned" flags (#7877 item 31, R1), all under mu_ and bounded by the
+    /// number of watches. Each is CLAIMED off-lock at log time (claim_warn, with a restore when
+    /// the log call throws) and re-armed where the condition it announced ends: a commit that
+    /// records a name clears `name_missing_warned`; a verification that decides clears
+    /// `undecided_warned`; a duplicate that succeeds clears `dup_failed_warned`. So a blind
+    /// watch warns once per blind episode, never once per agent per boot.
+    bool name_missing_warned{false};
+    bool undecided_warned{false};
+    bool dup_failed_warned{false};
+    /// Set when the "commit could not be confirmed" warn was claimed; cleared by the next
+    /// ACCEPTED commit (commit_locked), so a watch that keeps failing its confirmation warns
+    /// once per episode.
+    bool commit_unconfirmed_warned{false};
+    /// Mechanism-wide unique, never reused (assigned under mu_ from watch_serial_ when the
+    /// watch is created). The staged-warn claim compares it, so a new watch that reuses a
+    /// retired watch's ADDRESS (and a spark key) cannot take the flag a line staged for the
+    /// old one. The engine incarnation cannot serve: it is kNoSparkIncarnation for direct
+    /// callers, and it moves forward on adoption of the SAME watch.
+    std::uint64_t serial{0};
     /// A notify + wait is currently established. After a Lost verification verdict
     /// it STAYS true while the probe is Deferred for the retry: a callback for the OLD
     /// event can still arrive when the wait is re-pointed at the retry's commit; it
@@ -676,6 +1052,31 @@ struct SweepWork {
     std::vector<ProbeResult> dead_results;
     std::vector<DetachedCall<ProbeResult>> stale_calls;
     std::vector<std::unique_ptr<RegWatch>> dead_watches;
+    /// Per-watch diagnostics staged under mu_ and logged off-lock (a formatted log line is an
+    /// allocation): a watch with no recorded name (a Target commit that recorded none, or a
+    /// verification of such a watch; only while path verification is on), a verification that
+    /// could not decide, a failed DuplicateHandle, and a commit that could not be confirmed.
+    /// At most TWO are staged per visited watch per pass (a verification visit can stage a
+    /// no-name warn and an undecided warn; every other visit stages at most one), so the
+    /// per-pass reservation of 2 * `cap` entries bounds it; staged inside a try/catch that
+    /// drops the line on an allocation failure (a lost diagnostic, never a failed pass).
+    /// `watch` and `serial` are the identity the claim re-checks under mu_ (the pointer is
+    /// compared, never dereferenced; the serial is what makes a reused address distinct).
+    struct StagedWarn {
+        enum class Kind : std::uint8_t {
+            NameMissing,
+            Undecided,
+            DupFailed,
+            CommitUnconfirmed
+        } kind{Kind::NameMissing};
+        std::string key;
+        LONG code{0};            ///< an NTSTATUS, or a Win32 error when `win32`; 0 = none
+        bool win32{false};       ///< `code` is a Win32 error (a refused open, a duplicate)
+        const char* what{""};    ///< static text naming the step the code belongs to
+        const RegWatch* watch{nullptr};
+        std::uint64_t serial{0}; ///< RegWatch::serial of the watch the line was staged for
+    };
+    std::vector<StagedWarn> warns;
     std::vector<std::pair<std::string, std::uint64_t>> failed_emits;    ///< restore needs_resync
     std::vector<std::pair<std::string, std::uint64_t>> succeeded_emits; ///< reset the retry schedule
     /// Captured under mu_ at the top of sweep_locked() (the live member can be
@@ -858,8 +1259,11 @@ public:
             uw->probe_gen = ++gen_;
             gen = uw->probe_gen;
             w = uw.get();
+            uw->serial = ++watch_serial_;
             job.emplace(ProbeJob{root, std::move(subkey_w), rp->key, core_, w, /*create_wait=*/true,
-                                 probe_hook_, traversal_budget()});
+                                 probe_hook_, traversal_budget(), name_hook_, RegKeyHandle{},
+                                 /*confirm_commit=*/path_verify_interval().count() > 0,
+                                 /*is_verification=*/false}); // a new watch has no verification
             watches_.emplace(key, std::move(uw));
         }
 
@@ -885,6 +1289,7 @@ public:
         discards.stale_calls.reserve(1);
         discards.dead_results.reserve(1);
         discards.dead_watches.reserve(1);
+        discards.warns.reserve(1); // one per call at most (commit or deferral; never logged here)
         {
             std::lock_guard lk(mu_);
             auto it = watches_.find(key);
@@ -911,7 +1316,18 @@ public:
                 w->resync_epoch = ++resync_epoch_;
                 nudge_locked();
             } else if (taken) {
-                if (taken->has_value() && (*taken)->ok) {
+                if (taken->has_value() && (*taken)->ok && (*taken)->commit_unconfirmed) {
+                    // The probe's name did not survive its confirming read (#7877 item 31,
+                    // R1): the commit is NOT accepted. Not a failure the engine should roll
+                    // back (the key exists and armed): retry on the admission schedule, with
+                    // the observation gap owed, exactly like a refused launch. The result
+                    // (its handles) is discarded off-lock below.
+                    discards.dead_results.push_back(std::move(**taken)); // reserved: nothrow
+                    defer_commit_unconfirmed_locked(*w, discards); // its warn is counter-only here
+                    w->needs_resync = true;
+                    w->resync_epoch = ++resync_epoch_;
+                    nudge_locked();
+                } else if (taken->has_value() && (*taken)->ok) {
                     // `discards` (this call's local SweepWork) is destroyed
                     // unread at the end of this scope — staging
                     // into it here would be silently dropped. commit_locked()
@@ -946,6 +1362,14 @@ public:
                 nudge_locked();
             }
         }
+        // No diagnostic is logged on this path (watch() runs under the engine's per-type
+        // lock, ADR-0021 / #4704): a warn staged into `discards` (the NameMissing of a commit
+        // that recorded no name, the CommitUnconfirmed of a deferral) is destroyed unread and
+        // its per-watch flag is never claimed (claims happen at log time), so the first
+        // sweeper pass that meets the same condition still logs it. The initial-establishment
+        // case is therefore counter-only (commit_name_missing_, commit_capture_retry_), and
+        // a watch whose FIRST commit recorded no name is announced at its first verification
+        // (resolve_verify_locked stages the no-name warn again).
         // `discards` destroyed here, with mu_ released.
         if (error)
             return std::unexpected(std::move(*error));
@@ -1124,6 +1548,11 @@ public:
             sweep_cadence_ms_.store(c.sweep_cadence.count(), std::memory_order_relaxed);
         if (c.path_verify_interval.count() > 0)
             path_verify_ms_.store(c.path_verify_interval.count(), std::memory_order_relaxed);
+        if (c.name_hook)
+            name_hook_ = std::make_shared<const NameHook>(std::move(c.name_hook));
+        else
+            name_hook_.reset();
+        verify_fail_duplicate_ = c.verify_fail_duplicate; // under mu_, like the hooks
         nudge_locked();
     }
 
@@ -1154,8 +1583,30 @@ public:
         d.verify_launched = verify_launched_.load(std::memory_order_relaxed);
         d.verify_lost = verify_lost_.load(std::memory_order_relaxed);
         d.verify_undecided = verify_undecided_.load(std::memory_order_relaxed);
+        d.verify_name_lost = verify_name_lost_.load(std::memory_order_relaxed);
+        d.verify_name_undecided = verify_name_undecided_.load(std::memory_order_relaxed);
+        d.commit_name_recorded = commit_name_recorded_.load(std::memory_order_relaxed);
+        d.commit_name_missing = commit_name_missing_.load(std::memory_order_relaxed);
+        d.verify_dup_failed = verify_dup_failed_.load(std::memory_order_relaxed);
+        d.commit_capture_retry = commit_capture_retry_.load(std::memory_order_relaxed);
+        d.warns_claimed_name_missing = warns_claimed_name_missing_.load(std::memory_order_relaxed);
+        d.warns_claimed_undecided = warns_claimed_undecided_.load(std::memory_order_relaxed);
+        d.warns_claimed_dup_failed = warns_claimed_dup_failed_.load(std::memory_order_relaxed);
+        d.warns_claimed_commit_unconfirmed =
+            warns_claimed_commit_unconfirmed_.load(std::memory_order_relaxed);
         d.path_verify_ms = path_verify_ms_.load(std::memory_order_relaxed);
         return d;
+    }
+
+    /// Test observer: the commit-time name recorded for `key`'s watch (see
+    /// registry_committed_name_for_test). A copy made under mu_.
+    [[nodiscard]] std::optional<std::wstring>
+    committed_name_for_test(const std::string& key) const {
+        std::lock_guard lk(mu_);
+        const auto it = watches_.find(key);
+        if (it == watches_.end())
+            return std::nullopt;
+        return it->second->committed_name;
     }
 
     // Called from the TP_WAIT callback (reg_on_wait_cb) with `w` guaranteed live.
@@ -1178,7 +1629,10 @@ public:
                 try {
                     job.emplace(ProbeJob{w.root, w.subkey_w, w.subkey, core_, &w,
                                          /*create_wait=*/w.wait == nullptr, probe_hook_,
-                                         traversal_budget()});
+                                         traversal_budget(), name_hook_, RegKeyHandle{},
+                                         /*confirm_commit=*/path_verify_interval().count() > 0 &&
+                                             !w.verify_probe,
+                                         /*is_verification=*/w.verify_probe});
                 } catch (...) {
                     w.armed = false;
                     if (old_mode == WatchMode::Target) {
@@ -1382,6 +1836,61 @@ private:
             mark_coverage_locked(w, SparkCoverage::None);
     }
 
+    /// A probe result whose commit-capture confirmation failed (#7877 item 31, R1; see
+    /// ProbeJob::confirm_fresh_name): the commit is not accepted and the watch is retried on
+    /// the ADMISSION schedule (D, 2D, ... capped at kRegAdmissionBackoffCap; `admission_attempts`
+    /// resets at the next commit), not the 30 s backend ladder: a mismatch between two
+    /// back-to-back reads is transient or adversarial, never an OS refusal, and a flapping
+    /// path then costs a bounded, doubling number of probes. Not a fault by itself (the watch
+    /// stays whatever it was); the ordinary grace still reports an overdue obligation, as for
+    /// a refused launch, and the watch has no rename-and-recreate coverage until a commit is
+    /// accepted: coverage is None meanwhile, and a once-per-episode warn (kind
+    /// CommitUnconfirmed) is staged into `work` (logged off-lock by the sweeper; from
+    /// watch() `work` is the call's local discard set, so there it is counter-only). Counts
+    /// only its own counter: the DetachedLaunch statuses that defer_admission_locked counts
+    /// would be a lie here. No log (under mu_, and watch() must never log). Under mu_.
+    void defer_commit_unconfirmed_locked(RegWatch& w, SweepWork& work) {
+        commit_capture_retry_.fetch_add(1, std::memory_order_relaxed);
+        w.probe = ProbeState::Deferred;
+        w.call.reset();
+        ++w.admission_attempts;
+        w.next_retry_at = Clock::now() + doubled(admission_seed(), w.admission_attempts,
+                                                 kRegAdmissionBackoffCap);
+        // No coverage is established by an unaccepted result, in every calling context.
+        mark_coverage_locked(w, SparkCoverage::None);
+        stage_warn_locked(work, SweepWork::StagedWarn::Kind::CommitUnconfirmed, w, 0,
+                          /*win32=*/false,
+                          "the key's name could not be confirmed by a second read at commit");
+    }
+
+    /// A VERIFICATION result that a concurrent fire converted into the re-arm (the fire cleared
+    /// `armed` while the verification was outstanding): the job ran no confirming read (it was
+    /// launched as a verification), and its fresh name was read after an open that an
+    /// administrator can race, so it is NOT committed. The watch is retried at once as an
+    /// ordinary re-arm (not a verification, so the retry job runs the confirming read) with
+    /// the observation gap the fire already recorded. At once, not on the admission backoff:
+    /// the fire is a real change the verification merely collided with, a 50 ms wait would
+    /// only push the watch past its 50 ms grace and report a fault for it, and the loop is
+    /// bounded by the fires themselves: a verification is staged at most once per interval
+    /// (`last_verify_at`), so this can recur at most once per interval. A retry whose own
+    /// confirmation fails takes the ordinary backoff (defer_commit_unconfirmed_locked).
+    /// Grace: the retry REPLACES the re-arm the fire's own probe was to complete, so while the
+    /// grace of that obligation has not yet been counted its clock restarts here, as on_fire
+    /// restarted it at the fire; an obligation already reported overdue keeps its fault and its
+    /// count (no second count). The restart is bounded: this runs at most once per verification,
+    /// and the extra latency is one probe plus the sweeper's polling of it. Counts in
+    /// commit_capture_retry_. No warn: nothing unusual happened. Coverage stays the None the fire
+    /// marked (on_fire marks it unconditionally); the sweeper's next wake is computed from
+    /// `next_retry_at` (a Deferred watch), so no nudge is needed. Under mu_.
+    void retry_fire_converted_locked(RegWatch& w) {
+        commit_capture_retry_.fetch_add(1, std::memory_order_relaxed);
+        w.probe = ProbeState::Deferred;
+        w.call.reset();
+        w.next_retry_at = Clock::now();
+        if (!w.grace_counted)
+            w.accepted_at = w.next_retry_at;
+    }
+
     /// Genuine backend failure: retry on the 30 s doubling schedule, report the
     /// watch Faulted (the sweeper dispatches the edge). Under mu_.
     void fail_backend_locked(RegWatch& w, const char* reason) {
@@ -1424,6 +1933,26 @@ private:
         w.event = std::move(res.event);
         w.open_key = std::move(res.key);
         w.mode = res.mode;
+        // The name of the handle just installed (probe-time, then confirmed by a second read
+        // when the check was on at launch; allocated on the worker, so this is a nothrow
+        // move). A Target commit of a non-root watch that recorded none disables the primary
+        // name compare for this watch until a later commit does: counted every time, never a
+        // fault (an unreadable name is not proof of a rename), and warned once per watch while
+        // the check is on (a commit that records a name re-arms the warn).
+        w.commit_unconfirmed_warned = false; // an accepted commit ends a deferral episode
+        w.committed_name = std::move(res.key_name);
+        if (!w.committed_name.empty()) {
+            commit_name_recorded_.fetch_add(1, std::memory_order_relaxed);
+            w.name_missing_warned = false;
+        } else if (w.mode == WatchMode::Target && !w.subkey.empty()) {
+            commit_name_missing_.fetch_add(1, std::memory_order_relaxed);
+            // Only with the check on: with it off nothing ever compares this name, so "the
+            // rename check is off for this watch" would describe a check that is not running.
+            if (path_verify_interval().count() > 0)
+                stage_warn_locked(work, SweepWork::StagedWarn::Kind::NameMissing, w,
+                                  res.key_name_status, /*win32=*/false,
+                                  "the key's canonical name could not be read at commit");
+        }
         ::SetThreadpoolWait(w.wait, w.event.get(), nullptr); // the ONLY place a wait is armed
         w.armed = true;
         w.backend_attempts = 0;
@@ -1466,24 +1995,95 @@ private:
     /// The verdict on a periodic path verification (#7836); `r` came from a probe
     /// that was launched against an ARMED, Target-mode watch. The result is never
     /// committed: the live handle and notify stay in place unless the path is
-    /// lost, and whatever the probe opened is discarded off-lock. Under mu_.
-    ///   - not ok (open or notify refused, hook or probe threw): undecided. The
-    ///     watch keeps its handle and is NOT faulted (an unreadable path is not
-    ///     proof of a rename), and the next verification is one interval away.
-    ///     ACCEPTED residual (#7877): a rename the probe saw but could not conclude
-    ///     on (its ancestor walk failed) is discarded with it, so the watch keeps
-    ///     the old handle and misses that rename until a later verification decides.
-    ///   - Ancestor mode: the target path no longer resolves (a parent was
-    ///     renamed away, or the key deleted before its notification was
-    ///     consumed). The live handle follows the renamed tree and is deaf to the
-    ///     path: fault, owe a synthetic fire, and re-open the path on the
-    ///     ordinary backend retry (which recovers through commit_locked). While
-    ///     the path is still absent that retry commits in Ancestor mode, which is
-    ///     never verified: ACCEPTED residual (#7877), a later rename of that
-    ///     watch's shelter ancestor is missed.
-    ///   - Target mode: the path still resolves to a key. NOT compared with the
-    ///     key the watch holds: a rename that is followed by a re-creation of the
-    ///     path is not noticed (documented residual, docs/spark-flip-gate.md).
+    /// lost, and whatever the probe opened is discarded off-lock. Under mu_. The name
+    /// verdict (name_verdict_locked) is string compares and counters only (no OS call,
+    /// no allocation); the failure branches reach fail_backend_locked, which logs.
+    ///
+    /// Notation (#7877 item 31, R1): C = w.committed_name, the probe-time name of
+    /// the handle the watch holds; H = r->held_name, that SAME handle's name read now
+    /// through a duplicate; F = r->key_name, the fresh key the probe armed. Precedence,
+    /// first match wins:
+    ///   1. Ancestor mode: the target path no longer resolves (a parent was renamed
+    ///      away, or the key deleted before its notification was consumed). The live
+    ///      handle follows the renamed tree and is deaf to the path: fault, owe a
+    ///      synthetic fire, and re-open the path on the ordinary backend retry (which
+    ///      recovers through commit_locked). While the path is still absent that retry
+    ///      commits in Ancestor mode, which is never verified: residual, tracked in #7877
+    ///      (R2 item 33), a later rename of that watch's shelter ancestor is missed.
+    ///   2. PRIMARY, held versus commit-time: H != C, with both readable and C recorded.
+    ///      Unconditional on `r->ok`: it runs on every result the worker returns,
+    ///      including a failed fresh open (a deny-ACE re-creation fails the open with
+    ///      access-denied, yet the held name has still moved). C is the name the probe read
+    ///      on the worker after its open and arm, and (when the check was on at launch, which
+    ///      it is for any watch this function judges unless a test raised the interval after
+    ///      establishment) a commit is accepted only when a second by-path read confirmed it
+    ///      (ProbeJob::confirm_fresh_name), so a rename landing between the open and the first
+    ///      read is not recorded as C; a verification a concurrent fire converted into the
+    ///      re-arm is retried so that it is confirmed too (retry_fire_converted_locked).
+    ///      The window that remains is a flip between the two back-to-back reads, which the
+    ///      next verification catches. H is read once, so a rename still in effect when H was read is caught on
+    ///      the first verification after it, whether or not the path was re-created. Runs
+    ///      only for a watch whose commit RECORDED a name (commit_name_missing counts the
+    ///      ones that did not). A held name past the 64 KiB cap (raw 0x80000005) while C was
+    ///      recorded is the same verdict: C fit, H does not, so they differ. Fault: key moved.
+    ///   3. STATUS_HIVE_UNLOADED (0xC0000425) on the held query: lost, fault "hive
+    ///      unloaded". RACE-REACHABLE ONLY: a profile unload fires every held handle
+    ///      (a standalone probe on the rig saw all four held handles answer 0xC0000425,
+    ///      probes/unload-run5.local.out, 2026-11-24, author-reported; an unload against
+    ///      THIS mechanism is not measured), and normally the TP callback reaches on_fire
+    ///      first, clears `armed` and turns this verification into the re-arm (so this row is
+    ///      not reached and the re-arm walks to the HKU root without a fault); this verdict
+    ///      stands only when the sweeper resolves the probe BEFORE the callback takes mu_.
+    ///      Same event, two outcomes, both converge; the absence of this reason is not
+    ///      evidence about unloads.
+    ///   4. SECONDARY, fresh versus held (a Target result only): F != H, both readable
+    ///      (or F past the cap while H was readable: they differ):
+    ///      the path now resolves to a DIFFERENT key object while the held key did not
+    ///      move (a user-hive HKCR class key shadowing the machine one, a registry link
+    ///      re-pointed). Its window is a shadowing landing between the fresh open and the
+    ///      fresh-name query, which the next sample catches. Measured on a rig
+    ///      (2026-11-26): NtQueryKey through HKCR reports the underlying key's name (per-user
+    ///      `_Classes` or machine `SOFTWARE\Classes`); a per-user key appearing over a held
+    ///      machine key and a link re-pointed are each pinned through the real mechanism
+    ///      by a committed case (test_spark_mechanism.cpp, "(#7877 item 31, HKCR)" and
+    ///      "(#7877 item 31, link)") and give one fault with this reason.
+    ///      Fault: re-pointed.
+    ///   5. Otherwise, not ok (open or notify refused, hook or probe threw): undecided.
+    ///      The watch keeps its handle and is NOT faulted (an unreadable path is not
+    ///      proof of a rename), and the next verification is one interval away.
+    ///      Residual, tracked in #7877 (UP-1; Dave, no independent adjudicator, 2026-11-26:
+    ///      not fixed in R1, closed by R2 item 32, which makes repeated undecided a visible
+    ///      fault): a rename the probe saw but could not conclude on (its ancestor walk
+    ///      failed, or its fresh open was refused while the held name stayed put) is
+    ///      discarded with it until a later verification decides, and an administrator can
+    ///      FORCE the persistent case (a link re-pointed, or an HKCR key shadowed, onto a
+    ///      target that denies only KEY_NOTIFY to the agent, so the fresh open is refused
+    ///      while the held name does not move). R1 makes it visible, not closed: a per-watch
+    ///      warn in the agent log (once per blind episode) and the test-only counters.
+    ///   6. Otherwise a Target result: healthy; the path still resolves to the held key.
+    /// Any other name-query failure (STATUS_KEY_DELETED 0xC000017C included, which the
+    /// delete's own fire converges within milliseconds and which is NOT a rename proof;
+    /// invalid handle, access-denied, no memory, an unstable length, no duplicate; a name
+    /// past the cap on the held side with NO recorded C, or on the fresh side with an
+    /// unreadable H) is UNDECIDED by name: counted in verify_name_undecided, never a fault.
+    /// R2 HAND-OFF (not R1 work): a deleted-key answer must not count as an undecided strike
+    /// for the item 32 escalation, because the fire converges it.
+    ///
+    /// A lost verdict beats a healthy one, so every disagreement between the compares is
+    /// a fault. Two classes of false fault are ACCEPTED, both self-healing at the retry
+    /// (which re-opens through commit_locked and records a fresh C): an administrator who
+    /// renames P to P1 and creates a link P pointing at P1 leaves the path resolving to the
+    /// same key but H names the P1 spelling; and a case-only rename of an ancestor (P to p)
+    /// resolves to the same key but the exact UTF-16 compare sees a different spelling. A
+    /// rename that straddles the two queries, or lands between the probe's capture of C
+    /// and the commit, yields one fault for a real rename. A same-path delete and
+    /// recreate adds NO name-verdict fault (the held query is read AFTER the fresh one, so
+    /// it answers deleted, not a case-variant mismatch); the path-level false fault of
+    /// #7877 item 37 (the fresh open landing in the delete-to-recreate gap) is unchanged.
+    ///
+    /// Counters: `verify_undecided` keeps its PATH-level meaning and is counted BEFORE the
+    /// name verdict, so a result with a failed fresh open counts it even when the name verdict
+    /// then faults; `verify_name_lost` counts every name verdict (rows 2-4).
     void resolve_verify_locked(RegWatch& w, DetachedResult<ProbeResult> r, SweepWork& work) {
         w.call.reset();
         if (r.has_value() && r->ok && r->mode == WatchMode::Ancestor) {
@@ -1491,26 +2091,370 @@ private:
             work.dead_results.push_back(std::move(*r)); // reserved per visit: nothrow
             w.needs_resync = true;
             w.resync_epoch = ++resync_epoch_;
+            w.undecided_warned = false; // a verdict decides: the blind episode (if any) is over
             fail_backend_locked(w, "registry watch key renamed or replaced");
             return; // grace_counted stays true: this is not a missed obligation
         }
-        if (!(r.has_value() && r->ok))
+        const bool path_undecided = !(r.has_value() && r->ok);
+        if (path_undecided)
             verify_undecided_.fetch_add(1, std::memory_order_relaxed);
+        bool name_undecided = false;
+        if (const char* lost =
+                r.has_value() ? name_verdict_locked(w, *r, name_undecided) : nullptr) {
+            verify_name_lost_.fetch_add(1, std::memory_order_relaxed);
+            work.dead_results.push_back(std::move(*r)); // reserved per visit: nothrow
+            w.needs_resync = true;
+            w.resync_epoch = ++resync_epoch_;
+            w.undecided_warned = false; // a verdict decides
+            fail_backend_locked(w, lost);
+            return; // grace_counted stays true, as for the path verdict above
+        }
+        if (name_undecided)
+            verify_name_undecided_.fetch_add(1, std::memory_order_relaxed);
+        // A watch whose commit recorded NO name has nothing to compare the held name with: the
+        // primary compare is disabled and a readable held name takes the decided branch below
+        // without a word. Say so here too (the commit-time warn is counter-only when the
+        // first commit was made by watch(), which never logs, and is gone after a log
+        // rotation): staged at most once per episode (the flag), never a fault. The check is
+        // on by construction (a verification ran).
+        if (!w.subkey.empty() && w.committed_name.empty())
+            stage_warn_locked(work, SweepWork::StagedWarn::Kind::NameMissing, w, 0, /*win32=*/false,
+                              "no canonical name is recorded for this watch, so the held key's "
+                              "name has nothing to be compared with");
+        if (name_undecided || path_undecided) {
+            // A blind verification (the watch is not protected against a rename-and-recreate
+            // for this sample). A failed DuplicateHandle already warned with its own error
+            // code (kind DupFailed), so it does not warn a second time here.
+            const bool dup_missing = r.has_value() && !r->held_queried && !w.subkey.empty();
+            if (!dup_missing)
+                stage_undecided_warn_locked(w, r, work);
+        } else {
+            w.undecided_warned = false; // decided (equal names or none to compare): re-arm the warn
+        }
         if (r.has_value())
             work.dead_results.push_back(std::move(*r));
         w.probe = ProbeState::Idle;
         w.grace_counted = false; // as after a commit
     }
 
+    /// The name half of the verdict (rows 2-4 of resolve_verify_locked's table): the
+    /// fault reason if the held tree moved or the path now names another key, else
+    /// nullptr. Sets `undecided` when a name query (or the duplicate it needs) was
+    /// attempted and could not yield a comparable pair. Under mu_; compares only, no
+    /// allocation, no OS call.
+    [[nodiscard]] const char* name_verdict_locked(const RegWatch& w, const ProbeResult& r,
+                                                  bool& undecided) const noexcept {
+        if (r.held_queried) {
+            if (r.held_name_status == 0) {
+                if (!w.committed_name.empty() && r.held_name != w.committed_name)
+                    return kReasonKeyMoved; // row 2, whatever the fresh open did
+            } else if (r.held_name_status == kStatusHiveUnloaded) {
+                return kReasonHiveUnloaded; // row 3
+            } else if (r.held_name_status == kStatusBufferOverflow && !w.committed_name.empty()) {
+                // The held name is past the cap and C fit in it: a PROVEN mismatch, not an
+                // unreadable name. (An adversary-built deep path could otherwise make the held
+                // name unreadable for ever and hide a rename: the single-call-buffer version
+                // of this was the undecided row.)
+                return kReasonKeyMoved; // row 2
+            } else {
+                undecided = true; // deleted, invalid handle, denied, no memory, no C, ...
+            }
+        } else if (!w.subkey.empty()) {
+            undecided = true; // no duplicate for a non-root watch: DuplicateHandle failed
+        }
+        // A root-key watch (empty subkey) has no name to compare and is skipped here by
+        // design: no duplicate is taken for it and no verdict or undecided count is made.
+        if (!w.subkey.empty() && r.ok && r.mode == WatchMode::Target && r.key_name_queried) {
+            if (r.key_name_status == kStatusBufferOverflow && r.held_queried &&
+                r.held_name_status == 0)
+                return kReasonRepointed; // row 4: F past the cap, H readable (so it fit)
+            if (r.key_name_status != 0)
+                undecided = true;
+            else if (r.held_queried && r.held_name_status == 0 && r.key_name != r.held_name)
+                return kReasonRepointed; // row 4
+        }
+        return nullptr;
+    }
+
+    /// Take the duplicate of the held handle for the verification job just staged as
+    /// `work.probe_launches.back()`, under mu_ (#7877 item 31, R1). Only for a non-root
+    /// watch (an empty subkey names a predefined root, which cannot be renamed). Measured on
+    /// the rig (build 26100, 2026-11-25, #7877 R1): RegOpenKeyExW(HKCU, HKLM, HKCR or HKU,
+    /// empty or null subkey) returns the predefined pseudo-handle itself (the same value),
+    /// and NtQueryKey on it answers STATUS_INVALID_HANDLE (0xC0000008), so there is no name
+    /// to read. A second RegNotifyChangeKeyValue on that shared handle signalled the first
+    /// notify's event in a standalone probe, so a verification of a root-key watch converts
+    /// to a re-arm instead of being judged (test T11 records the observation; the engine
+    /// refuses an empty key, so only a direct caller of the mechanism can arm one).
+    ///
+    /// Why under mu_ and not off-lock: under mu_ the watch is in watches_, so it cannot be
+    /// retired or drained, and `open_key` is the handle this watch owns at this instant.
+    /// Duplicating off-lock from a value read here is the handle-recycle hazard (the drain
+    /// closes the original, a later open reuses the value, the duplicate names a
+    /// stranger's key). The call itself rests on the object model, not on a document: it
+    /// references the object through the handle table and inserts an entry, the Key type
+    /// has no open procedure that dispatches into the configuration manager, so no
+    /// registry lock is taken (NtQueryKey does take that lock, which is why it runs only
+    /// on the worker). Measured cost on a healthy hive: p99 under 1 us over 500 keys
+    /// (#7877 step 0, 2026-11-25). Measured against a long hive operation (2026-11-26,
+    /// standalone probe, one box, docs/spark-flip-gate.md): while another process looped
+    /// RegSaveKeyExW over a 276 MB hive that a second process held a KEY_NOTIFY handle in,
+    /// DuplicateHandle stayed at a median of 0.5 us (max 37 us) while NtQueryKey and
+    /// RegOpenKeyExW stalled up to 1.3 s. Not measured: the held key's own hive being
+    /// loaded or unloaded, and Handle Manipulation auditing on.
+    /// Precedent for a microsecond kernel call under mu_: SetThreadpoolWait in unwatch()
+    /// and the drain-lane launch in retire_locked(). The duplicate carries KEY_NOTIFY only
+    /// (DUPLICATE_SAME_ACCESS), which NtQueryKey(KeyNameInformation) accepts. If this ever
+    /// proves too costly the named alternative is shared ownership of the handle
+    /// (shared_ptr<RegKeyHandle> on RegWatch and ProbeResult).
+    ///
+    /// A failure is never a fault and never skips the verification: the path check still
+    /// runs, the verdict counts the name check as undecided, and the failure is warned once
+    /// per watch until a duplicate succeeds (off-lock, with the key token and the error code
+    /// only). A duplicate is taken at EVERY staging, so a verification that is deferred and
+    /// retried (a refused launch) re-takes it: with Handle Manipulation auditing on that is
+    /// two more events per retry.
+    /// noexcept: DuplicateHandle and the moves cannot throw; the one allocation (the
+    /// staged warning) sits in a try/catch that drops the line.
+    void stage_held_duplicate_locked(RegWatch& w, SweepWork& work) noexcept {
+        if (w.subkey.empty() || !w.open_key || work.probe_launches.empty() ||
+            !work.probe_launches.back().job)
+            return;
+        HANDLE dup = nullptr;
+        DWORD err = ERROR_GEN_FAILURE; // the seam's answer
+        bool ok = false;
+        if (!verify_fail_duplicate_) {
+            ok = ::DuplicateHandle(
+                     ::GetCurrentProcess(), reinterpret_cast<HANDLE>(w.open_key.get()),
+                     ::GetCurrentProcess(), &dup, 0, FALSE, DUPLICATE_SAME_ACCESS) != 0;
+            if (!ok)
+                err = ::GetLastError();
+        }
+        if (ok) {
+            // Into a local owner at once: the job owns it from here (see ProbeJob).
+            work.probe_launches.back().job->held_dup.reset(reinterpret_cast<HKEY>(dup));
+            w.dup_failed_warned = false; // a duplicate works again: re-arm the warn
+            return;
+        }
+        verify_dup_failed_.fetch_add(1, std::memory_order_relaxed);
+        stage_warn_locked(work, SweepWork::StagedWarn::Kind::DupFailed, w, static_cast<LONG>(err),
+                          /*win32=*/true, "DuplicateHandle of the held key");
+    }
+
+    /// The per-watch flag a warn kind claims. Under mu_.
+    [[nodiscard]] static bool& warned_flag(RegWatch& w, SweepWork::StagedWarn::Kind kind) noexcept {
+        switch (kind) {
+        case SweepWork::StagedWarn::Kind::NameMissing:
+            return w.name_missing_warned;
+        case SweepWork::StagedWarn::Kind::Undecided:
+            return w.undecided_warned;
+        case SweepWork::StagedWarn::Kind::CommitUnconfirmed:
+            return w.commit_unconfirmed_warned;
+        case SweepWork::StagedWarn::Kind::DupFailed:
+            break;
+        }
+        return w.dup_failed_warned;
+    }
+
+    /// Under mu_. Stages a per-watch diagnostic for off-lock logging, unless this watch's flag
+    /// for the kind is already claimed. The claim is NOT taken here but in log_staged_warns (at
+    /// log time), so a staged line that is never logged (a pass that threw before
+    /// run_off_lock, or watch(), which logs nothing) does not consume the watch's warn: the
+    /// next occurrence stages it again. At most two entries per visited watch per pass (see
+    /// StagedWarn), so the per-pass reservation bounds it. A failed push_back drops the line
+    /// (a lost diagnostic, never a failed pass or commit).
+    void stage_warn_locked(SweepWork& work, SweepWork::StagedWarn::Kind kind, RegWatch& w,
+                           LONG code, bool win32, const char* what) {
+        if (warned_flag(w, kind))
+            return;
+        try {
+            work.warns.push_back({kind, w.spark_key, code, win32, what, &w, w.serial});
+        } catch (...) {
+        }
+    }
+
+    /// Under mu_. Stages the "could not decide" warn of a blind verification, naming the step
+    /// that failed (the held name, the fresh name, the open itself, or nothing readable).
+    void stage_undecided_warn_locked(RegWatch& w, const DetachedResult<ProbeResult>& r,
+                                     SweepWork& work) {
+        LONG code = 0;
+        bool win32 = false;
+        const char* what = "the verification's probe produced no result";
+        if (r.has_value()) {
+            const ProbeResult& pr = *r;
+            if (pr.held_queried && pr.held_name_status != 0) {
+                code = pr.held_name_status;
+                what = "the held key's name could not be read";
+            } else if (pr.ok && pr.mode == WatchMode::Target && pr.key_name_queried &&
+                       pr.key_name_status != 0) {
+                code = pr.key_name_status;
+                what = "the path's key name could not be read";
+            } else if (!pr.ok) {
+                code = static_cast<LONG>(pr.err);
+                win32 = true;
+                what = "the path could not be opened for the check";
+            } else {
+                what = "the names could not be compared";
+            }
+        }
+        stage_warn_locked(work, SweepWork::StagedWarn::Kind::Undecided, w, code, win32, what);
+    }
+
+    /// Off-lock: claim `wn`'s per-watch flag, re-checking under mu_ that the key still maps to
+    /// the very watch the line was staged for: the pointer (compared, never dereferenced from
+    /// the staged copy) AND the watch's serial, so a new watch that was allocated at a retired
+    /// watch's address under the same key cannot take a flag staged for the old one (the
+    /// pointer compare alone, as fault_action_still_current makes it, cannot tell them
+    /// apart). True when this call took the flag (the caller then logs). A short mu_
+    /// acquisition off the sweeper's own lock, like fault_action_still_current; noexcept with a
+    /// catch (a lock failure is a lost diagnostic).
+    [[nodiscard]] bool claim_warn(const SweepWork::StagedWarn& wn) noexcept {
+        try {
+            std::lock_guard lk(mu_);
+            const auto it = watches_.find(wn.key);
+            if (it == watches_.end() || it->second.get() != wn.watch ||
+                it->second->serial != wn.serial)
+                return false;
+            bool& flag = warned_flag(*it->second, wn.kind);
+            if (flag)
+                return false;
+            flag = true;
+            return true;
+        } catch (...) {
+            return false;
+        }
+    }
+
+    /// Off-lock: give the flag back after a log call that threw, so the next occurrence warns.
+    void unclaim_warn(const SweepWork::StagedWarn& wn) noexcept {
+        try {
+            std::lock_guard lk(mu_);
+            const auto it = watches_.find(wn.key);
+            if (it != watches_.end() && it->second.get() == wn.watch &&
+                it->second->serial == wn.serial)
+                warned_flag(*it->second, wn.kind) = false;
+        } catch (...) {
+        }
+    }
+
+    /// The code of a staged warn as text: "no status" / "no error code" when the line carries
+    /// none (a warn about a step that produced no NTSTATUS, or about no result at all), so a
+    /// zero is never printed as if the OS had answered STATUS_SUCCESS. `buf` is the caller's.
+    static const char* code_text(const SweepWork::StagedWarn& wn, char (&buf)[48]) noexcept {
+        if (wn.code == 0)
+            return wn.win32 ? "no error code" : "no status";
+        const unsigned long v = static_cast<unsigned long>(static_cast<unsigned>(wn.code));
+        if (wn.win32)
+            std::snprintf(buf, sizeof buf, "Win32 error %lu", v);
+        else
+            std::snprintf(buf, sizeof buf, "NTSTATUS 0x%08lx", v);
+        return buf;
+    }
+
+    /// Off-lock; a non-static member, noexcept with an internal catch (the same backstop as
+    /// log_pass_outcome). Logs the per-watch diagnostics staged by this pass. The watch's flag
+    /// is claimed HERE, at log time, and handed back if the log call throws, so a failed log
+    /// never burns a watch's warn. Never logs a registry path or name (the key token only).
+    /// A pass that throws between this call and publish_locked is not re-logged: the flag is
+    /// already set, which is the intended one-line-per-blind-episode behaviour. The
+    /// `warns_claimed_*` test counters count a line when its flag was claimed and the log call
+    /// returned without throwing; they cannot see whether the sink wrote it (the one text
+    /// assertion in the tests captures a sink).
+    void log_staged_warns(const SweepWork& work) noexcept {
+        for (const auto& wn : work.warns) {
+            if (!claim_warn(wn))
+                continue;
+            bool logged = false;
+            try {
+                char buf[48];
+                const char* code = code_text(wn, buf);
+                switch (wn.kind) {
+                case SweepWork::StagedWarn::Kind::NameMissing:
+                    spdlog::warn("spark_registry: no canonical name is recorded for '{}' ({}, {}) - "
+                                 "the held-handle rename check is disabled for this watch until a "
+                                 "later commit records one, so the watch is NOT protected against "
+                                 "a parent rename and re-create until then; not logged again for "
+                                 "this watch until a name is recorded",
+                                 ::yuzu::log_key_token(wn.key), wn.what, code);
+                    break;
+                case SweepWork::StagedWarn::Kind::Undecided:
+                    spdlog::warn("spark_registry: the rename check for '{}' could not decide ({}, "
+                                 "{}); this is not evidence that a rename happened, but the watch "
+                                 "is NOT protected against a parent rename and re-create until a "
+                                 "check decides; not logged again for this watch until a check "
+                                 "decides",
+                                 ::yuzu::log_key_token(wn.key), wn.what, code);
+                    break;
+                case SweepWork::StagedWarn::Kind::DupFailed:
+                    spdlog::warn("spark_registry: DuplicateHandle of the held key for '{}' failed "
+                                 "({}) - the name check cannot run for this verification, so the "
+                                 "watch is NOT protected against a parent rename and re-create "
+                                 "until a duplicate succeeds; not logged again for this watch "
+                                 "until one does",
+                                 ::yuzu::log_key_token(wn.key), code);
+                    break;
+                case SweepWork::StagedWarn::Kind::CommitUnconfirmed:
+                    spdlog::warn("spark_registry: the key name for '{}' could not be confirmed by a "
+                                 "second read when the watch was (re)established ({}: the two "
+                                 "back-to-back name reads differed, or the second open or read was "
+                                 "refused or failed), so the commit was retried and has not been "
+                                 "accepted; until a commit is confirmed the watch has no "
+                                 "notification coverage and no rename-and-recreate check, and is "
+                                 "reported as pending past its grace; not logged again for this "
+                                 "watch until one is",
+                                 ::yuzu::log_key_token(wn.key), wn.what);
+                    break;
+                }
+                logged = true;
+            } catch (...) {
+            }
+            if (!logged) {
+                unclaim_warn(wn);
+                continue;
+            }
+            switch (wn.kind) {
+            case SweepWork::StagedWarn::Kind::NameMissing:
+                warns_claimed_name_missing_.fetch_add(1, std::memory_order_relaxed);
+                break;
+            case SweepWork::StagedWarn::Kind::Undecided:
+                warns_claimed_undecided_.fetch_add(1, std::memory_order_relaxed);
+                break;
+            case SweepWork::StagedWarn::Kind::DupFailed:
+                warns_claimed_dup_failed_.fetch_add(1, std::memory_order_relaxed);
+                break;
+            case SweepWork::StagedWarn::Kind::CommitUnconfirmed:
+                warns_claimed_commit_unconfirmed_.fetch_add(1, std::memory_order_relaxed);
+                break;
+            }
+        }
+    }
+
     void resolve_probe_locked(RegWatch& w, DetachedResult<ProbeResult> r, SweepWork& work) {
         // `&& w.armed` is mandatory: a fire that landed while the verification was
         // outstanding consumed the notification (armed=false), so this probe is the
         // watch's RE-ARM and must commit; judging it would leave the watch deaf.
-        if (std::exchange(w.verify_probe, false) && w.armed) {
+        const bool was_verification = std::exchange(w.verify_probe, false);
+        if (was_verification && w.armed) {
             resolve_verify_locked(w, std::move(r), work);
             return;
         }
         if (r.has_value() && r->ok) {
+            if (r->commit_unconfirmed) { // #7877 item 31, R1: retry, never commit it
+                work.dead_results.push_back(std::move(*r)); // reserved per visit: nothrow
+                defer_commit_unconfirmed_locked(w, work);
+                return;
+            }
+            // A verification a fire converted into the re-arm (the fire cleared `armed`): the job
+            // ran no confirming read, so its name is unconfirmed exactly like one that failed it.
+            // Retried as an ordinary re-arm, which confirms (retry_fire_converted_locked). Only
+            // while the check is on (with it off nothing is confirmed anywhere) and only for a
+            // result a commit would record a name from.
+            if (was_verification && path_verify_interval().count() > 0 &&
+                name_worth_confirming(*r, !w.subkey.empty())) {
+                work.dead_results.push_back(std::move(*r)); // reserved per visit: nothrow
+                retry_fire_converted_locked(w);
+                return;
+            }
             commit_locked(w, std::move(*r), work);
             return;
         }
@@ -1601,7 +2545,11 @@ private:
         work.failed_emits.reserve(2 * cap);
         work.probe_launches.reserve(cap);
         work.old_events.reserve(cap);
-        work.old_keys.reserve(cap);
+        work.old_keys.reserve(cap); // also takes a never-launched job's duplicate (<= 1 per visit)
+        // At most two staged warns per visited watch (one visit runs one arm of the switch: a
+        // commit's NameMissing or a deferral's CommitUnconfirmed, a verification's NameMissing
+        // plus Undecided, or a Deferred launch's DupFailed).
+        work.warns.reserve(2 * cap);
         work.dead_results.reserve(cap);
         work.stale_calls.reserve(cap + kDrainLaneCap);
         work.drain_launches.reserve(drain_lane_cap_.load(std::memory_order_relaxed));
@@ -1690,8 +2638,17 @@ private:
                         {w.spark_key, gen_ + 1,
                          ProbeJob{w.root, w.subkey_w, w.subkey, core_, &w,
                                   /*create_wait=*/w.wait == nullptr, probe_hook_,
-                                  traversal_budget()},
+                                  traversal_budget(), name_hook_, RegKeyHandle{},
+                                  /*confirm_commit=*/path_verify_interval().count() > 0 &&
+                                      !w.verify_probe,
+                                  /*is_verification=*/w.verify_probe},
                          DetachedLaunch::LaunchFailed, std::nullopt});
+                    // The duplicate for the name compare, taken only AFTER the push_back
+                    // above (its string copies are the only throw sites in this block): a
+                    // throw before the duplicate exists leaves nothing to close, and
+                    // everything from here down cannot throw.
+                    if (w.verify_probe && w.armed)
+                        stage_held_duplicate_locked(w, work);
                     w.probe = ProbeState::Pending;
                     w.probe_gen = ++gen_;
                 } else {
@@ -1776,6 +2733,7 @@ private:
                 drain_outcomes_.emplace_back(lr.status, std::move(*lr.fn));
         }
         work.drain_launches.clear();
+        log_staged_warns(work); // off-lock, noexcept; the per-watch diagnostics
 
         // Dispatch establishment reports before this pass's emits/faults
         // (rung 9c PR-6 item 1; same order as spark_service.cpp). What that
@@ -1896,6 +2854,9 @@ private:
     /// MOVED into `work.stale_calls` (pre-reserved by sweep_locked - the move
     /// itself cannot throw) so its handle-closing destructor runs when `work`
     /// is destroyed by the caller, off-lock - never destroyed here, under mu_.
+    /// The same rule covers a never-launched VERIFICATION job's duplicate of the held
+    /// handle (ProbeJob::held_dup, #7877 item 31 R1): it moves into `work.old_keys`
+    /// (reserved to the pass cap; at most one per visited watch), never closed here.
     void reconcile_probe_launches_locked(SweepWork& work) noexcept {
         for (auto& pl : work.probe_launches) {
             if (pl.job) {
@@ -1904,6 +2865,14 @@ private:
                 if (it != watches_.end() && it->second->probe == ProbeState::Pending &&
                     it->second->probe_gen == pl.gen && !it->second->call)
                     defer_admission_locked(*it->second, DetachedLaunch::LaunchFailed);
+                // A verification job's duplicate of the held handle must not be closed
+                // here, under mu_: hand it to the pass's off-lock disposal (#7877 item 31,
+                // R1). old_keys is reserved to the pass cap and a visited watch stages at
+                // most one launch OR commits one superseded key, never both, so this
+                // nothrow move stays inside the reservation and the function keeps its
+                // noexcept.
+                if (pl.job->held_dup)
+                    work.old_keys.push_back(std::move(pl.job->held_dup));
                 continue;
             }
             auto it = watches_.find(pl.key);
@@ -2269,12 +3238,15 @@ private:
     /// Mechanism-global (never per-watch, so a stale pointer cannot alias a fresh
     /// watch): bumped at every probe reservation and every retirement.
     std::uint64_t gen_{0};
+    std::uint64_t watch_serial_{0}; ///< under mu_: the next RegWatch::serial
     /// Mechanism-global: bumped whenever an observation gap is recorded.
     std::uint64_t resync_epoch_{0};
     std::string sweep_cursor_;
     std::vector<std::pair<DetachedLaunch, std::variant<DetachedCall<std::monostate>, DrainJob>>>
         drain_outcomes_; ///< sweeper-thread private scratch between run_off_lock and publish_locked
     std::shared_ptr<const ProbeHook> probe_hook_;                ///< test seam
+    std::shared_ptr<const NameHook> name_hook_;                  ///< test seam (#7877 item 31, R1)
+    bool verify_fail_duplicate_{false}; ///< test seam, under mu_: DuplicateHandle treated as failed
     std::shared_ptr<const std::function<void()>> sweep_hook_; ///< test seam (sre6-1 coverage)
     std::shared_ptr<const std::function<void()>> emit_bookkeeping_hook_; ///< test seam (PR #4225 review)
     SparkDetachedLane probe_lane_;
@@ -2314,6 +3286,22 @@ private:
     std::atomic<std::uint64_t> verify_launched_{0};  ///< verification probes actually launched
     std::atomic<std::uint64_t> verify_lost_{0};      ///< path verifications that found the path lost
     std::atomic<std::uint64_t> verify_undecided_{0}; ///< path verifications that could not decide
+    // #7877 item 31, R1 (test-only): name verdicts (moved, re-pointed, hive unloaded), a name
+    // query attempted without a comparable pair, commits that recorded a canonical name,
+    // Target commits of a non-root watch that recorded none, DuplicateHandle failures.
+    std::atomic<std::uint64_t> verify_name_lost_{0};
+    std::atomic<std::uint64_t> verify_name_undecided_{0};
+    std::atomic<std::uint64_t> commit_name_recorded_{0};
+    std::atomic<std::uint64_t> commit_name_missing_{0};
+    std::atomic<std::uint64_t> verify_dup_failed_{0};
+    /// Commit-capture confirmations that failed: a commit not accepted and retried.
+    std::atomic<std::uint64_t> commit_capture_retry_{0};
+    // Per-watch warns whose flag was claimed and whose log call returned (test-only; the
+    // per-watch flags are on RegWatch).
+    std::atomic<std::uint64_t> warns_claimed_name_missing_{0};
+    std::atomic<std::uint64_t> warns_claimed_undecided_{0};
+    std::atomic<std::uint64_t> warns_claimed_dup_failed_{0};
+    std::atomic<std::uint64_t> warns_claimed_commit_unconfirmed_{0};
     std::atomic<std::size_t> retiring_cap_{kRetiringCap};
     std::atomic<std::int64_t> caller_wait_ms_{kRegCallerWaitBudget.count()};
     std::atomic<std::int64_t> health_grace_ms_{kRegHealthGrace.count()};
@@ -2360,6 +3348,14 @@ registry_debug_counters_for_test(const ISparkMechanism& mech) {
     return real->debug_counters();
 }
 
+std::optional<std::wstring> registry_committed_name_for_test(const ISparkMechanism& mech,
+                                                             const std::string& spark_key) {
+    const auto* real = dynamic_cast<const WindowsRegistryMechanism*>(&mech);
+    if (!real)
+        return std::nullopt;
+    return real->committed_name_for_test(spark_key);
+}
+
 } // namespace yuzu::agent
 
 #else // ── Non-Windows: registry-change spark is Windows-only ─────────────────
@@ -2382,6 +3378,11 @@ bool set_registry_test_controls_for_test(ISparkMechanism&, RegistryMechanismTest
 
 std::optional<RegistryMechanismDebugCounters>
 registry_debug_counters_for_test(const ISparkMechanism&) {
+    return std::nullopt;
+}
+
+std::optional<std::wstring> registry_committed_name_for_test(const ISparkMechanism&,
+                                                             const std::string&) {
     return std::nullopt;
 }
 

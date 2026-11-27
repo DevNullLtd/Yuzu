@@ -5797,7 +5797,8 @@ groups:
       # cannot be read, and counts every such abort as
       # yuzu_server_guardian_reconciles_total{result="degraded"}. The causes are the
       # policy generation read (the first read before admission and the fresh read
-      # after it), the rule store, the Baseline deployed-set read, a rule bundle load
+      # after it), the rule store, the Baseline deployed-set read, the gateway route directory read
+      # for an agent whose session cannot deliver, a rule bundle load
       # that timed out waiting for another load or threw, and the tag or property
       # store during per-agent scope evaluation. YuzuGuardianReadDegraded counts only
       # the rule store reads of those, and the policy generation read and the Baseline
@@ -5833,12 +5834,13 @@ groups:
             that are behind the server's policy generation stay behind until the read
             recovers, and an agent with nothing armed yet receives no rules, unscoped
             rules included. The counter covers the policy generation read, the rule
-            store, the Baseline deployed-set read, a rule bundle load failure, and the
+            store, the Baseline deployed-set read, the gateway route directory read (for an
+            agent whose session cannot deliver), a rule bundle load failure, and the
             tag or property store read during scope evaluation. Find which: the
             guaranteed_state.reconcile audit rows with result=degraded and a detail
             beginning "heartbeat reconcile ABORTED" name the cause ("policy generation
             unreadable", "rule store degraded", "baseline store degraded", "rule
-            bundle load failed", "scope store degraded"), and the server warn log
+            bundle load failed", "scope store degraded", "route directory unreadable"), and the server warn log
             carries the same. The first policy generation read, before admission,
             writes no audit row, so a rising counter with no such rows points at that
             read. A rule store cause also fires YuzuGuardianReadDegraded and a scope
@@ -5847,7 +5849,9 @@ groups:
             When only yuzu_server_guardian_reconcile_exceptions_total rose, the cause
             is a throw, not a store abort: the server warn line "Heartbeat guardian
             reconcile threw for agent=..." carries the exception text.
-            Check Postgres reachability and yuzu_pg_* pool saturation first. The
+            Check Postgres reachability and yuzu_pg_* pool saturation first (the route directory
+            read is on the same Postgres and is not part of /readyz, so this alert is its
+            signal). The
             agents are retried on later heartbeats, so no operator action is needed
             once the store recovers.
           runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/guaranteed-state.md#4-push-to-agents"

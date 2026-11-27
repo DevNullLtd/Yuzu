@@ -1204,7 +1204,7 @@ endif
 # 2026-10-04 re-balance below.)
 # The carve uses only tags with >=25 cases (hand-pruned from a simulated-annealing
 # fit that used tiny tags and was 1-3% tighter): A is guarded by [ack],[actions],
-# [browser_policy],[drain],[execution_artifacts],[guard],[runtime]; B by [agent],
+# [browser_policy],[drain],[execution_artifacts],[guard],[runtime],[7877]; B by [agent],
 # [liveness],[mechanism],[trigger_engine] plus the tags the 2026-10-04 re-balance below added.
 # agent_shard_a_tags / agent_shard_b_tags below are authoritative. Re-balance by moving a tag
 # between the two variables, never by hand-editing a spec string.
@@ -1219,6 +1219,14 @@ endif
 # uploads meson-logs/progress.log with a RED run's artifact), take each case's tags from
 # `yuzu_agent_tests --list-tests -r xml '~[.]~[tsan-heavy]~[flaky-4086]'`, place it by the
 # partition rule above, and sum per shard. Count is not time: use the sums, not the counts.
+#
+# RE-BALANCE 2026-11-26 (#7877 item 31, R1): tag [7877] (the Spark Registry rename-plus-recreate
+# cases, 39 of them, all also tagged [mechanism]) is placed in shard A. The [mechanism] tag had
+# put them in shard B, which on Windows then ran past its 50% budget
+# (docs/testing/unit-test-conventions.md); [7877] is in A's tag list, so they run there instead
+# and B drops back. A dedicated shard is the longer-term answer; a follow-up issue is filed when
+# the item 31 PR opens. The measured figures are not kept here because they rot: they are in the
+# message of commit 689215c1bd and in docs/spark-flip-gate.md (R1 final rig run).
 #
 # The real-DISM cases ([actions][windows_optional_features] in
 # test_windows_optional_features_local_dispatcher.cpp ~157-237) stay in ONE shard
@@ -1270,7 +1278,7 @@ endif
 # check-pg-shard-partition.py pins this same literal as AGENT_REF_SPEC and fails if any
 # shard spec does not end with it, so edit both together (an edit to only one is caught).
 agent_shard_suffix = '~[.]~[tsan-heavy]~[flaky-4086]'
-agent_shard_a_tags = ['ack', 'actions', 'browser_policy', 'drain', 'execution_artifacts', 'guard', 'runtime']
+agent_shard_a_tags = ['ack', 'actions', 'browser_policy', 'drain', 'execution_artifacts', 'guard', 'runtime', '7877']
 agent_shard_b_tags = ['agent', 'liveness', 'mechanism', 'trigger_engine', 'log_handoff', 'posix_actions']
 _agent_a_terms = []
 _agent_a_excl = ''
@@ -1307,7 +1315,8 @@ agent_shard_deps = [reserved_name_fixture_plugin, invalid_name_fixture_plugin, r
 # attempt 4, job 126911227871); both passed on the rerun with no code change, so the box was
 # loaded, not hung. #7135 records ~222s for C alone on a 16-thread host. The worst case is at
 # least 240s (a timeout is a floor, not a measurement) and the limit is 2x that. Shards A
-# (98-102s) and B (70s) are well under. Do not shorten tests to fit; split the shard instead
+# and B are under their 240s limits; their current figures are in docs/spark-flip-gate.md (the
+# 2026-11-26 R1 rig record) because they rot here. Do not shorten tests to fit; split the shard instead
 # (#7177). Side effect to know about: flake-retry.py's 80%-of-timeout warning mark for C moves
 # from 192s to 384s, so C can grow ~80% before it warns; #7177 restores an early warning. The
 # one other measured contention figure is for SERVER `~[pg]` (c0 289s -> c4 603s, ~2.1x,
@@ -1788,6 +1797,7 @@ if build_server
       'unit/server/test_command_replay_horizon.cpp', # #3678: outbox redelivery horizon < agent dedup ring (compile-time cross-component pin)
       'unit/server/test_gateway_route_store.cpp', # HA WS-4 4.1: fenced agent->cluster routing directory
       'unit/server/test_gateway_route_reap_rules.cpp', # HA WS-4 4.2a: PURE decide_reap decision set (PR #4299 round-3 decide/apply split)
+      'unit/server/test_guardian_directory_route.cpp', # HA WS-5 #5685: the route-directory decision behind the Guardian reconcile send (real registry + real GatewayRouteStore)
       'unit/server/test_gateway_route_wiring.cpp', # HA WS-4 4.1: GatewayUpstreamServiceImpl wiring onto GatewayRouteStore (re-announce-vs-fresh, connect/disconnect/heartbeat, fail-open)
       'unit/server/test_gateway_mgmt_stub_pool.cpp', # HA WS-4 4.3: parse_gateway_cluster_addrs + GatewayMgmtStubPool resolution (cross-cluster fan-out)
       'unit/server/test_gateway_forward_guard.cpp', # #2146 D7: forward_gateway_pending spawn/setup guard seam (resolve-once, flag ordering, loop continues)
