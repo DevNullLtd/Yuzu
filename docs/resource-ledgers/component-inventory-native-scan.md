@@ -19,7 +19,8 @@ what is listed.
   program headers of exactly the format's own entry size, 4,096 dynamic entries (64 KiB), and for
   Mach-O at most 16 fat slices, 1,024 load commands in at most 512 KiB, plus a per-reader budget of
   4 MiB and 4,096 reads. The plugin keeps a 255-byte name cap on top. A count or size past a bound is
-  `unreadable` for that file, never a partial answer.
+  `unreadable` for a library, or a file whose type was never stated, and no row for a file whose header
+  states a non-library type; never a partial answer.
 - **Memory:** the buffers are `std::string` values owned by the readers' frames, freed at return. Worst
   case for one file is the 4 MiB read budget; the rows are bounded by count (5,000) and hold paths of at
   most 32 levels. No allocation persists between runs.
