@@ -556,6 +556,17 @@ agent_test_exe = executable(
     'unit/test_installed_apps_registry_walk.cpp', # #4711: Uninstall-hive walk against a process-suffixed scratch key: ok/absent/failed/mixed (Windows-only; no-op TU elsewhere)
     'unit/test_bundle_id_read.cpp',            # #4710: agent-core bounded bundle-id pass driver (portable; the CF reader is injected)
     'unit/test_proc_snapshot_read.cpp',        # SRE-1: agent-core bounded libproc snapshot driver (portable; the reader is injected)
+    'unit/test_bounded_single_flight.cpp',      # the shared single-flight slot, bounded driver and status mapping (portable; the call is injected)
+    'unit/test_win_wts_sessions.cpp',           # agent-core bounded WTS session read (injected reader on every OS; one real-API case on Windows)
+    'unit/test_win_share_enum.cpp',             # agent-core bounded share enumeration
+    'unit/test_win_session_enum.cpp',           # agent-core bounded server-session enumeration
+    'unit/test_win_account_enum.cpp',           # agent-core bounded account enumeration
+    'unit/test_users_win_rows.cpp',             # users plugin Windows row formatters
+    'unit/test_users_tool_budget.cpp',          # users plugin per-account tool budget
+    'unit/test_win_vss_snapshots.cpp',          # agent-core bounded VSS snapshot enumeration
+    'unit/test_win_join_registry.cpp',          # agent-core bounded join-information and registry reads
+    'unit/test_device_identity_win.cpp',        # device_identity Windows decisions
+    'unit/test_win_adapter_list.cpp',           # agent-core bounded network adapter list
     'unit/test_msi_packages_actions.cpp',     # Wave 4 PR4.3a remediation: real msi_packages.dylib driven
                                                 # end to end via LocalDispatcher (macOS and Windows, self-gated)
     'unit/test_msi_packages_inventory.cpp',   # pure list_inventory builder over the committed Kingsley REAL CAPTURE (fixture via YUZU_TEST_FIXTURE_DIR; runs on every OS)
@@ -830,7 +841,10 @@ agent_test_exe = executable(
   # backslashes either fail to compile or silently mangle the path (see that define's
   # own comment for the full reasoning).
   cpp_args: test_partial_init_args + agent_platform_args + agent_test_native_args +
-            ['-DYUZU_AGENT_SRC_DIR="' +
+            # This image is never unloaded, and its tests instantiate the bounded
+            # single-flight driver over their own slots.
+            ['-DYUZU_BOUNDED_DRIVER_TEST_IMAGE',
+             '-DYUZU_AGENT_SRC_DIR="' +
              (meson.project_source_root() / 'agents' / 'core' / 'src').replace('\\', '/') +
              '"',
              # Wave 7 PR7.1: committed fixture root; autoruns' REAL CAPTURE tests
@@ -1470,7 +1484,6 @@ if host_machine.system() == 'windows'
   echo_test_deps += cxx.find_library('wevtapi')  # echo_netconn_win.cpp EvtQuery/EvtRender
   echo_test_deps += cxx.find_library('ws2_32')   # winsock2 symbols the iphlpapi/netioapi headers in echo_netqual_boot.cpp pull in
   echo_test_deps += cxx.find_library('mpr')      # echo_mapdrive_collector.cpp WNet outbound
-  echo_test_deps += cxx.find_library('netapi32') # echo_mapdrive_collector.cpp NetSessionEnum inbound
   echo_test_deps += cxx.find_library('powrprof') # echo_power_collector.cpp PowerRegisterSuspendResumeNotification
 elif host_machine.system() == 'linux'
   # echo_power_collector.cpp is compiled DIRECTLY into this exe, and its Linux
@@ -4789,6 +4802,16 @@ test('virtualization wsl Windows shell wiring lexical gate',
 test('agent httplib clients disable response decompression lexical gate (WP14-A)',
   _python3_test,
   args: [files('test_agent_http_no_decompress_lexical.py')],
+  suite: 'agent',
+  timeout: 30,
+)
+
+# ADR-3008: plugin code makes no direct call to the Windows APIs agent-core bounds, never includes
+# the single-flight driver or names a win_*.hpp test seam, and its bounded_call sites are frozen
+# file by file. Lexical; carries its own mutation self-test.
+test('plugin bounded OS call lexical gate (ADR-3008)',
+  _python3_test,
+  args: [files('test_bounded_os_call_lexical.py')],
   suite: 'agent',
   timeout: 30,
 )

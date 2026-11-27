@@ -10,12 +10,14 @@
  * the full pinned wire-format contract.
  *
  * This header DECLARES (never defines) the three per-OS entry points; each
- * leg TU defines exactly one. It DEFINES the pure row formatters, the ctx
- * wrappers around them (the only ROW writers in this plugin -- see the note
- * at the wrappers), and mark_result_partial().
+ * leg TU defines exactly one. It DEFINES the pure row formatters, the pure
+ * plan of the Windows snapshots rows, the ctx wrappers around the formatters
+ * (the only ROW writers in this plugin -- see the note at the wrappers), and
+ * mark_result_partial().
  */
 #pragma once
 
+#include <yuzu/agent/win_vss_snapshots.hpp> // types only here: the pure snapshot plan
 #include <yuzu/plugin.hpp>
 #include <yuzu/string_utils.hpp>
 
@@ -23,9 +25,14 @@
 
 #include <spdlog/spdlog.h>
 
+#include <cstdint>
+#include <format>
+#include <functional>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
+#include <vector>
 
 namespace yuzu::filesystem_posture {
 
@@ -127,6 +134,149 @@ inline std::string format_snapshot_row(std::string_view mount_point, std::string
     out += '|';
     out += yuzu::util::safe_output_field(detail);
     return out;
+}
+
+// ── Windows snapshots plan ──────────────────────────────────────────────
+//
+// What one VSS read means as rows and degradation marks. Pure, so every arm
+// runs in the unit suite on every OS; the Windows leg only reads, resolves
+// mount points and writes.
+
+/// The values of one snapshot row, unescaped.
+struct SnapshotRow {
+    std::string mount_point, name, kind, detail;
+};
+
+/// One degradation: PERMISSION_DENIED when `denied`, otherwise CONSTRAINED.
+struct SnapshotMark {
+    bool denied = false;
+    std::string detail;
+    std::string_view cause{}; ///< set only when the read did not complete: the provenance suffix
+};
+
+struct VssRowPlan {
+    std::vector<SnapshotRow> rows;
+    std::vector<SnapshotMark> marks; ///< applied in order; the last one is the one reported
+};
+
+/// E_ACCESSDENIED, spelled out because this header also builds off Windows.
+inline constexpr std::uint32_t kVssAccessDenied = 0x80070005u;
+
+/// Renders a VSS step failure for both the row `detail` and the
+/// degradation mark. E_ACCESSDENIED is named explicitly: it is the one
+/// failure here an operator can actually act on, and it is what #1442 will
+/// turn this leg into fleet-wide.
+inline std::string vss_failure_detail(std::string_view step, std::int32_t hr) {
+    const auto code = static_cast<std::uint32_t>(hr);
+    if (code == kVssAccessDenied) {
+        // "commonly indicates", not "lacks": E_ACCESSDENIED from a COM call
+        // can also arise from COM security negotiation or the VSS service's
+        // own ACL. Administrative rights are the overwhelmingly likely cause
+        // and the one an operator can act on, but asserting a single cause
+        // from a generic HRESULT would be stating more than the code knows.
+        return std::format("{} denied (0x{:08X}): VSS snapshot enumeration requires "
+                           "administrative rights; this commonly indicates the agent service "
+                           "account lacks them",
+                           step, code);
+    }
+    return std::format("{} failed: 0x{:08X}", step, code);
+}
+
+namespace detail {
+/// The call a failed step names. com_init has its own fixed text instead.
+inline std::string_view vss_call_name(yuzu::agent::win::VssStep step) {
+    using yuzu::agent::win::VssStep;
+    switch (step) {
+    case VssStep::create:
+        return "CreateVssBackupComponents";
+    case VssStep::initialize:
+        return "InitializeForBackup";
+    case VssStep::query:
+        return "Query";
+    case VssStep::none:
+    case VssStep::com_init:
+    case VssStep::next:
+        break;
+    }
+    return "IVssEnumObject::Next";
+}
+} // namespace detail
+
+/// `mount_point_of` maps a snapshot's non-empty originating volume path onto the
+/// mount-point vocabulary the mounts action reports.
+inline VssRowPlan
+plan_vss_rows(const yuzu::agent::win::VssSnapshotsRead& read,
+              const std::function<std::string(const std::string&)>& mount_point_of) {
+    using yuzu::agent::win::VssStep;
+    VssRowPlan plan;
+    // A failure writes BOTH a `none` row and a degradation mark: it must stay
+    // distinguishable from a genuinely empty snapshot set (peer H6).
+    const auto none_row = [&plan](std::string why) {
+        plan.rows.push_back({"-", "-", "none", std::move(why)});
+    };
+
+    if (read.status != yuzu::agent::BoundedStatus::Completed) {
+        const std::string_view cause = yuzu::agent::bounded_cause(read.status);
+        const std::string why = std::format("VSS enumeration did not answer: {}", cause);
+        none_row(why);
+        plan.marks.push_back({false, why, cause});
+        return plan;
+    }
+    if (!read.api_available) {
+        none_row("built without the VSS SDK headers");
+        plan.marks.push_back({false, "SDK header vsbackup.h not present at build time"});
+        return plan;
+    }
+
+    for (const auto& s : read.snapshots) {
+        plan.rows.push_back(
+            {s.original_volume.empty() ? std::string{"-"} : mount_point_of(s.original_volume),
+             s.snapshot_id, "vss", s.device_object});
+    }
+
+    if (read.failed_step != VssStep::none) {
+        const std::string why =
+            read.failed_step == VssStep::com_init
+                ? std::string{"COM initialisation failed"}
+                : vss_failure_detail(detail::vss_call_name(read.failed_step), read.hr);
+        // Rows already read are real; only a read that produced nothing needs
+        // the `none` sentinel to carry the failure.
+        if (plan.rows.empty())
+            none_row(why);
+        // A privilege denial is PERMISSION_DENIED at every step, mid-walk
+        // included, so a status-keyed consumer can tell "not allowed to read
+        // this" from any other degradation.
+        plan.marks.push_back({static_cast<std::uint32_t>(read.hr) == kVssAccessDenied, why});
+        return plan;
+    }
+
+    // Only claim an empty machine when the walk was COMPLETE AND UNNARROWED: a
+    // truncated list, a failed SetContext and a skipped non-snapshot object each
+    // mean the walk did not see everything (Gate 3 cpp-safety F3, Gate 4 CA-3).
+    if (plan.rows.empty()) {
+        const bool complete =
+            !read.truncated && !read.context_narrowed && !read.skipped_wrong_type;
+        none_row(complete ? "no shadow copies present on any volume"
+                          : "no shadow copies observed, but the enumeration was incomplete "
+                            "-- see the degraded status for why");
+    }
+    // set_result_status ASSIGNS -- last writer wins -- so these run
+    // least-material first, leaving the most material cause (an incomplete
+    // list) as the one an operator sees.
+    if (read.skipped_wrong_type) {
+        plan.marks.push_back(
+            {false, "the provider returned a non-snapshot object; it was skipped"});
+    }
+    if (read.context_narrowed) {
+        plan.marks.push_back(
+            {false,
+             "SetContext(VSS_CTX_ALL) failed; only the default snapshot context was enumerated"});
+    }
+    if (read.truncated) {
+        plan.marks.push_back({false, std::format("snapshot list truncated at the {}-entry cap",
+                                                 yuzu::agent::win::kMaxVssSnapshots)});
+    }
+    return plan;
 }
 
 // ── ctx wrappers: the only ROW writers in this plugin ──

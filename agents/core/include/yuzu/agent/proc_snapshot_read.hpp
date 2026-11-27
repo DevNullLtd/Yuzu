@@ -21,11 +21,8 @@
  * A process-wide slot admits one read at a time. While a read is in flight the next call answers
  * at once instead of stacking another thread: Busy when the read is healthy (a concurrent
  * dispatch, retry shortly), Abandoned when an earlier call hit its deadline and its worker is
- * still blocked in the kernel. The worker releases the slot itself when it returns, so recovery
- * is automatic. A Rejected admission means the worker never ran, so the caller releases the slot.
- * The outstanding-call ceiling that produces Rejected is PER IMAGE, so the driver is a
- * header-only template taking the slot by reference: production binds agent-core's slot, tests
- * bind their own.
+ * still blocked in the kernel. The slot and the driver are the shared ones
+ * (bounded_single_flight.hpp, which states the release and recovery rules).
  *
  * WHAT IS READ
  * ------------
@@ -36,16 +33,13 @@
  * gate (tests/test_process_introspect_no_task_port_lexical.py) scans this unit's source too.
  */
 
-#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <functional>
-#include <memory>
-#include <mutex>
-#include <type_traits>
+#include <utility>
 
-#include <bounded_wait.hpp> // yuzu::shared::bounded_call_ex (agents/shared)
-#include <yuzu/plugin.h>    // YUZU_EXPORT
+#include <yuzu/agent/bounded_single_flight.hpp>
+#include <yuzu/plugin.h> // YUZU_EXPORT
 
 namespace yuzu::agent {
 
@@ -58,13 +52,8 @@ struct ProcSnapshot {
     std::uint64_t start_abstime = 0; ///< mach absolute time at process start (monotonic)
 };
 
-enum class ProcSnapshotStatus {
-    Completed, ///< the read returned within the deadline (snap.err may still be nonzero)
-    TimedOut,  ///< deadline hit (or the reader threw, or the budget was already spent): no answer
-    Busy,      ///< another read is in flight and healthy; none was started by this call
-    Abandoned, ///< an earlier call hit its deadline and its worker is still blocked; none started
-    Rejected,  ///< the outstanding-call ceiling refused, or setup failed: the worker never ran
-};
+/// The shared statuses (bounded_status.hpp). A Completed read may still carry a nonzero snap.err.
+using ProcSnapshotStatus = BoundedStatus;
 
 struct ProcSnapshotResult {
     ProcSnapshotStatus status = ProcSnapshotStatus::Rejected;
@@ -74,115 +63,22 @@ struct ProcSnapshotResult {
 /// libproc answers in microseconds; this only bounds a kernel wait that never ends.
 inline constexpr std::chrono::milliseconds kProcSnapshotDeadline{5000};
 
-/// The single-flight slot: free, busy (a healthy read in flight) or abandoned (a read past its
-/// deadline whose worker is still blocked). Pure and thread-free, like DismSlot.
-///
-/// Each acquisition carries a generation, so a late mark_abandoned from a caller whose worker has
-/// already released (and whose slot a NEW dispatch has since acquired) cannot land on that new,
-/// healthy read. The word packs the state in the low 2 bits and a 62-bit generation above it: at
-/// one acquisition per nanosecond the generation would take about 146 years to wrap, so wrap is
-/// not a practical concern and is not handled.
-class ProcSnapshotSlot {
-public:
-    enum class Acquire { acquired, busy, abandoned };
-    struct Ticket {
-        Acquire result = Acquire::busy;
-        std::uint64_t generation = 0; ///< meaningful only when result == acquired
-    };
-
-    [[nodiscard]] Ticket try_acquire() noexcept {
-        std::uint64_t w = word_.load(std::memory_order_acquire);
-        for (;;) {
-            if (state_of(w) != kFree)
-                return {state_of(w) == kAbandoned ? Acquire::abandoned : Acquire::busy, 0};
-            const std::uint64_t gen = (w >> kStateBits) + 1;
-            if (word_.compare_exchange_weak(w, (gen << kStateBits) | kBusy,
-                                            std::memory_order_acquire,
-                                            std::memory_order_acquire))
-                return {Acquire::acquired, gen};
-        }
-    }
-    /// Called by the caller whose deadline fired, with the generation of ITS acquisition. A CAS on
-    /// (generation, busy): a worker that finished at the deadline has already released, and a
-    /// stale generation (the slot was released and re-acquired since) does nothing.
-    void mark_abandoned(std::uint64_t generation) noexcept {
-        std::uint64_t expected = (generation << kStateBits) | kBusy;
-        word_.compare_exchange_strong(expected, (generation << kStateBits) | kAbandoned,
-                                      std::memory_order_acq_rel, std::memory_order_relaxed);
-    }
-    /// Called by the worker when its read returns or throws (or by the caller when the worker
-    /// never ran). Only the current owner calls it, so keeping the generation is race-free.
-    void release() noexcept {
-        std::uint64_t w = word_.load(std::memory_order_relaxed);
-        while (!word_.compare_exchange_weak(w, (w & ~kStateMask) | kFree,
-                                            std::memory_order_release,
-                                            std::memory_order_relaxed)) {
-        }
-    }
-
-private:
-    static constexpr std::uint64_t kFree = 0;
-    static constexpr std::uint64_t kBusy = 1;
-    static constexpr std::uint64_t kAbandoned = 2;
-    static constexpr int kStateBits = 2;
-    static constexpr std::uint64_t kStateMask = 3;
-    static constexpr std::uint64_t state_of(std::uint64_t w) noexcept { return w & kStateMask; }
-    std::atomic<std::uint64_t> word_{0};
-};
+using ProcSnapshotSlot = SingleFlightSlot;
 
 namespace detail {
 
 /// Header-only so tests can instantiate it in their own image. `reader` is a callable
-/// `ProcSnapshot(int pid)`; `slot` must outlive any abandoned worker (a static).
+/// `ProcSnapshot(int pid)`; `slot` must outlive any abandoned worker (never destroyed).
 template <typename Reader>
 ProcSnapshotResult bounded_proc_snapshot(ProcSnapshotSlot& slot, int pid,
                                          std::chrono::milliseconds deadline, Reader reader) {
-    static_assert(std::is_nothrow_move_constructible_v<Reader>,
-                  "a throwing Reader move would escape with the slot held");
+    const auto flight = bounded_single_flight(
+        slot, deadline, SlotWait::none,
+        [pid, reader = std::move(reader)]() mutable -> ProcSnapshot { return reader(pid); });
     ProcSnapshotResult out;
-    // Admission first: a call during an in-flight read is Busy/Abandoned even with a spent budget.
-    const auto ticket = slot.try_acquire();
-    switch (ticket.result) {
-    case ProcSnapshotSlot::Acquire::acquired:
-        break;
-    case ProcSnapshotSlot::Acquire::busy:
-        out.status = ProcSnapshotStatus::Busy;
-        return out;
-    case ProcSnapshotSlot::Acquire::abandoned:
-        out.status = ProcSnapshotStatus::Abandoned;
-        return out;
-    }
-    if (deadline <= std::chrono::milliseconds::zero()) {
-        slot.release(); // nothing handed off
-        out.status = ProcSnapshotStatus::TimedOut;
-        return out;
-    }
-    auto worker = [&slot, pid, reader = std::move(reader)]() mutable -> ProcSnapshot {
-        // Releaser FIRST: runs when the worker returns or throws, long after a TimedOut caller.
-        struct Releaser {
-            ProcSnapshotSlot& s;
-            ~Releaser() { s.release(); }
-        } releaser{slot};
-        return reader(pid);
-    };
-    auto r = yuzu::shared::bounded_call_ex(deadline, std::move(worker));
-    switch (r.status) {
-    case yuzu::shared::BoundedCallStatus::Completed:
-        out.status = ProcSnapshotStatus::Completed;
-        out.snap = *r.value;
-        break;
-    case yuzu::shared::BoundedCallStatus::TimedOut:
-        // Also a throwing reader, which returns at once with no value. If the worker is still
-        // running, mark it abandoned so the next dispatch is told so, not just "busy".
-        slot.mark_abandoned(ticket.generation);
-        out.status = ProcSnapshotStatus::TimedOut;
-        break;
-    case yuzu::shared::BoundedCallStatus::Rejected:
-        // The worker never ran, so no releaser exists: release the slot here.
-        slot.release();
-        out.status = ProcSnapshotStatus::Rejected;
-        break;
-    }
+    out.status = flight.status;
+    if (flight.value)
+        out.snap = *flight.value;
     return out;
 }
 
