@@ -2356,8 +2356,9 @@ dispatch-tag capability check), and it applies the per-OS kill switch (#5294) to
 delivery-path read only TRY-locks `stream_mu`, so a stalled stream write cannot stall the dispatch gate. Follow-up, deliberately not done here (touching Erlang triggers the gateway rows): the header comment of `gateway/apps/yuzu_gw/src/yuzu_gw_upstream.erl` (about lines 169-173) still quotes the old log text and describes `connected_unverified` as conditional on a local session; update it with the next gateway-touching change.
 (b) *hp-2, snapshot half.* The fleet snapshot's `os` on a replica with no session comes from the presence row
 (a primary-key read, only when this heartbeat's presence write succeeded; local wins; blank stays blank). The
-guardian heartbeat reconcile on a non-owning replica is NOT done: its push needs a local session, so it still
-reports `no_session`, and #5685 stays open for it. (c) *#6339.* `resolve_sessions` refuses a session id whose
+guardian heartbeat reconcile on a non-owning replica is done in part, below (Update, HA WS-5 PR A): a local session that cannot deliver is
+routed through the directory; an agent with no local session at all still reports `no_session` until the gateway's replay lands, an
+accepted residual awaiting the project lead, so #5685 stays open until then. (c) *#6339.* `resolve_sessions` refuses a session id whose
 local map and directory row name different agents (`session_lookup/agent_mismatch`) and lists it for replay (not
 counted as an unknown session), so the gateway replays `ProxyRegister` and the register path decides who holds it (the agent that is not the
 row's holder is refused `held_by_other_agent`); the no-row `announce_connected` probe is not added. This
@@ -2423,7 +2424,32 @@ every session lacks a delivery path (after a directory outage) an unfiltered bro
 one batched directory read per dispatch, and a no-path session whose directory row is stale can be reported
 queued although it never reaches the agent (the same shape as spike finding 10). Not measured: the query cost at
 fleet scale, and the one extra write per session.
-(e) *Slice 13.7 (#7062).* The server's gateway management channel sends a keepalive ping every 30 s with a 10 s
+(e) *Update (HA WS-5, #5685): the Guardian reconcile's send through the route directory.* The reconcile flow
+only reaches its send for an agent this replica holds a session for. After a server-only restart (or when the
+gateway replays a registration to this replica) that session is adopted from the replay and has no delivery path
+(empty `gateway_node`, no stream) until its re-announced CONNECTED reaches this replica; `AgentRegistry::send_to`
+returns false for it, so the push counted only `yuzu_server_system_reserved_push_total{result="undelivered"}`.
+`ServerImpl::send_guardian_push` now asks `resolve_guardian_directory_route`
+(`guardian_directory_route.hpp`) when `needs_directory_consult` holds: one `lookup_routes` read, then `routed`
+only if the row is `routable` (DB clock), names a cluster, and its `session_id` equals the session this replica
+holds; `send_via_directory` queues the push for that cluster (`result="sent_remote"`, audit detail ` via the
+route directory`). A degraded read is `unreadable`: nothing is sent and the reconcile aborts as `degraded` with an
+`ABORTED` audit row. A row for another session, an expired lease, an unplaced row, a tombstone or no row is
+`no_route`: counted `undelivered`, because a push built for one registration must never reach another's cluster.
+`GuardianDirectoryRoute` reads no OS or attribute from the directory, so no scope or identity is derived from it:
+the flow's scope evaluation and OS filter still use this replica's own session, and a replica with no session at
+all still reports `no_session` (the residual below). *Accepted, documented:* (1) two replicas can each push one
+agent (the claim and the budget are per replica and the reconcile is not fenced by the leader epoch, so the pushes carry the same generation and
+converge, but each has its own command id, which the agent's replay dedup does not collapse, and its own
+`guaranteed_state.reconcile` row); (2) an agent with no local session on this replica reports `no_session`
+until the gateway's replay lands. The replay guard (`registration_replay_session_guard_ms`, 10 s per
+session) limits how often one session is re-queued, not the number of rounds, so this is bounded (about 1,200 s for 10,000 agents, the earlier estimate above) only while one replica serves the agent or the gateway's upstream channel is sticky; across replicas convergence is probabilistic (7c) and is pending #5649; (3) gateway-fronted agents only, since a
+direct-connected agent never has a route row; (4) the session-held, no-delivery-path arm of `send_via_directory` (the arm this reconcile
+uses, since it always holds a session) does not apply `send_to`'s gateway-capability check, as for operator dispatch; it also applies the per-OS kill switch, which withholds nothing here because `__guard__.push_rules` is a protective action (`is_protective_action`) and so exempt, so do not count on a kill switch to stop this push (if a CONNECTED lands between the route read and the send, `send_via_directory` hands the push to `send_to`, which does check, and the outcome is still labelled `sent_remote`). The session id is read before the directory read and re-checked after it, so a re-registration during the read is `no_route`, not a match against the new session; the flow withholds the push if the session changed since it started, immediately before the send. A re-registration after that, between the read and the send, can still queue the push for the superseded registration's cluster: the rules were built for the old session and carry the same generation, so no later heartbeat repairs it until the generation moves (accepted, documented). An undelivered push, by contrast, is retried by the next heartbeat. The match is deliberately STRICTER than the other `send_via_directory` callers (`GatewayRouteFallback`), which take any routable row, because this push is built from this replica's own session state; do not harmonise them. Whether the re-announced
+CONNECTED reaches the adopting replica depends on the gateway's upstream channel staying connection-sticky (7c,
+#5649); this change does not decide that. #5685 stays open until the residual in (2) is accepted by the project
+lead, and it also still holds the stale-placement republish (see the Updates above); the safe-to-scale gate is NOT lifted.
+(f) *Slice 13.7 (#7062).* The server's gateway management channel sends a keepalive ping every 30 s with a 10 s
 timeout, also while idle, so a node that stops answering without closing the connection is found in about 40 s
 (from the code, the cowboy listener having no minimum ping interval, and a unit test through the `channel_via`
 seam; the final call into `grpc::CreateCustomChannel` is by inspection and detection is not measured against a

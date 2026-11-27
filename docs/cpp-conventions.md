@@ -31,6 +31,7 @@ The `cpp-expert` and `cpp-safety` agents load this document on any C++ source ch
 - The C API in `sdk/include/yuzu/plugin.h` must stay stable. No C++ types cross the boundary — only `const char*`, fixed-size arrays, and C enums.
 - C++ ergonomics live in `plugin.hpp` (CRTP + `YUZU_PLUGIN_EXPORT` macro). Don't break the C boundary when extending the C++ wrapper.
 - `YUZU_PLUGIN_ABI_VERSION` increments on any layout change with a migration plan (architect agent gates this).
+- A blocking OS call with no timeout of its own is bounded by an exported agent-core function, never by a detached thread in plugin code (the plugin can be unloaded under it). How to do it: [ADR-3008](adr/3008-bounded-os-calls-in-agent-core.md). `tests/test_bounded_os_call_lexical.py` enforces the plugin side.
 
 ### Reserved plugin names
 

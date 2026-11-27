@@ -63,7 +63,7 @@ constexpr const char* kGetOutputSchema =
     R"j({"type":"object","properties":{"agent_id":{"type":["string","null"]},"hostname":{"type":["string","null"]},"os":{"type":["string","null"]},"online":{"type":"boolean"},"last_seen":{"type":["string","null"]},"identity_state":{"type":"string","enum":["found","absent","degraded"]},"ci":{"type":["object","null"],"properties":{"manufacturer":{"type":["string","null"]},"model":{"type":["string","null"]},"serial":{"type":["string","null"]},"system_uuid":{"type":["string","null"]},"domain":{"type":["string","null"]},"ou":{"type":["string","null"]},"bios_vendor":{"type":["string","null"]},"bios_version":{"type":["string","null"]},"bios_date":{"type":["string","null"]},"cpu_model":{"type":["string","null"]},"cpu_cores":{"type":["integer","null"]},"cpu_threads":{"type":["integer","null"]},"ram_bytes":{"type":["integer","null"]},"disks_summary":{"type":["string","null"]},"primary_mac":{"type":["string","null"]},"macs_summary":{"type":["string","null"]},"nic_count":{"type":["integer","null"]},"os_name":{"type":["string","null"]},"os_version":{"type":["string","null"]},"os_build":{"type":["string","null"]},"arch":{"type":["string","null"]},"first_seen":{"type":"integer"},"last_seen":{"type":"integer"},"chassis_type":{"type":["string","null"]},"chassis_serial":{"type":["string","null"]},"chassis_asset_tag":{"type":["string","null"]},"chassis_source":{"type":["string","null"]},"board_vendor":{"type":["string","null"]},"board_product":{"type":["string","null"]},"board_serial":{"type":["string","null"]},"board_source":{"type":["string","null"]},"machine_id_hash":{"type":["string","null"]},"machine_id_algorithm":{"type":["string","null"]},"machine_id_source":{"type":["string","null"]},"sections":{"type":["array","null"],"description":"Per-section status and rows in registry order. Not emitted as null today: a failed sections read is the retryable error, and an unreadable record makes ci itself null. An empty array means none stored, not that the device has none.","items":{"type":"object","properties":{"kind":{"type":"string"},"status":{"type":["string","null"]},"reason":{"type":["string","null"]},"source":{"type":["string","null"]},"complete":{"type":"boolean"},"rows":{"type":"array","items":{"type":"object","description":"Cells are strings; parse numerics using the unit in the column name. Unread values are null.","additionalProperties":{"type":["string","null"]}}}},"required":["kind","status","reason","source","complete","rows"]}}},"required":["manufacturer","model","serial","system_uuid","domain","ou","bios_vendor","bios_version","bios_date","cpu_model","cpu_cores","cpu_threads","ram_bytes","disks_summary","primary_mac","macs_summary","nic_count","os_name","os_version","os_build","arch","first_seen","last_seen","chassis_type","chassis_serial","chassis_asset_tag","chassis_source","board_vendor","board_product","board_serial","board_source","machine_id_hash","machine_id_algorithm","machine_id_source","sections"]},"ci_state":{"type":"string","enum":["found","absent","degraded"]},"sections_state":{"type":"string","enum":["found","absent","degraded"],"description":"found: sections are stored. absent: none stored (an older agent or none reported), not that the device has none. degraded: ci itself could not be read (ci is null). A failed sections read is a retryable error instead, never this value."},"software":{"type":["array","null"],"items":{"type":"object","properties":{"name":{"type":"string"},"version":{"type":"string"},"publisher":{"type":"string"},"install_date":{"type":"string"}},"required":["name","version","publisher","install_date"]}},"software_truncated":{"type":"boolean"},"tags":{"type":["array","null"],"items":{"type":"object","properties":{"key":{"type":"string"},"value":{"type":"string"},"source":{"type":"string"},"updated_at":{"type":"integer"}},"required":["key","value","source","updated_at"]}},"agent_version":{"type":["string","null"]},"sync_supported":{"type":"boolean"},"software_last_seen":{"type":["integer","null"]}},"required":["agent_id","hostname","os","online","last_seen","identity_state","ci","ci_state","sections_state","software","software_truncated","tags","agent_version","sync_supported","software_last_seen"]})j";
 
 constexpr const char* kRecordsOutputSchema =
-    R"j({"type":"object","properties":{"devices":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"hostname":{"type":["string","null"],"description":"The hostname in the stored CI record (the last daily sync); null when empty or the literal unknown."},"ci":{"type":"object","properties":{"manufacturer":{"type":["string","null"]},"model":{"type":["string","null"]},"serial":{"type":["string","null"]},"system_uuid":{"type":["string","null"]},"domain":{"type":["string","null"]},"ou":{"type":["string","null"]},"bios_vendor":{"type":["string","null"]},"bios_version":{"type":["string","null"]},"bios_date":{"type":["string","null"]},"cpu_model":{"type":["string","null"]},"cpu_cores":{"type":["integer","null"]},"cpu_threads":{"type":["integer","null"]},"ram_bytes":{"type":["integer","null"]},"disks_summary":{"type":["string","null"]},"primary_mac":{"type":["string","null"]},"macs_summary":{"type":["string","null"]},"nic_count":{"type":["integer","null"]},"os_name":{"type":["string","null"]},"os_version":{"type":["string","null"]},"os_build":{"type":["string","null"]},"arch":{"type":["string","null"]},"first_seen":{"type":"integer"},"last_seen":{"type":"integer"},"chassis_type":{"type":["string","null"]},"chassis_serial":{"type":["string","null"]},"chassis_asset_tag":{"type":["string","null"]},"chassis_source":{"type":["string","null"]},"board_vendor":{"type":["string","null"]},"board_product":{"type":["string","null"]},"board_serial":{"type":["string","null"]},"board_source":{"type":["string","null"]},"machine_id_hash":{"type":["string","null"]},"machine_id_algorithm":{"type":["string","null"]},"machine_id_source":{"type":["string","null"]}},"required":["manufacturer","model","serial","system_uuid","domain","ou","bios_vendor","bios_version","bios_date","cpu_model","cpu_cores","cpu_threads","ram_bytes","disks_summary","primary_mac","macs_summary","nic_count","os_name","os_version","os_build","arch","first_seen","last_seen","chassis_type","chassis_serial","chassis_asset_tag","chassis_source","board_vendor","board_product","board_serial","board_source","machine_id_hash","machine_id_algorithm","machine_id_source"]},"content_hash":{"type":["string","null"],"description":"The stored hash of the device's CI record. Equal to your copy means the stored record is unchanged apart from first_seen and last_seen, which can move without a hash change (always take last_seen from the row); unequal means re-read it (it also covers section rows this tool does not return)."},"blob_version":{"type":"integer","description":"1 = the older 22-field record (chassis, board and machine-id values are null), 2 = the versioned record."}},"required":["agent_id","hostname","ci","content_hash","blob_version"]}},"next_cursor":{"type":"string","description":"Pass it back as cursor for the next page. Empty means there is nothing further to read; non-empty means more remain, even when the page is shorter than limit."},"page_bytes_capped":{"type":"boolean","enum":[true],"description":"Present (true) only when the page ended early at the response byte budget (1 MiB of device rows on MCP) rather than at limit: the page is shorter than limit and next_cursor is non-empty. Keep following next_cursor. A page always holds at least one device."},"scope_basis":{"type":"string","enum":["authority_scoped"],"description":"Present when the caller's read is confined to a scope: the pages describe only devices within that scope. A status, set whether or not any device was hidden."}},"required":["devices","next_cursor"]})j";
+    R"j({"type":"object","properties":{"devices":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"hostname":{"type":["string","null"],"description":"The hostname in the stored CI record (the last daily sync); null when empty or the literal unknown."},"ci":{"type":"object","properties":{"manufacturer":{"type":["string","null"]},"model":{"type":["string","null"]},"serial":{"type":["string","null"]},"system_uuid":{"type":["string","null"]},"domain":{"type":["string","null"]},"ou":{"type":["string","null"]},"bios_vendor":{"type":["string","null"]},"bios_version":{"type":["string","null"]},"bios_date":{"type":["string","null"]},"cpu_model":{"type":["string","null"]},"cpu_cores":{"type":["integer","null"]},"cpu_threads":{"type":["integer","null"]},"ram_bytes":{"type":["integer","null"]},"disks_summary":{"type":["string","null"]},"primary_mac":{"type":["string","null"]},"macs_summary":{"type":["string","null"]},"nic_count":{"type":["integer","null"]},"os_name":{"type":["string","null"]},"os_version":{"type":["string","null"]},"os_build":{"type":["string","null"]},"arch":{"type":["string","null"]},"first_seen":{"type":"integer"},"last_seen":{"type":"integer"},"chassis_type":{"type":["string","null"]},"chassis_serial":{"type":["string","null"]},"chassis_asset_tag":{"type":["string","null"]},"chassis_source":{"type":["string","null"]},"board_vendor":{"type":["string","null"]},"board_product":{"type":["string","null"]},"board_serial":{"type":["string","null"]},"board_source":{"type":["string","null"]},"machine_id_hash":{"type":["string","null"]},"machine_id_algorithm":{"type":["string","null"]},"machine_id_source":{"type":["string","null"]}},"required":["manufacturer","model","serial","system_uuid","domain","ou","bios_vendor","bios_version","bios_date","cpu_model","cpu_cores","cpu_threads","ram_bytes","disks_summary","primary_mac","macs_summary","nic_count","os_name","os_version","os_build","arch","first_seen","last_seen","chassis_type","chassis_serial","chassis_asset_tag","chassis_source","board_vendor","board_product","board_serial","board_source","machine_id_hash","machine_id_algorithm","machine_id_source"]},"content_hash":{"type":["string","null"],"description":"The stored hash of the device's CI record. Equal to your copy means the stored record is unchanged apart from first_seen and last_seen, which can move without a hash change (always take last_seen from the row); unequal means re-read it (it also covers section rows this tool does not return)."},"blob_version":{"type":"integer","description":"1 = the older 22-field record (chassis, board and machine-id values are null), 2 = the versioned record."},"changed_at":{"type":"integer","description":"When the stored record last changed content, in epoch seconds (database clock). It moves only when content_hash changes, so it, not last_seen, is the change signal; changed_since filters on it."}},"required":["agent_id","hostname","ci","content_hash","blob_version","changed_at"]}},"next_cursor":{"type":"string","description":"Pass it back as cursor for the next page. Empty means there is nothing further to read; non-empty means more remain, even when the page is shorter than limit."},"page_bytes_capped":{"type":"boolean","enum":[true],"description":"Present (true) only when the page ended early at the response byte budget (1 MiB of device rows on MCP) rather than at limit: the page is shorter than limit and next_cursor is non-empty. Keep following next_cursor. A page always holds at least one device."},"scope_basis":{"type":"string","enum":["authority_scoped"],"description":"Present when the caller's read is confined to a scope: the pages describe only devices within that scope. A status, set whether or not any device was hidden."},"next_changed_since":{"type":"integer","description":"The value to pass as changed_since on your NEXT delta pull: the database clock minus 300 seconds, in epoch seconds. Present on the FIRST response of a walk only (no cursor, no agent_id); the key is ABSENT on cursor pages and on agent_id reads. Keep ONLY that value, never derive it from max(changed_at), a later page or your own clock, replace your kept value only after the walk reached an empty next_cursor, and reuse the old value after a failed or partial walk. A first page without it means the filter was not applied: do not advance your kept value."}},"required":["devices","next_cursor"]})j";
 
 // ── shared answers ─────────────────────────────────────────────────────────
 
@@ -233,9 +233,14 @@ void handle_list_hardware_ci_records(const ToolCallContext& ctx) {
     // deps->ci_read_slots: the bulk-read concurrency cap (bulk_read_slots.hpp), the same instance
     // REST uses, held across the store call and this page's two audit rows (Page::hold); a point
     // read (agent_id) takes none. Null means no cap (tests only).
-    auto read = hardware_ci_page::read_page(deps->ci_page_reader, *rq, gate.scope,
-                                            deps->ci_collation_gate, deps->ci_read_slots,
-                                            hardware_ci_page::kMcpRowBudgetBytes);
+    // with_watermark stamps next_changed_since on a FIRST page only (no cursor, no agent_id) while
+    // its slot is still held; an unwired or failed provider is the kDegraded answer below for a
+    // first page, never a first page without the field. A cursor page and a point read carry no
+    // watermark and make no watermark read.
+    auto read = hardware_ci_page::with_watermark(
+        hardware_ci_page::read_page(deps->ci_page_reader, *rq, gate.scope, deps->ci_collation_gate,
+                                    deps->ci_read_slots, hardware_ci_page::kMcpRowBudgetBytes),
+        *rq, deps->ci_watermark_fn);
     if (!read) {
         // ONE answer per failure, shared with REST (hardware_ci_page::describe_read_error).
         const auto f = hardware_ci_page::describe_read_error(read.error(), hardware_ci_page::Surface::kMcp);
@@ -254,9 +259,10 @@ void handle_list_hardware_ci_records(const ToolCallContext& ctx) {
                                     f.retry_after_ms, f.remediation.empty() ? "retry the request" : f.remediation);
             return;
         }
-        // A refusal (scope too wide: TERMINAL, the caller's own scope is the cause and no store
-        // read ran; or a refused cursor). The domain verb's row is written only where the
-        // description says so (scope too wide), the generic row always; neither carries a count.
+        // A refusal (scope too wide or a scope-confined changed_since: both TERMINAL, the caller's
+        // own scope is the cause and no store read ran; or a refused cursor). The domain verb's row
+        // is written when `f.domain_audit_row` says so (those two scope refusals: a `denied` row;
+        // a refused cursor writes none), the generic row always; neither carries a count.
         const bool domain_ok =
             !f.domain_audit_row ||
             yuzu::server::detail::try_persist_audit(
@@ -448,11 +454,38 @@ constexpr ToolRecord kToolRecords[] = {
      "snapshot: a device registered, removed or newly in your scope during the walk can be missed "
      "or can vanish, so confirm a device with agent_id before you retire it, and never retire a device "
      "only because it is absent from a walk: after a database collation change the server has not yet "
-     "detected, writes can leave duplicate rows and keep decommissioned devices stored (see the server "
-     "administration guide). The data is each "
-     "device's last daily-sync snapshot: normally refreshed daily while the agent reports, but a "
-     "record can be arbitrarily old until the device is decommissioned, and last_seen is the "
+     "detected, writes can leave duplicate rows and keep decommissioned devices stored. The data is each "
+     "device's last daily-sync snapshot, possibly arbitrarily old; last_seen is the "
      "staleness signal. "
+     "Delta pull (a periodic sync into a CMDB): pass changed_since, an integer in epoch seconds, to "
+     "read only the records whose changed_at (when the stored record last changed content; unlike "
+     "last_seen it ignores a daily sync that finds nothing new) is at or after it. "
+     "Only the FIRST response of a walk (no cursor, no agent_id) carries next_changed_since, the "
+     "database clock minus 300 seconds: keep "
+     "ONLY that value and pass it as changed_since on your next walk, and never derive it from "
+     "max(changed_at), a later page or your own clock. Replace your kept value only after a walk "
+     "reached an empty next_cursor; restart a failed walk from page 1 and never resume a saved "
+     "cursor across days. A first page without next_changed_since means the filter was not "
+     "applied: do not advance your kept value. Do NOT send changed_since on an "
+     "agent_id confirm read: an empty page WITH changed_since means nothing changed at or after "
+     "the value, it does NOT mean no records exist. "
+     "Delivery is at-least-once, so upsert by agent_id. A delta carries no removal signal and "
+     "the margin is an estimate, not a proof, so run a full walk on a "
+     "schedule (for example weekly) as the backstop. changed_since "
+     "needs a credential holding a fleet-wide Inventory:Read grant: a scope-confined credential "
+     "(management-group or service-scoped) that sends it gets -32602 (terminal: omit "
+     "changed_since). A malformed, negative or future-dated value is -32602 "
+     "too (a replica whose clock is behind the database can refuse a value the server issued). "
+     "Run the first full walk under the SAME global credential that will run the deltas: a "
+     "scope-confined credential's first-page next_changed_since is NOT valid for a later global "
+     "delta. If the same delta page returns the same error (-32603) with "
+     "retry_after_ms 5000 at least 3 times over at least 60 s while unfiltered pages succeed, drop "
+     "changed_since and run ONE full walk, at most once per walk and not on every scheduled run; "
+     "honour every other hint (2000, 60000, an audit failure) and do not fall back for them. An "
+     "audit failure is the internal error whose message is \"audit subsystem unavailable, request "
+     "not served\". If that full walk's first page also "
+     "fails (it reads the watermark too) or the fallback recurs, stop and alert: the delta plan "
+     "is slow, raise it with the operator. "
      "Rows are in byte order of agent_id (not locale order); limit is 1..1000 (default 20); a page "
      "also ends early when its device rows reach 1 MiB (the page then carries page_bytes_capped "
      "true and holds at least one device), so a page can be shorter than limit: a non-empty "
@@ -460,18 +493,17 @@ constexpr ToolRecord kToolRecords[] = {
      "agent_id restricts the read to one "
      "device (take agent_id values from list_hardware_ci) and an empty devices array with an "
      "agent_id means no record or outside your scope, which are indistinguishable by design. An "
-     "empty devices array without agent_id means no stored CI records exist for the devices you "
-     "may read (none has synced one yet), not an error. It "
+     "empty devices array without agent_id and without changed_since means no stored CI records "
+     "exist for the devices you may read (none has synced yet), not an error. It "
      "reads the stored CI table, not the device roster, so a device that has been offline for more "
-     "than 30 days is still returned while its record exists (a record is removed when the "
-     "device's stored data is removed), and it carries no online state, tags or DEX score: for "
+     "than 30 days is still returned while its record exists, and it carries no online state, tags or DEX score: for "
      "those use list_hardware_ci, and for one device's section rows (CPU, DIMM, disk, volume, "
      "partition) and installed software use get_hardware_ci. "
-     "Read-only. A cursor belongs to the agent_id it was issued with; a refused cursor (malformed, "
-     "over 2048 bytes, or used with a different agent_id) is -32602: omit cursor to restart. "
+     "Read-only. A cursor belongs to the agent_id and changed_since it was issued with; a refused "
+     "cursor (malformed, over 2048 bytes, or issued for other values) is -32602: omit cursor to "
+     "restart. "
      "Confined: results are narrowed to the devices the caller may read and carry scope_basis authority_scoped (a "
-     "status, set whether or not any device was hidden); no count of hidden devices is ever "
-     "returned. Confinement applies only while RBAC enforcement is on: with it off every "
+     "status, set whether or not any was hidden); no count of hidden devices is ever returned. Confinement applies only while RBAC enforcement is on: with it off every "
      "non-engine caller the gate admits reads the whole fleet and a service-scoped token is "
      "refused. An engine principal is resolved by RBAC alone (refused without an explicit "
      "Inventory:Read grant, and always while RBAC is off; with the grant it reads fleet-wide), "
@@ -495,7 +527,7 @@ constexpr ToolRecord kToolRecords[] = {
      "while the check has not concluded Trusted, so a refused confirm is not an absence. Serial, system UUID, MAC and the chassis and board serials are "
      "personal data: every served page is audited as inventory.devices.ci and, unlike most MCP "
      "reads, fails CLOSED (no data, retryable error) when that audit row cannot be persisted.",
-     R"j({"type":"object","properties":{"limit":{"type":"integer","minimum":1,"maximum":1000,"default":20,"description":"Maximum devices in the page, 1..1000. Default 20; prefer 20 or less for agentic use."},"cursor":{"type":"string","maxLength":2048,"description":"The next_cursor of the previous page. Omit it for the first page. Valid only with the same agent_id it was issued with."},"agent_id":{"type":"string","minLength":1,"maxLength":256,"description":"Read only this device's record: at most 256 bytes, no byte below 0x20 (maxLength counts characters in JSON Schema; the server enforces bytes)."}}})j",
+     R"j({"type":"object","properties":{"limit":{"type":"integer","minimum":1,"maximum":1000,"default":20,"description":"Maximum devices in the page, 1..1000. Default 20; prefer 20 or less for agentic use."},"cursor":{"type":"string","maxLength":2048,"description":"The next_cursor of the previous page. Omit it for the first page. Valid only with the same agent_id and changed_since it was issued with."},"agent_id":{"type":"string","minLength":1,"maxLength":256,"description":"Read only this device's record: at most 256 bytes, no byte below 0x20 (maxLength counts characters in JSON Schema; the server enforces bytes)."},"changed_since":{"type":"integer","minimum":0,"maximum":253402300799,"description":"Delta filter: only records whose changed_at is at or after this, in epoch seconds. Use the next_changed_since of the FIRST response of your previous complete walk. Not in the future (up to 60 s past the server clock is accepted; the maximum here is coarser); needs a credential holding a fleet-wide Inventory:Read grant (a scope-confined one gets -32602, terminal). Do not send it on an agent_id confirm read. Bound to the cursor."}}})j",
      kRecordsOutputSchema, "Inventory", "Read", ServiceScopeClass::confined, ToolEffect::ReadOnly, true,
      "List hardware CI records (bulk)", &handle_list_hardware_ci_records},
     {"get_hardware_ci",

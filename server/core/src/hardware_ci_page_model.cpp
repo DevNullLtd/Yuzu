@@ -8,7 +8,9 @@
 
 #include <algorithm>
 #include <charconv>
+#include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <format>
 #include <iterator>
 #include <system_error>
@@ -60,6 +62,32 @@ std::optional<int> parse_rest_limit(std::string_view s) {
     return static_cast<int>(std::clamp<std::int64_t>(v, 1, kPageMax));
 }
 
+// True when `v` is past `now_secs + kChangedSinceFutureSkewSecs`. The sum saturates at INT64_MAX
+// instead of overflowing (an injected or hostile-clock `now_secs` near the top of the range would
+// otherwise be signed overflow, undefined behaviour), so the bound is never below the true one.
+bool changed_since_is_future(std::int64_t v, std::int64_t now_secs) {
+    const std::int64_t bound = now_secs > INT64_MAX - kChangedSinceFutureSkewSecs
+                                   ? INT64_MAX
+                                   : now_secs + kChangedSinceFutureSkewSecs;
+    return v > bound;
+}
+
+// REST `changed_since`: decimal digits only (no sign, no space, no exponent), at most 64 bits. A
+// negative value or any other shape is invalid; a well-formed value past `now + skew` is a
+// distinct, equally terminal refusal. `now_secs` is injected.
+std::expected<std::int64_t, std::string_view> parse_changed_since_text(std::string_view s,
+                                                                       std::int64_t now_secs) {
+    if (s.empty() || !std::ranges::all_of(s, [](char c) { return c >= '0' && c <= '9'; }))
+        return std::unexpected(kChangedSinceInvalidMessage);
+    std::int64_t v = 0;
+    const auto [ptr, ec] = std::from_chars(s.data(), s.data() + s.size(), v);
+    if (ec != std::errc{} || ptr != s.data() + s.size())
+        return std::unexpected(kChangedSinceInvalidMessage); // out of 64 bits
+    if (changed_since_is_future(v, now_secs))
+        return std::unexpected(kChangedSinceFutureMessage);
+    return v;
+}
+
 // The text checks every channel applies to the two string inputs. nullopt = acceptable.
 struct TextFault {
     std::string message;
@@ -84,7 +112,17 @@ std::optional<TextFault> text_error(const std::string& agent_id, const std::stri
 
 // ── Parameters ───────────────────────────────────────────────────────────────
 
+std::int64_t wall_clock_secs() {
+    return std::chrono::duration_cast<std::chrono::seconds>(
+               std::chrono::system_clock::now().time_since_epoch())
+        .count();
+}
+
 std::expected<Request, std::string> parse_params(const Params& p) {
+    return parse_params(p, wall_clock_secs());
+}
+
+std::expected<Request, std::string> parse_params(const Params& p, std::int64_t now_secs) {
     const auto first = [&](const char* key) -> std::string {
         const auto it = p.lower_bound(key);
         return it != p.end() && it->first == key ? it->second : std::string{};
@@ -106,10 +144,25 @@ std::expected<Request, std::string> parse_params(const Params& p) {
             return std::unexpected("invalid limit (expected integer)");
         r.limit = *n;
     }
+    // An EMPTY value (`changed_since=`) is treated as NOT GIVEN, like `limit` and `cursor`, so it IS
+    // a full read (a client that interpolates an empty variable gets the whole set back and, from
+    // the first page, the watermark, so it still learns where to resume). A non-empty bad one is a
+    // 400, never a silent full read: a malformed value would otherwise re-read everything, and a
+    // future-dated one would read as "nothing changed".
+    if (const std::string changed = first("changed_since"); !changed.empty()) {
+        const auto v = parse_changed_since_text(changed, now_secs);
+        if (!v)
+            return std::unexpected(std::string(v.error()));
+        r.changed_since = *v;
+    }
     return r;
 }
 
 std::expected<Request, ArgError> request_from_args(const nlohmann::json& args) {
+    return request_from_args(args, wall_clock_secs());
+}
+
+std::expected<Request, ArgError> request_from_args(const nlohmann::json& args, std::int64_t now_secs) {
     Request r;
     r.limit = static_cast<int>(kMcpDefaultLimit);
     if (args.is_null())
@@ -143,6 +196,21 @@ std::expected<Request, ArgError> request_from_args(const nlohmann::json& args) {
             return std::unexpected(ArgError{"limit must be between 1 and " + std::to_string(kPageMax)});
         r.limit = static_cast<int>(n);
     }
+    if (args.contains("changed_since")) {
+        const auto& c = args["changed_since"];
+        // A strict JSON integer: a string, float, boolean or null is refused, never coerced
+        // (nlohmann stores every non-negative integer as unsigned, so test that arm first, and
+        // refuse above INT64_MAX before get<int64_t>() could wrap).
+        if (!c.is_number_integer() ||
+            (c.is_number_unsigned() && c.get<std::uint64_t>() > static_cast<std::uint64_t>(INT64_MAX)))
+            return std::unexpected(ArgError{std::string(kChangedSinceInvalidMessage)});
+        const auto v = c.get<std::int64_t>();
+        if (v < 0)
+            return std::unexpected(ArgError{std::string(kChangedSinceInvalidMessage)});
+        if (changed_since_is_future(v, now_secs))
+            return std::unexpected(ArgError{std::string(kChangedSinceFutureMessage)});
+        r.changed_since = v;
+    }
     return r;
 }
 
@@ -158,7 +226,14 @@ std::string_view cursor_error_message(CursorError e) {
 }
 
 std::string filter_fingerprint(const Request& rq) {
-    return fnv1a_hex16("agent_id=" + rq.agent_id);
+    std::string bound = "agent_id=" + rq.agent_id;
+    // Appended ONLY when set, so the no-filter text (and so the fingerprint of every cursor issued
+    // before this filter existed) is unchanged. The separator is a byte below 0x20, which an
+    // `agent_id` can never carry (the request filter refuses it), so no id can spell a suffix that
+    // collides with a real `changed_since`. 0 is a value: it differs from unset.
+    if (rq.changed_since)
+        bound += std::format("\nchanged_since={}", *rq.changed_since);
+    return fnv1a_hex16(bound);
 }
 
 std::string encode_cursor(const Position& at, std::string_view fp) {
@@ -232,6 +307,11 @@ std::string_view read_error_message(ReadError e) {
         // Generic: it says this replica is at its bulk-read cap, nothing about the pool or the
         // cap's value.
         return "hardware CI bulk read capacity in use; retry after the hint";
+    case ReadError::kDeltaNeedsGlobalRead:
+        // Names no device, count or scope: the caller learns only that its credential cannot take a
+        // delta, which it already knows from holding a scoped credential.
+        return "changed_since needs a credential with global read; a scope-confined credential "
+               "cannot use a delta pull";
     case ReadError::kCount: // a sentinel, not an error: answered like an out-of-range value
         break;
     }
@@ -292,6 +372,15 @@ ReadFailure describe_read_error(ReadError e, Surface surface) {
         f.remediation = kBusyRemediation;
         f.domain_audit_row = false;
         return f;
+    case ReadError::kDeltaNeedsGlobalRead:
+        // TERMINAL, like kScopeTooWide: the caller's own credential is the cause and no read ran.
+        // Audited as a refusal (REST writes the domain row, best effort; MCP writes its generic
+        // row too), with no count and no device.
+        f.remediation = kDeltaNeedsGlobalReadRemediation;
+        f.domain_audit_row = true;
+        f.audit_outcome = "denied";
+        f.audit_detail = audit_detail_delta_needs_global_read(name);
+        return f;
     case ReadError::kCount: // a sentinel, not an error: answered like an out-of-range value
         break;
     }
@@ -306,6 +395,13 @@ std::expected<Page, ReadError>
 read_page(const Reader& read, const Request& rq, const authz::VisibleSet& scope,
           const std::atomic<pg::CollationGate>* gate, BulkReadSlots* slots,
           std::size_t row_budget_bytes) {
+    // FIRST, before the cursor and before the `agent_id` scope test: a delta needs global read, and
+    // a confined caller's answer must not depend on a cursor, on whether a named device exists or on
+    // whether it is in scope. `scope` present = confined (a management-group or service-scoped
+    // credential, even one whose set covers the whole fleet): `changed_at` does not move when a
+    // device ENTERS a scope, so a scoped delta would silently omit it.
+    if (rq.changed_since && scope.has_value())
+        return std::unexpected(ReadError::kDeltaNeedsGlobalRead);
     const std::string fp = filter_fingerprint(rq);
     Position incoming; // the head: nothing served yet
     if (!rq.cursor.empty()) {
@@ -317,8 +413,10 @@ read_page(const Reader& read, const Request& rq, const authz::VisibleSet& scope,
         incoming = std::move(*cur);
     }
     Page out;
-    // A named device outside the scope is answered without touching the store: nothing of it is
-    // read, and the page is the same empty page a scoped caller gets for a device that has no row.
+    // A named device outside the scope is answered by `read_page` without touching the store:
+    // nothing of it is read, and the page is the same empty page a scoped caller gets for a device
+    // that has no row. It is a point read (it names an `agent_id`), so `with_watermark` makes no
+    // watermark read for it either: no SQL runs at all.
     if (!rq.agent_id.empty() && !authz::in_scope(scope, rq.agent_id)) {
         out.target_denied = true;
         return out;
@@ -338,6 +436,7 @@ read_page(const Reader& read, const Request& rq, const authz::VisibleSet& scope,
 
     DeviceCiKeysetQuery q;
     q.after = incoming.after;
+    q.changed_since = rq.changed_since;
     if (!rq.agent_id.empty())
         q.agent_id = rq.agent_id;
     // TOP leaves the query alone; an engaged-empty scope is agent_ids = {} (the store answers
@@ -397,6 +496,26 @@ read_page(const Reader& read, const Request& rq, const authz::VisibleSet& scope,
     return out;
 }
 
+std::expected<Page, ReadError> with_watermark(std::expected<Page, ReadError> read, const Request& rq,
+                                              const Watermark& watermark) {
+    if (!read)
+        return read;
+    // Owner ruling 2026-11-24: the watermark belongs to the FIRST page of a walk only. A cursor page
+    // or a point read is served as it is and the provider is never called for it, so it takes no
+    // second pool lease and gains no new 503 dependency.
+    if (!rq.cursor.empty() || !rq.agent_id.empty())
+        return read;
+    // An unwired provider and a failed read are the same answer: no page, never a first page without
+    // the field and never a guessed value. Overwriting `read` below would release the slot too; the
+    // early return does it as `read` goes out of scope, and so does an exception from the provider
+    // (the slot is an RAII member of the `Page` held in `read`).
+    const auto w = watermark ? watermark() : std::nullopt;
+    if (!w)
+        return std::unexpected(ReadError::kDegraded);
+    read->next_changed_since = *w;
+    return read;
+}
+
 // ── JSON ─────────────────────────────────────────────────────────────────────
 
 nlohmann::json row_json(const DeviceCiRecord& rec) {
@@ -408,6 +527,7 @@ nlohmann::json row_json(const DeviceCiRecord& rec) {
         {"content_hash", rec.content_hash.empty() ? nlohmann::json(nullptr)
                                                    : nlohmann::json(rec.content_hash)},
         {"blob_version", rec.blob_version},
+        {"changed_at", rec.changed_at},
     };
 }
 
@@ -426,6 +546,9 @@ nlohmann::json page_json(const Page& page) {
     nlohmann::json out = nlohmann::json::object();
     out["devices"] = std::move(devices);
     out["next_cursor"] = page.next_cursor;
+    // Present only on a first page: absent (not null, not 0) on a cursor page and a point read.
+    if (page.next_changed_since)
+        out["next_changed_since"] = *page.next_changed_since;
     if (page.byte_capped)
         out["page_bytes_capped"] = true;
     return out;
@@ -459,6 +582,10 @@ std::string audit_detail(const Page& page, const Request& rq, std::string_view s
 
 std::string audit_detail_scope_too_wide(std::string_view surface) {
     return std::format("hardware CI records ({}) state=scope too wide", surface);
+}
+
+std::string audit_detail_delta_needs_global_read(std::string_view surface) {
+    return std::format("hardware CI records ({}) state=changed_since needs global read", surface);
 }
 
 std::string audit_detail_target_denied(std::string_view surface) {

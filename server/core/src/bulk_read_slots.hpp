@@ -23,7 +23,8 @@
 /// client's retry rate. It is a CONCURRENCY bound only: retries are not rate-limited, and the cap
 /// is per replica, so the fleet-wide ceiling is replicas x cap. It does NOT bound the audit writes
 /// of point reads (`agent_id`), of the failure row after a failed store read, of the refusal rows
-/// (scope too wide, collation ordering unverified, MCP argument refusals), or of any other route;
+/// (scope too wide, a scope-confined `changed_since` (the delta denied row), collation ordering
+/// unverified, MCP argument refusals), or of any other route;
 /// a busy refusal writes no row. At pool 1 the cap is the whole pool, so one stalled
 /// audit write can leave authorization without a connection; at pool 2 it takes two (the capped
 /// bulk writer plus one that holds no slot).

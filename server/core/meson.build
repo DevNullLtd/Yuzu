@@ -872,6 +872,8 @@ yuzu_server_core_lib = static_library(
     'src/software_deployment_model.cpp', # #2146 Batch B5 -- shared REST+MCP builder (Rule 1)
     'src/dex_perf_model.cpp',
     'src/live_model.cpp', # #2146 -- live-read kind table + parsers hoisted out of device_routes.cpp (pure, device seam family)
+    'src/live_result_json.cpp', # per-device live read: the ONE `data` JSON builder shared by REST and MCP (pure, device seam family)
+    'src/live_read_poll.cpp', # per-device live read: the shared response-store poll + the pure row reducer (REST and MCP)
     'src/dex_app_perf_model.cpp',
     'src/network_perf_model.cpp',
     'src/network_api.cpp', # ADR-0031 WS-A4: the first per-family in-process API seam pilot

@@ -15,6 +15,7 @@
 #include "device_ci_kinds.hpp"
 #include "device_ci_section_digest.hpp"
 #include "device_inventory_store.hpp"
+#include "hardware_ci_page_model.hpp"
 #include "hardware_list_model.hpp"
 #include "pg/pg_exec.hpp"
 #include "pg/pg_migration_runner.hpp"
@@ -38,6 +39,7 @@
 #include <latch>
 #include <limits>
 #include <optional>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -51,6 +53,7 @@ using yuzu::server::DeviceInventoryStore;
 using yuzu::server::InventoryIngestOutcome;
 using yuzu::server::parse_device_ci_blob;
 using yuzu::server::pg::PgPool;
+namespace hcp = yuzu::server::hardware_ci_page;
 namespace agentpb = yuzu::agent::v1;
 
 namespace {
@@ -1105,11 +1108,13 @@ TEST_CASE("device_ci schema created by the frozen migrations matches the section
                                    "content_digest:text:YES"});
 
     // The 11 scalars appended to device_ci at wire positions 22-32, after the 26 v1 columns
-    // (v1 ends at last_seen) and blob_version.
+    // (v1 ends at last_seen) and blob_version; v5's changed_at is the last column.
     const auto dev = live_columns(pool, "device_ci");
-    // 26 v1 columns, blob_version, then the appended scalars: tied to the wire constant, so a new
-    // scalar (kDeviceCiScalarFields grows) fails here until a migration adds its column.
-    REQUIRE(dev.size() == 26 + 1 + (yuzu::server::kDeviceCiScalarFields - 22));
+    // 26 v1 columns, blob_version, then the appended scalars, then changed_at (v5): tied to the wire
+    // constant, so a new scalar (kDeviceCiScalarFields grows) fails here until a migration adds its
+    // column.
+    REQUIRE(dev.size() == 26 + 1 + (yuzu::server::kDeviceCiScalarFields - 22) + 1);
+    CHECK(dev.back() == "changed_at:bigint:NO");
     CHECK(dev[26] == "blob_version:smallint:NO");
     const std::vector<std::string> scalars{
         "chassis_type",    "chassis_serial",      "chassis_asset_tag", "chassis_source",
@@ -1169,6 +1174,10 @@ TEST_CASE("DeviceInventoryStore refuses at construction when the schema lacks a 
          "ALTER TABLE device_inventory_store.device_ci DROP COLUMN content_hash", "device_ci",
          "ALTER TABLE device_inventory_store.device_ci ADD COLUMN content_hash TEXT NOT NULL "
          "DEFAULT ''"},
+        {"the v5 changed_at column absent (a v4 schema under a binary that reads it)",
+         "ALTER TABLE device_inventory_store.device_ci DROP COLUMN changed_at", "device_ci",
+         "ALTER TABLE device_inventory_store.device_ci ADD COLUMN changed_at BIGINT NOT NULL "
+         "DEFAULT 0"},
         {"a missing appended scalar on device_ci",
          "ALTER TABLE device_inventory_store.device_ci DROP COLUMN machine_id_source",
          "device_ci",
@@ -3540,10 +3549,11 @@ TEST_CASE("list_device_ci_after's second page is exact when a row is inserted or
     }
 }
 
-// Kills: dropping or renaming migration v4 (the index behind the bulk keyset read). That the
-// keyset statement really plans on this index is the EXPLAIN test below; this one pins the
-// definition and that v4 is additive.
-TEST_CASE("device_inventory_store has the C-collated agent_id index behind the bulk keyset read",
+// Kills: dropping or renaming migration v6 (the keyset index behind the bulk read), or leaving v4's
+// index behind. That the keyset statement really plans on this index is the EXPLAIN test below;
+// this one pins the definition and what v6 replaced. v4 built `device_ci_agent_id_c_idx`; v6 builds
+// `(agent_id COLLATE "C", changed_at)` and drops it, so a plan can test `changed_at` inside the index.
+TEST_CASE("device_inventory_store has the composite C-collated keyset index behind the bulk read",
           "[pg][device_ci][keyset][migration]") {
     YUZU_REQUIRE_PG_DB_TPL(db, device_ci_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 2}};
@@ -3555,23 +3565,24 @@ TEST_CASE("device_inventory_store has the C-collated agent_id index behind the b
     auto res = yuzu::server::pg::exec_params(
         lease.get(),
         "SELECT indexdef FROM pg_indexes WHERE schemaname = 'device_inventory_store' "
-        "AND tablename = 'device_ci' AND indexname = 'device_ci_agent_id_c_idx'",
+        "AND tablename = 'device_ci' AND indexname = 'device_ci_agent_id_c_changed_idx'",
         std::vector<std::string>{});
     REQUIRE(res.status() == PGRES_TUPLES_OK);
     REQUIRE(PQntuples(res.get()) == 1);
     const std::string def = PQgetvalue(res.get(), 0, 0);
-    CHECK(def.find("COLLATE \"C\"") != std::string::npos);
-    CHECK(def.find("agent_id") != std::string::npos);
+    CHECK(def.find("(agent_id COLLATE \"C\", changed_at)") != std::string::npos);
     CHECK(def.find("CONCURRENTLY") == std::string::npos);
-    // additive: the primary key and the hostname index are still there beside it
+    // the primary key, the hostname index and the v5 changed_at index are still there beside it, and
+    // v4's index is gone (the composite serves every query it served)
     auto all = yuzu::server::pg::exec_params(
         lease.get(),
-        "SELECT count(*) FROM pg_indexes WHERE schemaname = 'device_inventory_store' "
-        "AND tablename = 'device_ci' AND indexname IN ('device_ci_pkey', 'device_ci_hostname_idx', "
-        "'device_ci_agent_id_c_idx')",
+        "SELECT string_agg(indexname, ',' ORDER BY indexname) FROM pg_indexes "
+        "WHERE schemaname = 'device_inventory_store' AND tablename = 'device_ci'",
         std::vector<std::string>{});
     REQUIRE(all.status() == PGRES_TUPLES_OK);
-    CHECK(std::string(PQgetvalue(all.get(), 0, 0)) == "3");
+    CHECK(std::string(PQgetvalue(all.get(), 0, 0)) ==
+          "device_ci_agent_id_c_changed_idx,device_ci_changed_at_idx,device_ci_hostname_idx,"
+          "device_ci_pkey");
 }
 
 namespace {
@@ -3633,7 +3644,7 @@ TEST_CASE("list_device_ci_after's single-device read is byte-exact and plans on 
         q.limit = 2;
         const std::string plan = keyset_plan(pool, q);
         INFO(plan);
-        CHECK(plan.find("device_ci_agent_id_c_idx") != std::string::npos);
+        CHECK(plan.find("device_ci_agent_id_c_changed_idx") != std::string::npos);
         CHECK(plan.find("device_ci_pkey") == std::string::npos);
     }
     SECTION("a page by bound and a scope-membership page plan on the same index") {
@@ -3642,14 +3653,14 @@ TEST_CASE("list_device_ci_after's single-device read is byte-exact and plans on 
         after.limit = 101;
         const std::string after_plan = keyset_plan(pool, after);
         INFO(after_plan);
-        CHECK(after_plan.find("device_ci_agent_id_c_idx") != std::string::npos);
+        CHECK(after_plan.find("device_ci_agent_id_c_changed_idx") != std::string::npos);
         CHECK(after_plan.find("device_ci_pkey") == std::string::npos);
         yuzu::server::DeviceCiKeysetQuery scoped;
         scoped.agent_ids = std::vector<std::string>{"g-000010", "g-000020", "agent-1"};
         scoped.limit = 101;
         const std::string scoped_plan = keyset_plan(pool, scoped);
         INFO(scoped_plan);
-        CHECK(scoped_plan.find("device_ci_agent_id_c_idx") != std::string::npos);
+        CHECK(scoped_plan.find("device_ci_agent_id_c_changed_idx") != std::string::npos);
         CHECK(scoped_plan.find("device_ci_pkey") == std::string::npos);
     }
 }
@@ -3663,9 +3674,9 @@ TEST_CASE("list_device_ci_after's single-device read is byte-exact and plans on 
 TEST_CASE("migration v4 lifts the statement timeout and allows a longer lock wait for its index build",
           "[device_ci][migration][v4]") {
     const auto& all = yuzu::server::device_inventory_migrations();
-    REQUIRE(all.size() == 4);
-    REQUIRE(all.back().version == 4);
-    const std::string& sql = all.back().sql;
+    REQUIRE(all.size() >= 6); // v7+ (the removals feed) append; indices below stay valid
+    REQUIRE(all[3].version == 4);
+    const std::string& sql = all[3].sql;
     const auto at = [&](const char* needle) { return sql.find(needle); };
     REQUIRE(at("SET LOCAL lock_timeout = '30s'") != std::string::npos);
     REQUIRE(at("SET LOCAL statement_timeout = 0") != std::string::npos);
@@ -3681,7 +3692,7 @@ TEST_CASE("migration v4 lifts the statement timeout and allows a longer lock wai
 // long ingest transaction) for 2.5 s. The migration must wait it out under its own SET LOCAL
 // lock_timeout, build the index over the EXISTING rows (a v3 database being upgraded) and open.
 // Without the setting the 1 s pool timeout fails the migration and the store does not open.
-TEST_CASE("a v3 database upgrades to v4 behind a lock held longer than the pool's lock timeout",
+TEST_CASE("a v3 database upgrades through v6 behind a lock held longer than the pool's lock timeout",
           "[pg][device_ci][migration][v4]") {
     YUZU_REQUIRE_PG_MIGRATION_DB(db);
     PgPool pool{{.conninfo = db.dsn(), .size = 3}};
@@ -3692,8 +3703,9 @@ TEST_CASE("a v3 database upgrades to v4 behind a lock held longer than the pool'
         store_ci(seed, "agent-up-1", "h1");
         store_ci(seed, "Agent-up-2", "h2");
     }
-    // a database as v3 left it: no index, recorded version 3
-    exec_stmt(pool, "DROP INDEX device_inventory_store.device_ci_agent_id_c_idx");
+    // a database as v3 left it: no keyset index and no changed_at column (dropping the column drops
+    // the two indexes that use it), recorded version 3. The open then runs v4, v5 and v6 in turn.
+    exec_stmt(pool, "ALTER TABLE device_inventory_store.device_ci DROP COLUMN changed_at");
     exec_stmt(pool, "UPDATE public.schema_meta SET version = 3 WHERE store = 'device_inventory_store'");
 
     PgPool short_lock_pool{{.conninfo = db.dsn(), .size = 2, .lock_timeout_ms = 1000}};
@@ -3751,28 +3763,145 @@ TEST_CASE("a v3 database upgrades to v4 behind a lock held longer than the pool'
 
     REQUIRE(store.is_open());
     CHECK(waited > std::chrono::milliseconds(1500)); // it really did wait past the pool's 1 s
-    // the index exists and the pre-existing rows are served in byte order
+    // v4 built its index over the existing rows and v6 then replaced it with the composite keyset
+    // index, so the open ends with the composite and without v4's; the pre-existing rows are served
+    // in byte order
     auto lease = pool.acquire();
     REQUIRE(lease);
     auto res = yuzu::server::pg::exec_params(
         lease.get(),
-        "SELECT count(*) FROM pg_indexes WHERE schemaname = 'device_inventory_store' "
-        "AND indexname = 'device_ci_agent_id_c_idx'",
+        "SELECT string_agg(indexname, ',' ORDER BY indexname) FROM pg_indexes "
+        "WHERE schemaname = 'device_inventory_store' AND tablename = 'device_ci' "
+        "AND indexname LIKE 'device_ci_%_idx' AND indexname <> 'device_ci_hostname_idx'",
         std::vector<std::string>{});
     REQUIRE(res.status() == PGRES_TUPLES_OK);
-    CHECK(std::string(PQgetvalue(res.get(), 0, 0)) == "1");
+    CHECK(std::string(PQgetvalue(res.get(), 0, 0)) ==
+          "device_ci_agent_id_c_changed_idx,device_ci_changed_at_idx");
     yuzu::server::DeviceCiKeysetQuery q;
     CHECK(keyset_ids(store.list_device_ci_after(q)) ==
           std::vector<std::string>{"Agent-up-2", "agent-up-1"});
 }
 
-// Kills: no runtime check of the v4 index. `schema_meta` saying v4 is not proof the index exists (a
-// restore, a hand-run DROP INDEX, a same-named index of another definition that IF NOT EXISTS
-// accepted). Each case below leaves the store OPEN (the read is still correct) and logs one
-// WARN that names the index, the cost and the statement to run; a healthy open logs none. The walk
-// is checked after each, so "stays correct" is observed and not just claimed.
-TEST_CASE("opening the store warns when the C-collated index is missing, invalid or defined differently",
-          "[pg][device_ci][migration][v4][index_check]") {
+// Kills: a v6 that trusts a same-named composite left by a cancelled hand build and then drops v4's
+// index, which would leave NO usable keyset index (every page a scan plus a sort) behind a WARN. The
+// fixture is a database stamped v5 that still has v4's index and a same-named composite that is
+// misdefined or invalid; opening must end with a valid composite of the migration's definition, no
+// v4 index and no WARN.
+TEST_CASE("migration v6 replaces a misdefined or invalid same-named composite instead of trusting it",
+          "[pg][device_ci][migration][v6][index_check]") {
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
+    PgPool pool{{.conninfo = db.dsn(), .size = 3}};
+    REQUIRE(pool.valid());
+    {
+        DeviceInventoryStore seed{pool};
+        REQUIRE(seed.is_open());
+        store_ci(seed, "b-2", "h2");
+        store_ci(seed, "A-1", "h1");
+    }
+    // a database as v5 left it: v4's index present, no composite, recorded version 5
+    exec_stmt(pool, "DROP INDEX device_inventory_store.device_ci_agent_id_c_changed_idx");
+    exec_stmt(pool, "CREATE INDEX device_ci_agent_id_c_idx ON device_inventory_store.device_ci "
+                    "((agent_id COLLATE \"C\"))");
+    exec_stmt(pool, "UPDATE public.schema_meta SET version = 5 WHERE store = 'device_inventory_store'");
+    const auto composite_def = [&] {
+        auto lease = pool.acquire();
+        REQUIRE(lease);
+        auto res = yuzu::server::pg::exec_params(
+            lease.get(),
+            "SELECT pg_get_indexdef(i.indexrelid) || '|' || i.indisvalid::text FROM pg_index i "
+            "JOIN pg_class c ON c.oid = i.indexrelid JOIN pg_namespace n ON n.oid = c.relnamespace "
+            "WHERE n.nspname = 'device_inventory_store' AND c.relname = 'device_ci_agent_id_c_changed_idx'",
+            std::vector<std::string>{});
+        REQUIRE(res.status() == PGRES_TUPLES_OK);
+        REQUIRE(PQntuples(res.get()) == 1);
+        return std::string(PQgetvalue(res.get(), 0, 0));
+    };
+    const auto open_and_check = [&] {
+        yuzu::test::LogCapture cap(spdlog::level::warn);
+        DeviceInventoryStore store{pool};
+        cap.stop();
+        REQUIRE(store.is_open());
+        CHECK(cap.text().find("DeviceInventoryStore:") == std::string::npos); // no index WARN, and no "could not check"
+        const std::string def = composite_def();
+        INFO(def);
+        CHECK(def.find("USING btree (agent_id COLLATE \"C\", changed_at)|true") != std::string::npos);
+        CHECK(count_rows(pool, "SELECT count(*) FROM pg_indexes WHERE schemaname = 'device_inventory_store' "
+                               "AND indexname = 'device_ci_agent_id_c_idx'") == 0);
+        yuzu::server::DeviceCiKeysetQuery q;
+        CHECK(keyset_ids(store.list_device_ci_after(q)) == std::vector<std::string>{"A-1", "b-2"});
+    };
+
+    SECTION("a same-named composite on the plain column") {
+        exec_stmt(pool, "CREATE INDEX device_ci_agent_id_c_changed_idx ON device_inventory_store.device_ci "
+                        "(agent_id, changed_at)");
+        open_and_check();
+    }
+    SECTION("a same-named composite with the columns the other way round") {
+        exec_stmt(pool, "CREATE INDEX device_ci_agent_id_c_changed_idx ON device_inventory_store.device_ci "
+                        "(changed_at, agent_id COLLATE \"C\")");
+        open_and_check();
+    }
+    SECTION("an invalid same-named composite (a cancelled build)") {
+        exec_stmt(pool, "CREATE INDEX device_ci_agent_id_c_changed_idx ON device_inventory_store.device_ci "
+                        "(agent_id COLLATE \"C\", changed_at)");
+        {
+            auto lease = pool.acquire();
+            REQUIRE(lease);
+            auto res = yuzu::server::pg::exec_params(
+                lease.get(),
+                "UPDATE pg_index SET indisvalid = false WHERE indexrelid = "
+                "'device_inventory_store.device_ci_agent_id_c_changed_idx'::regclass",
+                std::vector<std::string>{});
+            if (res.status() != PGRES_COMMAND_OK)
+                SKIP("the test role cannot update pg_index (not a superuser): "
+                     << PQresultErrorMessage(res.get()));
+        }
+        open_and_check();
+    }
+    SECTION("control: a correct pre-existing composite is rebuilt to the same definition") {
+        exec_stmt(pool, "CREATE INDEX device_ci_agent_id_c_changed_idx ON device_inventory_store.device_ci "
+                        "(agent_id COLLATE \"C\", changed_at)");
+        open_and_check();
+    }
+    // Kills: v6 re-run state "composite present, v4's index already absent, stamped v5" (a restore, or
+    // a partial hand drop): it must still open clean and end with ONE valid composite.
+    SECTION("re-run: the composite is already there and v4's index is already gone") {
+        exec_stmt(pool, "DROP INDEX device_inventory_store.device_ci_agent_id_c_idx");
+        exec_stmt(pool, "CREATE INDEX device_ci_agent_id_c_changed_idx ON device_inventory_store.device_ci "
+                        "(agent_id COLLATE \"C\", changed_at)");
+        // with v4's index already gone from the store schema, an UNQUALIFIED second drop would fall
+        // through to `public`: a foreign index of v4's name there must survive too
+        exec_stmt(pool, "CREATE TABLE public.yuzu_test_v6_foreign2 (agent_id text)");
+        exec_stmt(pool, "CREATE INDEX device_ci_agent_id_c_idx ON public.yuzu_test_v6_foreign2 (agent_id)");
+        open_and_check();
+        CHECK(count_rows(pool, "SELECT count(*) FROM pg_indexes WHERE schemaname = 'public' AND tablename = "
+                               "'yuzu_test_v6_foreign2' AND indexname = 'device_ci_agent_id_c_idx'") == 1);
+        exec_stmt(pool, "DROP TABLE public.yuzu_test_v6_foreign2");
+    }
+    // Kills: an UNQUALIFIED `DROP INDEX IF EXISTS` in v6. The runner's search_path is
+    // "<store>", public, so a name that does not exist in the store schema falls through to `public`
+    // and a same-named index there is dropped (verified on PostgreSQL 18.4). Same-named indexes on
+    // a table in `public` must survive v6; the store's own pair is still handled.
+    SECTION("same-named indexes in the public schema are not touched") {
+        exec_stmt(pool, "CREATE TABLE public.yuzu_test_v6_foreign (agent_id text, changed_at bigint)");
+        exec_stmt(pool, "CREATE INDEX device_ci_agent_id_c_idx ON public.yuzu_test_v6_foreign (agent_id)");
+        exec_stmt(pool, "CREATE INDEX device_ci_agent_id_c_changed_idx ON public.yuzu_test_v6_foreign "
+                        "(agent_id, changed_at)");
+        open_and_check();
+        CHECK(count_rows(pool, "SELECT count(*) FROM pg_indexes WHERE schemaname = 'public' AND tablename = "
+                               "'yuzu_test_v6_foreign' AND indexname IN ('device_ci_agent_id_c_idx', "
+                               "'device_ci_agent_id_c_changed_idx')") == 2);
+        exec_stmt(pool, "DROP TABLE public.yuzu_test_v6_foreign");
+    }
+}
+
+// Kills: no runtime check of the v6 keyset index and the v5 changed_at index. `schema_meta` saying v6
+// is not proof the indexes exist (a restore, a hand-run DROP INDEX, a same-named index of another
+// definition that IF NOT EXISTS accepted). Each case below leaves the store OPEN (the read is still
+// correct) and logs one WARN that names the index, the cost and the statement to run; a healthy open
+// logs none. The walk is checked after each, so "stays correct" is observed and not just claimed.
+TEST_CASE("opening the store warns when a read index is missing, invalid or defined differently",
+          "[pg][device_ci][migration][v6][index_check]") {
     YUZU_REQUIRE_PG_DB_TPL(db, device_ci_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 3}};
     REQUIRE(pool.valid());
@@ -3791,66 +3920,111 @@ TEST_CASE("opening the store warns when the C-collated index is missing, invalid
         yuzu::server::DeviceCiKeysetQuery q;
         CHECK(keyset_ids(reopened.list_device_ci_after(q)) == std::vector<std::string>{"A-1", "b-2"});
     };
+    const auto replace_keyset = [&](const char* ddl_tail) {
+        exec_stmt(pool, "DROP INDEX device_inventory_store.device_ci_agent_id_c_changed_idx");
+        exec_stmt(pool, std::string("CREATE INDEX device_ci_agent_id_c_changed_idx ON "
+                                    "device_inventory_store.device_ci ") +
+                            ddl_tail);
+    };
+    const auto replace_changed_at = [&](const char* ddl_tail) {
+        exec_stmt(pool, "DROP INDEX device_inventory_store.device_ci_changed_at_idx");
+        exec_stmt(pool, std::string("CREATE INDEX device_ci_changed_at_idx ON "
+                                    "device_inventory_store.device_ci ") +
+                            ddl_tail);
+    };
     std::string warn;
 
-    SECTION("a healthy index: no warning") {
+    SECTION("healthy indexes: no warning for either") {
         open_and_capture(warn);
-        CHECK(warn.find("device_ci_agent_id_c_idx") == std::string::npos);
+        CHECK(warn.find("device_ci_agent_id_c_changed_idx") == std::string::npos);
+        CHECK(warn.find("device_ci_changed_at_idx") == std::string::npos);
     }
-    SECTION("a dropped index") {
-        exec_stmt(pool, "DROP INDEX device_inventory_store.device_ci_agent_id_c_idx");
+    SECTION("a dropped keyset index") {
+        exec_stmt(pool, "DROP INDEX device_inventory_store.device_ci_agent_id_c_changed_idx");
         open_and_capture(warn);
-        CHECK(warn.find("device_ci_agent_id_c_idx is missing") != std::string::npos);
+        CHECK(warn.find("device_ci_agent_id_c_changed_idx is missing") != std::string::npos);
         CHECK(warn.find("scan plus a sort") != std::string::npos);
-        CHECK(warn.find("CREATE INDEX IF NOT EXISTS device_ci_agent_id_c_idx ON "
-                        "device_inventory_store.device_ci ((agent_id COLLATE \"C\"))") !=
+        CHECK(warn.find("CREATE INDEX IF NOT EXISTS device_ci_agent_id_c_changed_idx ON "
+                        "device_inventory_store.device_ci (agent_id COLLATE \"C\", changed_at)") !=
               std::string::npos);
+        CHECK(warn.find("device_ci_changed_at_idx") == std::string::npos); // the other one is fine
+        // a missing index has nothing to drop, and the line points at the manual
+        CHECK(warn.find("must be dropped first") == std::string::npos);
+        CHECK(warn.find("DROP INDEX") == std::string::npos);
+        CHECK(warn.find("CREATE INDEX IF NOT EXISTS device_ci_agent_id_c_changed_idx ON "
+                        "device_inventory_store.device_ci (agent_id COLLATE \"C\", changed_at); See ") !=
+              std::string::npos); // the statement is terminated, so it pastes as written
+        CHECK(warn.find("docs/user-manual/upgrading.md") != std::string::npos);
     }
-    SECTION("a same-named index on the plain column") {
-        exec_stmt(pool, "DROP INDEX device_inventory_store.device_ci_agent_id_c_idx");
+    SECTION("v4's old index left beside a healthy composite is not a problem") {
         exec_stmt(pool, "CREATE INDEX device_ci_agent_id_c_idx ON device_inventory_store.device_ci "
-                        "(agent_id)");
+                        "((agent_id COLLATE \"C\"))");
+        open_and_capture(warn);
+        CHECK(warn.find("DeviceInventoryStore:") == std::string::npos);
+    }
+    // The index NAME contains "agent_id", so a check that looks for that word in the definition
+    // text accepts these; the check compares the printed key list whole.
+    SECTION("a same-named index on the plain column") {
+        replace_keyset("(agent_id, changed_at)");
+        open_and_capture(warn);
+        CHECK(warn.find("is defined differently") != std::string::npos);
+        // an index that exists but differs must be dropped before `IF NOT EXISTS` can build it
+        CHECK(warn.find("the existing index must be dropped first") != std::string::npos);
+        CHECK(warn.find("DROP INDEX device_inventory_store.device_ci_agent_id_c_changed_idx; CREATE INDEX IF "
+                        "NOT EXISTS device_ci_agent_id_c_changed_idx ON device_inventory_store.device_ci "
+                        "(agent_id COLLATE \"C\", changed_at);") != std::string::npos);
+    }
+    SECTION("a same-named index without changed_at (v4's definition under the new name)") {
+        replace_keyset("((agent_id COLLATE \"C\"))");
         open_and_capture(warn);
         CHECK(warn.find("is defined differently") != std::string::npos);
     }
-    // The index NAME contains "agent_id", so a check that looks for that word in the definition
-    // text accepts all three of these; the check compares the printed key list whole.
-    SECTION("a same-named multi-column index starting with the right expression") {
-        exec_stmt(pool, "DROP INDEX device_inventory_store.device_ci_agent_id_c_idx");
-        exec_stmt(pool, "CREATE INDEX device_ci_agent_id_c_idx ON device_inventory_store.device_ci "
-                        "(agent_id COLLATE \"C\", hostname)");
+    SECTION("a same-named index with another second column") {
+        replace_keyset("(agent_id COLLATE \"C\", hostname)");
+        open_and_capture(warn);
+        CHECK(warn.find("is defined differently") != std::string::npos);
+    }
+    SECTION("a same-named index with the columns the other way round") {
+        replace_keyset("(changed_at, agent_id COLLATE \"C\")");
         open_and_capture(warn);
         CHECK(warn.find("is defined differently") != std::string::npos);
     }
     SECTION("a same-named index with an INCLUDE column") {
-        exec_stmt(pool, "DROP INDEX device_inventory_store.device_ci_agent_id_c_idx");
-        exec_stmt(pool, "CREATE INDEX device_ci_agent_id_c_idx ON device_inventory_store.device_ci "
-                        "((agent_id COLLATE \"C\")) INCLUDE (hostname)");
+        replace_keyset("(agent_id COLLATE \"C\", changed_at) INCLUDE (hostname)");
         open_and_capture(warn);
         CHECK(warn.find("is defined differently") != std::string::npos);
     }
     SECTION("a same-named index on lower(agent_id) in C collation") {
-        exec_stmt(pool, "DROP INDEX device_inventory_store.device_ci_agent_id_c_idx");
-        exec_stmt(pool, "CREATE INDEX device_ci_agent_id_c_idx ON device_inventory_store.device_ci "
-                        "((lower(agent_id) COLLATE \"C\"))");
+        replace_keyset("((lower(agent_id) COLLATE \"C\"), changed_at)");
         open_and_capture(warn);
         CHECK(warn.find("is defined differently") != std::string::npos);
     }
-    SECTION("the plain collated column is the same index and stays silent") {
-        exec_stmt(pool, "DROP INDEX device_inventory_store.device_ci_agent_id_c_idx");
-        exec_stmt(pool, "CREATE INDEX device_ci_agent_id_c_idx ON device_inventory_store.device_ci "
-                        "(agent_id COLLATE \"C\")");
-        open_and_capture(warn);
-        CHECK(warn.find("device_ci_agent_id_c_idx") == std::string::npos);
-    }
-    SECTION("a partial index of the right expression") {
-        exec_stmt(pool, "DROP INDEX device_inventory_store.device_ci_agent_id_c_idx");
-        exec_stmt(pool, "CREATE INDEX device_ci_agent_id_c_idx ON device_inventory_store.device_ci "
-                        "((agent_id COLLATE \"C\")) WHERE blob_version >= 2");
+    SECTION("a descending second column") {
+        replace_keyset("(agent_id COLLATE \"C\", changed_at DESC)");
         open_and_capture(warn);
         CHECK(warn.find("is defined differently") != std::string::npos);
     }
-    SECTION("an invalid index (an interrupted build)") {
+    SECTION("the operator's own statement from the warning is the same index and stays silent") {
+        replace_keyset("(agent_id COLLATE \"C\", changed_at)");
+        open_and_capture(warn);
+        CHECK(warn.find("device_ci_agent_id_c_changed_idx") == std::string::npos);
+    }
+    SECTION("an operator-tuned storage parameter does not read as a different definition") {
+        replace_keyset("(agent_id COLLATE \"C\", changed_at) WITH (fillfactor = 70)");
+        open_and_capture(warn);
+        CHECK(warn.find("device_ci_agent_id_c_changed_idx") == std::string::npos);
+    }
+    SECTION("a storage parameter does not hide an INCLUDE list") {
+        replace_keyset("(agent_id COLLATE \"C\", changed_at) INCLUDE (hostname) WITH (fillfactor = 70)");
+        open_and_capture(warn);
+        CHECK(warn.find("is defined differently") != std::string::npos);
+    }
+    SECTION("a partial index of the right columns") {
+        replace_keyset("(agent_id COLLATE \"C\", changed_at) WHERE blob_version >= 2");
+        open_and_capture(warn);
+        CHECK(warn.find("is defined differently") != std::string::npos);
+    }
+    SECTION("an invalid keyset index (an interrupted build)") {
         // Writing pg_index needs a superuser. Skip on any other role, as the pg_index and
         // pg_database writes in test_pg_collation_check.cpp do: a least-privilege test role
         // (scripts/setup-rhel9.sh grants CREATEDB and pg_signal_backend only) is a supported setup.
@@ -3860,7 +4034,7 @@ TEST_CASE("opening the store warns when the C-collated index is missing, invalid
             auto res = yuzu::server::pg::exec_params(
                 lease.get(),
                 "UPDATE pg_index SET indisvalid = false WHERE indexrelid = "
-                "'device_inventory_store.device_ci_agent_id_c_idx'::regclass",
+                "'device_inventory_store.device_ci_agent_id_c_changed_idx'::regclass",
                 std::vector<std::string>{});
             if (res.status() != PGRES_COMMAND_OK)
                 SKIP("the test role cannot update pg_index (not a superuser): "
@@ -3868,6 +4042,42 @@ TEST_CASE("opening the store warns when the C-collated index is missing, invalid
         }
         open_and_capture(warn);
         CHECK(warn.find("is invalid") != std::string::npos);
+        CHECK(warn.find("or a concurrent build still running") != std::string::npos);
+    }
+
+    // The v5 index: nothing warned about it before. A delta is correct without it, so the line says
+    // what is lost (a sparse delta is served from the keyset index) and how to build it.
+    SECTION("a dropped changed_at index") {
+        exec_stmt(pool, "DROP INDEX device_inventory_store.device_ci_changed_at_idx");
+        open_and_capture(warn);
+        CHECK(warn.find("device_ci_changed_at_idx is missing") != std::string::npos);
+        CHECK(warn.find("sparse delta") != std::string::npos);
+        CHECK(warn.find("scan plus a sort") == std::string::npos); // that is the keyset index's cost
+        CHECK(warn.find("CREATE INDEX IF NOT EXISTS device_ci_changed_at_idx ON "
+                        "device_inventory_store.device_ci (changed_at)") != std::string::npos);
+        CHECK(warn.find("device_ci_agent_id_c_changed_idx") == std::string::npos); // that one is fine
+    }
+    SECTION("a same-named changed_at index on another column") {
+        replace_changed_at("(last_seen)");
+        open_and_capture(warn);
+        CHECK(warn.find("device_ci_changed_at_idx is defined differently") != std::string::npos);
+    }
+    SECTION("a descending changed_at index is defined differently") {
+        replace_changed_at("(changed_at DESC)");
+        open_and_capture(warn);
+        CHECK(warn.find("device_ci_changed_at_idx is defined differently") != std::string::npos);
+    }
+    SECTION("a partial changed_at index") {
+        replace_changed_at("(changed_at) WHERE blob_version >= 2");
+        open_and_capture(warn);
+        CHECK(warn.find("device_ci_changed_at_idx is defined differently") != std::string::npos);
+    }
+    SECTION("both indexes dropped: one warning for each") {
+        exec_stmt(pool, "DROP INDEX device_inventory_store.device_ci_agent_id_c_changed_idx");
+        exec_stmt(pool, "DROP INDEX device_inventory_store.device_ci_changed_at_idx");
+        open_and_capture(warn);
+        CHECK(warn.find("device_ci_agent_id_c_changed_idx is missing") != std::string::npos);
+        CHECK(warn.find("device_ci_changed_at_idx is missing") != std::string::npos);
     }
 }
 
@@ -4050,4 +4260,800 @@ TEST_CASE("list_device_ci_after counts a saturated pool as pool_acquire_timeout 
         CHECK(ci_read_degrades(metrics, "pool_acquire_timeout") == 0.0);
         CHECK(ci_read_degrades(metrics, "store_not_open") == 0.0);
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// changed_at / the `changed_since` delta filter (migration v5)
+// ---------------------------------------------------------------------------------------------
+
+namespace {
+
+// The PostgreSQL clock in epoch seconds, spelled as the store spells it.
+long long db_now_secs(PgPool& pool) {
+    return count_rows(pool, "SELECT EXTRACT(EPOCH FROM clock_timestamp())::bigint");
+}
+
+// One bigint column of one row; -1 when the row is absent or the read fails.
+long long ci_column(PgPool& pool, const std::string& id, const std::string& column) {
+    return count_rows(pool, "SELECT " + column + " FROM device_inventory_store.device_ci WHERE agent_id = '" +
+                                id + "'");
+}
+
+// Stores one v2 record under `id` whose pinned content hash is `hash`.
+InventoryIngestOutcome put_ci(DeviceInventoryStore& store, const std::string& id, const std::string& hash) {
+    DeviceCiRecord r = distinct_v2_record("A");
+    r.content_hash = hash;
+    return store.apply_device_ci(id, DeviceInventoryStore::canonical_hash(r), std::optional<DeviceCiRecord>{r}, 1);
+}
+
+// The ids of a changed_since page, in served order.
+std::vector<std::string> since_ids(DeviceInventoryStore& store, yuzu::server::DeviceCiKeysetQuery q) {
+    return keyset_ids(store.list_device_ci_after(q));
+}
+
+} // namespace
+
+// Kills: changed_at stamped from the replica clock, stamped on every upsert, not stamped on insert,
+// or moved by a hash-skip touch (the defect that makes last_seen useless as a change marker).
+// Backdating both columns to 1000 makes "left alone" and "moved to now" unmistakable on a fast box.
+TEST_CASE("changed_at is stamped from the database clock on insert and moves only when the content hash changes",
+          "[pg][device_ci][changed_since]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, device_ci_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 3}};
+    REQUIRE(pool.valid());
+    DeviceInventoryStore store{pool};
+    REQUIRE(store.is_open());
+
+    const long long before = db_now_secs(pool);
+    REQUIRE(put_ci(store, "agent-1", "hash-1") == InventoryIngestOutcome::kStored);
+    const long long after = db_now_secs(pool);
+    REQUIRE(before > 0);
+
+    SECTION("a first store is stamped inside the database clock's window and the record carries it") {
+        const long long at = ci_column(pool, "agent-1", "changed_at");
+        CHECK(at >= before);
+        CHECK(at <= after);
+        auto got = store.get_device_ci("agent-1");
+        REQUIRE(got.has_value());
+        REQUIRE(got->has_value());
+        CHECK((**got).changed_at == at);
+    }
+
+    // From here every section starts with both timestamps in the past.
+    exec_stmt(pool, "UPDATE device_inventory_store.device_ci SET changed_at = 1000, last_seen = 1000");
+
+    SECTION("a full re-send of unchanged content leaves changed_at alone and still moves last_seen") {
+        REQUIRE(put_ci(store, "agent-1", "hash-1") == InventoryIngestOutcome::kStored);
+        CHECK(ci_column(pool, "agent-1", "changed_at") == 1000);
+        CHECK(ci_column(pool, "agent-1", "last_seen") > 1000);
+    }
+    SECTION("a full replace with a different content hash moves changed_at forward to the database clock") {
+        const long long b = db_now_secs(pool);
+        REQUIRE(put_ci(store, "agent-1", "hash-2") == InventoryIngestOutcome::kStored);
+        const long long a = db_now_secs(pool);
+        const long long at = ci_column(pool, "agent-1", "changed_at");
+        CHECK(at >= b);
+        CHECK(at <= a);
+        // and the new hash is the baseline: re-sending it does not move the marker again
+        exec_stmt(pool, "UPDATE device_inventory_store.device_ci SET changed_at = 1000");
+        REQUIRE(put_ci(store, "agent-1", "hash-2") == InventoryIngestOutcome::kStored);
+        CHECK(ci_column(pool, "agent-1", "changed_at") == 1000);
+    }
+    SECTION("a hash-skip touch moves last_seen and leaves changed_at alone") {
+        REQUIRE(store.apply_device_ci("agent-1", "hash-1", std::nullopt, 1) == InventoryIngestOutcome::kTouched);
+        CHECK(ci_column(pool, "agent-1", "changed_at") == 1000);
+        CHECK(ci_column(pool, "agent-1", "last_seen") > 1000);
+    }
+    SECTION("changed_at is not part of the content hash") {
+        DeviceCiRecord r = distinct_v2_record("A");
+        r.changed_at = 12345; // a record field a caller might set must not reach the stored marker
+        r.content_hash = "hash-1";
+        REQUIRE(store.apply_device_ci("agent-1", DeviceInventoryStore::canonical_hash(r),
+                                      std::optional<DeviceCiRecord>{r}, 1) == InventoryIngestOutcome::kStored);
+        CHECK(ci_column(pool, "agent-1", "changed_at") == 1000);
+        DeviceCiRecord v1 = parse_device_ci_blob(sample_blob());
+        DeviceCiRecord v1b = v1;
+        v1b.changed_at = 99;
+        CHECK(DeviceInventoryStore::canonical_hash(v1) == DeviceInventoryStore::canonical_hash(v1b));
+    }
+}
+
+// Kills: a filter that is `>`, that is ignored when combined with another narrowing, or that does
+// not compose with the cursor. The seeded stamps are 100, 200, 300, 400 on ids a..d in byte order.
+TEST_CASE("changed_since returns exactly the rows with changed_at >= since, alone and combined",
+          "[pg][device_ci][changed_since][keyset]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, device_ci_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 3}};
+    REQUIRE(pool.valid());
+    DeviceInventoryStore store{pool};
+    REQUIRE(store.is_open());
+    for (const char* id : {"a", "b", "c", "d"})
+        REQUIRE(put_ci(store, id, std::string("hash-") + id) == InventoryIngestOutcome::kStored);
+    exec_stmt(pool, "UPDATE device_inventory_store.device_ci SET changed_at = "
+                    "CASE agent_id WHEN 'a' THEN 100 WHEN 'b' THEN 200 WHEN 'c' THEN 300 ELSE 400 END");
+    using Ids = std::vector<std::string>;
+    yuzu::server::DeviceCiKeysetQuery q;
+
+    q.changed_since = 300;
+    CHECK(since_ids(store, q) == Ids{"c", "d"}); // inclusive at the boundary
+    q.changed_since = 301;
+    CHECK(since_ids(store, q) == Ids{"d"});
+    q.changed_since = 401;
+    auto none = store.list_device_ci_after(q);
+    REQUIRE(none.has_value()); // an answered empty page, not a degrade
+    CHECK(none->empty());
+    q.changed_since = 0;
+    CHECK(since_ids(store, q) == Ids{"a", "b", "c", "d"});
+    q.changed_since = std::numeric_limits<std::int64_t>::min() + 1;
+    CHECK(since_ids(store, q).size() == 4);
+
+    SECTION("with the cursor, the limit and the byte order") {
+        q.changed_since = 200;
+        q.after = "b";
+        CHECK(since_ids(store, q) == Ids{"c", "d"});
+        q.after = "";
+        q.limit = 2;
+        CHECK(since_ids(store, q) == Ids{"b", "c"});
+        q.after = "c";
+        CHECK(since_ids(store, q) == Ids{"d"});
+    }
+    SECTION("with a single-device read") {
+        q.changed_since = 300;
+        q.agent_id = "d";
+        CHECK(since_ids(store, q) == Ids{"d"});
+        q.agent_id = "a"; // exists but is older than the filter: absent, and answered
+        auto page = store.list_device_ci_after(q);
+        REQUIRE(page.has_value());
+        CHECK(page->empty());
+    }
+    SECTION("with a scope-membership list") {
+        q.changed_since = 200;
+        q.agent_ids = Ids{"a", "c", "zzz"};
+        CHECK(since_ids(store, q) == Ids{"c"});
+        q.agent_ids = Ids{}; // deny-all stays deny-all: no SQL, an empty answered page
+        auto page = store.list_device_ci_after(q);
+        REQUIRE(page.has_value());
+        CHECK(page->empty());
+    }
+    SECTION("every served row carries its own changed_at") {
+        q.changed_since = 300;
+        auto page = store.list_device_ci_after(q);
+        REQUIRE(page.has_value());
+        REQUIRE(page->size() == 2);
+        CHECK((*page)[0].changed_at == 300);
+        CHECK((*page)[1].changed_at == 400);
+    }
+    SECTION("the keyed read carries it too") {
+        auto keyed = store.list_device_ci_for({"b"});
+        REQUIRE(keyed.has_value());
+        REQUIRE(keyed->size() == 1);
+        CHECK((*keyed)[0].changed_at == 200);
+    }
+}
+
+// Kills: a no-filter statement that changed (text or parameters), a filter bound by interpolation
+// instead of a parameter, or a placeholder renumbering that shifts the LIMIT. The unfiltered tail is
+// pinned literally; the select list differs from before ONLY by the appended `changed_at` column.
+TEST_CASE("the keyset statement without changed_since is the unfiltered statement, and with it adds one bound clause",
+          "[device_ci][changed_since][keyset]") {
+    using yuzu::server::device_ci_keyset_statement;
+    yuzu::server::DeviceCiKeysetQuery plain;
+    const auto base = device_ci_keyset_statement(plain);
+    // The unfiltered text from FROM onward and its parameters, exactly as before this change.
+    constexpr const char* kTail =
+        " FROM device_inventory_store.device_ci WHERE true ORDER BY agent_id COLLATE \"C\" ASC LIMIT $1::bigint";
+    CHECK(base.sql.ends_with(std::string(", content_hash") + kTail));
+    CHECK(base.sql.find("machine_id_source, changed_at, content_hash FROM") != std::string::npos);
+    CHECK(base.sql.find("changed_since") == std::string::npos);
+    CHECK(base.sql.find("changed_at >=") == std::string::npos);
+    CHECK(base.params == std::vector<std::string>{"100"});
+
+    SECTION("alone: one clause, one bound parameter, before the LIMIT") {
+        auto q = plain;
+        q.changed_since = 1234567890123LL;
+        const auto st = device_ci_keyset_statement(q);
+        std::string expected = base.sql;
+        const auto at = expected.find(" ORDER BY");
+        REQUIRE(at != std::string::npos);
+        expected.insert(at, " AND changed_at >= $1::bigint");
+        expected.replace(expected.find("LIMIT $1::bigint"), 16, "LIMIT $2::bigint");
+        CHECK(st.sql == expected);
+        CHECK(st.params == std::vector<std::string>{"1234567890123", "100"});
+        CHECK(st.sql.find("1234567890123") == std::string::npos); // never interpolated
+    }
+    SECTION("with the cursor and both narrowings the placeholders stay in order") {
+        auto q = plain;
+        q.after = "m";
+        q.agent_id = "x";
+        q.agent_ids = std::vector<std::string>{"y"};
+        const auto without = device_ci_keyset_statement(q);
+        q.changed_since = 7;
+        const auto with = device_ci_keyset_statement(q);
+        REQUIRE(without.params.size() == 4); // after, agent_id, agent_ids, limit
+        REQUIRE(with.params.size() == 5);
+        CHECK(with.params[3] == "7");
+        CHECK(with.params[4] == "100");
+        CHECK(with.params[0] == without.params[0]);
+        CHECK(with.params[1] == without.params[1]);
+        CHECK(with.params[2] == without.params[2]);
+        CHECK(with.sql.find(" AND changed_at >= $4::bigint ORDER BY") != std::string::npos);
+        CHECK(with.sql.find("LIMIT $5::bigint") != std::string::npos);
+    }
+    SECTION("a negative or zero filter is still a bound parameter") {
+        auto q = plain;
+        q.changed_since = -5;
+        CHECK(device_ci_keyset_statement(q).params == std::vector<std::string>{"-5", "100"});
+    }
+}
+
+// Kills: a v5 that rewrites the table (a volatile default), builds its index without v4's
+// transaction-local settings, is not idempotent, or uses CONCURRENTLY (the runner's transaction
+// refuses it). The default must be the STABLE `now()`, never `clock_timestamp()` (volatile).
+TEST_CASE("migration v5 adds changed_at with a stable default and builds its index under transaction-local timeouts",
+          "[device_ci][migration][v5][changed_since]") {
+    const auto& all = yuzu::server::device_inventory_migrations();
+    REQUIRE(all.size() >= 6); // v7+ (the removals feed) append; indices below stay valid
+    REQUIRE(all[4].version == 5);
+    const std::string& sql = all[4].sql;
+    const auto at = [&](const char* needle) { return sql.find(needle); };
+    REQUIRE(at("SET LOCAL lock_timeout = '30s'") != std::string::npos);
+    REQUIRE(at("SET LOCAL statement_timeout = 0") != std::string::npos);
+    REQUIRE(at("ALTER TABLE device_ci ADD COLUMN IF NOT EXISTS changed_at BIGINT NOT NULL "
+               "DEFAULT (EXTRACT(EPOCH FROM now()))::bigint") != std::string::npos);
+    REQUIRE(at("CREATE INDEX IF NOT EXISTS device_ci_changed_at_idx ON device_ci (changed_at)") !=
+            std::string::npos);
+    CHECK(at("SET LOCAL lock_timeout") < at("ALTER TABLE"));
+    CHECK(at("SET LOCAL statement_timeout") < at("ALTER TABLE"));
+    CHECK(at("ALTER TABLE") < at("CREATE INDEX"));
+    // the type guard sits between the two: after the ADD COLUMN it inspects, before the index
+    REQUIRE(at("DO $v5guard$") != std::string::npos);
+    CHECK(at("ALTER TABLE") < at("DO $v5guard$"));
+    CHECK(at("DO $v5guard$") < at("CREATE INDEX"));
+    CHECK(sql.find("RAISE EXCEPTION 'device_inventory_store.device_ci.changed_at must be bigint NOT NULL") !=
+          std::string::npos);
+    CHECK(sql.find("CONCURRENTLY") == std::string::npos);
+    CHECK(sql.find("clock_timestamp") == std::string::npos);
+    CHECK(sql.find("DROP") == std::string::npos);
+    CHECK(yuzu::server::kChangedSinceMarginSecs == 300);
+}
+
+// Kills: a v6 that can drop v4's index while the composite is absent or unusable, loses the
+// transaction-local settings (the runner's pooled connection carries a 30 s statement_timeout and a
+// 10 s lock_timeout, and a failed migration refuses to start the server on every restart), is not
+// idempotent, or uses CONCURRENTLY (the runner's transaction refuses it). The statement ORDER is the
+// point: drop any pre-existing composite, create it, then drop v4's, so a same-named index left by a
+// cancelled hand build is replaced and not trusted. The whole texts of v4, v5 and v6 are pinned by
+// SHA-256 because their hashes are recorded in every database that ran them (v4's is on dev; v5 and
+// v6 are unshipped and pinned to freeze them); changing one is a deliberate act that needs a drift
+// recipe, and these pins make it fail here first. (Within one
+// transaction the order does not change what a concurrent reader sees; it changes only the locks taken.)
+TEST_CASE("migration v6 locks first, rebuilds the composite keyset index under transaction-local timeouts, then drops v4's",
+          "[device_ci][migration][v6][changed_since]") {
+    const auto& all = yuzu::server::device_inventory_migrations();
+    REQUIRE(all.size() >= 6); // v7+ (the removals feed) append; indices below stay valid
+    REQUIRE(all[5].version == 6);
+    const std::string& sql = all[5].sql;
+    const auto at = [&](const char* needle) { return sql.find(needle); };
+    REQUIRE(at("SET LOCAL lock_timeout = '30s'") != std::string::npos);
+    REQUIRE(at("SET LOCAL statement_timeout = 0") != std::string::npos);
+    // the strongest lock FIRST: a build that took SHARE and upgraded to ACCESS EXCLUSIVE at the drop
+    // can deadlock against a session that has read the table and then writes it
+    REQUIRE(at("LOCK TABLE device_ci IN ACCESS EXCLUSIVE MODE") != std::string::npos);
+    // the drops are schema-qualified: the runner's search_path is "<store>", public, so an
+    // unqualified DROP INDEX IF EXISTS would fall through to `public`
+    REQUIRE(at("DROP INDEX IF EXISTS device_inventory_store.device_ci_agent_id_c_changed_idx") !=
+            std::string::npos);
+    REQUIRE(at("CREATE INDEX IF NOT EXISTS device_ci_agent_id_c_changed_idx ON device_ci "
+               "(agent_id COLLATE \"C\", changed_at)") != std::string::npos);
+    REQUIRE(at("DROP INDEX IF EXISTS device_inventory_store.device_ci_agent_id_c_idx") != std::string::npos);
+    CHECK(sql.find("DROP INDEX IF EXISTS device_ci_") == std::string::npos); // no unqualified drop
+    CHECK(at("SET LOCAL lock_timeout") < at("LOCK TABLE"));
+    CHECK(at("SET LOCAL statement_timeout") < at("LOCK TABLE"));
+    CHECK(at("LOCK TABLE") < at("DROP INDEX"));
+    // the composite is dropped, then built, and only then is v4's dropped
+    CHECK(at("DROP INDEX IF EXISTS device_inventory_store.device_ci_agent_id_c_changed_idx") <
+          at("CREATE INDEX"));
+    CHECK(at("CREATE INDEX") < at("DROP INDEX IF EXISTS device_inventory_store.device_ci_agent_id_c_idx"));
+    CHECK(sql.find("CONCURRENTLY") == std::string::npos);
+    // nothing else: the changed_at index and the column are v5's
+    CHECK(sql.find("device_ci_changed_at_idx") == std::string::npos);
+    CHECK(sql.find("ALTER") == std::string::npos);
+
+    // whole-text pins: v4 shipped (it is on dev and its hash is recorded in every database that ran
+    // it); v5 and v6 are not shipped yet and are pinned to freeze them, so a later edit is deliberate
+    const auto sha = [](const std::string& t) {
+        const auto d = yuzu::server::sha256_hex(t);
+        REQUIRE(d.has_value());
+        return *d;
+    };
+    CHECK(sha(all[3].sql) == "c3278af7579d58415f02d5cedad350bf60df93b17082f10be589355956a37b4e");
+    CHECK(sha(all[4].sql) == "dc82eed9947d2d2e776144f04a59b29c30b0cff8a4e1bc143b35999b541bfccb");
+    CHECK(sha(all[5].sql) == "5fed893100124de59616bcaecb6e82a48115abae862f3b62cb0d924bfc131585");
+}
+
+// Kills: a v5 that fails on a populated v4 database, rewrites the table (the relfilenode changes
+// when it does), loses the rows' content, or leaves the index out. The existing rows read
+// "changed at the migration" (the stable default's evaluation time), not 0 and not their last_seen.
+TEST_CASE("a v4 database upgrades to v5 in place without a table rewrite and backfills the migration time",
+          "[pg][device_ci][migration][v5][changed_since]") {
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
+    PgPool pool{{.conninfo = db.dsn(), .size = 3}};
+    REQUIRE(pool.valid());
+    {
+        DeviceInventoryStore seed{pool};
+        REQUIRE(seed.is_open());
+        REQUIRE(put_ci(seed, "agent-v4-1", "h1") == InventoryIngestOutcome::kStored);
+        REQUIRE(put_ci(seed, "agent-v4-2", "h2") == InventoryIngestOutcome::kStored);
+    }
+    exec_stmt(pool, "INSERT INTO device_inventory_store.device_ci (agent_id, first_seen, last_seen) "
+                    "SELECT 'bulk-' || i, 5, 5 FROM generate_series(1, 20000) AS i");
+    // a database as v4 left it: no column, no changed_at index, v4's own keyset index, recorded
+    // version 4 (dropping the column also drops the composite index that includes it)
+    exec_stmt(pool, "DROP INDEX device_inventory_store.device_ci_changed_at_idx");
+    exec_stmt(pool, "ALTER TABLE device_inventory_store.device_ci DROP COLUMN changed_at");
+    exec_stmt(pool, "CREATE INDEX device_ci_agent_id_c_idx ON device_inventory_store.device_ci "
+                    "((agent_id COLLATE \"C\"))");
+    exec_stmt(pool, "UPDATE public.schema_meta SET version = 4 WHERE store = 'device_inventory_store'");
+    const long long rows = count_rows(pool, "SELECT count(*) FROM device_inventory_store.device_ci");
+    REQUIRE(rows == 20002);
+    const long long file_before =
+        count_rows(pool, "SELECT pg_relation_filenode('device_inventory_store.device_ci')::bigint");
+    REQUIRE(file_before > 0);
+
+    const long long t0 = db_now_secs(pool);
+    DeviceInventoryStore store{pool}; // runs v5 and v6 over the populated table
+    const long long t1 = db_now_secs(pool);
+    REQUIRE(store.is_open());
+
+    CHECK(count_rows(pool, "SELECT pg_relation_filenode('device_inventory_store.device_ci')::bigint") ==
+          file_before); // metadata-only: the heap file was not rewritten
+    CHECK(count_rows(pool, "SELECT count(*) FROM device_inventory_store.device_ci") == rows);
+    CHECK(count_rows(pool, "SELECT count(*) FROM pg_indexes WHERE schemaname = 'device_inventory_store' "
+                           "AND indexname = 'device_ci_changed_at_idx'") == 1);
+    // v6 then replaced v4's keyset index with the composite one over the populated table
+    CHECK(count_rows(pool, "SELECT count(*) FROM pg_indexes WHERE schemaname = 'device_inventory_store' "
+                           "AND indexname = 'device_ci_agent_id_c_changed_idx'") == 1);
+    CHECK(count_rows(pool, "SELECT count(*) FROM pg_indexes WHERE schemaname = 'device_inventory_store' "
+                           "AND indexname = 'device_ci_agent_id_c_idx'") == 0);
+    // every row reads the migration time (statement-start now(), inside the window around the open)
+    CHECK(count_rows(pool, "SELECT count(*) FROM device_inventory_store.device_ci WHERE changed_at < " +
+                               std::to_string(t0 - 1) + " OR changed_at > " + std::to_string(t1 + 1)) == 0);
+    auto got = store.get_device_ci("agent-v4-1");
+    REQUIRE(got.has_value());
+    REQUIRE(got->has_value());
+    CHECK((**got).changed_at >= t0 - 1);
+    // and a delta pull from before the upgrade sees every pre-existing row (nothing is silently old)
+    yuzu::server::DeviceCiKeysetQuery q;
+    q.changed_since = t0 - 5;
+    q.agent_id = "agent-v4-2";
+    CHECK(since_ids(store, q) == std::vector<std::string>{"agent-v4-2"});
+}
+
+// Kills: a watermark from the replica clock, one that omits the margin, or a nullopt that is
+// really a guess. The window is the database clock read before and after the call.
+TEST_CASE("device_ci_watermark is the database clock minus the margin, and absent when it cannot be read",
+          "[pg][device_ci][changed_since]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, device_ci_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    REQUIRE(pool.valid());
+    DeviceInventoryStore store{pool};
+    REQUIRE(store.is_open());
+
+    const long long lo = db_now_secs(pool) - yuzu::server::kChangedSinceMarginSecs;
+    const auto w = store.device_ci_watermark();
+    const long long hi = db_now_secs(pool) - yuzu::server::kChangedSinceMarginSecs;
+    REQUIRE(w.has_value());
+    CHECK(*w >= lo);
+    CHECK(*w <= hi);
+
+    SECTION("a saturated pool is nullopt, not a stale or guessed value") {
+        PgPool one{{.conninfo = db.dsn(), .size = 1}};
+        REQUIRE(one.valid());
+        DeviceInventoryStore s2{one};
+        REQUIRE(s2.is_open());
+        auto held = one.acquire();
+        REQUIRE(held);
+        CHECK_FALSE(s2.device_ci_watermark().has_value());
+    }
+}
+
+// Kills: a watermark that set its statement timeout with a plain SET (it would leak onto the pooled
+// connection for every later user). The pool's one connection runs the read, then its own `SHOW
+// statement_timeout` is what it was before. This does NOT prove the cap is applied at all (a read
+// with no cap leaves the setting untouched too): the cap's presence is pinned by the lexical test
+// on the statement text.
+TEST_CASE("device_ci_watermark's statement timeout is transaction-local",
+          "[pg][device_ci][changed_since][watermark]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, device_ci_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 1}};
+    REQUIRE(pool.valid());
+    DeviceInventoryStore store{pool};
+    REQUIRE(store.is_open());
+    const auto show_timeout = [&]() -> std::string {
+        auto lease = pool.acquire();
+        REQUIRE(lease);
+        auto res = yuzu::server::pg::exec_params(lease.get(), "SHOW statement_timeout", std::vector<std::string>{});
+        REQUIRE(res.status() == PGRES_TUPLES_OK);
+        return PQgetvalue(res.get(), 0, 0);
+    };
+    const std::string before = show_timeout();
+    REQUIRE(before != std::string(yuzu::server::kDeviceCiWatermarkStatementTimeout)); // the check must be able to fail
+    REQUIRE(store.device_ci_watermark().has_value());
+    CHECK(show_timeout() == before);
+}
+
+TEST_CASE("device_ci_watermark on a closed store is nullopt", "[device_ci][changed_since]") {
+    PgPool pool{{.conninfo = "host=127.0.0.1 port=1 connect_timeout=1 dbname=x user=x", .size = 1}};
+    DeviceInventoryStore store{pool};
+    REQUIRE_FALSE(store.is_open());
+    CHECK_FALSE(store.device_ci_watermark().has_value());
+}
+
+// Kills: a v5 whose changed_at index the planner cannot use for a sparse delta (a delta pull would
+// then walk the whole agent_id index per page and, on a large fleet, run into the 5 s statement
+// cap), and a filter spelling that defeats the agent_id index for a dense delta. The REAL statement
+// is explained. Measured on PostgreSQL 18.4 at 1,000,000 rows: a 0.1% delta plans on the
+// changed_at index (about 6 ms) and a 90% delta on the agent_id index (about 6 ms a page); the
+// planner's one known bad case (a mid-density delta whose rows cluster at the END of agent_id order)
+// is documented in the security review, not asserted here.
+TEST_CASE("changed_since plans a sparse delta on the changed_at index and a dense one on the agent_id index",
+          "[pg][device_ci][changed_since][keyset]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, device_ci_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 3}};
+    REQUIRE(pool.valid());
+    DeviceInventoryStore store{pool};
+    REQUIRE(store.is_open());
+    // 50,000 rows; every 1000th (0.1%) changed after the cutoff, the rest long ago. Ids are
+    // zero-padded so byte order is numeric order.
+    exec_stmt(pool, "INSERT INTO device_inventory_store.device_ci (agent_id, hostname, first_seen, last_seen, "
+                    "changed_at) SELECT 'g-' || lpad(i::text, 6, '0'), 'h' || i, 1, 1, "
+                    "CASE WHEN i % 1000 = 0 THEN 2000000000 ELSE 1000 END FROM generate_series(1, 50000) AS i");
+    exec_stmt(pool, "ANALYZE device_inventory_store.device_ci");
+
+    SECTION("a sparse delta, first page and mid-walk page, plans on the changed_at index") {
+        yuzu::server::DeviceCiKeysetQuery q;
+        q.changed_since = 1500000000;
+        q.limit = 1001;
+        const std::string first = keyset_plan(pool, q);
+        INFO(first);
+        CHECK(first.find("device_ci_changed_at_idx") != std::string::npos);
+        q.after = "g-025000";
+        const std::string mid = keyset_plan(pool, q);
+        INFO(mid);
+        CHECK(mid.find("device_ci_changed_at_idx") != std::string::npos);
+        // and it returns exactly the 50 changed rows, in byte order
+        q.after.clear();
+        const auto ids = keyset_ids(store.list_device_ci_after(q));
+        REQUIRE(ids.size() == 50);
+        CHECK(ids.front() == "g-001000");
+        CHECK(ids.back() == "g-050000");
+        CHECK(std::is_sorted(ids.begin(), ids.end()));
+    }
+    SECTION("a dense delta plans on the agent_id index and still pages in byte order") {
+        exec_stmt(pool, "UPDATE device_inventory_store.device_ci SET changed_at = CASE WHEN i_ok THEN "
+                        "2000000000 ELSE 1000 END FROM (SELECT agent_id AS a, (random() < 0.9) AS i_ok "
+                        "FROM device_inventory_store.device_ci) s WHERE agent_id = s.a");
+        exec_stmt(pool, "ANALYZE device_inventory_store.device_ci");
+        yuzu::server::DeviceCiKeysetQuery q;
+        q.changed_since = 1500000000;
+        q.limit = 101;
+        const std::string plan = keyset_plan(pool, q);
+        INFO(plan);
+        CHECK(plan.find("device_ci_agent_id_c_changed_idx") != std::string::npos);
+        const auto ids = keyset_ids(store.list_device_ci_after(q));
+        REQUIRE(ids.size() == 101);
+        CHECK(std::is_sorted(ids.begin(), ids.end()));
+    }
+}
+
+// Kills: the keyset index losing `changed_at` (v4's `agent_id`-only index) or the delta filter being
+// spelled so the planner cannot test it inside the index. HWCI-DELTA-PLAN-FLIP: with an index on
+// `agent_id` alone, a delta of a few percent of the table that sits at the head of agent_id order
+// made the planner walk that index for the rest of the table and test `changed_at` against each heap
+// row (a `Filter:` line): 3.6 to 3.8 s on the terminal page at 1M rows in one review's measurement,
+// 262 to 268 ms in a later re-measure on a heap ordered like agent_id (a random heap reproduced 2.5 s; the record
+// gives all three).
+// With `(agent_id COLLATE "C", changed_at)` the test is an `Index Cond:` on the index itself. The
+// assertion is on the plan's CONDITION LINE, not on a timing, so it is deterministic: the same
+// statement that planned `Filter: (changed_at >= ...)` on v4's index plans `Index Cond: (... AND
+// (changed_at >= ...))` here. Prototyped on PostgreSQL 18.4 at this table shape.
+TEST_CASE("a clustered delta's terminal page tests changed_at inside the keyset index, not row by row",
+          "[pg][device_ci][changed_since][keyset]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, device_ci_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 3}};
+    REQUIRE(pool.valid());
+    DeviceInventoryStore store{pool};
+    REQUIRE(store.is_open());
+    // 100,000 rows; the first 5,000 (5%, the head of agent_id order) changed after the cutoff
+    exec_stmt(pool, "INSERT INTO device_inventory_store.device_ci (agent_id, hostname, first_seen, last_seen, "
+                    "changed_at) SELECT 'g-' || lpad(i::text, 6, '0'), 'h' || i, 1, 1, "
+                    "CASE WHEN i <= 5000 THEN 2000000000 ELSE 1000 END FROM generate_series(1, 100000) AS i");
+    // Without the v5 index the planner has only the keyset index to choose from, so the assertion is
+    // about THAT index carrying `changed_at` as a condition and cannot fail on a cost-model change that
+    // prefers `device_ci_changed_at_idx` plus a sort for this shape.
+    exec_stmt(pool, "DROP INDEX device_inventory_store.device_ci_changed_at_idx");
+    exec_stmt(pool, "ANALYZE device_inventory_store.device_ci");
+    yuzu::server::DeviceCiKeysetQuery q;
+    q.changed_since = 1500000000;
+    q.after = "g-004000"; // the last page of the delta: 1,000 matching rows, then 95,000 that do not
+    q.limit = 1001;
+    const std::string plan = keyset_plan(pool, q);
+    INFO(plan);
+    CHECK(plan.find("device_ci_agent_id_c_changed_idx") != std::string::npos);
+    // the bound AND the delta test are both index conditions
+    const auto cond = plan.find("Index Cond:");
+    REQUIRE(cond != std::string::npos);
+    const auto cond_end = plan.find('\n', cond);
+    CHECK(plan.substr(cond, cond_end - cond).find("changed_at") != std::string::npos);
+    CHECK(plan.find("Filter:") == std::string::npos);
+    // and the page is right: the 1,000 changed rows after the cursor, in byte order
+    const auto ids = keyset_ids(store.list_device_ci_after(q));
+    REQUIRE(ids.size() == 1000);
+    CHECK(ids.front() == "g-004001");
+    CHECK(ids.back() == "g-005000");
+    CHECK(std::is_sorted(ids.begin(), ids.end()));
+}
+
+// ---------------------------------------------------------------------------------------------
+// Governance fix round (hardware-CI changed_since): v5 type guard, watermark error arm, a real-PG
+// multi-page delta walk through read_page, and the v1 hash path.
+// ---------------------------------------------------------------------------------------------
+
+// Kills: a v5 that is stamped as applied over a pre-existing `changed_at` of the wrong type or
+// nullability (ADD COLUMN IF NOT EXISTS skips it silently; every content upsert then fails with
+// `CASE types text and bigint cannot be matched` and every delta 503s). The guard must refuse the
+// open with a reason that names the column and what was found, and leave v5 UNSTAMPED. The positive
+// control (a correct hand-made column) must still open, so the guard is not simply refusing all.
+TEST_CASE("migration v5 refuses a pre-existing changed_at that is not bigint NOT NULL and does not stamp v5",
+          "[pg][device_ci][migration][v5][changed_since]") {
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
+    PgPool pool{{.conninfo = db.dsn(), .size = 3}};
+    REQUIRE(pool.valid());
+    {
+        DeviceInventoryStore seed{pool};
+        REQUIRE(seed.is_open());
+        REQUIRE(put_ci(seed, "agent-g-1", "h1") == InventoryIngestOutcome::kStored);
+    }
+    // a database as v4 left it, then a hand-made column of another shape
+    exec_stmt(pool, "DROP INDEX device_inventory_store.device_ci_changed_at_idx");
+    exec_stmt(pool, "ALTER TABLE device_inventory_store.device_ci DROP COLUMN changed_at");
+    exec_stmt(pool, "UPDATE public.schema_meta SET version = 4 WHERE store = 'device_inventory_store'");
+    // ... whose runner table (public.yuzu_schema_migrations: one row per applied version, written in
+    // the same transaction as the version stamp) has no v5 row either; the seed above recorded one
+    exec_stmt(pool, "DELETE FROM public.yuzu_schema_migrations WHERE store = 'device_inventory_store' "
+                    "AND version >= 5");
+
+    const auto stored_version = [&] {
+        return count_rows(pool, "SELECT version FROM public.schema_meta WHERE store = 'device_inventory_store'");
+    };
+    const auto v5_hash_rows = [&] {
+        return count_rows(pool, "SELECT count(*) FROM public.yuzu_schema_migrations "
+                                "WHERE store = 'device_inventory_store' AND version = 5");
+    };
+    REQUIRE(v5_hash_rows() == 0); // the fixture is a v4 database
+    const auto try_open = [&](std::string& log_text) {
+        yuzu::test::LogCapture cap(spdlog::level::err);
+        DeviceInventoryStore store{pool};
+        cap.stop();
+        log_text = cap.text();
+        return store.is_open();
+    };
+    std::string log;
+
+    SECTION("a TEXT column") {
+        exec_stmt(pool, "ALTER TABLE device_inventory_store.device_ci ADD COLUMN changed_at TEXT NOT NULL "
+                        "DEFAULT ''");
+        CHECK_FALSE(try_open(log));
+        CHECK(log.find("migration v5 failed for device_inventory_store") != std::string::npos);
+        CHECK(log.find("device_inventory_store.device_ci.changed_at must be bigint NOT NULL") != std::string::npos);
+        CHECK(log.find("found type text, not null true") != std::string::npos);
+        CHECK(stored_version() == 4);
+        CHECK(v5_hash_rows() == 0); // the refused v5 recorded no hash either
+        // nothing was built behind the refusal (the transaction rolled back as a whole)
+        CHECK(count_rows(pool, "SELECT count(*) FROM pg_indexes WHERE schemaname = 'device_inventory_store' "
+                               "AND indexname = 'device_ci_changed_at_idx'") == 0);
+        // and a restart repeats the refusal rather than stamping it
+        CHECK_FALSE(try_open(log));
+        CHECK(stored_version() == 4);
+        CHECK(v5_hash_rows() == 0);
+    }
+    SECTION("a nullable BIGINT column") {
+        exec_stmt(pool, "ALTER TABLE device_inventory_store.device_ci ADD COLUMN changed_at BIGINT");
+        CHECK_FALSE(try_open(log));
+        CHECK(log.find("changed_at must be bigint NOT NULL") != std::string::npos);
+        CHECK(log.find("found type bigint, not null false") != std::string::npos);
+        CHECK(stored_version() == 4);
+        CHECK(v5_hash_rows() == 0);
+    }
+    SECTION("an INTEGER column") {
+        exec_stmt(pool, "ALTER TABLE device_inventory_store.device_ci ADD COLUMN changed_at INTEGER NOT NULL "
+                        "DEFAULT 0");
+        CHECK_FALSE(try_open(log));
+        CHECK(log.find("found type integer, not null true") != std::string::npos);
+        CHECK(stored_version() == 4);
+        CHECK(v5_hash_rows() == 0);
+    }
+    SECTION("control: a hand-made bigint NOT NULL column is accepted and v5 is stamped") {
+        exec_stmt(pool, "ALTER TABLE device_inventory_store.device_ci ADD COLUMN changed_at BIGINT NOT NULL "
+                        "DEFAULT 0");
+        CHECK(try_open(log));
+        CHECK(log.find("migration v5 failed") == std::string::npos);
+        CHECK(stored_version() == 6); // v5 accepted the column, then v6 ran after it
+        CHECK(v5_hash_rows() == 1); // the control: an accepted v5 DOES record its hash
+        CHECK(count_rows(pool, "SELECT count(*) FROM pg_indexes WHERE schemaname = 'device_inventory_store' "
+                               "AND indexname = 'device_ci_changed_at_idx'") == 1);
+    }
+}
+
+// Kills: a watermark whose query-error arm answers a value (a guess), or answers nullopt without
+// being counted as a query error. The backend of the pool's only idle connection is terminated, so
+// the next statement on it fails on a live pool lease (not a closed store and not a saturated pool).
+TEST_CASE("device_ci_watermark is nullopt and counted as query_error when its statement fails",
+          "[pg][device_ci][changed_since]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, device_ci_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 1}};
+    PgPool admin{{.conninfo = db.dsn(), .size = 1}};
+    REQUIRE(pool.valid());
+    REQUIRE(admin.valid());
+    DeviceInventoryStore store{pool};
+    REQUIRE(store.is_open());
+    yuzu::MetricsRegistry metrics;
+    store.set_metrics(&metrics);
+    REQUIRE(store.device_ci_watermark().has_value()); // healthy first
+
+    long long pid = -1;
+    {
+        auto lease = pool.acquire();
+        REQUIRE(lease);
+        auto res = yuzu::server::pg::exec_params(lease.get(), "SELECT pg_backend_pid()", std::vector<std::string>{});
+        REQUIRE(res.status() == PGRES_TUPLES_OK);
+        pid = std::atoll(PQgetvalue(res.get(), 0, 0));
+    } // the lease goes back to the pool, idle
+    REQUIRE(pid > 0);
+    REQUIRE(count_rows(admin, "SELECT pg_terminate_backend(" + std::to_string(pid) + ")::int") == 1);
+    // wait until the backend is really gone (the terminate is asynchronous), and REQUIRE it: a
+    // loop that fell through silently would run the statement on a live backend and flake red
+    const auto backend_gone = [&] {
+        return count_rows(admin, "SELECT count(*) FROM pg_stat_activity WHERE pid = " + std::to_string(pid)) == 0;
+    };
+    for (int i = 0; i < 250 && !backend_gone(); ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    REQUIRE(backend_gone());
+
+    CHECK_FALSE(store.device_ci_watermark().has_value());
+    CHECK(ci_read_degrades(metrics, "query_error") == 1.0);
+    CHECK(ci_read_degrades(metrics, "pool_acquire_timeout") == 0.0);
+    CHECK(ci_read_degrades(metrics, "store_not_open") == 0.0);
+}
+
+// Kills (QE-F1): a delta walk that skips or doubles a row where `changed_at` stamps are TIED across
+// a page cut (the keyset is agent_id, the filter changed_at; a bug that paged on changed_at would
+// split a tie), a watermark on a cursor page, and none on the first. Runs the REAL page model over
+// the REAL store on PostgreSQL, with the production wiring shape: the store's own list and watermark.
+TEST_CASE("a real-PostgreSQL delta walk through read_page returns every changed row once across tied stamps, "
+          "and only its first page carries next_changed_since",
+          "[pg][device_ci][changed_since][ci_page][hardware_ci_page]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, device_ci_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 3}};
+    REQUIRE(pool.valid());
+    DeviceInventoryStore store{pool};
+    REQUIRE(store.is_open());
+    // d1..d9 by byte order; a TIE of five rows at 300 straddles every limit-2 page cut
+    const std::vector<std::pair<std::string, long long>> stamps = {
+        {"d1", 100}, {"d2", 300}, {"d3", 300}, {"d4", 300}, {"d5", 100},
+        {"d6", 300}, {"d7", 300}, {"d8", 50},  {"d9", 400}};
+    for (const auto& [id, at] : stamps)
+        REQUIRE(put_ci(store, id, "hash-" + id) == InventoryIngestOutcome::kStored);
+    for (const auto& [id, at] : stamps)
+        exec_stmt(pool, "UPDATE device_inventory_store.device_ci SET changed_at = " + std::to_string(at) +
+                            " WHERE agent_id = '" + id + "'");
+
+    yuzu::server::BulkReadSlots slots(2);
+    int watermark_calls = 0;
+    const hcp::Reader reader = [&](const yuzu::server::DeviceCiKeysetQuery& q) { return store.list_device_ci_after(q); };
+    const hcp::Watermark watermark = [&]() {
+        ++watermark_calls;
+        return store.device_ci_watermark();
+    };
+    const auto walk = [&](hcp::Request rq, std::vector<bool>& had_watermark) {
+        std::vector<std::string> served;
+        for (int guard = 0; guard < 50; ++guard) {
+            auto page = hcp::with_watermark(
+                hcp::read_page(reader, rq, std::nullopt, nullptr, &slots, hcp::kRestRowBudgetBytes), rq, watermark);
+            REQUIRE(page.has_value());
+            had_watermark.push_back(page->next_changed_since.has_value());
+            for (const auto& r : page->rows)
+                served.push_back(r.agent_id);
+            const std::string next = page->next_cursor;
+            page->release_slot();
+            if (next.empty())
+                return served;
+            rq.cursor = next;
+        }
+        FAIL("the walk did not end");
+        return served;
+    };
+
+    SECTION("a delta walk at 300, limit 2") {
+        hcp::Request rq;
+        rq.limit = 2;
+        rq.changed_since = 300;
+        std::vector<bool> marks;
+        const auto served = walk(rq, marks);
+        CHECK(served == std::vector<std::string>{"d2", "d3", "d4", "d6", "d7", "d9"}); // exactly the set, once each
+        CHECK(std::set<std::string>(served.begin(), served.end()).size() == served.size()); // no duplicates
+        REQUIRE(marks.size() == 3);
+        CHECK(marks == std::vector<bool>{true, false, false}); // the first page only
+        CHECK(watermark_calls == 1);
+    }
+    SECTION("a delta walk at 301 (the tie is excluded) and a full walk agree with the table") {
+        hcp::Request rq;
+        rq.limit = 2;
+        rq.changed_since = 301;
+        std::vector<bool> marks;
+        CHECK(walk(rq, marks) == std::vector<std::string>{"d9"});
+        CHECK(marks == std::vector<bool>{true});
+        hcp::Request full;
+        full.limit = 2;
+        std::vector<bool> fmarks;
+        const auto all = walk(full, fmarks);
+        CHECK(all == std::vector<std::string>{"d1", "d2", "d3", "d4", "d5", "d6", "d7", "d8", "d9"});
+        CHECK(fmarks == std::vector<bool>{true, false, false, false, false});
+        CHECK(watermark_calls == 2);
+    }
+    SECTION("the first page's value is the database clock minus the margin") {
+        hcp::Request rq;
+        rq.changed_since = 300;
+        const long long lo = db_now_secs(pool) - yuzu::server::kChangedSinceMarginSecs;
+        auto page = hcp::with_watermark(
+            hcp::read_page(reader, rq, std::nullopt, nullptr, &slots, hcp::kRestRowBudgetBytes), rq, watermark);
+        const long long hi = db_now_secs(pool) - yuzu::server::kChangedSinceMarginSecs;
+        REQUIRE(page.has_value());
+        REQUIRE(page->next_changed_since.has_value());
+        CHECK(*page->next_changed_since >= lo);
+        CHECK(*page->next_changed_since <= hi);
+    }
+}
+
+// Kills (QE-F2): changed_at moving on every full send of a v1 record (the 22-field blob, hashed by
+// the same canonical_hash), or never moving on a real v1 content change. The v2 path is covered above.
+TEST_CASE("changed_at on the v1 (blob_version 1) hash path moves on a hash change and stays on an equal hash",
+          "[pg][device_ci][changed_since]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, device_ci_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 3}};
+    REQUIRE(pool.valid());
+    DeviceInventoryStore store{pool};
+    REQUIRE(store.is_open());
+
+    DeviceCiRecord v1 = parse_device_ci_blob(sample_blob());
+    REQUIRE(v1.blob_version == 1);
+    const auto send = [&](const DeviceCiRecord& r) {
+        DeviceCiRecord copy = r;
+        const std::string hash = DeviceInventoryStore::canonical_hash(copy);
+        REQUIRE_FALSE(hash.empty());
+        copy.content_hash = hash;
+        return store.apply_device_ci("agent-v1", hash, std::optional<DeviceCiRecord>{copy}, 1);
+    };
+    REQUIRE(send(v1) == InventoryIngestOutcome::kStored);
+    REQUIRE(ci_column(pool, "agent-v1", "blob_version") == 1);
+    exec_stmt(pool, "UPDATE device_inventory_store.device_ci SET changed_at = 1000, last_seen = 1000");
+
+    // the same v1 content again: the marker stays, the receipt time moves
+    REQUIRE(send(v1) == InventoryIngestOutcome::kStored);
+    CHECK(ci_column(pool, "agent-v1", "changed_at") == 1000);
+    CHECK(ci_column(pool, "agent-v1", "last_seen") > 1000);
+
+    // a changed v1 field is a different hash: the marker moves to the database clock
+    DeviceCiRecord changed = v1;
+    changed.model += "-rev2";
+    const long long b = db_now_secs(pool);
+    REQUIRE(send(changed) == InventoryIngestOutcome::kStored);
+    const long long a = db_now_secs(pool);
+    const long long at = ci_column(pool, "agent-v1", "changed_at");
+    CHECK(at >= b);
+    CHECK(at <= a);
+    // and the new content is the baseline
+    exec_stmt(pool, "UPDATE device_inventory_store.device_ci SET changed_at = 1000");
+    REQUIRE(send(changed) == InventoryIngestOutcome::kStored);
+    CHECK(ci_column(pool, "agent-v1", "changed_at") == 1000);
 }

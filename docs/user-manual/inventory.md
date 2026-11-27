@@ -577,7 +577,8 @@ unpacked (the archive's directory and, when needed, two small entries are read).
   and a row with no readable version (`version_unreadable`) ride the status row as information. On
   Windows a file the OS stores behind a reparse point (a cloud placeholder, a file compressed with the
   Windows Overlay Filter) is counted in `link_skipped` and not read. A `constrained` answer names its one cause only. A missing root is
-  skipped silently.
+  skipped silently on Linux and macOS. On Windows the answer is `constrained`: `mount_table_unreadable`
+  when the Program Files directories cannot be named, `dir_unreadable` when a named root cannot be listed.
 - **What to do about a token.** Terminal (a repeat gives the same answer): `budget_entries`,
   `section_rows`, `anchor_rows`, `depth`, `dir_truncated`, and `archive_unenumerated` for that
   archive. Retryable: `budget_time` (run again off-peak), `archive_changed`,
@@ -627,14 +628,18 @@ no process is started.
   (`libssl.so.3.0.13` reads `3.0.13`), else from the SONAME's suffix. On macOS, from the library's
   Mach-O `current_version` when it is not `0.0.0`, else from the file name's version
   (`libfoo.1.2.dylib` reads `1.2`). On Windows, from the fixed file version of the PE's version
-  resource (source `pe`; `.dll` and `.DLL` are both read, `.dll.mui` is not); a PE with no version
+  resource (source `pe`; `.dll` and `.DLL` are both read, `.dll.mui` is not; a file whose PE
+  header is read and does not set `IMAGE_FILE_DLL` is not listed, some .NET application entry
+  assemblies such as `pwsh.dll` included); a DLL with no version
   resource, or one whose fixed version is `0.0.0.0`, is listed with `version_source` `unreadable`. A
   library whose header cannot be read inside the fixed
   bounds, or that names no version, is still listed from its file name with `version_source`
   `unreadable`; that is a gap in one row and does not make the scan incomplete. A file whose name
-  looks like a library but whose header says it is not one is not listed.
+  looks like a library but whose header says it is not one is not listed, even when the rest of it
+  is damaged.
 - **Bounds.** The scan's (400,000 directory entries, 45 seconds, 32 levels, 50,000 entries per
-  directory, 3,000 rows per application folder) with 5,000 rows in all. Per library, at most 128
+  directory, 3,000 rows per application folder) with 5,000 rows in all. A file that matches by name
+  counts toward those row caps even when it gives no row. Per library, at most 128
   ELF program headers, 4,096 dynamic entries, a 255-byte name, 16 fat slices and 1,024 load
   commands in 512 KiB, and for a PE 96 sections, 4,096 resource directory entries, 256 KiB of
   version data and 512 version nodes; a count past one of those makes that library `unreadable`,
@@ -2253,7 +2258,11 @@ Postgres schema **`device_inventory_store`** (table `device_ci`): manufacturer,
 model, **serial number**, **system UUID**, BIOS vendor/version/date, CPU
 model/cores/threads, RAM, a disk summary, **primary MAC** + MAC summary + NIC
 count, OS name/version/build, and architecture. Serial number and system UUID are
-the CMDB correlation key.
+the CMDB correlation key. Each row also carries **`changed_at`** (epoch seconds, stamped from
+the database clock, in the same behavioural-PII tier as the rest of the row): the time the
+record's content last changed. It moves only when the content hash changes, so the daily sync
+that finds nothing new leaves it alone, unlike `last_seen`. It is deleted with the row when the
+device is decommissioned.
 
 It is collected via the existing `hardware` (incl. a new `system` action for
 serial + UUID), `device_identity`, `os_info`, and `network_config` plugins. It
@@ -2261,6 +2270,10 @@ serial + UUID), `device_identity`, `os_info`, and `network_config` plugins. It
 deliberately: those change between cycles and would flip the content hash every
 sync, defeating the hash-skip protocol.
 
+- **Windows domain and adapter reads.** On Windows, if the domain-join read or the
+  network adapter read gets no answer within 5 seconds, or the adapter read fails,
+  the agent skips that `device_ci` cycle; the stored record stays as it was, and a
+  read that stays hung or keeps failing keeps it from updating.
 - **Scope / privacy.** Machine-scope only (no per-user data), but serial/UUID/MAC
   are device-persistent identifiers — treat as potentially personal data where a
   device is person-assigned. The same **`--inventory-disable`** flag suppresses
@@ -2369,7 +2382,7 @@ sync, defeating the hash-skip protocol.
   device that has been offline longer still appears while its record exists. Walk the pages one
   at a time and off-peak; do not fan pages out in parallel. Every page leases one connection from
   the server's shared PostgreSQL pool (`--postgres-pool-size`), which also serves RBAC checks and
-  audit writes. Rows are ordered by the byte value of `agent_id`, not by the database's collation, and every `agent_id` comparison it makes (the single-device `?agent_id=` read included) is byte-ordered, so a change to the operating system's collation rules cannot make this READ skip or miss a device; an index on that byte order makes an index scan available for each page (the planner decides, and the representative plans measured use it). Writes, decommission and the per-device reads (`GET /api/v1/hardware/{id}`, `get_hardware_ci`) still go through the primary key, which follows the database collation. If the collation changes and the indexes are not rebuilt, an emulation (20,000 devices, one run; an upper bound, not a prediction for a real upgrade) showed about 6 in 10 existing devices not found by those per-device reads, every report inserting a new row instead of updating the record (about 38,000 rows after four rounds), some reports refused, duplicate and divergent records for one device served by this walk (and for some devices not the newest copy), and a decommission reporting success while removing only about 4 records in 10, so decommissioned devices stayed stored and kept being served. Once a replica has detected the mismatch, it pauses device-CI writes (ingest is answered `need_full` and not stored, decommission removal is not attempted) and refuses this read with a retryable `503` (`retry_after_ms` 60000); the per-device reads then answer in their degraded state. After such a refusal restart the walk from the first page rather than resuming the old cursor, and compare with your copy. A gate that is Unproven because the check cannot conclude (the database records a collation version while the host reports none, the catalog read is refused, or the versions are equal while an invalid index exists in the schema `device_inventory_store`, a `REINDEX ... CONCURRENTLY` still running included) does not clear on its own and has no override flag: the read stays refused, while writes are not paused. The invalid-index case clears when the index is dropped or rebuilt. The pause does not repair rows duplicated before it began, detection can take up to an hour, and every other keyset read still follows the database collation and is not gated: see "PostgreSQL collation version" in [Server administration](server-admin.md#postgresql-collation-version). A complete walk is not a snapshot: confirm a device with `?agent_id=<id>` (byte-exact; refused too while the collation gate is not Trusted, so retire nothing while you cannot confirm) before acting on its absence, and treat an empty confirm page as "not found" (no stored record, or outside the credential's scope), not as "deleted". `GET /api/v1/devices/{id}` is no substitute: it answers only for a device with a live session, so a long-offline device is `404` although its record exists. Retire a configuration item only through your own decommission process, never from absence in a walk or a `404` there. See [REST API](rest-api.md#get-apiv1hardware-ci).
+  audit writes. Rows are ordered by the byte value of `agent_id`, not by the database's collation, and every `agent_id` comparison it makes (the single-device `?agent_id=` read included) is byte-ordered, so a change to the operating system's collation rules cannot make this READ skip or miss a device; an index on that byte order makes an index scan available for each page (the planner decides, and the representative plans measured use it). Writes, decommission and the per-device reads (`GET /api/v1/hardware/{id}`, `get_hardware_ci`) still go through the primary key, which follows the database collation. If the collation changes and the indexes are not rebuilt, an emulation (20,000 devices, one run; an upper bound, not a prediction for a real upgrade) showed about 6 in 10 existing devices not found by those per-device reads, every report inserting a new row instead of updating the record (about 38,000 rows after four rounds), some reports refused, duplicate and divergent records for one device served by this walk (and for some devices not the newest copy), and a decommission reporting success while removing only about 4 records in 10, so decommissioned devices stayed stored and kept being served. Once a replica has detected the mismatch, it pauses device-CI writes (ingest is answered `need_full` and not stored, decommission removal is not attempted) and refuses this read with a retryable `503` (`retry_after_ms` 60000); the per-device reads then answer in their degraded state. After such a refusal restart the walk from the first page rather than resuming the old cursor, and compare with your copy. A gate that is Unproven because the check cannot conclude (the database records a collation version while the host reports none, the catalog read is refused, or the versions are equal while an invalid index exists in the schema `device_inventory_store`, a `REINDEX ... CONCURRENTLY` still running included) does not clear on its own and has no override flag: the read stays refused, while writes are not paused. The invalid-index case clears when the index is dropped or rebuilt. The pause does not repair rows duplicated before it began, detection can take up to an hour, and every other keyset read still follows the database collation and is not gated: see "PostgreSQL collation version" in [Server administration](server-admin.md#postgresql-collation-version). A complete walk is not a snapshot: confirm a device with `?agent_id=<id>` (byte-exact; refused too while the collation gate is not Trusted, so retire nothing while you cannot confirm) before acting on its absence, and treat an empty confirm page as "not found" (no stored record, or outside the credential's scope), not as "deleted". `GET /api/v1/devices/{id}` is no substitute: it answers only for a device with a live session, so a long-offline device is `404` although its record exists. Retire a configuration item only through your own decommission process, never from absence in a walk or a `404` there. **Delta pulls.** `changed_since` (epoch seconds) returns only the rows whose `changed_at` is at or after it, and each row carries `changed_at`. The first response of a walk (the one with no `cursor` and no `agent_id`) carries `next_changed_since`, the database clock minus 300 seconds; cursor pages and `?agent_id=` reads omit it. Keep only that first value for the next pull, never one derived from `max(changed_at)`, a later page or your own clock, and restart a failed walk from the first page rather than resuming a saved cursor. Delivery is at-least-once (upsert by `agent_id`), a delta carries no removal signal, and `last_seen` goes stale on an unchanged device under a delta, so run a periodic full walk as the backstop. A delta needs a credential with a fleet-wide `Inventory:Read` grant: a scope-confined caller is refused. Do not send `changed_since` on a `?agent_id=` confirm read: an empty page there means nothing changed, not that the device is not found. See [REST API](rest-api.md#get-apiv1hardware-ci) "Delta sync".
 - **What the agent sends.** An agent that carries this change always sends the versioned
   record; there is no flag to fall back to the earlier format, and `--inventory-disable`
   still stops the collection. Each section reports one of four levels:

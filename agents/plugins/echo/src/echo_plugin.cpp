@@ -2275,7 +2275,7 @@ private:
         // partial ARP table must never be diffed against the last COMPLETE
         // snapshot (it would manufacture false appeared/removed forensic
         // events) or replace it as the new baseline -- same
-        // collect-or-retain contract as the service/mapdrive legs below.
+        // collect-or-retain contract as the service/user/mapdrive legs below.
         // arp_pre, when supplied, carries the OUTCOME of a precollection
         // attempt (nullopt if that threw -- do_collect_fast), not just the
         // entries.
@@ -2693,8 +2693,8 @@ private:
 
     // ── collect_slow: services + users ────────────────────────────────────────
     // Unlocked implementation -- caller must hold collect_mu_
-    // skipped_sources: see collect_fast_impl's parameter doc above -- service
-    // and mapdrive are BOTH collected entirely inside this function (no
+    // skipped_sources: see collect_fast_impl's parameter doc above -- service,
+    // user and mapdrive are ALL collected entirely inside this function (no
     // outer precollection stage like arp/dns/netqual has), so this is the
     // only place their collect_or_retain skip can be recorded for do_snapshot.
     int collect_slow_impl(yuzu::CommandContext& ctx,
@@ -2756,29 +2756,43 @@ private:
         // User diff
         const auto user_state = yuzu::echo::source_enabled_state(*db_, "user");
         if (user_state.value_or(false)) {
-            const std::string usr_key{yuzu::echo::diff_state_key("user")}; // #538
-            auto current = yuzu::echo::enumerate_users();
-            yuzu::echo::scrub_wire_strings(current); // baseline round-trips losslessly
-            auto prev_json = db_->get_state(usr_key);
-            auto previous = json_to_users(prev_json);
-
-            auto typed = yuzu::echo::compute_user_events(previous, current, ts, snap_id);
-            // Events + baseline in ONE transaction (#1654).
-            const std::string state_json = users_to_json(current).dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
-            const bool ok = typed.empty()
-                                ? db_->set_state(usr_key, state_json)
-                                : db_->fold_user_events(
-                                      typed, yuzu::echo::StateWrite{usr_key, state_json});
-            if (!ok) {
-                const char* tok = typed.empty() ? "state_save_failed" : "insert_failed";
-                spdlog::error("ECHO: user {} — nothing persisted, next tick re-diffs", tok);
-                ctx.write_output(typed.empty() ? "error|user state_save_failed"
-                                               : "error|user insert failed");
-                note_health("user", tok);
-                return 1;
+            // enumerate_users() throws when the Windows session read did not answer, failed or
+            // was cut at the cap: same collect-or-retain contract as mapdrive below, so an
+            // unanswered read is never diffed as "everyone logged off".
+            auto res = yuzu::echo::collect_or_retain([] { return yuzu::echo::enumerate_users(); });
+            auto current = std::move(res.current);
+            if (!current) {
+                spdlog::warn("ECHO: user snapshot incomplete ({}) -- retaining baseline",
+                             res.skip_reason);
+                if (skipped_sources)
+                    skipped_sources->push_back("user");
+                note_health("user", "capture_incomplete");
             }
-            total_events += static_cast<int>(typed.size());
-            note_health("user", "events_recorded");
+            if (current) {
+                yuzu::echo::scrub_wire_strings(*current); // baseline round-trips losslessly
+                const std::string usr_key{yuzu::echo::diff_state_key("user")}; // #538
+                auto prev_json = db_->get_state(usr_key);
+                auto previous = json_to_users(prev_json);
+
+                auto typed = yuzu::echo::compute_user_events(previous, *current, ts, snap_id);
+                // Events + baseline in ONE transaction (#1654).
+                const std::string state_json = users_to_json(*current).dump(
+                    -1, ' ', false, nlohmann::json::error_handler_t::replace);
+                const bool ok =
+                    typed.empty()
+                        ? db_->set_state(usr_key, state_json)
+                        : db_->fold_user_events(typed, yuzu::echo::StateWrite{usr_key, state_json});
+                if (!ok) {
+                    const char* tok = typed.empty() ? "state_save_failed" : "insert_failed";
+                    spdlog::error("ECHO: user {} — nothing persisted, next tick re-diffs", tok);
+                    ctx.write_output(typed.empty() ? "error|user state_save_failed"
+                                                   : "error|user insert failed");
+                    note_health("user", tok);
+                    return 1;
+                }
+                total_events += static_cast<int>(typed.size());
+                note_health("user", "events_recorded");
+            }
         } else {
             note_health("user", skip_token(user_state));
         }
@@ -2996,7 +3010,7 @@ private:
                 // persisted anything on this path, so the cursor stays
                 // exactly as last written -- skip this tick's status/persist
                 // entirely, same collect_or_retain skip-and-retain contract
-                // as service/mapdrive above (echo_capture_status.hpp:187).
+                // as service/user/mapdrive above (echo_capture_status.hpp:187).
                 spdlog::warn("ECHO: {} cursor collect incomplete ({}) -- retaining cursor",
                             src_name, e.what());
                 note_health(src_name, yuzu::echo::kCollectStatusCaptureIncomplete);
@@ -3960,8 +3974,8 @@ private:
         const bool dns_on = source_enabled(*db_, "dns");
         const bool netqual_on = source_enabled(*db_, "netqual");
         // round 3 (B3-002): names of every enabled source classified
-        // incomplete this pass (arp/service/mapdrive) -- accumulated across
-        // the arp precollection below AND collect_slow_impl's service/
+        // incomplete this pass (arp/service/user/mapdrive) -- accumulated across
+        // the arp precollection below AND collect_slow_impl's service/user/
         // mapdrive legs (collect_fast_impl's arp leg never adds to this: arp
         // is always precollected here, so its own internal else-branch is
         // unreachable for this caller). snapshot_result_line
@@ -3973,7 +3987,7 @@ private:
         // action wrote "echo|snapshot|complete" unconditionally.
         //
         // round 4 (BR4-001): that fix covered only the collect_or_retain /
-        // IncompleteCaptureError skip path (arp/service/mapdrive). An
+        // IncompleteCaptureError skip path (arp/service/user/mapdrive). An
         // ordinary persistence failure inside collect_fast_impl,
         // collect_slow_impl, or do_collect_software (each already writes
         // its own "error|... insert failed" line and returns 1) was still
@@ -4034,7 +4048,7 @@ private:
         // honesty response -- see the comment above skipped_sources.
         //
         // round 5 (adversarial-review finding): by this point skipped_sources
-        // already holds every arp/service/mapdrive name collect_fast_impl /
+        // already holds every arp/service/user/mapdrive name collect_fast_impl /
         // collect_slow_impl pushed for a collect_or_retain skip (each phase
         // rc above stays 0 for that kind of skip -- it's not a persistence
         // failure). Fold that into the honesty decision too, so a snapshot

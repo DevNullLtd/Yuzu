@@ -117,6 +117,8 @@ inline constexpr TwinRow kExpectedTwins[] = {
     // header comment above was originally pinned against).
     {"get_dex_device_score", "GuaranteedState", "Read", true},
     {"get_dex_device_app_perf", "GuaranteedState", "Read", true},
+    // #2146 PR B: the per-device live read twin (POST /api/v1/dex/devices/{id}/live).
+    {"get_device_live", "GuaranteedState", "Read", true},
     // #4035: the 8 genuinely-new REST+MCP twins from the same issue.
     {"get_dex_app", "GuaranteedState", "Read", true},
     {"list_dex_apps", "GuaranteedState", "Read", true},

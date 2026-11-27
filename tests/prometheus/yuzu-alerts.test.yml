@@ -3786,8 +3786,8 @@ tests:
   # `sum(increase(yuzu_server_guardian_reconciles_total{result="degraded"}
   # [10m])) > 0` OR `sum(increase(yuzu_server_guardian_reconcile_exceptions_total
   # [10m])) > 0`, for: 10m, warning. The reconciles counter family is
-  # pre-seeded to 0 for all five results and the exceptions counter to 0, so
-  # the healthy shape is six flat series.
+  # pre-seeded to 0 for all seven results and the exceptions counter to 0, so
+  # the healthy shape is eight flat series.
 
   # CASE: a store outage that keeps aborting reconciles pages, and only the
   # degraded series counts: the sent series climbing alongside it is the

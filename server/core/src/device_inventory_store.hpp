@@ -61,6 +61,19 @@ inline constexpr const char* kDeviceInventoryStoreSchema = "device_inventory_sto
 /// migration carries (the transaction-local settings of v4) without a second copy of it.
 [[nodiscard]] const std::vector<pg::PgMigration>& device_inventory_migrations();
 
+/// Safety margin, in seconds, subtracted from the database clock to form the `changed_since`
+/// watermark a client keeps (`DeviceInventoryStore::device_ci_watermark`). It absorbs a row whose
+/// `changed_at` was authored (`clock_timestamp()`) inside an ingest transaction that committed
+/// later than a page that missed it, and small skew between database nodes. An ESTIMATE of how late
+/// a commit can land, not a proof: a transaction held open longer than this is missed by a delta
+/// pull, and the periodic full walk is the backstop.
+inline constexpr std::int64_t kChangedSinceMarginSecs = 300;
+
+/// Execution cap of the watermark statement (`SET LOCAL statement_timeout` inside its transaction,
+/// like the keyset read's), so a stalled backend frees the pooled connection at this bound rather
+/// than at the pool's 30 s default. A first bulk page takes this lease after its keyset read.
+inline constexpr const char* kDeviceCiWatermarkStatementTimeout = "5s";
+
 /// The statement `DeviceInventoryStore::list_device_ci_after` runs for `q` and its bound
 /// parameters, in placeholder order. Exposed so a test can EXPLAIN the REAL statement (a copy of
 /// the text in a test would stay green with the store's spelling changed). Does not check the
@@ -183,8 +196,19 @@ public:
     /// whatever its last contact. Authoritative: `std::nullopt` on a closed store, a lease timeout
     /// or a query error, NEVER an empty page. Reads serial / UUID / MAC: any caller must sit behind
     /// the fail-closed `inventory.devices.ci` audit and the Inventory:Read scope gate.
+    /// `changed_since` narrows to rows whose `changed_at >= changed_since` (migration v5's btree
+    /// index serves a sparse delta; the planner picks it or the agent_id index per page).
+    /// `changed_at` is the CONTENT-change marker, NOT a membership marker: a device entering or
+    /// leaving a caller's scope does not move it, so a scope-confined caller cannot use the filter
+    /// correctly (the route layer refuses that combination).
     [[nodiscard]] std::optional<std::vector<DeviceCiRecord>>
     list_device_ci_after(const DeviceCiKeysetQuery& q);
+
+    /// The value a delta client keeps as its next `changed_since`: the PostgreSQL clock in epoch
+    /// seconds (`EXTRACT(EPOCH FROM clock_timestamp())::bigint`, the SAME expression that authors
+    /// `changed_at`, so one primary's stamps and watermark share a clock) MINUS `kChangedSinceMarginSecs`. `std::nullopt` on a closed store, a lease
+    /// timeout or a query error, NEVER a guess from the replica's own clock.
+    [[nodiscard]] std::optional<std::int64_t> device_ci_watermark();
 
     /// One agent's v2 per-section statuses + list rows (cpu, dimm, disk, swap, volume,
     /// partition, topology; chassis/baseboard/machine_id carry a status only), in the

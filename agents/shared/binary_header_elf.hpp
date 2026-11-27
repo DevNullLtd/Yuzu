@@ -284,9 +284,14 @@ inline void read_soname(Reader& r, const std::vector<ElfProgramHeader>& phs, boo
 
 } // namespace elf_detail
 
+// `header_type`, when given, is cleared on entry and set to e_type as soon as the file header is
+// read, so a caller can still classify a file whose program headers do not parse.
 [[nodiscard]] inline std::expected<ElfInfo, ParseError>
-read_elf(const Source& src, const ElfLimits& lim = {}, ReadBudget budget = {}) {
+read_elf(const Source& src, const ElfLimits& lim = {}, ReadBudget budget = {},
+         std::optional<std::uint16_t>* header_type = nullptr) {
     using namespace elf_detail;
+    if (header_type)
+        header_type->reset();
     if (src.size < 4)
         return std::unexpected(ParseError::not_this_format);
 
@@ -314,6 +319,8 @@ read_elf(const Source& src, const ElfLimits& lim = {}, ReadBudget budget = {}) {
     const std::endian order = info.byte_order;
     info.os_abi = static_cast<std::uint8_t>((*head)[7]);
     info.type = ld<std::uint16_t>(*head, 16, order);
+    if (header_type)
+        *header_type = info.type;
     info.machine = ld<std::uint16_t>(*head, 18, order);
     std::uint64_t phoff = 0;
     std::uint16_t phentsize = 0, phnum = 0;
