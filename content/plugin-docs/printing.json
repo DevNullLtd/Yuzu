@@ -689,9 +689,7 @@
     "capability_rows": [
       "server/core/src/capability_decls/plugin_action_catalogue_printing.hpp"
     ],
-    "changelog": [
-      "changelog.d/8216-printing-getpwuid-r.fixed.md"
-    ],
+    "changelog": [],
     "definitions": [
       "content/definitions/printing.yaml"
     ],

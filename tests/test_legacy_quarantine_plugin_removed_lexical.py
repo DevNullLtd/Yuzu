@@ -2541,9 +2541,9 @@ class DeploymentContractWording(unittest.TestCase):
              "docs/user-manual/upgrading.md", "docs/user-manual/security-hardening.md",
              "docs/adr/0047-quarantine-store-postgres-migration.md",
              "agents/plugins/firewall/README.md", "agents/plugins/services/README.md",
-             "content/plugin-docs/firewall.json", "content/plugin-docs/services.json",
-             "changelog.d/2026-11-14-containment-followups.changed.md",
-             "changelog.d/2026-11-14-containment-followups.fixed.md")
+             "content/plugin-docs/firewall.json", "content/plugin-docs/services.json")
+    # The two 2026-11-14 containment-followups changelog fragments were promoted into
+    # CHANGELOG.md (an allowlisted history file) by the 0.16.0 release, so they are no longer scanned.
     UPGRADE_PATH = re.compile(r"(?i)with (?:the|this) agent upgrade|provisioned before the|upgraded host"
                               r"|earlier copy of (?:the|this) (?:installer|script)|upgrade both"
                               r"|until (?:it|the installer) (?:has been|is) re-?run"

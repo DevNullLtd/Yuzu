@@ -166,5 +166,4 @@ What constrains the answer and what is only logged, by read (the first rows are 
 - Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_middleware.hpp`
 - Tests: `tests/test_middleware_definition.py` · `tests/unit/test_middleware_linux_parsers.cpp` · `tests/unit/test_middleware_local_dispatcher.cpp` · `tests/unit/test_middleware_parsers.cpp` · `tests/unit/test_middleware_win_parsers.cpp`
 - Privilege row: `docs/agent-privilege-model.md`
-- Changelog: `changelog.d/2026-10-29-middleware-ibm-mq.added.md` · `changelog.d/sam47-middleware-mq-windows.added.md`
 <!-- END GENERATED -->

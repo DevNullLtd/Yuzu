@@ -1,4 +1,4 @@
-captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash 5734018da5be
+captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-11-27 · euid 0 · leg-hash bdc2a71645c5
 == action=logged_on
 [result_status] UNDECLARED / UNKNOWN / 
 

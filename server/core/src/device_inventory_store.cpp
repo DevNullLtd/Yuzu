@@ -74,6 +74,15 @@ std::int64_t now_secs() {
         .count();
 }
 
+// The PostgreSQL clock in epoch seconds. ONE spelling for every authoring and reading site of
+// `changed_at` (the content upsert, `device_ci_watermark`), so the stamp and the watermark that
+// brackets it come from the same clock and the same rounding. clock_timestamp(), not now(): it
+// advances inside a transaction, so a long ingest transaction does not stamp an old instant.
+// "Same clock" holds for ONE primary: a failover to a node whose clock differs, or a clock step,
+// puts new stamps and an already-issued watermark on different timelines (a residual of the
+// margin, docs/security-reviews/hardware-ci-changed-since-2026-11.md).
+constexpr const char* kDbClockSecsExpr = "EXTRACT(EPOCH FROM clock_timestamp())::bigint";
+
 // Per-site degrade-WARN state (one static instance per call site).
 struct DegradeSampler {
     std::atomic<std::uint64_t> count{0};
@@ -225,6 +234,8 @@ constexpr const char* kMigrationV3Sql =
 // index makes an index scan available for each page (the planner decides): only an index on that
 // exact expression can serve the query, and without it every page is a scan plus a sort (about
 // 317 ms a page at 1M rows).
+// SUPERSEDED by v6, which builds `(agent_id COLLATE "C", changed_at)` and drops this index. This v4
+// text stays byte-for-byte as shipped (its hash is recorded in every database that ran it).
 // ADDITIVE and idempotent (IF NOT EXISTS; no existing object is touched). Not CONCURRENTLY: the
 // runner applies a migration in a transaction, where CONCURRENTLY is refused. A plain build takes
 // a SHARE lock on device_ci (writes wait, reads do not): about 0.5 s of blocked ingest per
@@ -236,10 +247,10 @@ constexpr const char* kMigrationV3Sql =
 // build and allows a lock wait of 30 s (ca_store's value) behind a long ingest transaction.
 // The btree key list of the index, exactly as `pg_get_indexdef` prints it after `USING btree`
 // (verified on PostgreSQL 18.4, where the parenthesised expression and a plain collated column
-// print the same). ONE spelling for the migration DDL, the operator's DDL in the WARN and the
-// runtime check, so the three cannot drift: the check compares the printed key list to this text
-// and nothing else, so a same-named index with another column, more columns, INCLUDE, a different
-// expression or an opclass does not pass.
+// print the same). These two constants and `agent_id_c_index_ddl` feed v4's FROZEN migration text (its
+// SHA-256 is recorded in every database that ran it and pinned in the tests) and v6's DROP, and
+// nothing else: the runtime check uses `kKeysetIndexKey` / `kChangedAtIndexKey` below. Changing the
+// spelling here changes v4's recorded hash, so a tidy-up of these constants needs a new migration.
 constexpr std::string_view kAgentIdCIndexKey = "(agent_id COLLATE \"C\")";
 constexpr const char* kAgentIdCIndexName = "device_ci_agent_id_c_idx";
 
@@ -258,9 +269,112 @@ const std::string kMigrationV4Sql = "SET LOCAL lock_timeout = '30s'; "
                                     "SET LOCAL statement_timeout = 0; " +
                                     agent_id_c_index_ddl("device_ci") + ";";
 
-// The index as the runtime check (and an operator by hand) creates it: schema-qualified, because
+// v5: `changed_at`, the change marker behind the bulk read's `changed_since` delta filter. Epoch
+// SECONDS (the unit of first_seen/last_seen) of the last CONTENT change, authored by the PostgreSQL
+// clock inside the content upsert (kDbClockSecsExpr there); `last_seen` cannot serve because every
+// hash-skip daily sync bumps it. The DEFAULT is the migration's own `now()`: a STABLE, non-volatile
+// expression, which PostgreSQL 11+ evaluates once and records as the column's "missing value"
+// instead of rewriting the table, so the ADD COLUMN is metadata-only (measured on PostgreSQL 18.4,
+// docs/security-reviews/hardware-ci-changed-since-2026-11.md), and every existing row reads
+// "changed at the migration" - the conservative answer, since nothing says when it really changed.
+// clock_timestamp() (volatile) would force a rewrite, so it is NOT the default. The default stays on
+// the column: the content upsert always supplies the value, and a hand-inserted row still gets one.
+// Idempotent (IF NOT EXISTS on both). The index serves a sparse delta (`changed_at >= $n`); it is
+// built with v4's transaction-local settings for the same reason (a plain build takes a SHARE lock
+// and the pool's 30 s statement_timeout / 10 s lock_timeout would otherwise bound it, and a failed
+// migration refuses to start the server on every restart). Not CONCURRENTLY: the runner's
+// transaction refuses it.
+//
+// The type guard between the two statements: IF NOT EXISTS skips the ADD COLUMN for a column of
+// ANOTHER type or nullability that is already there (a hand-made or half-restored table), and the
+// migration would then be stamped as applied over a column every content upsert fails on (`CASE
+// types text and bigint cannot be matched`) and every delta 503s on. So the DO block RAISEs, which
+// aborts the migration's transaction: v5 is not stamped, the store refuses to open, and the log
+// names the column and what was found. `device_ci` resolves through the runner's transaction-local
+// search_path (the store schema first), exactly like the unqualified DDL around it.
+const std::string kMigrationV5Sql =
+    "SET LOCAL lock_timeout = '30s'; "
+    "SET LOCAL statement_timeout = 0; "
+    "ALTER TABLE device_ci ADD COLUMN IF NOT EXISTS changed_at BIGINT NOT NULL "
+    "DEFAULT (EXTRACT(EPOCH FROM now()))::bigint; "
+    "DO $v5guard$ DECLARE col_type text; col_not_null boolean; BEGIN "
+    "SELECT format_type(a.atttypid, a.atttypmod), a.attnotnull INTO col_type, col_not_null "
+    "FROM pg_attribute a WHERE a.attrelid = 'device_ci'::regclass AND a.attname = 'changed_at' "
+    "AND NOT a.attisdropped; "
+    "IF col_type IS DISTINCT FROM 'bigint' OR col_not_null IS DISTINCT FROM true THEN "
+    "RAISE EXCEPTION 'device_inventory_store.device_ci.changed_at must be bigint NOT NULL "
+    "(found type %, not null %)', coalesce(col_type, 'missing'), coalesce(col_not_null::text, 'missing'); "
+    "END IF; END $v5guard$; "
+    "CREATE INDEX IF NOT EXISTS device_ci_changed_at_idx ON device_ci (changed_at);";
+
+// v6: the keyset index the bulk read plans on from v6 on, `(agent_id COLLATE "C", changed_at)`,
+// REPLACING v4's `device_ci_agent_id_c_idx`. Why: with only v4's index, a delta of roughly 3% or more
+// of the table that is clustered in `agent_id` order made the planner scan the whole `agent_id` index
+// and test `changed_at` in the heap row by row, which is the slow case recorded as HWCI-DELTA-PLAN-FLIP
+// in docs/security-reviews/hardware-ci-changed-since-2026-11.md. With `changed_at` as the second key
+// column the planner tests it inside the index, so the same walk reads only the matching heap rows.
+// It still serves a plain keyset (the leading column is the v4 expression), so v4's index is a strict
+// prefix of it and redundant (its size and its write cost buy nothing), and it is dropped here in the
+// same transaction. The v5 `device_ci_changed_at_idx` stays: it keeps a sparse delta at a few
+// milliseconds.
+// LOCKING, deliberately: the FIRST statement takes ACCESS EXCLUSIVE on device_ci. A build that took
+// SHARE and then upgraded to ACCESS EXCLUSIVE at the drop could deadlock against any session that
+// had read the table and then wrote it (reproduced on PostgreSQL 18.4, and the migration can be the
+// victim); taking the strongest mode first removes the upgrade and leaves ONE lock wait, bounded by
+// the 30 s lock_timeout below (the sibling gateway_route_store migration does the same for the same
+// reason). The price is that reads of device_ci block for the build too (about 0.6 s per million rows
+// on an idle database, measured; longer under write load), which v5 already costs.
+// The statement order is DETERMINISTIC on purpose: DROP the composite if it exists, CREATE it, then
+// DROP v4's. A bare `CREATE INDEX IF NOT EXISTS` would be skipped over a same-named index that is
+// INVALID or differently defined (an operator's cancelled hand build after a lock-timeout failure of
+// this very migration), and the unconditional drop of v4's index would then remove the only usable
+// keyset index. The composite's name has never shipped, so dropping a pre-existing one costs one
+// rebuild and nothing else.
+// The two DROPs are SCHEMA-QUALIFIED: the runner's search_path is `"<store>", public`, so an
+// unqualified `DROP INDEX IF EXISTS` falls through to `public` and would drop a same-named index
+// there (verified). That is a deliberate local exception to the unqualified-DDL convention of the
+// other migrations (the CREATE and the LOCK resolve through the store schema, which comes first).
+// A SEPARATE migration, not an edit of v5: a recorded migration's text is frozen (the runner
+// refuses a drifted hash). Idempotent (a re-run drops and rebuilds), built under v4's transaction-local settings for the same reasons, and not
+// CONCURRENTLY (the runner's transaction refuses it).
+// THE CONSTANTS BELOW FEED v6's RECORDED HASH: changing the index name, the key spelling or
+// `index_ddl` changes v6's SHA-256 in every database that ran it (the tests pin it), so it needs a
+// new migration, not an edit. The check compares the key list `pg_get_indexdef` prints after
+// `USING btree` to `kKeysetIndexKey` / `kChangedAtIndexKey`, optionally followed by an operator's
+// ` WITH (...)` storage parameter (verified on PostgreSQL 18.4); a same-named index with another
+// column, an INCLUDE, a different expression or a predicate does not pass.
+constexpr std::string_view kKeysetIndexKey = "(agent_id COLLATE \"C\", changed_at)";
+constexpr const char* kKeysetIndexName = "device_ci_agent_id_c_changed_idx";
+// The v5 index, spelled as `pg_get_indexdef` prints it, for the runtime check only (the v5
+// migration keeps its own literal text, which is what its recorded hash covers).
+constexpr std::string_view kChangedAtIndexKey = "(changed_at)";
+constexpr const char* kChangedAtIndexName = "device_ci_changed_at_idx";
+
+std::string index_ddl(std::string_view name, std::string_view key, std::string_view table) {
+    std::string ddl = "CREATE INDEX IF NOT EXISTS ";
+    ddl += name;
+    ddl += " ON ";
+    ddl += table;
+    ddl += " ";
+    ddl += key;
+    return ddl;
+}
+
+const std::string kMigrationV6Sql = std::string("SET LOCAL lock_timeout = '30s'; "
+                                                "SET LOCAL statement_timeout = 0; "
+                                                "LOCK TABLE device_ci IN ACCESS EXCLUSIVE MODE; "
+                                                "DROP INDEX IF EXISTS device_inventory_store.") +
+                                    kKeysetIndexName + "; " +
+                                    index_ddl(kKeysetIndexName, kKeysetIndexKey, "device_ci") +
+                                    "; DROP INDEX IF EXISTS device_inventory_store." +
+                                    kAgentIdCIndexName + ";";
+
+// The indexes as the runtime check (and an operator by hand) creates them: schema-qualified, because
 // no search_path is set outside the migration runner.
-const std::string kAgentIdCIndexCreateSql = agent_id_c_index_ddl("device_inventory_store.device_ci");
+const std::string kKeysetIndexCreateSql =
+    index_ddl(kKeysetIndexName, kKeysetIndexKey, "device_inventory_store.device_ci");
+const std::string kChangedAtIndexCreateSql =
+    index_ddl(kChangedAtIndexName, kChangedAtIndexKey, "device_inventory_store.device_ci");
 
 const std::vector<pg::PgMigration>& migrations() {
     // Unqualified DDL: the runner sets `search_path` to the store schema for the
@@ -305,6 +419,8 @@ const std::vector<pg::PgMigration>& migrations() {
         {2, kMigrationV2Sql},
         {3, kMigrationV3Sql},
         {4, kMigrationV4Sql},
+        {5, kMigrationV5Sql},
+        {6, kMigrationV6Sql},
     };
     return kMigrations;
 }
@@ -316,7 +432,7 @@ constexpr const char* kSelectCols =
     "disks_summary, primary_mac, macs_summary, nic_count, os_name, os_version, os_build, "
     "arch, first_seen, last_seen, blob_version, chassis_type, chassis_serial, "
     "chassis_asset_tag, chassis_source, board_vendor, board_product, board_serial, "
-    "board_source, machine_id_hash, machine_id_algorithm, machine_id_source";
+    "board_source, machine_id_hash, machine_id_algorithm, machine_id_source, changed_at";
 
 /// Returns the index of the first column after the ones it read, so a query that appends columns
 /// to `kSelectCols` can continue from there.
@@ -360,17 +476,29 @@ int fill_record(PGresult* res, int row, DeviceCiRecord& out) {
     out.machine_id_hash = col();
     out.machine_id_algorithm = col();
     out.machine_id_source = col();
+    out.changed_at = to_i64(col());
     return c;
 }
 
-/// After migrations: is the v4 index really there, valid and defined as the keyset read needs it?
-/// `schema_meta` saying v4 is not proof (a restore, a hand `DROP INDEX`, or a same-named index of
-/// another definition that `IF NOT EXISTS` accepted). The read stays CORRECT without it (its
-/// `COLLATE "C"` spelling carries correctness), so a miss or a failed check is a WARN and the
-/// store still opens, but every page becomes a scan plus a sort, which a loaded server feels as an
-/// exhausted pool, so the line says how to fix it. It logs and returns and does not change
-/// `open_`; a failed check logs and moves on.
-void warn_if_agent_id_c_index_unusable(PGconn* conn) {
+/// What the runtime check needs to know about one index: its name, the key list `pg_get_indexdef`
+/// prints after `USING btree`, the operator's DDL, and what a miss costs (said in the WARN).
+/// CALL-SCOPED: `create_sql` is a reference to a namespace-scope constant, so build one only as an
+/// argument of `warn_if_index_unusable`; never store it.
+struct IndexCheck {
+    const char* name;
+    std::string_view key;
+    const std::string& create_sql;
+    const char* consequence;
+};
+
+/// After migrations: is the index really there, valid and defined as the read needs it?
+/// The recorded schema version being v6 is not proof (a restore, a hand `DROP INDEX`, or a same-named index of
+/// another definition that `IF NOT EXISTS` accepted). The read stays CORRECT without it (the
+/// `COLLATE "C"` spelling and the `changed_at` comparison in the query carry correctness), so a miss
+/// or a failed check is a WARN and the store still opens, but the plan degrades, which a loaded
+/// server feels as an exhausted pool, so the line says how to fix it. It logs and returns and does
+/// not change `open_`; a failed check logs and moves on.
+void warn_if_index_unusable(PGconn* conn, const IndexCheck& chk) {
     pg::PgResult res = pg::exec_params(
         conn,
         "SELECT i.indisvalid, i.indisready, i.indpred IS NOT NULL, pg_get_indexdef(i.indexrelid) "
@@ -378,11 +506,11 @@ void warn_if_agent_id_c_index_unusable(PGconn* conn) {
         "JOIN pg_namespace n ON n.oid = c.relnamespace "
         "WHERE n.nspname = 'device_inventory_store' AND c.relname = $1 "
         "AND i.indrelid = 'device_inventory_store.device_ci'::regclass",
-        std::vector<std::string>{kAgentIdCIndexName});
+        std::vector<std::string>{chk.name});
     if (res.status() != PGRES_TUPLES_OK) {
         spdlog::warn("DeviceInventoryStore: could not check index {} ({}); the bulk device-CI read "
                      "stays correct but may be slow if it is missing",
-                     kAgentIdCIndexName, ::yuzu::log_key_token(PQerrorMessage(conn)));
+                     chk.name, ::yuzu::log_key_token(PQerrorMessage(conn)));
         return;
     }
     std::string problem;
@@ -396,29 +524,58 @@ void warn_if_agent_id_c_index_unusable(PGconn* conn) {
         // The definition is judged by the key list `pg_get_indexdef` prints after "USING btree",
         // compared whole to the migration's own spelling (the index NAME also contains
         // "agent_id", so a substring test would accept a same-named index on another column).
-        // The parenthesised-expression print is accepted too: it is the same index to the planner.
         constexpr std::string_view kUsing = " USING btree ";
         const auto using_at = def.find(kUsing);
         const std::string_view key =
             using_at == std::string::npos ? std::string_view{}
                                           : std::string_view{def}.substr(using_at + kUsing.size());
-        const std::string wrapped = "(" + std::string(kAgentIdCIndexKey) + ")";
-        const bool by_c_bytes = key == kAgentIdCIndexKey || key == wrapped;
+        // A storage parameter (an operator-tuned `WITH (fillfactor=...)`) prints after the key list
+        // and does not change what the planner can use the index for, so it is accepted; an INCLUDE
+        // list prints between them and a predicate is read from `indpred`, so both still differ.
+        constexpr std::string_view kWith = " WITH (";
+        const bool same_key =
+            key == chk.key || (key.substr(0, chk.key.size()) == chk.key &&
+                               key.substr(chk.key.size(), kWith.size()) == kWith);
         if (valid != "t" || ready != "t")
-            problem = "is invalid (an interrupted build)";
-        else if (partial == "t" || !by_c_bytes)
+            problem = "is invalid (an interrupted build, or a concurrent build still running)";
+        else if (partial == "t" || !same_key)
             problem = "is defined differently from the migration";
     }
     if (problem.empty())
         return;
+    // A missing index has nothing to drop; an invalid or differently defined one must be dropped
+    // first (`CREATE INDEX IF NOT EXISTS` would be skipped over it). Say which, and print both
+    // statements, each terminated, so the tail of the line can be pasted into a session as written.
+    const std::string statements =
+        problem == "is missing"
+            ? chk.create_sql + ";"
+            : std::string("DROP INDEX device_inventory_store.") + chk.name + "; " + chk.create_sql + ";";
     spdlog::warn("DeviceInventoryStore: index {} {}. GET /api/v1/hardware-ci and list_hardware_ci_"
-                 "records stay correct but every page becomes a scan plus a sort of device_ci "
-                 "(about 317 ms a page at 1M devices), which can exhaust the database pool under "
-                 "load. Create it as the table owner, in a session that first ran SET lock_timeout = '30s' "
-                 "(a plain build queues behind any session holding a lock on device_ci, and every "
-                 "writer queues behind it); DROP INDEX device_inventory_store.{} first if it exists "
-                 "but is invalid or differs: {};",
-                 kAgentIdCIndexName, problem, kAgentIdCIndexName, kAgentIdCIndexCreateSql);
+                 "records stay correct but {} Create it as the table owner, in a session that first "
+                 "ran SET lock_timeout = '30s' (a plain build blocks writers to device_ci and queues "
+                 "behind any session holding a lock on it), then run{}: {} See "
+                 "docs/user-manual/upgrading.md, \"Checked at every start\".",
+                 chk.name, problem, chk.consequence,
+                 problem == "is missing" ? "" : " both statements (the existing index must be dropped first)",
+                 statements);
+}
+
+void warn_if_read_indexes_unusable(PGconn* conn) {
+    // The keyset index serves every page; without it each page is a scan plus a sort of device_ci.
+    warn_if_index_unusable(
+        conn, {kKeysetIndexName, kKeysetIndexKey, kKeysetIndexCreateSql,
+               "every page becomes a scan plus a sort of device_ci (about 317 ms a page at 1M "
+               "devices in one measurement, growing with the table), which can exhaust the database "
+               "pool under load, and a delta of a few percent of the table that is clustered in "
+               "agent_id order reads most of it. (If v4's device_ci_agent_id_c_idx still exists, plain "
+               "pages are served from it and only such a delta is slow.)"});
+    // The changed_at index serves a sparse delta; without it a delta page falls back to the keyset
+    // index with the changed_at test inside it, so a delta is still correct and bounded.
+    warn_if_index_unusable(
+        conn, {kChangedAtIndexName, kChangedAtIndexKey, kChangedAtIndexCreateSql,
+               "a sparse delta page is then served from the keyset index instead (a few tens of "
+               "milliseconds a page at 1M devices in the review record's measurement, against a few "
+               "milliseconds with this index)."});
 }
 
 } // namespace
@@ -531,7 +688,7 @@ DeviceInventoryStore::DeviceInventoryStore(pg::PgPool& pool) : pool_(pool) {
             }
         }
     }
-    warn_if_agent_id_c_index_unusable(lease.get());
+    warn_if_read_indexes_unusable(lease.get());
     open_ = true;
 }
 
@@ -663,16 +820,21 @@ InventoryIngestOutcome DeviceInventoryStore::apply_device_ci(std::string_view ag
         // v2 -> v1 downgrade blanks them.
         pg::PgResult up = pg::exec_params(
             c,
-            "INSERT INTO device_inventory_store.device_ci ("
+            (// The statement is text-built (the DB-clock expression is spliced in, never a bound
+             // parameter, so the stamp is the database's own); the temporary lives to the end of
+             // this full expression.
+             "INSERT INTO device_inventory_store.device_ci ("
             "agent_id, content_hash, manufacturer, model, serial, system_uuid, hostname, domain, "
             "ou, bios_vendor, bios_version, bios_date, cpu_model, cpu_cores, cpu_threads, "
             "ram_bytes, disks_summary, primary_mac, macs_summary, nic_count, os_name, os_version, "
             "os_build, arch, first_seen, last_seen, blob_version, chassis_type, chassis_serial, "
             "chassis_asset_tag, chassis_source, board_vendor, board_product, board_serial, "
-            "board_source, machine_id_hash, machine_id_algorithm, machine_id_source) VALUES ("
+            "board_source, machine_id_hash, machine_id_algorithm, machine_id_source, changed_at) VALUES ("
             "$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14::bigint, $15::bigint, "
             "$16::bigint, $17, $18, $19, $20::bigint, $21, $22, $23, $24, $25::bigint, "
-            "$26::bigint, $27::smallint, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38) "
+            "$26::bigint, $27::smallint, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, " +
+                std::string(kDbClockSecsExpr) +
+                ") "
             "ON CONFLICT (agent_id) DO UPDATE SET "
             "content_hash = EXCLUDED.content_hash, manufacturer = EXCLUDED.manufacturer, "
             "model = EXCLUDED.model, serial = EXCLUDED.serial, system_uuid = EXCLUDED.system_uuid, "
@@ -691,8 +853,14 @@ InventoryIngestOutcome DeviceInventoryStore::apply_device_ci(std::string_view ag
             "board_product = EXCLUDED.board_product, board_serial = EXCLUDED.board_serial, "
             "board_source = EXCLUDED.board_source, machine_id_hash = EXCLUDED.machine_id_hash, "
             "machine_id_algorithm = EXCLUDED.machine_id_algorithm, "
-            "machine_id_source = EXCLUDED.machine_id_source "
-            "RETURNING agent_id",
+            "machine_id_source = EXCLUDED.machine_id_source, "
+            // changed_at moves only when the stored content hash differs from the incoming one. The
+            // right-hand sides of a DO UPDATE read the OLD row, so `device_ci.content_hash` is the
+            // stored hash even though `content_hash = EXCLUDED.content_hash` sits earlier in the
+            // list. A full re-send of unchanged content therefore keeps it.
+            "changed_at = CASE WHEN device_ci.content_hash IS DISTINCT FROM EXCLUDED.content_hash "
+            "THEN " + std::string(kDbClockSecsExpr) + " ELSE device_ci.changed_at END "
+            "RETURNING agent_id").c_str(),
             std::vector<std::string>{
                 agent_id_s, server_hash, r.manufacturer, r.model, r.serial, r.system_uuid,
                 r.hostname, r.domain, r.ou, r.bios_vendor, r.bios_version, r.bios_date,
@@ -957,8 +1125,8 @@ DeviceCiKeysetStatement device_ci_keyset_statement(const DeviceCiKeysetQuery& q)
     // a duplicated id can hide the extra copies because the cursor is strictly `agent_id > after`;
     // at least one row per id is always served), from making the single-device read miss an
     // existing id (a plain `agent_id = $n` is served by that same primary key), and lets the
-    // planner use the v4 expression index, which serves only a query spelling exactly this
-    // expression. All four sites must keep it.
+    // planner use the keyset index (v6; v4's `agent_id` expression index before it), which serves
+    // only a query spelling exactly this expression. All four sites must keep it.
     if (!q.after.empty()) {
         params.push_back(q.after);
         sql += " AND agent_id COLLATE \"C\" > $" + std::to_string(params.size());
@@ -971,6 +1139,13 @@ DeviceCiKeysetStatement device_ci_keyset_statement(const DeviceCiKeysetQuery& q)
         const std::vector<std::string_view> ids(q.agent_ids->begin(), q.agent_ids->end());
         params.push_back(pg::to_text_array(ids));
         sql += " AND agent_id COLLATE \"C\" = ANY($" + std::to_string(params.size()) + "::text[])";
+    }
+    if (q.changed_since) {
+        // `>=`, never `>`: a row stamped in the same second as the client's watermark must still be
+        // delivered (at-least-once). The comparison is on the plain column, so the v5 btree index
+        // can serve it; no filter adds no text and no parameter.
+        params.push_back(std::to_string(*q.changed_since));
+        sql += " AND changed_at >= $" + std::to_string(params.size()) + "::bigint";
     }
     params.push_back(std::to_string(eff));
     sql += " ORDER BY agent_id COLLATE \"C\" ASC LIMIT $" + std::to_string(params.size()) + "::bigint";
@@ -1041,6 +1216,61 @@ DeviceInventoryStore::list_device_ci_after(const DeviceCiKeysetQuery& q) {
                                   : err.empty() ? std::string("commit failed")
                                                 : ::yuzu::log_key_token(err);
         spdlog::warn("DeviceInventoryStore: keyset list degraded: {}", cause);
+    }
+    return std::nullopt;
+}
+
+std::optional<std::int64_t> DeviceInventoryStore::device_ci_watermark() {
+    if (!open_) {
+        static DegradeSampler s;
+        if (note_read_degrade(metrics_, kReasonStoreNotOpen, s).should_log)
+            spdlog::warn("DeviceInventoryStore: watermark read on a closed store");
+        return std::nullopt;
+    }
+    // The database's clock, minus the margin, in one statement: the same expression that authors
+    // `changed_at`, so on ONE primary the watermark and the stamps it brackets read the same clock
+    // and rounding (across a failover or a clock step they can disagree: the margin's residual).
+    // Run in a transaction whose SELECT is capped by SET LOCAL statement_timeout (the keyset read's
+    // idiom): the statement touches no table, but a stalled backend must not hold one of the shared
+    // pool's connections for the pool's 30 s default on every first page. A timeout is a nullopt
+    // (a degrade) like any other query error, never a guessed value.
+    const std::string sql = std::string("SELECT (") + kDbClockSecsExpr + ") - $1::bigint";
+    // Acquire first (bounded) so a lease timeout and a failure on a held connection (a failed
+    // BEGIN, a statement error, a timeout) keep their two distinct degrade reasons.
+    auto lease = pool_.try_acquire_for(kQueryAcquireTimeout);
+    if (!lease) {
+        static DegradeSampler s;
+        if (note_read_degrade(metrics_, kReasonPoolTimeout, s).should_log)
+            spdlog::warn("DeviceInventoryStore: watermark skipped, no connection in time ({})",
+                         pool_.last_error());
+        return std::nullopt;
+    }
+    std::optional<std::int64_t> out;
+    std::string err;
+    const bool ok = pool_.with_txn_on(std::move(lease), [&](PGconn* c) -> bool {
+        pg::PgResult t = pg::exec_params(
+            c, (std::string("SET LOCAL statement_timeout = '") + kDeviceCiWatermarkStatementTimeout + "'").c_str(),
+            std::vector<std::string>{});
+        if (t.status() != PGRES_COMMAND_OK) {
+            err = PQerrorMessage(c);
+            return false;
+        }
+        pg::PgResult res = pg::exec_params(c, sql.c_str(),
+                                           std::vector<std::string>{std::to_string(kChangedSinceMarginSecs)});
+        if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) != 1 || PQgetisnull(res.get(), 0, 0)) {
+            err = PQerrorMessage(c);
+            return false;
+        }
+        out = to_i64(PQgetvalue(res.get(), 0, 0));
+        return true;
+    });
+    if (ok)
+        return out;
+    static DegradeSampler s;
+    if (note_read_degrade(metrics_, kReasonQueryError, s).should_log) {
+        // `err` is empty when BEGIN failed (the helper logs that itself) or the COMMIT did not take.
+        spdlog::warn("DeviceInventoryStore: watermark read failed: {}",
+                     err.empty() ? std::string("begin or commit failed") : ::yuzu::log_key_token(err));
     }
     return std::nullopt;
 }

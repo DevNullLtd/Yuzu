@@ -837,9 +837,16 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         // `deps_.ci_read_slots` is the bulk-read concurrency cap (bulk_read_slots.hpp), held across
         // the store call and this page's access-audit write (Page::hold); a point read (agent_id)
         // takes none. Null means no cap (tests only).
-        auto read = hardware_ci_page::read_page(deps_.ci_page_reader, rq, gate.scope,
-                                                deps_.ci_collation_gate, deps_.ci_read_slots,
-                                                hardware_ci_page::kRestRowBudgetBytes);
+        // `with_watermark` stamps `next_changed_since` on a FIRST page only (no cursor, no agent_id)
+        // while its slot is STILL held (the watermark read is inside the cap); an unwired or failed
+        // provider turns a first page into the kDegraded answer below (a 503), never a first page
+        // without the field. A cursor page and a point read are served as read, with no watermark
+        // read and no `next_changed_since` key.
+        auto read = hardware_ci_page::with_watermark(
+            hardware_ci_page::read_page(deps_.ci_page_reader, rq, gate.scope,
+                                        deps_.ci_collation_gate, deps_.ci_read_slots,
+                                        hardware_ci_page::kRestRowBudgetBytes),
+            rq, deps_.ci_watermark_fn);
         if (!read) {
             // ONE answer per failure, shared with MCP (hardware_ci_page::describe_read_error): a
             // scope too wide is TERMINAL (400, no retry hint, audited as a refusal with no count),

@@ -325,10 +325,7 @@
     "capability_rows": [
       "server/core/src/capability_decls/plugin_action_catalogue_d.hpp"
     ],
-    "changelog": [
-      "changelog.d/7710-ioc-hosts-exact-match.fixed.md",
-      "changelog.d/8164-ioc-domain-cap.fixed.md"
-    ],
+    "changelog": [],
     "definitions": [
       "content/definitions/ioc.yaml"
     ],

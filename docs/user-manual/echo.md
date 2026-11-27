@@ -648,7 +648,7 @@ POST /api/v1/instructions/execute
 }
 ```
 
-**Partial captures never fabricate events.** If a subprocess-backed leg (`systemctl`/`launchctl`/`smbstatus`/`journalctl`/`wevtutil`) or a procfs/`getfsstat` read fails or is truncated mid-capture, that tick's diff is skipped and the prior baseline is retained — no appeared/removed events are fabricated from a partial read. A rate-limited warning is logged and the source's `<source>_last_status` reads `capture_incomplete` with `<source>_consecutive_failures` counting the streak in `echo.status`.
+**Partial captures never fabricate events.** If a subprocess-backed leg (`systemctl`/`launchctl`/`smbstatus`/`journalctl`/`wevtutil`) or a procfs/`getfsstat` read fails or is truncated mid-capture, that tick's diff is skipped and the prior baseline is retained — no appeared/removed events are fabricated from a partial read. A rate-limited warning is logged and the source's `<source>_last_status` reads `capture_incomplete` with `<source>_consecutive_failures` counting the streak in `echo.status`. On Windows the `user` session list and the inbound `mapdrive` read have a 5 second limit per read; the inbound `mapdrive` read is made once per `NetSessionEnum` level it tries (a second level after an access denial), so it can take up to 10 seconds. An unanswered or capped read (over 4,096 sessions for `user`), or a failed `user` session listing, skips the tick the same way. An agent whose session listing is refused (for example under a virtual service account) records no `user` events and reads `capture_incomplete`.
 
 ## Performance impact
 

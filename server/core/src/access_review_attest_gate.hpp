@@ -49,7 +49,8 @@
 /// refusal of an engine session and of a non-JSON body run earlier and carry an empty
 /// `target_id`): `target_type=AccessReview`, `target_id` =
 /// the campaign id alone, and the grant tuple in the detail as
-/// ` principal_type=<tok> principal_id=<tok> role=<tok>` after the outcome fields. Each tuple field
+/// ` principal_type=<tok> principal_id=<tok> role=<tok>` and then the scope (` scope=fleet`, or
+/// ` scope=management_group scope_group_id=<tok>`) after the outcome fields. Each tuple field
 /// goes through `audit_token` (CWE-117), which folds a space, so a REFUSAL row (there is no history
 /// row to recover the exact tuple from) can read the same for two distinct raw ids that fold to one
 /// token. That collision is a DISCLOSED residual and applies to success rows too: `seq` numbers
@@ -276,17 +277,27 @@ struct SodRefusal {
     return decision == "flagged_revoke" ? "access_review.flagged" : "access_review.attested";
 }
 
-/// ` principal_type=<tok> principal_id=<tok> role=<tok>`: the grant tuple appended to every
-/// attestation audit detail (the target id is the campaign alone). CWE-117 via `audit_token`.
+/// ` principal_type=<tok> principal_id=<tok> role=<tok> scope=fleet` or
+/// ` ... scope=management_group scope_group_id=<tok>`: the grant tuple appended to every
+/// attestation audit detail (the target id is the campaign alone). The scope tokens come last, so a
+/// parser that reads the earlier tokens by prefix keeps working. CWE-117 via `audit_token`; the
+/// scope word is one of two fixed literals (`scope_kind`).
 [[nodiscard]] inline std::string attest_tuple_detail(std::string_view principal_type,
                                                      std::string_view principal_id,
-                                                     std::string_view role_name) {
+                                                     std::string_view role_name,
+                                                     std::string_view scope_group_id) {
     std::string out = " principal_type=";
     out += audit_token(principal_type);
     out += " principal_id=";
     out += audit_token(principal_id);
     out += " role=";
     out += audit_token(role_name);
+    out += " scope=";
+    out += scope_kind(scope_group_id);
+    if (!scope_group_id.empty()) {
+        out += " scope_group_id=";
+        out += audit_token(scope_group_id);
+    }
     return out;
 }
 

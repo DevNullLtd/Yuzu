@@ -31,6 +31,7 @@
 #include <constraint_accumulator.hpp>
 #include <yuzu/agent/runner_status.hpp>
 #include <yuzu/agent/subprocess_runner.hpp>
+#include <yuzu/agent/win_share_enum.hpp> // ShareRec (portable)
 #include <yuzu/plugin.hpp>
 #include <yuzu/string_utils.hpp>
 
@@ -428,13 +429,9 @@ inline Listing list_linux(const LinuxFs& fs) {
 // Windows decision logic (OS-free; the shell in shares_win.cpp injects NetShareEnum)
 // ---------------------------------------------------------------------------
 
-/// One NetShareEnum entry, already converted to UTF-8 by the shell. No `remark` (free text
-/// that can name people) and no ACL: names, paths and the type word only.
-struct WinShareRec {
-    std::string name;
-    std::string path; ///< empty at level 1 (SHARE_INFO_1 carries none) and for IPC$
-    std::uint32_t type = 0; ///< SHARE_INFO_*.shi*_type
-};
+/// One NetShareEnum entry: agent-core's record, already UTF-8. No `remark` (free text that can
+/// name people) and no ACL: names, paths and the type word only.
+using WinShareRec = yuzu::agent::win::ShareRec;
 
 /// One NetShareEnum call: its NET_API_STATUS, the entries of THAT page only, and the API's
 /// `totalentries` for that call.
@@ -442,6 +439,9 @@ struct WinPage {
     std::uint32_t status = 0;
     std::vector<WinShareRec> shares;
     std::uint32_t total = 0;
+    /// Cause token of a read that did not complete (agent-core's bounded_cause; static
+    /// storage), empty for an answered page. When set, the other fields mean nothing.
+    std::string_view unanswered;
 };
 
 /// Successive calls at one level return successive pages. The shell owns the resume handle
@@ -461,8 +461,9 @@ inline constexpr std::uint32_t kRpcUnknownIf = 1717;          ///< RPC_S_UNKNOWN
 
 /// Level 2 first; ERROR_ACCESS_DENIED at level 2 discards what was gathered and retries
 /// level 1 (names, no paths) as `constrained`. A stopped Server service is typed
-/// `unsupported`, never an empty list. Any other status on any page discards every row (a
-/// partial drain is never reported as a complete list).
+/// `unsupported`, never an empty list. Any other status on any page, and a page whose read did
+/// not complete (`unanswered`), discards every row (a partial drain is never reported as a
+/// complete list).
 ///
 /// The enumeration is NOT a snapshot: NetShareEnum's resume handle is an index into the live
 /// share list, so a share deleted before the cursor makes the next page skip one and a share
@@ -495,6 +496,11 @@ inline Listing list_windows(const WinPageFn& page) {
     for (;;) {
         const WinPage p = page(level);
 
+        if (!p.unanswered.empty()) { // no answer: there is no status to classify
+            t.acc.add_failure(tok(p.unanswered));
+            failed = true;
+            break;
+        }
         if (p.status == kWinAccessDenied) {
             got.clear();
             seen.clear();
