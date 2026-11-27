@@ -6,6 +6,7 @@
  * (tests/unit/test_echo_capture_status.cpp).
  */
 
+#include <format>
 #include <string>
 #include <vector>
 
@@ -22,13 +23,13 @@ namespace yuzu::echo {
 inline std::vector<UserSession>
 user_sessions_from_wts(const yuzu::agent::win::WtsSessionsRead& read) {
     if (read.status != yuzu::agent::BoundedStatus::Completed)
-        throw IncompleteCaptureError("ECHO: user session read " +
-                                     std::string{yuzu::agent::bounded_cause(read.status)});
+        throw IncompleteCaptureError(
+            std::format("ECHO: user session read {}", yuzu::agent::bounded_cause(read.status)));
     if (read.truncated)
         throw IncompleteCaptureError("ECHO: user session read hit the session cap");
     if (!read.enumerated)
         throw IncompleteCaptureError(
-            "ECHO: user session read failed (rc=" + std::to_string(read.win_error) + ")");
+            std::format("ECHO: user session read failed (rc={})", read.win_error));
 
     using yuzu::agent::win::kWtsActive;
     using yuzu::agent::win::kWtsDisconnected;

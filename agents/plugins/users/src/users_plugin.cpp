@@ -400,6 +400,9 @@ int do_logged_on(yuzu::CommandContext& ctx) {
     for (const auto& row : yuzu::users_win::logged_on_rows(read))
         ctx.write_output(row);
     declare_partial(ctx, yuzu::users_win::wts_degraded_provenance(read));
+    // A refused listing fails the command: no rows at rc 0 reads as nobody signed in.
+    if (!read.enumerated)
+        return 1;
 #endif
     return 0;
 }
@@ -461,6 +464,9 @@ int do_sessions(yuzu::CommandContext& ctx) {
     for (const auto& row : yuzu::users_win::session_rows(read))
         ctx.write_output(row);
     declare_partial(ctx, yuzu::users_win::wts_degraded_provenance(read));
+    // As in do_logged_on: a refused listing fails the command.
+    if (!read.enumerated)
+        return 1;
 #endif
     return 0;
 }
@@ -757,7 +763,7 @@ int do_local_users(yuzu::CommandContext& ctx) {
 #elif defined(_WIN32)
     const auto read = yuzu::agent::win::read_local_users(yuzu::agent::win::kLocalUsersDeadline);
     if (yuzu::agent::forward_bounded_failure(ctx, read.status, "windows:users:net_user_enum")) {
-        ctx.write_output(std::format("local_user|error|false|Never|{}",
+        ctx.write_output(std::format("local_user|error|unknown|unknown|{}",
                                      yuzu::agent::bounded_cause(read.status)));
         return 1;
     }

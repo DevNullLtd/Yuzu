@@ -49,12 +49,6 @@ SingleFlightSlot& g_vss_slot = detail::new_slot();
 /// -- the non-snapshot skip -- runs on a turn where no owner was constructed
 /// at all; see the trade-off note at that branch.
 ///
-/// Two earlier revisions of this comment were wrong in opposite directions,
-/// which is why the ordering is spelled out rather than asserted: one claimed
-/// it freed on "every loop turn, including the early-continue paths" (the skip
-/// path contradicts that -- Gate 2, docs-writer), and the code then briefly
-/// checked the cap BEFORE constructing the owner, making the cap `break` leak
-/// (Gate 3, cpp-safety and cpp-expert, independently).
 /// Unwrapped manual cleanup in new C++ is a governance policy floor, not a
 /// style preference.
 class ScopedSnapshotProp {

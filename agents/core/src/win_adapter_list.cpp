@@ -93,7 +93,12 @@ AdapterList read_raw() {
 
     AdapterList out;
     ULONG size = 0;
-    ::GetAdaptersAddresses(AF_UNSPEC, kFlags, nullptr, nullptr, &size);
+    const ULONG sized = ::GetAdaptersAddresses(AF_UNSPEC, kFlags, nullptr, nullptr, &size);
+    // Any other answer is a failed read, which must not read as "no adapters" below.
+    if (sized != ERROR_BUFFER_OVERFLOW && sized != ERROR_NO_DATA && sized != ERROR_SUCCESS) {
+        out.win_error = sized;
+        return out;
+    }
     if (size == 0) {
         out.empty_table = true;
         return out;

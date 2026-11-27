@@ -43,8 +43,11 @@ Result run_bounded_read(SingleFlightSlot& slot, std::chrono::milliseconds deadli
         break;
     case BoundedStatus::Busy:
     case BoundedStatus::Abandoned:
-    case BoundedStatus::Rejected:
         spdlog::debug("{}: no answer ({})", what, bounded_cause(flight.status));
+        break;
+    case BoundedStatus::Rejected:
+        spdlog::warn(
+            "{}: read not started (refused by the outstanding-call ceiling or thread setup)", what);
         break;
     }
     return out;

@@ -2,21 +2,24 @@
 """ADR-3008 lexical gate: how plugin code may reach a blocking OS call.
 
 Over agents/plugins/**/*.{cpp,hpp,mm}, with comments and string/char literals blanked:
-  (a) no direct call of a Windows API that agent-core reads for plugins (BANNED);
-      GetAdaptersAddresses stays allowed in the firewall plugin only;
+  (a) no direct call of a Windows API that agent-core reads for plugins (BANNED, the two WTS reads
+      in their unsuffixed, A, W and Ex spellings); GetAdaptersAddresses stays allowed in the
+      firewall plugin only;
   (b) no include of the agent-core driver bounded_single_flight.hpp, and no use of a *_for_test
-      seam declared in agents/core/include/yuzu/agent/win_*.hpp;
+      seam declared in agents/core/include/yuzu/agent/win_*.hpp or proc_snapshot_read.hpp;
   (c) the per-file count of `bounded_call*(` sites equals GRANDFATHERED. A new file or a higher
       count fails; a lower count fails until the table is lowered, so the freeze only ratchets down;
   (d) each WIRED site keeps the text that handles a bounded answer, in shells no unit test reaches:
-      shares' unanswered page, users' "did not complete" returns and its declaration of a failed or
-      cut read, and the tool budget's deadline, settlement and end-of-run status on the
-      per-account tools.
+      shares' unanswered page; users' "did not complete" returns, its declaration of a failed or
+      cut read, its return on a refused session listing, and the tool budget's deadline, settlement
+      and end-of-run status on the per-account tools; the status device_identity and network_config
+      forward; and the cause filesystem_posture puts on its VSS marks;
+  (e) no `.detach(`: a thread detached by plugin code can outlive the plugin.
 
 Stated limits: a wrapper whose name does not start with `bounded_call` is not seen, nor is a call
 with explicit template arguments (`bounded_call_ex<F>(`); (a) matches the listed spellings only;
-(b) sees a direct include, not a transitive one. Lexical only; the self-test plants each violation
-in memory and requires it flagged.
+(b) sees a direct include, not a transitive one; (e) does not see `->detach(`. Lexical only; the
+self-test plants each violation in memory and requires it flagged.
 """
 import functools
 import pathlib
@@ -29,8 +32,8 @@ PLUGINS = ROOT / "agents" / "plugins"
 
 BANNED = (
     "NetShareEnum", "NetUserEnum", "NetLocalGroupGetMembers", "NetSessionEnum",
-    "NetGetJoinInformation", "WTSEnumerateSessionsW", "WTSQuerySessionInformationW",
-    "CreateVssBackupComponents", "GetAdaptersAddresses",
+    "NetGetJoinInformation", "WTSEnumerateSessions(?:Ex)?[AW]?",
+    "WTSQuerySessionInformation(?:Ex)?[AW]?", "CreateVssBackupComponents", "GetAdaptersAddresses",
 )
 ALLOWED = {("firewall/src/firewall_plugin.cpp", "GetAdaptersAddresses")}
 
@@ -88,10 +91,24 @@ WIRED = (
      BEFORE_NEXT_USERS_READ + r"\bdeclare_partial\s*\(\s*ctx\s*,\s*"
      r"yuzu::users_win::incomplete_provenance\s*\(\s*,\s*read\.truncated\s*,"
      r"\s*read\.no_progress\s*\)\s*\)\s*;", 3),
+    # A refused session listing then fails the command.
+    ("users/src/users_plugin.cpp", r"\bread_wts_sessions\s*\(",
+     BEFORE_NEXT_USERS_READ + r"\bdeclare_partial\s*\([^;]*;\s*"
+     r"if\s*\(\s*!\s*read\.enumerated\s*\)\s*return\s+1\s*;", 2),
+    # The status writes of the other Windows shells.
+    ("device_identity/src/device_identity_plugin.cpp", r"\bread_join_info\s*\(",
+     r"[^{}]*\byuzu::agent::forward_bounded_failure\s*\(\s*ctx\s*,\s*read\.status\s*,\s*\)\s*;",
+     1),
+    ("network_config/src/network_config_plugin.cpp", r"\bread_adapters\s*\(",
+     r"[^;]*;\s*yuzu::agent::forward_bounded_failure\s*\(\s*ctx\s*,\s*list\.status\s*,\s*\)\s*;",
+     1),
+    ("filesystem_posture/src/filesystem_posture_win.cpp", r"\bread_vss_snapshots\s*\(",
+     r"[\s\S]*?\bprovenance\.append\s*\(\s*\)\s*\.append\s*\(\s*mark\.cause\s*\)\s*;", 1),
 )
 
 SITE = re.compile(r"\bbounded_call\w*\s*\(")
 BANNED_CALL = re.compile(r"\b(" + "|".join(BANNED) + r")\s*\(")
+DETACH = re.compile(r"\.\s*detach\s*\(")
 INCLUDE = re.compile(r"^[ \t]*#[ \t]*include\b", re.M)
 DRIVER = re.compile(r'[ \t]*[<"][^<>"\n]*\bbounded_single_flight\.hpp[>"]')
 TOKEN = re.compile(
@@ -116,14 +133,15 @@ def sources():
 
 
 def seams():
+    headers = ROOT / "agents" / "core" / "include" / "yuzu" / "agent"
     return {name
-            for p in (ROOT / "agents" / "core" / "include" / "yuzu" / "agent").glob("win_*.hpp")
+            for p in (*headers.glob("win_*.hpp"), headers / "proc_snapshot_read.hpp")
             for name in re.findall(r"\b(\w+_for_test)\s*\(", blank(p.read_text(encoding="utf-8")))}
 
 
 @functools.lru_cache(maxsize=None)
 def scan(name, raw, seam):
-    """One file's (a) and (b) findings and its (c) site count. Cached on the name and the full
+    """One file's (a), (b) and (e) findings and its (c) site count. Cached on the name and the full
     text, so a self-test edit rescans only the file it changes."""
     code, found = blank(raw), []
     for m in BANNED_CALL.finditer(code):
@@ -133,6 +151,8 @@ def scan(name, raw, seam):
         found.append(f"{name}: includes bounded_single_flight.hpp, which is agent-core only")
     for m in seam.finditer(code):
         found.append(f"{name}: names {m[1]}, a seam for test binaries")
+    if DETACH.search(code):
+        found.append(f"{name}: detaches a thread, which can outlive the plugin (ADR-3008)")
     return tuple(found), len(SITE.findall(code))
 
 
@@ -191,6 +211,12 @@ class BoundedOsCall(unittest.TestCase):
             (new, "#include <yuzu/agent/bounded_single_flight.hpp>", "agent-core only"),
             (new, '  #  include "bounded_single_flight.hpp"', "agent-core only"),
             (new, "auto r = read_vss_snapshots_for_test(d, f);", "seam for test binaries"),
+            (new, "auto r = read_proc_snapshot_bounded_for_test(p, d, f);", "seam for test binaries"),
+            (new, "void f(std::thread t) { t.detach(); }", "detaches a thread"),
+            (new, "void f() { WTSEnumerateSessions(0); }", "calls WTSEnumerateSessions"),
+            (new, "void f() { ::WTSEnumerateSessionsExW(0); }", "calls WTSEnumerateSessionsExW"),
+            (new, "void f() { WTSQuerySessionInformationA(0); }",
+             "calls WTSQuerySessionInformationA"),
             (new, "auto r = yuzu::shared::bounded_call(d, f);", "1 bounded_call sites, 0 frozen"),
             (processes, "auto r = yuzu::shared::bounded_call_ex(d, f);", "3 bounded_call sites"),
             (power, "auto r = bounded_call_tracked(f);", "11 bounded_call sites"),
@@ -201,6 +227,9 @@ class BoundedOsCall(unittest.TestCase):
 
     def test_selftest_dropped_wiring_is_caught(self):
         shares, users = "shares/src/shares_win.cpp", "users/src/users_plugin.cpp"
+        identity = "device_identity/src/device_identity_plugin.cpp"
+        network = "network_config/src/network_config_plugin.cpp"
+        posture = "filesystem_posture/src/filesystem_posture_win.cpp"
         guard = r"if \(yuzu::agent::forward_bounded_failure\("
         # (file, what to break, its replacement, how often it occurs): one occurrence at a time.
         for name, pattern, replacement, expected in (
@@ -217,6 +246,10 @@ class BoundedOsCall(unittest.TestCase):
              "", 2),
             (users, r"(?s)declare_partial\(ctx, yuzu::users_win::incomplete_provenance\(.*?\);",
              "", 3),
+            (users, r"if \(!read\.enumerated\)\s+return 1;", "", 2),
+            (identity, r"yuzu::agent::forward_bounded_failure\([^;]*;", "", 1),
+            (network, r"yuzu::agent::forward_bounded_failure\([^;]*;", "", 1),
+            (posture, r"provenance\.append\([^;]*mark\.cause\);", "", 1),
         ):
             src = self.srcs[name]
             matches = list(re.finditer(pattern, src))

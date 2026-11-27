@@ -100,6 +100,7 @@ TEST_CASE("read_vss_snapshots completes with this OS's answer", "[bounded_os_cal
     const auto r = read_vss_snapshots(yuzu::agent::win::kVssDeadline);
     REQUIRE(r.status == BoundedStatus::Completed);
 #ifdef _WIN32
+    CHECK(r.api_available); // false: built without the VSS SDK headers, so nothing is read
     // Without administrative rights the walk is refused: E_ACCESSDENIED, and nothing else.
     const bool denied = r.hr == static_cast<std::int32_t>(0x80070005u);
     INFO("failed_step " << static_cast<int>(r.failed_step) << " hr " << r.hr);

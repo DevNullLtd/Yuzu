@@ -152,7 +152,7 @@ inline CaptureCompleteness classify_subprocess_capture(bool tool_ran, bool timed
 /// (an incomplete/failed/truncated/capped capture, however the specific
 /// collector detected that -- subprocess status via
 /// classify_subprocess_capture above, or a platform syscall's own error
-/// contract for the native ARP/mapdrive legs), in which case `current` is
+/// contract for the native ARP/mapdrive/user legs), in which case `current` is
 /// empty and `skip_reason` carries the thrown what() for logging.
 template <typename T>
 struct CollectOrRetain {

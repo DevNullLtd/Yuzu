@@ -111,7 +111,7 @@ SmbSessionsRead read_smb_sessions(int level, std::size_t max_entries,
 SmbSessionsRead
 read_smb_sessions_for_test(int level, std::size_t max_entries, std::chrono::milliseconds deadline,
                            const std::function<SmbSessionsRead(int, std::size_t)>& reader) {
-    // An init-capture, so the copy the worker owns is not const (the lambda stays movable).
+    // An init-capture, so the copy the worker owns is not const (the lambda stays nothrow movable).
     return detail::run_bounded_read<SmbSessionsRead>(
         g_smb_slot, deadline, "smb_sessions",
         [owned = reader, level, max_entries] { return owned(level, max_entries); });

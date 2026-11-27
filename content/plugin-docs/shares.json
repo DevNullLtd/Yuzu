@@ -262,7 +262,7 @@
       "completeness": "partial",
       "provenance": "`windows:shares:netshareenum:deadline_exceeded`, `windows:shares:netshareenum:call_in_progress`, `windows:shares:netshareenum:abandoned_call_pending`",
       "status": "`CONSTRAINED`",
-      "when": "Windows: a page was not answered within 5 seconds: the call passed the limit or could not be run (`deadline_exceeded`), another share read was still in flight when this read's limit ended (`call_in_progress`), or an earlier call passed its limit and is still blocked, so none was started (`abandoned_call_pending`). The source row says `failed` and no share rows are reported, even if earlier pages were read"
+      "when": "Windows: a page was not answered within 5 seconds: the call passed the limit or could not be run (`deadline_exceeded`), another share read was still in flight when this read's limit ended (`call_in_progress`), or an earlier call passed its limit and is still blocked, so none was started (`abandoned_call_pending`). The source row says `failed` and no share rows are reported, even if earlier pages were read. The action returns 0"
     },
     {
       "completeness": "partial",

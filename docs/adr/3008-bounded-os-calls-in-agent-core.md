@@ -64,6 +64,9 @@ covers the wait for the slot and the call together.
 - The agent-core reads in D6 wait behind a healthy call, inside their own deadline. Several callers
   can want the same read (operator dispatch, Echo, daily sync), and an immediate `Busy` would turn
   a healthy overlap into a degraded answer on an unchanged host.
+- A caller that waited runs its call on what is left of its deadline, and marks the slot abandoned
+  when that runs out; later callers then answer `abandoned_call_pending` until the call returns.
+  This is kept because a real hang started by a queued caller must be marked.
 - `read_proc_snapshot_bounded` (macOS, its own slot, `kProcSnapshotDeadline` 5000 ms) keeps the
   immediate `Busy`: its documented `call_in_progress` answer does not change.
 
@@ -83,6 +86,11 @@ covers the wait for the slot and the call together.
   `forward_bounded_failure()` writes `<prefix>:<cause>`; `shares` and `filesystem_posture` carry the
   same cause token through their own status writers.
 - Echo skips the tick on a user or mapped-drive read that did not complete, and keeps its baseline.
+- The `CONSTRAINED` rule above covers reporting actions. A dispatched Echo collect reports the
+  events it recorded and sets no status; the skip shows in `echo.status` health and in `snapshot`.
+- The return code follows each plugin's existing convention: an unanswered read returns 1 in
+  `users`, `network_config` and `device_identity.domain`, and 0 in `shares` and
+  `filesystem_posture`.
 - Completeness is separate from the deadline. An agent-core read that stopped at an entry cap or a
   page bound is `Completed` with `truncated` or `no_progress` set, and it is partial: reporting
   actions write the rows and mark them `CONSTRAINED` + `PARTIAL`, and Echo skips the tick and keeps
@@ -136,6 +144,8 @@ covers the wait for the slot and the call together.
 - The `disk_actions` `DeviceIoControl` volume reads.
 - Blocking plugin calls not in the D6 table, for example the firewall plugin's own
   `GetAdaptersAddresses` and Echo's outbound mapped-drive (`WNet*`) enumeration.
+- `device_identity.ou` (`GetComputerObjectNameA`), which the daily sync runs right after the
+  bounded `domain` read.
 - The frozen plugin-local `bounded_call` sites (the gate's table; a wrapper definition counts):
 
 | File under `agents/plugins/` | Sites |
@@ -178,11 +188,17 @@ They are valid callers:
 
 Manual procedure, on a disposable Windows machine:
 
-1. Suspend `VSSVC.exe` and dispatch six concurrent `filesystem_posture.snapshots`. Each answers
-   within 15 s plus 2 s with a constrained result.
+1. Record the agent's dispatch worker count (the hardware thread count, clamped to 4 to 32).
+   Suspend `VSSVC.exe` and dispatch at least twice that many concurrent
+   `filesystem_posture.snapshots`. Each answers within 15 s plus 2 s with a constrained result. An
+   `os_info.os_name` sent before the first of them times out answers within 15 s plus 2 s.
 2. With the process still suspended, a later snapshot call answers at once with
-   `abandoned_call_pending`, and `os_info.os_name` answers in under 1 s.
+   `abandoned_call_pending`, and an `os_info.os_name` sent after the first timeout answers in under
+   1 s.
 3. Resume the process. The next snapshot call completes.
+4. Suspend the process again, let one snapshot call time out, and stop the agent service while the
+   process is still suspended. It stops inside the service stop timeout with no crash dump. Start it
+   and call again.
 
 The other items raised in the #3925 comments (POSIX file reads, the reconnect join, the metric) are
 the D7 list and stay there.

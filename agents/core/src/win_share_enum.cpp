@@ -111,7 +111,7 @@ SharePage read_share_page(int level, std::uint32_t resume, std::chrono::millisec
 SharePage read_share_page_for_test(int level, std::uint32_t resume,
                                    std::chrono::milliseconds deadline,
                                    const std::function<SharePage(int, std::uint32_t)>& reader) {
-    // An init-capture, so the copy the worker owns is not const (the lambda stays movable).
+    // An init-capture, so the copy the worker owns is not const (the lambda stays nothrow movable).
     return detail::run_bounded_read<SharePage>(
         g_share_slot, deadline, "share_enum",
         [owned = reader, level, resume] { return owned(level, resume); });

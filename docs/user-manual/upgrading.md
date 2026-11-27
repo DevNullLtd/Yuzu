@@ -11,6 +11,28 @@ A statement elsewhere on this page that a rollback, a mixed fleet or an in-place
 
 Running `dev` between releases? Some entries below describe changes on `dev` that are not in a release yet. For what a `git pull` of `dev` changed, run the repository script `python3 scripts/whats-new.py` (`--versions` for the version bumps, rebuild notes and Docker image bumps); see `changelog.d/README.md`.
 
+## ⚠️ Breaking: `users.local_users` `enabled` is a string, and some Windows reads now have a time limit that can fail a command (#3925)
+
+This describes the build in a fresh deployment (see "Deployment contract (hard cutover)" in the Forensics section of this page): every writer runs this build, and this page is not a procedure for a rolling or mixed-version upgrade.
+
+**In short.** Affected: anything that reads the `enabled` column of `users.local_users`; anything that reads the Windows results of `users` (`logged_on`, `sessions`, `local_users`, `local_admins`, `group_members`), `shares.list`, `filesystem_posture.snapshots`, `device_identity.domain` or `network_config` (`adapters`, `ip_addresses`, `dns_servers`); and Echo's Windows `user` and inbound `mapdrive` sources. To do: read `enabled` as a string, and treat a failed command or a constrained result from these reads as no answer, never as an empty list.
+
+**What changed.**
+
+- `users.local_users` `enabled` is a string (`true`, `false`, `unknown`); it was a bool. On macOS it reads `unknown` when the login-shell read fails or is cut off, where it used to read `true`.
+- When Windows refuses to list logon sessions, `users.logged_on` and `users.sessions` fail (return code 1) with a constrained result and no rows, instead of reporting nobody logged on. The Windows error code is in the agent log, and Echo skips that `user` tick.
+- The Windows reads have a time limit: 5 seconds per read, the group and administrator member reads included (per page for `shares.list`), 10 seconds for the local account list and 15 seconds for volume snapshots. A read that misses its limit, even if it would later have succeeded, is reported constrained. `users`, `device_identity.domain` and `network_config` then fail the command, and `users.local_users`, `local_admins` and `group_members` write an `error` row (in `local_users` its `enabled` field reads `unknown`). `shares` and `filesystem_posture` return 0. Echo skips that tick of its `user` or inbound `mapdrive` source.
+
+**Who is affected.** Consumers that read `enabled` as a bool or select enabled or disabled accounts (`unknown` is neither); scripts and automation that expect these commands to succeed on a Windows host where one of these reads can take longer than its limit; and anything that parses `local_user`, `admin` or `group_member` rows without checking for an `error` row.
+
+**What to do.**
+
+- Treat an `enabled` value of `unknown` as neither enabled nor disabled.
+- Do not count an `error` row (`local_user|error|...`, `admin|error|...`, `group_member|error|...`) as an account or a member.
+- A result or agent log line that names `abandoned_call_pending` means an earlier call is still blocked, and it names the read. Restore the Windows service behind that read: Volume Shadow Copy for `vss`, the Server service for shares and SMB sessions, the session manager for `wts_sessions`, the account database for accounts and members. If `abandoned_call_pending` persists once the service is healthy, restart the agent service: only a process restart frees a call that never returns (ADR-3008, "Consequences").
+
+**Scope of this note.** A supported deployment starts from a fresh database (see "Deployment contract (hard cutover)" in the Forensics section of this page); a development or UAT database seeded by an earlier build keeps `enabled` typed bool in its stored `device.users.local_users` definition, and this is not an upgrade procedure.
+
 ## Behaviour change: the firewall `state` and `rules` reads answer through granted privilege on macOS and a root snapshot broker on packaged Linux, and a Windows rule property that cannot be read is `unknown`
 
 This describes the build in a fresh deployment (see "Deployment contract (hard cutover)" in the Forensics section of this page): every writer runs this build, and this page is not a procedure for a rolling or mixed-version upgrade.

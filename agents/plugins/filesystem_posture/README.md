@@ -69,7 +69,7 @@ sequenceDiagram
   D-->>D: rows, or one none row plus a degraded status
 ```
 
-The Windows `snapshots` action reads through agent-core, which makes the chain of synchronous cross-process COM calls on its own worker thread and waits at most 15 s for the whole read. An unanswered read reports one `none` row (`VSS enumeration did not answer: <cause>`) and `CONSTRAINED` with provenance `windows:vss:<cause>`: `windows:vss:deadline_exceeded`, `windows:vss:call_in_progress` or `windows:vss:abandoned_call_pending`. The calls cannot be cancelled: after the limit the worker thread stays blocked in agent-core until the service answers. One read runs at a time, so a hung Volume Shadow Copy service or third-party backup provider holds that one thread and no further read starts until it returns. The walk itself is capped at 1,024 turns, and any failure is reported distinctly from a genuinely empty set.
+The Windows `snapshots` action reads through agent-core, which makes the chain of synchronous cross-process COM calls on its own worker thread and waits at most 15 s for the whole read. An unanswered read reports one `none` row (`VSS enumeration did not answer: <cause>`) and `CONSTRAINED` with provenance `windows:vss:<cause>`: `windows:vss:deadline_exceeded`, `windows:vss:call_in_progress` or `windows:vss:abandoned_call_pending`. The action returns 0. The calls cannot be cancelled: after the limit the worker thread stays blocked in agent-core until the service answers. One read runs at a time, so a hung Volume Shadow Copy service or third-party backup provider holds that one thread and no further read starts until it returns. The walk itself is capped at 1,024 turns, and any failure is reported distinctly from a genuinely empty set.
 
 ## OS capability
 

@@ -478,6 +478,7 @@ TEST_CASE("read_join_info answers on this host", "[bounded_os_call][agent]") {
     const auto r = read_join_info(yuzu::agent::win::kJoinInfoDeadline);
     REQUIRE(r.status == BoundedStatus::Completed);
     CHECK(r.nerr == 0);
+    CHECK(r.has_name); // a workgroup name or a domain name
 }
 
 TEST_CASE("read_hklm_values reads present and absent values", "[bounded_os_call][agent]") {

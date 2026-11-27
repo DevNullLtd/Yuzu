@@ -146,6 +146,7 @@ TEST_CASE("read_local_group_members completes with this OS's answer", "[bounded_
     REQUIRE(r.status == BoundedStatus::Completed);
 #ifdef _WIN32
     CHECK(r.nerr == 0);
+    CHECK_FALSE(r.members.empty()); // Administrators always has a member
 #else
     CHECK(r.nerr == 120);
     CHECK(r.members.empty());

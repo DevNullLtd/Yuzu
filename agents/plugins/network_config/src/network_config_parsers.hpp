@@ -146,7 +146,7 @@ inline bool is_listed_adapter(const yuzu::agent::win::Adapter& a) {
 }
 
 /// The Windows MAC rendering: uppercase, the first six bytes, '-' when shorter. Not format_mac
-/// above, which is lowercase and refuses any length but six.
+/// below, which is lowercase and refuses any length but six.
 inline std::string format_windows_mac(const std::vector<std::uint8_t>& addr) {
     if (addr.size() < 6)
         return "-";
