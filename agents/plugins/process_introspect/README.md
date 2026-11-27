@@ -186,5 +186,4 @@ cap|ambient|0000000000000000
 - Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_process_introspect.hpp`
 - Tests: `tests/test_process_introspect_definition.py` · `tests/test_process_introspect_no_task_port_lexical.py` · `tests/unit/test_process_introspect_legs.cpp` · `tests/unit/test_process_introspect_local_dispatcher.cpp` · `tests/unit/test_process_introspect_parsers.cpp`
 - Privilege row: `docs/agent-privilege-model.md`
-- Changelog: `changelog.d/2026-11-16-process_introspect-inspect.added.md` · `changelog.d/8070-process_introspect-macos-leg.added.md`
 <!-- END GENERATED -->

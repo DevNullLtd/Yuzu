@@ -3682,10 +3682,7 @@
     "capability_rows": [
       "server/core/src/capability_decls/plugin_action_catalogue_a.hpp"
     ],
-    "changelog": [
-      "changelog.d/6478-filesystem-search-dir-bounds.changed.md",
-      "changelog.d/8687-wp06-filesystem-stat-errors-refuse.security.md"
-    ],
+    "changelog": [],
     "definitions": [
       "content/definitions/filesystem.yaml",
       "content/definitions/t2_capabilities.yaml",

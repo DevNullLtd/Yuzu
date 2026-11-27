@@ -348,10 +348,7 @@
     "capability_rows": [
       "server/core/src/capability_decls/plugin_action_catalogue_process_introspect.hpp"
     ],
-    "changelog": [
-      "changelog.d/2026-11-16-process_introspect-inspect.added.md",
-      "changelog.d/8070-process_introspect-macos-leg.added.md"
-    ],
+    "changelog": [],
     "definitions": [
       "content/definitions/process_introspect.yaml"
     ],

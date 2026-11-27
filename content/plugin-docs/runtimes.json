@@ -654,10 +654,7 @@
     "capability_rows": [
       "server/core/src/capability_decls/plugin_action_catalogue_runtimes.hpp"
     ],
-    "changelog": [
-      "changelog.d/2026-10-28-runtimes-python.added.md",
-      "changelog.d/2026-11-04-runtimes-dotnet-jvm-drivers-inventory.added.md"
-    ],
+    "changelog": [],
     "definitions": [
       "content/definitions/runtimes.yaml"
     ],

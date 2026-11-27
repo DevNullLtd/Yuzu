@@ -843,11 +843,7 @@
     "capability_rows": [
       "server/core/src/capability_decls/plugin_action_catalogue_virtualization.hpp"
     ],
-    "changelog": [
-      "changelog.d/2026-11-08-virtualization-wsl.added.md",
-      "changelog.d/pr12-1a-virtualization-host.added.md",
-      "changelog.d/pr12-1b-virtualization-runtime-posture.added.md"
-    ],
+    "changelog": [],
     "definitions": [
       "content/definitions/virtualization.yaml"
     ],

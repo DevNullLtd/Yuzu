@@ -302,5 +302,4 @@ runtime|containerd|detected|present:0660:0:0|absent|-|-
 - Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_virtualization.hpp`
 - Tests: `tests/test_virtualization_definition.py` · `tests/test_virtualization_wsl_pin_lexical.py` · `tests/unit/test_virtualization_local_dispatcher.cpp` · `tests/unit/test_virtualization_parsers.cpp` · `tests/unit/test_virtualization_runtime_legs.cpp` · `tests/unit/test_virtualization_runtime_parsers.cpp` · `tests/unit/test_virtualization_wsl_parsers.cpp`
 - Privilege row: `docs/agent-privilege-model.md`
-- Changelog: `changelog.d/2026-11-08-virtualization-wsl.added.md` · `changelog.d/pr12-1a-virtualization-host.added.md` · `changelog.d/pr12-1b-virtualization-runtime-posture.added.md`
 <!-- END GENERATED -->

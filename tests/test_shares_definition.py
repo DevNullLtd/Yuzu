@@ -23,7 +23,7 @@ import yaml
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFINITION = REPO_ROOT / "content" / "definitions" / "shares.yaml"
 README = REPO_ROOT / "agents" / "plugins" / "shares" / "README.md"
-CHANGELOG = REPO_ROOT / "changelog.d" / "2026-10-29-shares-macos-leg.added.md"
+CHANGELOG = REPO_ROOT / "CHANGELOG.md"  # the fragment is promoted at release; the disclosure lives in the assembled entry
 PLUGIN_SOURCE = REPO_ROOT / "agents" / "plugins" / "shares" / "src" / "shares_plugin.cpp"
 
 # One stream, rows discriminated by field 0 (row_kind); the YAML names the shared tail fields
