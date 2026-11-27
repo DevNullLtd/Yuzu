@@ -17,9 +17,9 @@ namespace yuzu::agent {
 
 namespace {
 
-// Process-wide: one read in flight. Static storage so an abandoned worker's releaser never
-// touches a destroyed object.
-ProcSnapshotSlot g_snapshot_slot;
+// Process-wide: one read in flight. Never destroyed, so an abandoned worker's releaser never
+// touches a destroyed mutex.
+ProcSnapshotSlot& g_snapshot_slot = *new ProcSnapshotSlot;
 
 #if defined(__APPLE__)
 

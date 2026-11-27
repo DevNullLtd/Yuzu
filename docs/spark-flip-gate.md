@@ -1225,7 +1225,7 @@ flip, with a red-first test each:
     latched apply failure also holds the generation, so corroborate with
     `yuzu.guardian_arm_failed`/`arm_pending`, the compensation tags and the agent log) or the compensation age gauge above a chosen threshold
     (no alert rule ships). Existing server signals to watch:
-    `yuzu_server_guardian_reconciles_total{result="sent"}`,
+    `yuzu_server_guardian_reconciles_total{result="sent"}` (plus `result="sent_remote"` on a multi-replica deployment, where a replica pushes through the route directory),
     `yuzu_server_guardian_pushes_dispatched_total{reason="reconcile"}`, and repeated
     `guaranteed_state.reconcile` audit rows for one `agent_id`. Recovery without a restart is
     one of the exits above (the full-push and re-key exits subject to the same-type condition); an agent restart also ends the hold (with `--spark-disable`
@@ -1443,7 +1443,7 @@ flip, with a red-first test each:
     per-agent metric: the agent log WARN (`N cached rule(s) failed to re-arm at boot`),
     repeated `guaranteed_state.reconcile` audit rows reading `generation 0 -> N` for one
     agent id, and the fleet-wide `yuzu_server_guardian_reconciles_total{result="sent"}`
-    rate. Fleet-wide detection of the tag and the alert decision are #5558. A persistently
+    rate (plus `result="sent_remote"` on a multi-replica deployment). Fleet-wide detection of the tag and the alert decision are #5558. A persistently
     failing rule is re-pushed with an agent-side back-off (after each failed catch-up the
     agent reports its real generation for the next 1, 2, 4, 8, then 10 heartbeats before
     reporting 0 again; about 60 s, 90 s, 150 s, 270 s, then 330 s apart at the default 30 s
@@ -1845,8 +1845,11 @@ flip, with a red-first test each:
     - The pre-flip measurement of Security-log behaviour (#7877 item 39) covers watched DIRECTORIES (File: default ON,
       every 5 s, and a UNC path means a periodic NTLM sign-in) as well as Registry keys; neither is measured.
     - #7877: the umbrella of the remaining verification residuals is triaged, File and Registry. The Registry items
-      are item 31 (a rename followed by a re-creation of the path before the next sample is not noticed; ACCEPTED
-      residual, Dave, no independent adjudicator) and two more accepted residuals found by the #7836 governance
+      are item 31 (R1: with the opt-in check enabled, a parent renamed away and its path re-created is now detected at
+      the next verification sample, by comparing the held handle's name with the one recorded at commit and the fresh
+      open's name with the held one; a rename away and back inside one interval stays an ACCEPTED residual, Dave, no
+      independent adjudicator; the name reported through HKCR, a per-user key appearing over a held machine key and a
+      link re-point were measured on the 2026-11-26 rig, the last two now pinned by committed cases) and two more accepted residuals found by the #7836 governance
       review: item 32 (an undecided verification keeps the old handle and so misses a rename it saw until the next
       verification that decides) and item 33 (an Ancestor-mode watch is never verified, so a later rename of its
       shelter ancestor, including one re-committed in Ancestor mode after a verdict, is missed); item 34 (a Fired
@@ -1863,15 +1866,21 @@ flip, with a red-first test each:
       launches" case).
     - #7901: a CI leg installs `dbus-daemon` and sets `YUZU_REQUIRE_SPARK_DBUS_TESTS`, so the Linux Service case runs.
     - Also below: export of the File debug counters (#7658; the Registry `verify_lost` and `verify_undecided` counters
-      are test-only too and should be exported alongside them, a recommendation: #7658 does not yet say so), the audit,
-      EDR and SMB sign-in check of item (2), and the Gate 5 flip-time scenarios of item (4).
+      and the R1 counters `verify_name_lost`, `verify_name_undecided`, `commit_name_recorded`, `commit_name_missing`,
+      `verify_dup_failed`, `commit_capture_retry` and the `warns_claimed_*` counters are test-only too and should be exported alongside them, a
+      recommendation: #7658 does not yet say so; `verify_name_undecided` and `commit_name_missing` are the ONLY
+      discriminators between a blind Registry watch and a healthy one besides the per-watch agent-log warns, so they must
+      be exported before the flip), the audit, EDR and SMB sign-in check of item (2), and the Gate 5 flip-time scenarios of
+      item (4).
     **Flip-blocking under the owner threat model (Dave, 2026-11-16, also posted on #7877).** A local administrator who
     defeats a Registry guard IS in the Guardian threat model, so a deaf watch that reads Healthy is a security-control
     failure (I1) at the flip, not only a lost wakeup (I3). Before any `prefer_spark` flip each of these needs code, a
     measurement, or a fresh explicit owner decision recorded against it:
-    - #7877 item 31: a Registry parent renamed and the original path recreated within one verification interval leaves
-      the watch Healthy and deaf. Detect it before any flip (for example the held-handle name check through a
-      `DuplicateHandle` of the held `HKEY`, which the rig showed to be feasible).
+    - #7877 item 31: a Registry parent renamed and the original path recreated within one verification interval left
+      the watch Healthy and deaf. R1 detects it at the sampling bound with both compares (the held handle's name
+      against the name recorded at commit, through a `DuplicateHandle` of the held `HKEY`, and the fresh open's name
+      against the held one), only while the opt-in check is enabled (the default stays off until R3). The case where
+      the parent is renamed away and back inside one interval remains, and is R3's.
     - #7877 items 32 and 33: an undecided Registry verification keeps the old handle, and an Ancestor-mode Registry
       watch is never verified.
     - The File residual "renamed away and back between two samples" (the same class as item 31): not noticed.
@@ -2002,12 +2011,19 @@ flip, with a red-first test each:
     does not bypass the validation. On a Windows service that shows as Service Control Manager error 1053 with nothing in
     the agent log. A trailing `#` comment on the environment line is fatal too, because a systemd `EnvironmentFile` does
     not strip comments and the whole text becomes the value.
-    **Open residuals of the Registry fix** (none is claimed as covered; the first three are ACCEPTED residuals, owner
-    Dave, no independent adjudicator, tracked in #7877): a parent renamed away and a key re-created at
-    the original path BEFORE the next sample is not noticed (#7877 item 31), because the fresh open succeeds and is not
-    compared with the key the watch holds (a held-handle name check, `NtQueryKey(KeyNameInformation)` on a duplicate of
-    the notify handle, was measured to work on the rig, see the Runs paragraph, and is not implemented: it needs a handle
-    duplication under the pass lock; a test pins the residual); an undecided verification keeps the old handle, so a
+    **Open residuals of the Registry fix** (none is claimed as covered; the item 32 and item 33 clauses below are ACCEPTED
+    residuals, owner Dave, no independent adjudicator, tracked in #7877). **Item 31 (R1, #7877):** a parent renamed away
+    and a key re-created at the original path is detected at the next verification sample, only while the opt-in check is
+    enabled (see the dated R1 paragraph in the Runs record below): the held handle's canonical name
+    (`NtQueryKey(KeyNameInformation)` on a duplicate taken under the pass lock) is compared with the name recorded at
+    commit, and the fresh open's name with the held one. The first compare runs only for a watch whose commit recorded
+    a name, and a deny-ACE re-creation that makes the fresh open fail is caught by it and stays a visible fault. A name past
+    the stack buffer (4096 bytes including the 4-byte header, so one call covers names up to about 4092 bytes, 2046
+    UTF-16 units; a deep path of 255-character components is longer) is read through a one-time heap retry up to 64
+    KiB, and one past that cap is a proven mismatch against a recorded name; a commit is accepted only when a second by-path read
+    of the name agrees with the first (both fixed in the governance fix round, below, and no longer residuals). What R1
+    does not close is stated in the clauses below (the rename away and back inside one interval; the HKCR and link
+    sub-cases were measured on the rig, see below). An undecided verification keeps the old handle, so a
     rename the probe saw but could not conclude on (its ancestor walk failed) is missed until the next verification that
     decides; an Ancestor-mode watch is never verified, so after a verdict re-commits the watch in Ancestor mode a later
     rename of its shelter ancestor is missed (and an Ancestor-mode watch whose shelter ancestor is renamed is not
@@ -2015,9 +2031,22 @@ flip, with a red-first test each:
     a key deleted and re-created around a verification (an installer) can fault a healthy watch with the same reason
     text and leave it without coverage until the retry, about 30 s, the synthetic fire covering the gap;
     a persistent access-denied on the verification open leaves the watch unverified with no fault and no streak (unlike
-    File); HKCR is a merged view, so a user-hive key that appears later changes what the path resolves to, and a
-    registry link re-pointed to another target is the same class (the verification open follows links; both are
-    sub-cases of the rename-plus-recreate residual, item 31); every
+    File), except where the held handle's name shows the key moved (item 31 above); HKCR is a merged view, so a
+    user-hive key that appears later changes what the path resolves to, and a registry link re-pointed to another target
+    does the same (the verification open follows links; both are sub-cases of the item 31 class): the second compare
+    catches both (measured, below). `NtQueryKey(KeyNameInformation)` on a handle opened through HKCR was MEASURED on the
+    2026-11-26 rig to report the underlying key's canonical name (`\REGISTRY\USER\<SID>_Classes\...` for `.txt`,
+    `Directory`, `CLSID`, `*`, `AppID`, `Interface`, `TypeLib`, `Installer` and `MIME`; `\REGISTRY\MACHINE\SOFTWARE\Classes\Licenses`
+    for `Licenses`), not an HKCR spelling. Also measured on the rig on 2026-11-26 (build 26100, probe plus Catch2
+    cases, committed afterwards as the HKCR and link cases of the 2026-11-26 paragraph below): with a watch holding a machine class
+    key, a per-user class key appearing over it leaves the held name and the held notify unchanged (the notify does not
+    fire) while a fresh open names the per-user `_Classes` key; a registry link re-pointed from one target to another
+    does the same (held handle on the old target, fresh open on the new one, no notify). Through the real mechanism each
+    gave one fault, `registry watch path re-pointed to another key`, and the retry recovered onto the new key, so both
+    are detected by the second compare only (the first compare sees no move). A per-user key deleted while held answers
+    `0xC000017C` on the held name and fires the notify, so it settles without a fault. Not measured: a non-administrator
+    or CI-runner token (the `[7877]` cases passed under an elevated token and under two deny-only-Administrators
+    tokens, the HKCR and link probes under the elevated and one standard-style token); every
     watch commits at about the same time at startup, so N watches launch their verifications together against the
     16-slot probe lane (no fairness queue like File's; a refused launch is retried on the admission backoff and does not
     demote coverage); a verification that hangs pins one probe-lane slot and that watch stays unverified, and because the
@@ -2029,14 +2058,91 @@ flip, with a red-first test each:
     costs one idempotent evaluation that re-reads live state, ends at the retry, and the File mechanism suppresses
     it (the "no Fired event between Faulted and Recovered" case above is a File case). Cost and audit: one
     detached worker launch, one `RegOpenKeyExW`, one `RegNotifyChangeKeyValue`, one event and two or three handle
-    closes per watched key per interval, and an object-access audit event on a key that carries an auditing SACL (not
-    measured; no figure is quoted). The cost statement of item (2) below and #7876 (now titled for the File and Registry
-    mechanisms) apply to the Registry verification by reference, which the owner accepted; the operator levers until the
+    closes per watched key per interval, plus (R1) one `DuplicateHandle` and one `NtQueryKey` per held and per fresh key,
+    and an object-access audit event on a key that carries an auditing SACL. Measured by a peer on ONE key whose SACL
+    audits all access for Everyone (author-reported, one box, see the 2026-11-25 R1 note below): 1 audit event per check
+    with Registry auditing alone; with Handle Manipulation also on, 6 per check (4 for the by-path open, 2 for the
+    duplicate); 1,440 versus 8,640 events a day per key at 60 s and 17,280 versus 103,680 at 5 s. There is no positive
+    control for the Handle Manipulation zeros, and real fleet SACLs, N keys, and fleet-synchronised bursts are not
+    measured. With the check ON, every establishment, re-arm and retry of a non-root Target watch (not a
+    verification) whose first name read succeeds also opens the key by path a second time (the commit-capture
+    confirmation added in the governance fix rounds): one more event with Registry auditing alone and four more with Handle Manipulation also on, per commit.
+    That figure is DERIVED from the by-path-open measurement above, not measured for the confirming open itself. With
+    the check OFF (the default; the interval is fixed at launch of each probe) the confirming read does not run: the
+    name work is one `NtQueryKey` per establishment or re-arm on the handle the probe already holds (a peer measured no
+    audit event for a name query), with no second open, no duplicate and no warning. A verification that the probe lane
+    refused (admission) and that is retried takes a new duplicate for the retry, two more events with Handle
+    Manipulation on; a verification that a fire converted into the re-arm is not retried as a verification but as an
+    ordinary re-arm (a commit with the confirming read, no duplicate). Fire-rate worst case (DERIVED from the code, not
+    measured): with the check on, the confirming open runs on every fire-driven re-arm, so the audit cost on a key that
+    fires scales with how often the key fires, not with the interval; the re-arm rate is bounded only by the 50 ms
+    sweep cadence, about 20 commits a second per watch, up to 40 opens a second on an audited key (one by-path open per
+    commit and one for the confirming read; each is one event with Registry auditing alone, four with Handle
+    Manipulation on). Episodes can repeat (DERIVED from the code, not measured): the per-watch warns are once per
+    episode, not once per watch for ever, so an environment that alternates read outcomes can start a new episode and
+    log again, up to about 10 lines a second per watch by code reading; a per-watch hold-off is a follow-up, not done.
+    The "one name read per establishment" statement of the check-off case holds for names that fit one call (up to
+    about 4092 bytes, 2046 UTF-16 units; a longer name takes the heap retry: two calls). The cost statement of item (2)
+    below and #7876 (now titled for the File and Registry mechanisms) apply to the Registry verification by reference, which the owner accepted; the operator levers until the
     runtime switch exists are the boot-time Registry interval (0 = off, the default) and `--spark-disable`, a boot-time
-    flag that restarts the agent and switches off all three spark mechanisms. A Registry delete-and-recreate case was not added: the existing RF-6 case (#4340) already covers
-    that transition, with a coverage oracle rather than a `fault()` oracle. *Windows Service: NOT covered*, by owner
+    flag that restarts the agent and switches off all three spark mechanisms. (Before R1) A Registry delete-and-recreate case was not added: the existing RF-6 case (#4340) already covers
+    that transition, with a coverage oracle rather than a `fault()` oracle; R1 adds the delete-and-recreate name-verdict cases, see the Runs record. *Windows Service: NOT covered*, by owner
     ruling: deleting a Windows service needs administrator rights. macOS has no File, Registry or Service
     mechanism, so there is nothing to test there.
+    **R1 residual register (added by the 2026-11-26 governance Gate 7 fix round).** Every decision below is Dave, no
+    independent adjudicator, 2026-11-26 (governance Gate 7 decision); none is a covered claim. Each entry says whether R1
+    introduces or inherits the residual, whether an administrator can force it, and what closes it. All of them apply
+    only while the opt-in check is enabled, and Spark Registry is not the live detector (`prefer_spark_` is false).
+    - **UP-1, a persistent forced "undecided" (INHERITED from #7836, #7877 item 32; made visible, not closed, by R1).** An
+      undecided verification keeps the old handle. An administrator can FORCE it to persist: a registry link re-pointed,
+      or an HKCR key shadowed, onto a target that denies only `KEY_NOTIFY` to the agent leaves the fresh open refused
+      while the held name does not move (the primary compare then has nothing to fault on), and Guardian's own
+      `KEY_QUERY_VALUE` read still succeeds on the decoy. The same blindness follows from an unreadable name, a failed
+      `DuplicateHandle` and handle-table exhaustion (measured in the Gate 7 probe: `DuplicateHandle` fails fast with
+      `ERROR_NO_SYSTEM_RESOURCES` and succeeds again once a handle is freed). R1 only makes it observable: a per-watch
+      warn in the agent log once per blind episode, and the test-only counters `verify_name_undecided` and
+      `commit_name_missing`. A name whose length an administrator changes between the helper's two reads (the
+      overflow retry) also answers undecided (`0xE0000002`): the same forcing class, the same residual. Closed by R2
+      item 32 (an undecided result becomes a visible fault after 3 results). Pinned by the case titled "an unreadable
+      held name hides a rename until a verification can read it".
+    - **UP-3, a deterministic verification phase (INHERITED from the #7836 sampling design; newly relevant under R1's
+      name compare; NOT closed).** A verification is due at `commit time + interval`, with no jitter. An administrator
+      who can observe one sample (a SACL audit event, or the interval as a boot setting) can swap in a decoy just after it
+      and revert just before the next, a window of about one interval. Not closed; a +-25% jitter is deferred to a
+      follow-up (R3 or its own issue).
+    - **Rename away and back inside one interval (EXISTING, #7836; the File mechanism has the same class).** The held
+      name is back at its commit-time value, so nothing differs. Not closed; R3. Pinned by the case "a parent renamed
+      away and back inside one interval is not noticed, a documented residual".
+    - **One false fault, self-healing (INTRODUCED by R1).** A link created at the parent after the parent was renamed, and
+      a case-only rename of an ancestor, each leave the path resolving to the same key but the exact name compare sees a
+      different spelling: one fault, healed at the retry (the case-only class is pinned with an injected name; whether
+      `RegRenameKey` accepts a case-only rename was not measured).
+    - **FIXED in R1, no longer residuals:** (1) a held name past the single-call stack buffer (about 4092 bytes of
+      name; a deep path of 255-character components) used to overflow into "undecided", so an administrator could hide a
+      rename for as long as he liked; the query now retries into a heap buffer up to 64 KiB, and a name past that cap is
+      a proven mismatch against a recorded one (sec-F1). (2) A rename landing between a probe's open and its first name read used to record the MOVED name as
+      the committed name; a commit is now accepted only when a second by-path read agrees with the first, otherwise it is
+      retried on the admission backoff, never faulted (sec-F2). What remains of (2) is a flip between those two
+      back-to-back reads, which the next verification catches. (3) A verification that a concurrent fire converted into
+      the re-arm used to be committed as it stood (it ran no confirming read, so the commit-capture race applied to it,
+      and the fire is attacker-causable by a value write); the second fix round retries it at once as an ordinary re-arm,
+      which gets the confirming read (Gate 8, sec G8-1). Each of (2) and (3) applies while the check is on: with it off
+      no second read is made.
+    - **Not measured (kept open):** Windows builds before 26100 (X1: `NtQueryKey` on a `KEY_NOTIFY`-only duplicate was
+      measured only on build 26100); a real non-administrator account; the CI runner's own token; a profile unload against
+      the mechanism (a standalone probe saw every held handle answer `0xC0000425`, `probes/unload-run5.local.out`,
+      2026-11-24, author-reported). The full `[7877]` set under LocalSystem was run in the FINAL RIG RUN below (37 pass,
+      the two HKCR cases skipped by design, one box, author-reported).
+    - **Measured in the Gate 7 round (`r1-rig-gate7`, standalone probe, elevated, author-reported, one box, below-normal
+      priority, scratch hives only; the mechanism's own lock is not modelled):** `DuplicateHandle` is NOT blocked by a
+      long hive operation (a 276 MB hive under repeated `RegSaveKeyExW`: median 0.5 us, max 37 us, none over 1 ms, while
+      `NtQueryKey` and `RegOpenKeyExW` in the same window stalled up to 1.3 s; the claim that the duplicate under the pass
+      lock cannot block on a hung hive was an inference and is now measured for a hive-level save, not for the held key's
+      own hive being loaded or unloaded, nor with Handle Manipulation auditing on). A held DUPLICATE pins the hive against
+      an unload exactly like the original (`RegUnLoadKey` refused while only the duplicate is open); a forced unload makes
+      the duplicate answer `0xC0000425` and signals its notify. A forced `RegRestoreKey` over a held key signals the notify
+      and the held handle answers `0xC0000425`, so it is a fire plus a lost-hive verdict; a non-forced restore changes
+      nothing. `RegReplaceKey` leaves kernel-locked files on the box (8 KB, harmless) until a reboot.
     *The File fix.* An idle File watch re-opens its directory path every `path_verify_interval` (5 s in production;
     a sampled check, not continuous) on a detached worker and compares the directory identity (volume serial plus
     `FileIdInfo` file id) with the identity its own handle was opened on. A different identity, or a path that names
@@ -2434,11 +2540,225 @@ flip, with a red-first test each:
     faulted. All seven mutations were caught. Not run: any TSan run, the 50, 200 and 500 key cost measurements (no
     figure is quoted anywhere), the flip-time chaos scenarios, and the object-access audit behaviour on a key with a
     SACL.
+    **2026-11-25, R1 (#7877 item 31): dated note; the record above is unchanged.** The held-handle name compare described
+    above as not made is implemented by R1 (the held handle's name, read from a duplicate, against the name recorded at
+    commit, and the fresh open's name against the held one; the fault reasons are `registry watch key moved from its
+    path`, `registry watch path re-pointed to another key` and `registry watch hive unloaded`). The bytes, md5s, counts
+    and runs recorded in this record are the #7836 bytes and stand; they were not re-run for R1. R1 does not close the
+    family: a rename away and back inside one interval remains, and the HKCR merged view and a link re-point were
+    later measured and are detected (see the open residuals above and the R1 rig run paragraphs below), and the
+    check stays off by default until R3. Measurements taken for R1 on 2026-11-25 on the
+    weecolin rig (build 26100, elevated, peer-run and spot-checked, author-reported like the rest of this record, not
+    a CI run, scripts not in the tree): three runs of 33 checks each, 33 passed, 0 failed, re-measured the three
+    `DuplicateHandle` facts above (works on a `KEY_NOTIFY`-only `HKEY`; the duplicate's name tracks a rename of the
+    PARENT; closing the duplicate does not cancel the original's notify) and found that closing the original while a
+    duplicate is alive defers the notify's rundown until the duplicate, the last handle, closes. `DuplicateHandle`
+    p99 was 0.4 to 0.9 us over 500 keys and `NtQueryKey(KeyNameInformation)` p50 1.6 to 1.9 us (cost on a healthy hive,
+    P/Invoke overhead included; the claim that taking the duplicate under the pass lock cannot block on a hung hive was
+    an inference from the object model when this paragraph was written, and was measured later, see the Gate 7 round).
+    Audit, on a key whose SACL audits all access for Everyone (success and failure), two runs of 34 checks each, 34
+    passed: the duplicate adds no audit events under the Registry subcategory alone; if an operator also enables the
+    Handle Manipulation subcategory, each verification adds one 4690 and one 4658 for the duplicate (2 events), the
+    audited by-path open itself gains 3 events (4 in total instead of 1; the Registry-only single-event figure is from
+    an earlier peer run), and the new `NtQueryKey` calls add none. That is 1,440 events a day per key at a 60 s interval
+    (17,280 at 5 s) with Registry auditing alone, and 8,640 (103,680 at 5 s) with Handle Manipulation also on; a
+    narrower SACL yields fewer. There is no independent positive control for the Handle Manipulation subcategory, so its
+    zeros mean zero observed. Not measured in these runs: establishment and re-arm latency through the real probe job,
+    the name `NtQueryKey` reports through HKCR (measured on 2026-11-26, recorded in the paragraph "2026-11-26, R1: ASan,
+    a 50-repeat run, the HKCR and link cases and a token check" below) or a registry link, a profile unload against the
+    mechanism, and the real (narrower) SACLs of a fleet.
+    **2026-11-25 (later), R1 (#7877 item 31): first Windows rig run of the item 31 code and tests, which was RED, and the
+    green runs after the test-side fixes; every rig figure here is author-reported, one box (weecolin, build 26100), not a
+    CI run, raw logs local only (evidence directory `~/.claude/plans/spark-7877-evidence/`: `r1-rig`,
+    `r1-rig-asan`, `r1-rig-probes`, `r1-rig-race`, `r1-rig-committed`, `r1-rig-gate7`).** The item 31 code compiles on MSVC.
+    The FIRST run, at `c36e78a6b3`, was red: `[7877]` 12 of 15 cases passed and 3 failed in all 20 repeat runs (430 of 433
+    assertions; `[spark][mechanism][windows]` 156 of 159), because of three test-side defects, fixed in `141aee7bd6` (no
+    production change). After that fix: `[7877]` 15 of 15 cases pass (445 assertions) at `141aee7bd6`, 20 of 20 repeat runs;
+    at `fa246079f9` and `d2c1dea0ba` (the same C++ bytes) the 22 `[7877]` cases pass (650 assertions), 20 of 20 repeat
+    runs, and `[spark][mechanism][windows]` passes (166 cases, 3096 assertions). An earlier statement here that
+    `[spark][mechanism][windows]` passed 159 of 159 twice is NOT RETAINED: no log of it is in the evidence set (the 166 case,
+    3096 assertion run is). The deny-ACE case ran (it did not skip) and passed. Red proof: with only the primary compare
+    neutralised, 5 of the 15 cases go red (the deny-ACE case sees no fault at all); with the whole name verdict
+    neutralised, 9 of 15 go red.
+    HKCR: `NtQueryKey` on a key opened through HKCR reports the underlying canonical name (`\REGISTRY\USER\<SID>_Classes\...`
+    for `.txt`, `Directory`, `CLSID`, `*`, `AppID`, `Interface`, `TypeLib`, `Installer` and `MIME`;
+    `\REGISTRY\MACHINE\SOFTWARE\Classes\Licenses` for `Licenses`), so the HKCR name reporting is now measured (the
+    evidence for it is dated 2026-11-26). The per-user-over-machine and link re-point cases, not driven in the first run,
+    were driven in the paragraphs that follow the root-key finding.
+    **Root-key watch (a finding, PRE-EXISTING, not caused or changed by R1):** `RegOpenKeyExW` on `HKCU`, `HKLM`, `HKCR` or
+    `HKU` with an empty or NULL subkey returns the predefined pseudo-handle itself, and `NtQueryKey` on it answers
+    `0xC0000008` (`STATUS_INVALID_HANDLE`). A root-key (empty subkey) watch driven through the raw mechanism with
+    verification on never reaches the verdict: the first verification's own notify registration signals the live
+    notify (a second `RegNotifyChangeKeyValue` on the shared predefined handle signals the first event, and
+    `RegCloseKey` signals the new one), so the watch re-arms about every 31 ms with a synthetic fire each time, and
+    `verify_launched` stays at 1. It is not reachable through the engine (`spark_engine.cpp` refuses an empty key), and
+    R1 only guarantees that no duplicate handle is staged for it. Options, not decided: (a) leave it, as the engine
+    refuses the key; (b) have the mechanism refuse an empty subkey at `watch()`, so the engine and the mechanism agree;
+    (c) support a root-key watch properly (for example by not verifying it, or by opening a real handle for it).
+    Environment note: the shared `vcpkg_installed` on the rig was stale (sqlite3 3.52.0 against the pinned 3.54.1), so the
+    run used a private manifest install.
+    **2026-11-26, R1: ASan, a 50-repeat run, the HKCR and link cases and a token check; author-reported, one box (weecolin
+    rig, build 26100), not a CI run, raw logs local only (`r1-rig-asan`, `r1-rig-probes`).** The MSVC AddressSanitizer build of the agent test
+    binary (`-fsanitize=address`, `debugoptimized`) ran the 15 `[7877]` cases 50 times, one run at a time: 50 of 50
+    passed (445 assertions each), 13 to 14 s a run, no AddressSanitizer report. The tree built had the two C++ sources
+    of the R1 tip; the documentation-only commits that followed did not change it. Three more plain-build runs were
+    green and two 20-run plain loops were 20 of 20 each. HKCR and link cases: held handle and fresh open were
+    measured to report different names when a per-user class key appears over a held machine key (held machine, fresh
+    per-user `_Classes`, the held notify not signalled) and when a registry link is re-pointed (held old target,
+    fresh new target, not signalled); through the real mechanism each gave one `registry watch path re-pointed to
+    another key` fault, recovery onto the new key and no flap, using scratch Catch2 cases (committed afterwards, see the
+    2026-11-26 paragraph below). A
+    per-user key deleted while held answered `0xC000017C` and fired the notify, so the watch settled with no fault.
+    The delete race was then driven through the real mechanism with parked-worker scratch cases (20 of 20
+    runs, no flake; committed afterwards as the four delete-race cases of the 2026-11-26 paragraph below). When the delete's own fire is consumed before the verification result is judged, which is the
+    natural order, the real `0xC000017C` is returned but the result is committed as the re-arm and the name verdict is
+    never reached, so `verify_name_undecided` stays 0 and the watch converges; the undecided-by-name row is reached only
+    when the sweeper judges the result first (forced with a sweep hook: counter 0 to 1, no fault, converges). An
+    unforced run of 1500 delete and re-create rounds at a 1 ms interval never reached it. Two side findings, both
+    outside the R1 verdicts: with the sweeper first and the key deleted before the probe's open, a plain delete with no
+    re-create faults the watch with `registry watch key renamed or replaced` (the existing path-level row, the item 37
+    class in #8188), recovers at the retry once the key exists, and gives no fault in the natural order; and a delete
+    that lands between the held and fresh name queries commits with no recorded name, which logs the one-time
+    `no canonical name could be recorded` warning with status `0xc000017c` and heals at the next re-arm.
+    Token check: all 15 cases passed, none skipped, under an elevated token and under `runas /trustlevel:0x20000`
+    tokens (Administrators deny-only, one also at Medium integrity); the `[7877]` cases touch only HKCU and the test
+    code has no privilege guard. A scheduled task with `RunLevel Limited` did not give a filtered token on this rig, a
+    genuine UAC-filtered token could not be started, the rig has no CI runner so the runner's own token was not
+    observed, and no non-administrator account was created. Not measured: a real non-administrator account, the
+    runner token, and the profile unload cycle.
+    **2026-11-26, R1: the HKCR, link and delete-race cases are committed; author-reported, one box (weecolin rig, build 26100),
+    not a CI run, raw logs local only (`r1-rig-race`, `r1-rig-committed`).** The scratch cases of the two paragraphs above are now committed, as seven Windows
+    cases (22 `[7877]` cases in all, 650 assertions): a per-user HKCR class key appearing over a held machine key (with a
+    negative control first) and one deleted while held, a registry link re-pointed (titles end `(#7877 item 31, HKCR)` and
+    `(#7877 item 31, link)`), and the delete race, driven with the verification worker parked before its held-name query,
+    in the natural and in the sweeper-first order, each with a plain delete and with a delete and re-create (titles end
+    `(#7877 item 31, delete race)`). The measured results above stand and are asserted: one `registry watch path
+    re-pointed to another key` fault, recovery onto the new key (per-user `_Classes` name, or the link's second target),
+    a write there fires, no flap; a deleted per-user key settles with no fault and the committed name goes back to the
+    machine key; the real `0xC000017C` is read on the worker (a test-held handle on the same key object), the natural order
+    leaves `verify_name_undecided` at 0 and the sweeper-first order takes it from 0 to 1, neither faults, both converge.
+    The sweeper-first window is 4 ms inside the sweeper's 5 ms pass, so the driver repeats the whole scenario up to five
+    times if a slow box loses it; in the 21 runs below it was reached at the first attempt every time. NOT committed, on
+    purpose: the plain delete with the worker parked before its open (it faults `registry watch key renamed or replaced`,
+    the item 37 class in #8188) and the unforced delete-and-recreate loop. The HKCR cases need a machine class key, so they
+    probe `HKLM\SOFTWARE\Classes` once and SKIP with the reason when the token cannot write it; the link and delete-race
+    cases use HKCU only and every case removes its salted `yuzu_test_name_*` keys on a failure too (the link by handle first).
+    Rig runs (tests commit `fa246079f9`; plain build, `-j4`, below-normal priority, one process at a time, cross-session
+    lock held): elevated token, all 22 pass, none skipped, 650 assertions, and 20 further sequential runs 20 of 20 (25 to 26
+    s a run, 551 s wall with 2 s between runs); `[spark][mechanism][windows]` 166 of 166 (3096 assertions); under `runas
+    /trustlevel:0x20000` (Administrators deny-only, High integrity, `SeChangeNotifyPrivilege` only) 20 pass, 598
+    assertions, and the two HKCR cases SKIP with the stated reason while the link and the four delete-race cases pass. Red
+    proof (a temporary edit on the rig, reverted, tree clean, rebuilt): with the fresh-versus-held compare neutralised
+    (row 4 never returns) 4 of the 22 go red, the HKCR-appears case, the link case and the two older cases that pin that
+    compare (the injected name, and the watch that recorded no name); the other 18 stay green. No `yuzu_test_*` key
+    remained under `HKCU\Software`, `HKCU\Software\Classes` or `HKLM\SOFTWARE\Classes` afterwards. Still not measured: a
+    real non-administrator account and the CI runner's own token (the second run above is a deny-only-Administrators
+    token), and ASan on the new cases.
+    **2026-11-26, R1 governance fix round (Gate 7); the code and tests changed AFTER every rig figure above, so read the
+    rig figures above as figures for the bytes at `d2c1dea0ba` only. The bytes of this round and of the later rounds
+    were built and run at the final tip `187a56bc75`, recorded in the FINAL RIG RUN paragraph below.** Findings
+    addressed: the held name past the single-call stack buffer of about 4092 bytes (sec-F1: a heap retry
+    up to 64 KiB, a held name past the cap against a recorded commit-time name is a proven move, a fresh name past the cap
+    against a readable held name is a re-point; the helper's own malformed-length answer is now a distinct local sentinel
+    so the kernel's `0xC0000023` stays real); the commit-capture race (sec-F2: a commit-capable result is accepted only
+    when a second by-path read of the name agrees with the first, otherwise it is retried on the 50 ms-doubling admission
+    backoff, never faulted; new test-only counter `commit_capture_retry`); blind-watch visibility (sre-F1: the two
+    mechanism-wide one-shot warns became per-watch warns, one per blind episode, re-armed by a commit that records a name,
+    by a verification that decides, and by a working duplicate; the missing-name warn is staged only while the check is
+    on; the flag is claimed at log time and handed back if the log call throws). Decisions of the same round (Dave, no
+    independent adjudicator, 2026-11-26): UP-1 is NOT fixed in R1 and is recorded as an inherited residual closed by R2 item
+    32; UP-3 is recorded and jitter is deferred; the commit-capture race IS fixed in R1. Tests: 10 further Windows `[7877]`
+    cases (32 in all: the deep real name, the cap branch, the commit race in an accessible and a deny-ACE variant, the
+    process handle count, two warn cases, and three residual pins), every precondition skip now fails instead of skipping
+    when `YUZU_REQUIRE_WINDOWS_REGISTRY_TESTS` is set (a CI Windows leg with that flag set will FAIL the HKCR pair if its
+    token cannot write `HKLM\SOFTWARE\Classes`, and the link and deny-ACE cases if it cannot create a link or set a DACL).
+    **2026-11-26, R1 governance SECOND fix round (Gate 8); the code and tests changed AFTER the Gate 7 round above. These
+    bytes were built and run at the final tip `187a56bc75`, recorded in the FINAL RIG RUN paragraph below.** Findings
+    addressed: the confirming read
+    and its deferral now run only while the check is on (the interval is read when each probe is launched, a
+    verification never runs it, and a verification whose duplicate failed is still a verification); the name capture
+    on the already-open handle stays unconditional, so the default agent pays one `NtQueryKey` per establishment or
+    re-arm and nothing else; a verification converted into the re-arm by a fire is no longer committed (sec G8-1, retried
+    at once as an ordinary re-arm that confirms, the grace of its obligation restarting at the retry decision); a watch
+    that recorded no name is announced at its first verification (sec G8-2); a deferred commit has its own
+    once-per-episode warn (sre F3, from the second attempt on, the first being made inside `watch()` which logs nothing);
+    the warn claim compares a per-watch serial as well as the address (sec G8-5); `process_handle_count` fails loudly.
+    Residual, unchanged and still Dave's: UP-1 and UP-3 (Gate 7 decision, no independent adjudicator). The oscillating
+    name length is added to the UP-1 vector list as the same forcing class, not a new decision. The test-only counters
+    `warns_logged_*` were renamed `warns_claimed_*` (counted when the flag is claimed and the log call returned; the
+    sink is not observed except in the two cases that capture the log) and `warns_claimed_commit_unconfirmed` was
+    added. Tests: the establishment-site commit race (one-shot and permanent), the fire-converted verification (accessible
+    and deny-ACE), the interval-0 case with a check-on positive control, the first-verification no-name warn, the warn
+    text, two watches warning independently, and the handle-count case with a warm-up and a positive control.
+    **2026-11-26, R1 governance THIRD fix round (Gate 8, delta); comment, log-text, test and documentation changes only,
+    no behaviour change. These bytes were built and run at the final tip `187a56bc75`, recorded in the FINAL RIG RUN
+    paragraph below.** The CommitUnconfirmed warn now says what is true during a deferral (no notification coverage, no
+    rename-and-recreate check, the commit not accepted); `commit_capture_retry` is documented as counting both unconfirmed
+    deferrals and fire-converted verification retries; the operator strings say the confirming second open applies to
+    a non-root Target watch whose first name read succeeds; the fire-converted verification case now proves the retry
+    made its confirming read (an odd fresh-side name-call delta of at least 3). Recorded as UNMEASURED at that time: (1) the
+    sweeper-first delete-race window of 4 ms was measured only on an idle box, so a loaded runner can lose it more
+    often than the rig did (the driver repeats the scenario up to five times and asserts nothing on a lost one); this
+    stays unmeasured on a loaded runner (the final run's contention test below used 8 spinners on one box and did not
+    measure the window); (2) the shard B budget, which the final rig run below measured once, standalone (resolved
+    there by moving the cases to shard A).
+    **2026-11-26, R1 FINAL RIG RUN at tip `187a56bc75`, the bytes of every governance fix round above; author-reported,
+    one box (the weecolin rig, Windows build 26100, MSVC 19.44), raw logs local only (evidence directory
+    `r1-rig-final`), not a CI run.** Build: clean on MSVC 19.44 (rc 0, no errors). Warnings, attributed to the files:
+    `spark_mechanism.hpp` C4100 (pre-existing); `test_spark_mechanism.cpp` C4996 for `getenv` at four sites (three
+    pre-existing and one new, from the `skip_or_fail_registry` helper); `main.cpp` C4996 and C4505 (not in this branch's
+    diff); none from `spark_registry.cpp` or `agent.cpp`.
+    Results. `[7877]` elevated: 39 of 39 pass, 1197 assertions, 40 s; 40 of 40 sequential repeats pass (each 39 cases
+    and 1197 assertions). The previous tip `a0982195db` had 1 failure in 40 repeats, at the HKCR 'deleted settles onto
+    the machine key' case; the root cause was never reproduced, so the test-side fix of this tip (waiting for the
+    committed name instead of the engine's last coverage report) is a HYPOTHESIS, and no failure in 40 runs on this tip
+    is consistent with it and does not prove it. `[spark][mechanism][windows]`: 183 cases, 3638 assertions, all pass,
+    133 s. Elevated with `YUZU_REQUIRE_WINDOWS_REGISTRY_TESTS=1`: 39 of 39. Under `runas /trustlevel:0x20000`
+    (Administrators deny-only): 37 pass and 2 skip (the HKCR pair); with the env var the same token gives 37 pass and 2
+    fail (the HKCR pair, with the stated reason), so the require guard is shown to bite. Under LocalSystem (a one-shot
+    scheduled task): 37 pass and 2 skip (the HKCR pair, reason 'HKCU is the .DEFAULT hive under LocalSystem'), and the
+    link case RAN and passed (1.77 s), so the changed link target has now run on Windows under that token.
+    ASan (the MSVC AddressSanitizer build), `[7877]`: 20 of 20 pass, 0 AddressSanitizer reports, all 39 cases, this tip.
+    Contention: 8 below-normal spinner processes, `[7877]` three times, 3 of 3 pass, no measurable slowdown (41 s each)
+    on an 8-core, 16-thread box; a weak stress, not a loaded CI runner. Red proofs on the box (a temporary edit,
+    reverted, rebuilt, and green again at 39 of 39, 1197 assertions): disabling the fire-converted verification retry
+    reddens 3 cases (5 assertions: two delete-race cases, where `commit_capture_retry >= 1` read 0, and the
+    fire-converted case in its accessible and deny-ACE variants); making `confirm_commit` ignore the interval reddens 1
+    case (the interval-0 case, 2 assertions). Hygiene: the box worktree was clean at `187a56bc75` and no `yuzu_test_`
+    key remained (one leaked by the session's own mid-run kill of an aborted earlier chain was deleted by hand).
+    Shard B, measured once and standalone: the Windows shard B filter, taken from the meson introspection, was run alone
+    (not through the meson test runner): 894 cases, 893 pass and 1 skip (the U7b log-file case, not a `[7877]` case),
+    89222 assertions, 159 s wall against its 240 s timeout (66%). `[7877]` is 39 cases and 40.5 s of that, so shard B
+    without it is about 118 s. `[7877]` therefore pushes shard B past the 50% (120 s) budget stated in
+    `tests/meson.build` and `docs/testing/unit-test-conventions.md`. This is a standalone figure; CI runs the shards
+    3-wide, so a CI wall time may differ and is not measured. Shard B budget, RESOLVED 2026-11-26 (Dave, governance Gate 7): the `[7877]` cases move to shard A (commit
+    `689215c1bd`, tag `7877` added to `agent_shard_a_tags` in `tests/meson.build`). Post-move rig run at that commit
+    (author-reported, one box: the weecolin rig, Windows build 26100, elevated, raw logs local only, not a CI run).
+    The partition checker passes: 3 agent shards, 7429 cases, an exact partition (A 1015, B 855, C 5559), all 39
+    `[7877]` cases in A and none in B or C. Each shard run alone: A 140 s (1015 cases; 58% of its 240 s timeout; over
+    the 50% half-budget of 120 s; `[7877]` is 40.5 s of A's 139.7 s case sum, so A was about 99 s before), B 122 s
+    (855 cases; 51% of 240 s, on the 120 s line; 118.5 s case sum, against 159 s with `[7877]`), C 353 s (5559
+    cases; 74% of its 480 s timeout; over its 240 s half-budget as the known deliberate #7135 / #7177 exception, and
+    longer than the roughly 222 s recorded in the `tests/meson.build` comments, which was not investigated). Run
+    3-wide with `meson test --suite agent-shard`, twice: B 118.5 s, A 140.0 s, C 351.0 s (total wall 352 s) and B
+    118.5 s, A 139.5 s, C 346.7 s (total wall 347 s), all passing, with no measurable slowdown from running 3-wide
+    on this 16-thread box. So shard A is now over the half-budget and shard B is on the line; both are under
+    `flake-retry.py`'s 80% mark (192 s). A dedicated shard for the `[7877]` cases is the follow-up (an issue is filed
+    when the item 31 PR opens). The 3-wide figures are one box, not a CI runner pool.
+    NOT run, or unmeasured at this tip (the meson-level concurrent 3-shard run was done later, at `689215c1bd`, above): the full agent suite on this tip; Windows builds
+    before 26100 (X1); a real non-administrator account; the CI runner's own token; a profile unload against the
+    mechanism. Two further records from the final delta reviews. (1) A CI runner that ran as LocalSystem would skip the
+    two HKCR cases even with `YUZU_REQUIRE_WINDOWS_REGISTRY_TESTS=1` (a premise mismatch, deliberately not routed
+    through the require guard); today only #7637 prevents that runner configuration, and the two HKCR cases, and
+    therefore the flake fix they carry, are not exercised under SYSTEM. (2) INFO: in the delete-race loop
+    `rearm_committed` can still pass on a stray late commit of an earlier change; the window is narrow.
     **Governance review and the fixes after it (#7836).** A scoped `/governance` run (range `da67bf0371..5731eb0632`, ten
     governance agents; happy-path, compliance-officer and enterprise-readiness were omitted by the caller, and the chaos
     plan was written, not executed) was NOT a pass: it raised 43 findings (REG-01 to REG-43), four of them blocking-provisional
     (REG-01, REG-02, REG-03 and the test-side REG-07) and one owner-accepted row (REG-04). REG-01, REG-02 and REG-04 are
-    ACCEPTED residuals (owner Dave, no independent adjudicator; deferred to #7877, see the residuals above); REG-03 is
+    ACCEPTED residuals (owner Dave, no independent adjudicator; deferred to #7877, see the residuals above; as of
+    2026-11-25 REG-04, item 31, is detected at the sampling bound by R1 when the opt-in check is enabled, and its
+    rename-away-and-back case remains, see the dated R1 note above); REG-03 is
     adjudicated separately. Four commits follow `5731eb0632`: a test commit (`96882cae88`, whole-repo tree `6086bb292f87b1e7633c3fdbd25590180704c618`; REG-07: the
     `ProbeGate` hook of the Registry cases now owns its state by value) and three documentation and comment commits (`9c04408b6a`, `1beb84467e`, `b330b7c60a`; no behaviour
     change: `git diff -U0` over `spark_registry.cpp` and `spark_mechanism.hpp` shows comment lines only). **Rig run of the final
@@ -4110,16 +4430,26 @@ Needs its own fix + timeline, tracked separately. Only #2797's spark-branch half
 
 **#7877 items 31, 32 and 33 and the File away-and-back residual** (a Registry or File watch can read Healthy and
 stay deaf after a rename; review ids REG-04, REG-01, REG-02)
-- Detection signal: none. A watch that missed a rename reports Healthy; the Registry `verify_lost` and
-  `verify_undecided` counters are test-only (#7658).
+- Detection signal: none for items 32 and 33 and the File residual. A watch that missed a rename reports Healthy; the
+  Registry `verify_lost` and `verify_undecided` counters are test-only (#7658). Item 31 (R1, 2026-11-25) is detected
+  at the sampling bound when the opt-in Registry check is enabled: the watch faults with `registry watch key moved from
+  its path` (the held handle's name differs from the one recorded at commit), `registry watch path re-pointed to
+  another key` (the fresh open names another key than the held one) or `registry watch hive unloaded`; the new name
+  counters are test-only too (#7658). Since the governance fix round a watch whose check cannot decide also logs one
+  per-watch warn per blind episode (agent log, key token and status only; it says the watch is not protected until a
+  check decides). The residuals for item 31 are a parent renamed away and back inside one interval (not noticed), UP-1 (an
+  administrator-forceable persistent undecided, inherited, closed by R2 item 32) and UP-3 (a deterministic verification
+  phase, jitter deferred); see the R1 residual register above. The sub-cases of a per-user key appearing over a held
+  machine key and a link re-point were driven on a rig (2026-11-26) and are detected by the fresh-versus-held compare; committed cases pin both (titles ending
+  `(#7877 item 31, HKCR)` and `(#7877 item 31, link)`).
 - Operator action: none exists beyond restarting the agent or `--spark-disable`. Not confirmed as a documented
   runbook step.
 - Compensating control: Spark File and Registry are not live (`prefer_spark_` is false in production), so only
   rig-flipped agents can meet them. The legacy `IGuard` path stays the live detector.
 - Owner: Dave (repository owner), who accepted these as documented residuals deferred to #7877 (item 31 for REG-04,
-  item 32 for REG-01, item 33 for REG-02). The same person authored the commits and no independent adjudicator
-  reviewed the acceptance. On 2026-11-16 the owner ruled that a local administrator defeating a Registry guard is in
-  the threat model, so each of these, and the File "renamed away and back between samples" residual, is an I1
+  item 32 for REG-01, item 33 for REG-02; R1 has since changed what item 31 leaves open, see the detection signal
+  above; the UP-1 and UP-3 decisions are Dave, no independent adjudicator, 2026-11-26). The same person authored the commits and no independent adjudicator reviewed the acceptance. On 2026-11-16
+  the owner ruled that a local administrator defeating a Registry guard is in the threat model, so each of these, and the File "renamed away and back between samples" residual, is an I1
   (security-control failure) at the flip and flip-blocking, not only I3.
 - Milestone: not assigned.
 - Revisit trigger: before any `prefer_spark` flip.
