@@ -18,3 +18,8 @@ No new fd, HANDLE, SOCKET, FILE*, sqlite3*, OpenSSL or BCrypt handle, thread, ca
 
 - TSan: the two-thread attest test is a real concurrent writer on a shared store and pool. NOT run (TSan is `--full` only).
 - ASan/UBSan: none beyond the default run; the hex write is in bounds by construction.
+
+## Addendum: docs fix round for the PR review (a8ac4c16ab)
+
+- Comment-only C++ change: `access_review_store.cpp` (v4 migration comments) and `access_review_store.hpp` (v4 header paragraph). No resource, handle, thread, allocation, cast or lifetime change. cpp-safety and cpp-expert (Gate 8) confirmed the hunks hold no non-comment token.
+- Sanitizer coverage needed: none (no executable change).
