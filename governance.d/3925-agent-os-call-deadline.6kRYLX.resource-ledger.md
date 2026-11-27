@@ -24,4 +24,3 @@ Recorded by: Doomgoose
 NOTE: the earlier shares Resource Ledger (`docs/resource-ledgers/shares-windows-leg.md`, commit ae663d8696) is superseded in two lines by this change: the plugin-side NetApiBuf buffer now lives in agent-core (win_share_enum.cpp) and the "no deadline on NetShareEnum" statement no longer holds.
 
 Casts: reinterpret_cast on LPBYTE* out-params, Net* buffers to typed arrays, GetAdaptersAddresses buffer to IP_ADAPTER_ADDRESSES*, sockaddr by family.
-

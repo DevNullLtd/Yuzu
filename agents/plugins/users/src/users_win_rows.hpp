@@ -6,7 +6,8 @@
 // (test_users_win_rows.cpp). The SDK constants declared below are static_asserted against the real
 // headers in users_plugin.cpp; the session states are agent-core's (win_wts_sessions.hpp).
 //
-// A read whose status is not Completed carries no answer, so every builder returns no rows for it.
+// A read whose status is not Completed carries no answer, so every list builder returns no rows
+// for it; unanswered_local_user_row is the one row local_users writes instead.
 #pragma once
 
 #include <cstdint>
@@ -151,6 +152,11 @@ local_user_rows(const yuzu::agent::win::LocalUsersRead& read,
                         u.comment.empty() ? "-" : u.comment));
     }
     return rows;
+}
+
+/// local_users: the error row for a read that did not answer; `enabled` and `last_logon` unread.
+inline std::string unanswered_local_user_row(std::string_view cause) {
+    return std::format("local_user|error|unknown|unknown|{}", cause);
 }
 
 /// local_admins: rows only when no call failed, so a failure after earlier pages never leaves a

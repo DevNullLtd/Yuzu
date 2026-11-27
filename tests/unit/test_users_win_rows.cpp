@@ -156,6 +156,12 @@ TEST_CASE("local_user rows: flags, comment and last logon", "[users][win_rows][b
     CHECK(local_user_rows(read, stamp) == expected);
 }
 
+TEST_CASE("an unanswered local_users read says enabled and last logon are unknown",
+          "[users][win_rows][bounded_os_call]") {
+    CHECK(unanswered_local_user_row("deadline_exceeded") ==
+          "local_user|error|unknown|unknown|deadline_exceeded");
+}
+
 TEST_CASE("admin rows: member type and domain split", "[users][win_rows][bounded_os_call]") {
     CHECK(admin_rows(canned_members()) ==
           Rows{"admin|alice|user|HOST-A", "admin|Domain Admins|group|CORP",

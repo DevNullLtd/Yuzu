@@ -15,7 +15,7 @@ Running `dev` between releases? Some entries below describe changes on `dev` tha
 
 This describes the build in a fresh deployment (see "Deployment contract (hard cutover)" in the Forensics section of this page): every writer runs this build, and this page is not a procedure for a rolling or mixed-version upgrade.
 
-**In short.** Affected: anything that reads the `enabled` column of `users.local_users`; anything that reads the Windows results of `users` (`logged_on`, `sessions`, `local_users`, `local_admins`, `group_members`), `shares.list`, `filesystem_posture.snapshots`, `device_identity.domain` or `network_config` (`adapters`, `ip_addresses`, `dns_servers`); and Echo's Windows `user` and inbound `mapdrive` sources. To do: read `enabled` as a string, and treat a failed command or a constrained result from these reads as no answer, never as an empty list.
+**In short.** Affected: anything that reads the `enabled` column of `users.local_users`; anything that reads the Windows results of `users` (`logged_on`, `sessions`, `local_users`, `local_admins`, `group_members`), `shares.list`, `filesystem_posture.snapshots`, `device_identity.domain` or `network_config` (`adapters`, `ip_addresses`, `dns_servers`); and Echo's Windows `user` and inbound `mapdrive` sources. To do: read `enabled` as a string; treat a failed command as no answer, never as an empty list; and treat a constrained result as incomplete, never as the whole list or as an empty one (rows may be missing; the rows it does carry were read, except a placeholder or status row that only reports on the read, such as `snapshot|-|-|none|...`).
 
 **What changed.**
 

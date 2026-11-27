@@ -763,8 +763,8 @@ int do_local_users(yuzu::CommandContext& ctx) {
 #elif defined(_WIN32)
     const auto read = yuzu::agent::win::read_local_users(yuzu::agent::win::kLocalUsersDeadline);
     if (yuzu::agent::forward_bounded_failure(ctx, read.status, "windows:users:net_user_enum")) {
-        ctx.write_output(std::format("local_user|error|unknown|unknown|{}",
-                                     yuzu::agent::bounded_cause(read.status)));
+        ctx.write_output(
+            yuzu::users_win::unanswered_local_user_row(yuzu::agent::bounded_cause(read.status)));
         return 1;
     }
     const auto local_time = [](std::uint32_t seconds) -> std::string {
