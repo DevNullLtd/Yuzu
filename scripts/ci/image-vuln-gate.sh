@@ -925,8 +925,12 @@ grype_scan() {
     ignored="$(printf '%s\n' "$ginfo" | sed -n 's/^ignored=//p')"
     fcrit="$(printf '%s\n' "$ginfo" | sed -n 's/^fixable_critical=//p')"
     fcrit_acc="$(printf '%s\n' "$ginfo" | sed -n 's/^fixable_critical_accepted=//p')"
-    local dver
+    local dver gos="?"
     dver="$(printf '%s\n' "$ginfo" | sed -n 's/^distro_version=//p')"
+    # OS packages grype catalogued (CycloneDX of the same scan). Read for every
+    # image; judged only where Trivy scanned OS packages (want_family set).
+    gos="$("${CHECKS[@]}" grype-os-packages "$gcdx" 2>/dev/null | sed -n 's/^os_packages=//p')" || gos="?"
+    [ -n "$gos" ] || gos="?"
     # The components grype must have catalogued in this image (see
     # GRYPE_REQUIRED_COMPONENTS), from its CycloneDX output of the same scan.
     comps="${GRYPE_REQUIRED_COMPONENTS[$n]:-}"
@@ -996,6 +1000,14 @@ grype_scan() {
                err "$img: grype's gate scan passed but its record lists $fcrit fixable CRITICAL not accepted (treated as a failure)"
                gres="FAIL: grype's record and gate scans disagree"
                failed=1
+           elif [ -n "$want_family" ] && [ "$gos" != "?" ] && [ "$gos" -eq 0 ]; then
+               err "$img: grype catalogued no OS package, though Trivy scanned OS packages ($want_family): a grype or package-database change stopped it reading them, so it matched none (treated as a failure)"
+               gres="FAIL: grype catalogued no OS package"
+               failed=1
+           elif [ -n "$want_family" ] && [ "$gos" = "?" ]; then
+               err "$img: grype's CycloneDX output could not be read for its OS packages (treated as a failure)"
+               gres="FAIL: grype OS packages unreadable"
+               failed=1
            elif [ -n "$want_family" ] && [ "$distro" != "$want_family" ]; then
                err "$img: grype did not detect the OS ($want_family): it detected distro '${distro:-none}', so it matched none of the OS packages Trivy scanned (treated as a failure)"
                gres="FAIL: grype did not detect the OS ($want_family)"
@@ -1044,6 +1056,7 @@ grype_scan() {
             "distro: ${distro:-none} ${dver}" \
             "matches: $matches not accepted, of them fixable CRITICAL: $fcrit (the gate's verdict is its own scan below)" \
             "accepted (ignoredMatches): $ignored, of them fixable CRITICAL: $fcrit_acc" \
+            "os packages catalogued (grype): $gos" \
             "required components: $comps_desc"
     fi
     grype_reported[$n]=1

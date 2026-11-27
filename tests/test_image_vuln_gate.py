@@ -273,6 +273,10 @@ GRYPE_STUB = textwrap.dedent(
     if mode == "os-erlang":  # an OS package of the same name is not the runtime
         # Same name AND the expected version: only the purl tells it apart.
         comps = [{"name": "erlang", "version": "28.5.0.8", "purl": "pkg:apk/alpine/erlang@28.5.0.8"}]
+    if mode != "no-os-pkgs":  # grype's own cataloguing of an OS package
+        comps.append({"name": "libc6", "version": "2.36", "purl": "pkg:deb/debian/libc6@2.36"})
+    if mode == "cdx-unreadable":
+        comps = None
     if "cyclonedx-json" in outs:
         open(outs["cyclonedx-json"], "w").write(json.dumps({"bomFormat": "CycloneDX", "components": comps}))
     sys.exit(0)
@@ -1329,6 +1333,32 @@ class GateBehaviour(unittest.TestCase):
         # An image with no required component is not held to it.
         r = self.run_gate("yuzu-server=img:1", grype_mode="no-erlang")
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+
+    def test_every_required_component_key_is_a_published_image_name(self):
+        """GRYPE_REQUIRED_COMPONENTS is keyed on the NAME the workflows pass; a renamed leg
+        would silently skip the requirement (#8415, UP2-4)."""
+        gate = GATE.read_text(encoding="utf-8")
+        body = re.search(r"GRYPE_REQUIRED_COMPONENTS=\((.*?)\n\)", gate, re.S).group(1)
+        keys = re.findall(r"\[([a-z0-9-]+)\]=", body)
+        self.assertTrue(keys)
+        pre = PRE_RELEASE.read_text(encoding="utf-8")
+        for k in keys:
+            self.assertIn(k, PUBLISHED, k)
+            self.assertRegex(pre, r"(?<![\w-])" + re.escape(k) + r"(?![\w-])", f"{k} not in pre-release.yml")
+
+    def test_grype_must_catalogue_os_packages_where_trivy_did(self):
+        rep = self.tmp / "rep-ospkgs"
+        r = self.run_gate("yuzu-server=img:1", extra=("--report-dir", str(rep)))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("os packages catalogued (grype): 1",
+                      (rep / "grype-yuzu-server.gate.txt").read_text(encoding="utf-8"))
+        rep = self.tmp / "rep-noospkgs"
+        r = self.run_gate("yuzu-server=img:1", grype_mode="no-os-pkgs", extra=("--report-dir", str(rep)))
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("gate: FAIL: grype catalogued no OS package",
+                      (rep / "grype-yuzu-server.gate.txt").read_text(encoding="utf-8"))
+        r = self.run_gate("yuzu-server=img:1", grype_mode="cdx-unreadable")
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
 
     def test_a_stale_os_provider_refuses_only_images_on_that_os(self):
         rep = self.tmp / "rep-deb"

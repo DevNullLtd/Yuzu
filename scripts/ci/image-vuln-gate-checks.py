@@ -1414,6 +1414,22 @@ def cmd_grype_components(path, names):
     return 1 if missing or wrong else 0
 
 
+def cmd_grype_os_packages(path):
+    """Count the OS-package components (pkg:apk/, pkg:deb/, pkg:rpm/) in grype's CycloneDX."""
+    try:
+        d = _load_json_object(path, "grype CycloneDX output")
+        comps = d.get("components")
+        if not isinstance(comps, list):
+            raise ValueError(f"{path} has no components list")
+    except (OSError, ValueError, RecursionError) as e:
+        print(f"grype os packages: cannot read {e}", file=sys.stderr)
+        return 1
+    n = sum(1 for c in comps if isinstance(c, dict) and isinstance(c.get("purl"), str)
+            and c["purl"].startswith(("pkg:apk/", "pkg:deb/", "pkg:rpm/")))
+    print(f"os_packages={n}")
+    return 0
+
+
 def cmd_grype_report(path):
     try:
         d = _load_json_object(path, "grype report")
@@ -1503,6 +1519,8 @@ def main(argv):
                 return cmd_grype_db_providers(pos[0], pos[1:], f.get("--waivers"))
         elif len(argv) >= 3 and argv[0] == "grype-components":
             return cmd_grype_components(argv[1], argv[2:])
+        elif len(argv) == 2 and argv[0] == "grype-os-packages":
+            return cmd_grype_os_packages(argv[1])
         elif len(argv) == 2 and argv[0] == "grype-report":
             return cmd_grype_report(argv[1])
         elif argv and argv[0] == "db-age":

@@ -1305,6 +1305,11 @@ after Trivy:
   fails (`grype did not detect the OS (<family>)`). An image listed as not covered (no image is listed)
   has no OS packages Trivy could see, so there is nothing to cross-check. This check can only refuse an
   image; Trivy's report stays the only coverage reader.
+- **OS packages catalogued.** A distro match alone does not show grype read any package. For an
+  image whose OS packages Trivy scanned, the image fails when grype's CycloneDX holds no OS-package
+  component (`pkg:apk/`, `pkg:deb/` or `pkg:rpm/`), or cannot be read. The count is reported as
+  `os packages catalogued (grype)`. The check is for at least one; it does not compare the count
+  with Trivy's, because the two scanners count packages differently and no ratio has been measured.
 - **Required components.** grype's JSON lists matches only, so a runtime grype did not recognise
   would read as clean. For `yuzu-gateway` and `yuzu-gateway-chisel`, whose Erlang/OTP runtime is
   the reason grype runs, the image fails unless grype itself identified `erlang` (purl
@@ -1992,6 +1997,9 @@ except the agent bundle:
 - **The image could not be exported for grype** (`could not export ... for grype`, `not an image in
   the local Docker daemon`): `docker save` failed, usually a full disk under `RUNNER_TEMP` or a
   daemon fault. "Re-run failed jobs"; if it recurs, check the runner's free disk.
+- **grype catalogued no OS package** (`grype catalogued no OS package`): grype's cataloguer read
+  none of the packages Trivy scanned, so it matched none. Find the grype or package-database
+  change that did it; a fix is a commit, so re-tag.
 - **grype did not detect the OS** (`grype did not detect the OS`): the image's OS release is one
   the pinned grype does not recognise; a newer grype or a supported OS release is a commit, so re-tag.
 - **grype did not catalogue erlang** (`grype did not catalogue erlang`, or `erlang <version>
