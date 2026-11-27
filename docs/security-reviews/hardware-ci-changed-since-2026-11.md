@@ -8,9 +8,12 @@ owner before implementation, and the governance round that followed changed it i
 returned on the first response of a walk only (owner ruling 2026-11-24, decision 5 below). Migration v6 was added on
 2026-11-26 to mitigate HWCI-DELTA-PLAN-FLIP and the runtime index check now covers `device_ci_changed_at_idx` too
 (HWCI-DELTA-INDEX-NO-WARN, closed); see "Migration v6" under "Measured query plans". On 2026-11-26 the owner ruled on
-every row that needed it: HWCI-DELTA-PLAN-FLIP (the remainder), HWCI-DELTA-MARGIN-ESTIMATE, HWCI-DELTA-MIXED-BUILDS,
-HWCI-DELTA-NO-REMOVALS, HWCI-DELTA-REPARSE, HWCI-DELTA-HOT-LOSS and HWCI-DELTA-AUDIT-NO-MARKER are accepted, with the
-follow-up issues named in the table (the plan-flip `retry_after_ms` hint carries the waived-A5 ledger entry in
+every row that needed it: HWCI-DELTA-PLAN-FLIP (the remainder), HWCI-DELTA-MARGIN-ESTIMATE,
+HWCI-DELTA-NO-REMOVALS, HWCI-DELTA-HOT-LOSS and HWCI-DELTA-AUDIT-NO-MARKER are accepted, with the
+follow-up issues named in the table. HWCI-DELTA-MIXED-BUILDS and HWCI-DELTA-REPARSE were also ruled on that day (a
+procedural fresh-deployment rule, and the full-walk rule); on the review of PR #8856 they became "Closed by the
+deployment contract", because the hard-cutover contract excludes the mixed builds and upgrades they describe, and the
+record no longer documents those procedures (the plan-flip `retry_after_ms` hint carries the waived-A5 ledger entry in
 `docs/agentic-first-principle.md`, issue #8839). Residuals recorded as design consequences, which this record does
 not ask the owner to waive: HWCI-DELTA-SCOPED-REFUSED, HWCI-DELTA-LAST-SEEN-STALE and HWCI-DELTA-ENTER-SCOPE.
 This
@@ -39,8 +42,8 @@ A real change marker and a delta filter close that.
    (HWCI-DELTA-CLOCK-DOMAINS).
 3. **Backfill by default value, metadata only.** `ADD COLUMN ... DEFAULT (EXTRACT(EPOCH FROM now()))::bigint`
    is a stable (not volatile) default, which PostgreSQL 11 and later apply without rewriting the table.
-   Existing rows therefore read as changed at migration time, and the first delta pull returns the fleet
-   once. The index is built in the same migration under the `SET LOCAL lock_timeout` and `statement_timeout`
+   In a fresh deployment the column is created with the empty table, so no row reads as changed at a migration
+   time. The index is built in the same migration under the `SET LOCAL lock_timeout` and `statement_timeout`
    pattern that migration v4 uses.
 4. **Filter `changed_at >= $n`**, so delivery is at-least-once: a row exactly at the boundary is served again
    rather than lost. The client upserts by `agent_id`. With no filter the SQL text and parameters are
@@ -62,8 +65,8 @@ A real change marker and a delta filter close that.
    is an estimate of that lag, not a bound on it (HWCI-DELTA-MARGIN-ESTIMATE). A client that kept the LAST
    page's value, or one derived from `max(changed_at)` or its own clock, silently misses changes behind the
    cursor on a long walk, which is why the first-response-only rule exists and why the manual says to keep that
-   value and nothing else. A first response without the key means the filter was not applied (a replica that
-   predates the feature): the client must not advance its watermark.
+   value and nothing else. A first response without the key means the filter was not applied: the client must not
+   advance its watermark.
 6. **A delta needs a global-read credential.** A scope-confined caller (management group or service scoped)
    who sends `changed_since` gets a definitive refusal that names no device and no count (message `changed_since needs a credential with global read; a scope-confined credential cannot use a delta pull`, remediation `use a credential holding a fleet-wide Inventory:Read grant (a management-group or service-scoped token cannot), or omit changed_since and walk the full set`). On MCP the refusal writes both audit rows (the domain row and the generic row), and on REST its best-effort `denied` row can carry `Sec-Audit-Failed: true`, like the scope-over-10,000 refusal. A device that
    enters a caller's scope does not change its record, so `changed_at` does not move and a scoped delta
@@ -80,8 +83,8 @@ A real change marker and a delta filter close that.
    existing `changed_at` is `bigint NOT NULL` and raises an exception when it is not (a pre-existing column of
    another type would otherwise be skipped by `IF NOT EXISTS`, and every upsert and delta would then fail at run
    time). The v5 `ALTER` takes `ACCESS EXCLUSIVE`, held through the index build, so reads and writes of
-   `device_ci` are blocked for the migration (about 0.2 to 0.7 s per million rows on 18.4, an empty table in a fresh
-   deployment); it waits up to 30 s for the lock and then fails, and the server refuses to start. The supported
+   `device_ci` are blocked for the migration (about 0.2 to 0.7 s per million rows on 18.4, measured on populated tables; the table of a fresh
+   deployment is empty); it waits up to 30 s for the lock and then fails, and the server refuses to start. The supported
    deployment is a fresh database (`docs/user-manual/upgrading.md`, "Deployment contract (hard cutover)"), so this
    record gives no upgrade, rollback or hash-drift procedure.
 9. **Data classification.** `changed_at` is stored in `device_ci` and served on every row to whoever may read the
@@ -242,9 +245,9 @@ deadlock cases), not the real server or pool. Raw logs are not retained. All six
 
 | Scenario | Observed |
 |---|---|
-| Long reader or slowed `pg_dump` at start | the migration fails at its lock timeout and rolls back completely (stamp 5, v4's index kept, no invalid index); a writer queued during the wait stalled and recovered the moment it failed; pooled `device_ci` requests fail at exactly 10 s (the pool's timeout is shorter than v6's 30 s); a second replica fails at the pool's 10 s on the advisory lock; one restart after the holder ends converges in about 0.5 s |
+| Long reader or slowed `pg_dump` at start | the migration fails at its lock timeout and rolls back completely (stamp 5, v4's index kept, no invalid index); a writer queued during the wait stalled and recovered the moment it failed; pooled `device_ci` requests fail at exactly 10 s (the pool's timeout is shorter than v6's 30 s); a second replica fails at the pool's 10 s on the advisory lock; the next start re-runs the migration in about 0.5 s |
 | `kill -9` of the client mid-build | the backend finishes the whole message, then rolls back; locks held 2.2 s after the kill (grows with the table); v5 intact; `client_connection_check_interval` shortens it |
-| Client cut after the last statement, before the commit | the session stays `idle in transaction` holding the exclusive and advisory locks (65 s or more observed; about 2 h 11 min of OS keepalive by calculation); restarts fail at 10 s; `pg_terminate_backend` leaves v5 intact and a restart converges; `idle_in_transaction_session_timeout` bounds it |
+| Client cut after the last statement, before the commit | the session stays `idle in transaction` holding the exclusive and advisory locks (65 s or more observed; about 2 h 11 min of OS keepalive by calculation); restarts fail at 10 s; `pg_terminate_backend` leaves v5 intact and the next start re-runs the migration; `idle_in_transaction_session_timeout` bounds it |
 | Deadlock against a read-then-write session | the final text never deadlocks (the writer jumps the queue in 0.56 ms; the migration waits for its commit); the rejected SHARE-first text deadlocked with the migration as the victim |
 | Hand `CREATE INDEX CONCURRENTLY` in progress | blocks the migration's lock, which fails at its timeout and rolls back; after the build is cancelled a re-run drops the invalid index and rebuilds |
 | Disk full | error 53100 (sort spill or extending a file), full rollback, reads and writes still served, a re-run converges once space is freed; with a small WAL ring on the same volume PostgreSQL itself crash-restarted twice and recovered |
@@ -259,7 +262,8 @@ runner and pool, foreign-key child writes, a write load, and sizes beyond 6M row
 ## Residuals
 
 Each row is stated so a client, a reviewer and the owner can plan around it. A status of "Accepted by owner
-2026-11-26" records the owner's ruling of that date; "design consequence" means the behaviour follows from a recorded
+2026-11-26" records the owner's ruling of that date; "Closed by the deployment contract" means the row describes a situation the hard-cutover contract excludes (fresh
+database, one build), so no procedure is documented for it; "design consequence" means the behaviour follows from a recorded
 design decision and is stated, not waived; "Residual" rows are not waived either. The owner of every row is the
 repository owner (FortitudeEtc); the issue column names where the work or the decision is tracked (#8833 is the
 tracking issue for the whole change).
@@ -290,7 +294,7 @@ tracking issue for the whole change).
 
 Done at the push, in this order:
 
-1. Owner rulings on the seven "Ruling needed" rows were given on 2026-11-26 and are recorded in the table above.
+1. Owner rulings on the seven "Ruling needed" rows were given on 2026-11-26 and are recorded in the table above (two of them, MIXED-BUILDS and REPARSE, were later closed by the deployment contract, see the note above the table).
 2. The tracking issue (#8833) and the follow-up issues were filed, one outcome each: #8834 (an orphaned migration backend
    and `idle_in_transaction_session_timeout`), #8835 (the runner's 10 s advisory-lock wall for a second replica), #8836 (the
    WARN recognising v4's leftover index), #8837 (a non-superuser way to test the invalid-index replacement), #8838 (the chaos
