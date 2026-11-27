@@ -19,7 +19,8 @@ extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t* data, std::size_t size
     const std::span<const std::byte> bytes(reinterpret_cast<const std::byte*>(data), size);
 
     // 1. Default limits and budget over the honest source.
-    (void)bh::read_elf(bh::span_source(bytes));
+    std::optional<std::uint16_t> header_type;
+    (void)bh::read_elf(bh::span_source(bytes), {}, {}, &header_type);
 
     // 2. Tight limits and budget: every cap and the degrade paths become reachable from
     //    small inputs.

@@ -16,13 +16,17 @@
  *                            with what the file name offers, an item-level gap.
  * Mapping: ParseError::not_this_format is not a library; io, truncated, malformed and limit_exceeded
  * are unreadable (a bound violation is never a partial answer), and so is an ELF whose dynamic
- * section the reader flagged dynamic_unreadable. An ELF is a library only when its
- * type is ET_DYN; a Mach-O only through the FIRST slice that has no error and is an MH_DYLIB, and a
- * slice that errored is never read as a value. The ELF magic on 4 to 15 bytes is unreadable (a
- * file-name row); under 4 bytes or another magic is not a library. A PE is a library when it has the
- * MZ and PE signatures (read_pe_version answers not_this_format otherwise); a PE with no version
- * resource, or one whose fixed file version is 0.0.0.0, is a library that declares no version, and a
- * truncated or malformed one is unreadable.
+ * section the reader flagged dynamic_unreadable.
+ *
+ * TYPE FIRST. Once a header has stated a type that is not a library's, the answer is not_library,
+ * whatever fails afterwards (a parse error or an exception): an ELF e_type other than ET_DYN, a thin
+ * Mach-O filetype other than MH_DYLIB, a PE whose COFF header does not set IMAGE_FILE_DLL. A
+ * universal Mach-O is a library through the FIRST slice that has no error and is an MH_DYLIB; a slice
+ * with an error counts as unreadable only when its filetype is MH_DYLIB or was never read. The ELF
+ * magic on 4 to 15 bytes is unreadable (a file-name row); under 4 bytes or another magic is not a
+ * library. A PE without the MZ and PE signatures is not a library, a file cut before its COFF header
+ * is unreadable, and a DLL with no version resource, or one whose fixed file version is 0.0.0.0, is
+ * a library that declares no version.
  *
  * CONSUMER OBLIGATIONS of the shared readers, kept here: the caller checks FileView::unchanged()
  * after the parse (scan_native does); the ReadAt it passes is deadline-aware (scan_native wraps it);
@@ -85,6 +89,9 @@ namespace native_detail {
                                                                                         std::uint64_t size) {
     namespace bh = yuzu::shared::binary_header;
     using namespace native_detail;
+    std::optional<std::uint16_t> type;
+    // A header that states another type is no library, whatever fails after it.
+    const auto not_shared = [&type] { return type && *type != 3 /* ET_DYN */; };
     try {
         // Under 4 bytes cannot carry the magic. The right magic on 4 to 15 bytes is a library that
         // cannot be parsed (unreadable); the shared reader calls that file not_this_format.
@@ -98,11 +105,11 @@ namespace native_detail {
             return std::unexpected(NativeError::not_library);
         if (size < 16)
             return std::unexpected(NativeError::unreadable);
-        const auto info = bh::read_elf(bh::Source{rd, size});
+        const auto info = bh::read_elf(bh::Source{rd, size}, {}, {}, &type);
+        if (not_shared())
+            return std::unexpected(NativeError::not_library);
         if (!info)
             return from_parse_error(info.error());
-        if (info->type != 3 /* ET_DYN */)
-            return std::unexpected(NativeError::not_library);
         // The reader degrades a dynamic section it could not read to an empty soname plus this
         // flag; that must not read as "declares none".
         if (info->dynamic_unreadable)
@@ -113,7 +120,7 @@ namespace native_detail {
             return std::unexpected(NativeError::unreadable);
         return std::optional<std::string>{printable(info->soname)};
     } catch (...) {
-        return std::unexpected(NativeError::unreadable);
+        return std::unexpected(not_shared() ? NativeError::not_library : NativeError::unreadable);
     }
 }
 
@@ -123,14 +130,20 @@ namespace native_detail {
                                                                                       std::uint64_t size) {
     namespace bh = yuzu::shared::binary_header;
     using namespace native_detail;
+    std::optional<std::uint32_t> thin_type;
+    const auto not_dylib = [&thin_type] { return thin_type && *thin_type != 6 /* MH_DYLIB */; };
     try {
-        const auto info = bh::read_macho(bh::Source{rd, size});
+        const auto info = bh::read_macho(bh::Source{rd, size}, {}, {}, &thin_type);
+        if (not_dylib())
+            return std::unexpected(NativeError::not_library);
         if (!info)
             return from_parse_error(info.error());
         bool slice_error = false;
         for (const auto& s : info->slices) {
             if (s.error) {
-                slice_error = true;
+                // A slice whose header was read as another type is no dylib: not a gap.
+                if (!s.header_read || s.file_type == 6 /* MH_DYLIB */)
+                    slice_error = true;
                 continue;
             }
             if (s.file_type != 6 /* MH_DYLIB */)
@@ -143,7 +156,7 @@ namespace native_detail {
         }
         return std::unexpected(slice_error ? NativeError::unreadable : NativeError::not_library);
     } catch (...) {
-        return std::unexpected(NativeError::unreadable);
+        return std::unexpected(not_dylib() ? NativeError::not_library : NativeError::unreadable);
     }
 }
 
@@ -154,8 +167,13 @@ namespace native_detail {
                                                                                        std::uint64_t size) {
     namespace bh = yuzu::shared::binary_header;
     using namespace native_detail;
+    std::optional<std::uint16_t> flags;
+    // A renamed executable is no library even when the rest of the file is damaged.
+    const auto not_dll = [&flags] { return flags && (*flags & bh::kImageFileDll) == 0; };
     try {
-        const auto info = bh::read_pe_version(bh::Source{rd, size});
+        const auto info = bh::read_pe_version(bh::Source{rd, size}, {}, {}, &flags);
+        if (not_dll())
+            return std::unexpected(NativeError::not_library);
         if (!info)
             return from_parse_error(info.error());
         const auto& v = info->file_version;
@@ -164,7 +182,7 @@ namespace native_detail {
         return std::optional<std::string>{std::to_string(v[0]) + '.' + std::to_string(v[1]) + '.' +
                                           std::to_string(v[2]) + '.' + std::to_string(v[3])};
     } catch (...) {
-        return std::unexpected(NativeError::unreadable);
+        return std::unexpected(not_dll() ? NativeError::not_library : NativeError::unreadable);
     }
 }
 

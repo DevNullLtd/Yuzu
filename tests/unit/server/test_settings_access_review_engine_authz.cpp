@@ -424,6 +424,83 @@ TEST_CASE(
     CHECK(inputs == 2); // the justification box is withheld from the own row too
 }
 
+TEST_CASE("access-review campaign fragment: a Scope column, and data-scope and data-scope-group-id "
+          "on BOTH decision buttons, which the script sends and names in its confirm text",
+          "[pg][settings][access_review][6969]") {
+    YUZU_REQUIRE_PG_DB_TPL(db_, ar_engine_tpl);
+    Rig r{db_.dsn(), /*rbac_enabled=*/false};
+    // Fleet row, a named group row, a group row frozen before the name key existed, and one whose
+    // id and name need escaping.
+    auto id = r.reviews.open_campaign(
+        "Scope page", "root",
+        {GrantRef{"user", "alice", "Operator", R"({"display_name":"alice"})", ""},
+         GrantRef{"user", "alice", "Operator", R"({"scope_group_name":"Ops <team>"})", "g-1"},
+         GrantRef{"user", "alice", "Viewer", R"({"display_name":"alice"})", "g-2"},
+         GrantRef{"user", "alice", "Auditor", R"({"scope_group_name":"n"})", "g\"<3>"}},
+        "disabled");
+    REQUIRE(id.has_value());
+    const auto root = r.cookie("root", auth::Role::admin);
+
+    const auto res = r.cookie_get(std::string(kGetFragment) + "?id=" + *id, root);
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    const auto& b = res->body;
+    CHECK_THAT(b, ContainsSubstring("<th>Role</th><th>Scope</th><th>Decision</th>"));
+    CHECK_THAT(b, ContainsSubstring("<td>Fleet-wide</td>"));
+    CHECK_THAT(b, ContainsSubstring("<td title=\"g-1\">Group: Ops &lt;team&gt;</td>"));
+    CHECK_THAT(b, !ContainsSubstring("Ops <team>"));
+    CHECK_THAT(b, ContainsSubstring("<td>Group: name unavailable (g-2)</td>"));
+    CHECK_THAT(b, !ContainsSubstring("not found"));
+    CHECK_THAT(b, !ContainsSubstring("<td></td>"));
+
+    const auto count = [&](const std::string& needle) {
+        std::size_t n = 0;
+        for (auto at = b.find(needle); at != std::string::npos; at = b.find(needle, at + 1))
+            ++n;
+        return n;
+    };
+    // Four rows, two buttons each: every button carries the scope pair, fleet and group alike.
+    CHECK(count("data-decision=\"attested\" onclick=\"arAttest(this)\"") == 4);
+    CHECK(count("data-decision=\"flagged_revoke\" onclick=\"arAttest(this)\"") == 4);
+    CHECK(count("data-scope=\"fleet\" data-scope-group-id=\"\" data-decision=") == 2);
+    CHECK(count("data-scope=\"management_group\" data-scope-group-id=\"g-1\" data-decision=") == 2);
+    CHECK(count("data-scope=\"management_group\" data-scope-group-id=\"g-2\" data-decision=") == 2);
+    CHECK(count("data-scope-group-id=\"g&quot;&lt;3&gt;\" data-decision=") == 2);
+    CHECK_THAT(b, !ContainsSubstring("g\"<3>"));
+
+    // The script (in the list fragment) sends both fields and names the scope in the confirm text.
+    const auto list = r.cookie_get(kListFragment, root);
+    REQUIRE(list);
+    REQUIRE(list->status == 200);
+    CHECK_THAT(list->body, ContainsSubstring("scope: d.scope,"));
+    CHECK_THAT(list->body, ContainsSubstring("scope_group_id: d.scopeGroupId,"));
+    CHECK_THAT(list->body, ContainsSubstring("d.scope === 'management_group'"));
+    CHECK_THAT(list->body, ContainsSubstring("'\" (' + scopeText + ') for revocation? '"));
+}
+
+TEST_CASE("access-review campaign fragment: an empty campaign's placeholder row spans every "
+          "column of the table, Scope included",
+          "[pg][settings][access_review][6969]") {
+    YUZU_REQUIRE_PG_DB_TPL(db_, ar_engine_tpl);
+    Rig r{db_.dsn(), /*rbac_enabled=*/false}; // the default: the admin viewer can attest
+    auto id = r.reviews.open_campaign("Empty", "root", {}, "disabled");
+    REQUIRE(id.has_value());
+    const auto root = r.cookie("root", auth::Role::admin);
+
+    const auto res = r.cookie_get(std::string(kGetFragment) + "?id=" + *id, root);
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    const auto& b = res->body;
+    // Eight header cells for an attesting viewer: Principal, Role, Scope, Decision, Reviewer,
+    // Decided, Justification and the button column.
+    std::size_t headers = 0;
+    for (auto at = b.find("<th>"); at != std::string::npos; at = b.find("<th>", at + 1))
+        ++headers;
+    CHECK(headers == 8);
+    CHECK_THAT(b, ContainsSubstring("<td colspan=\"8\" class=\"muted\">No frozen grants in this "
+                                    "campaign</td>"));
+}
+
 TEST_CASE("access-review campaign fragment: a malformed or unknown id shows a plain notice, never "
           "the store's classification prefix",
           "[pg][settings][access_review][4752]") {

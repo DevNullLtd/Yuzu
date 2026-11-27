@@ -4,7 +4,7 @@
  * that decides whether a bounded-subprocess capture is complete enough to
  * diff/persist as authoritative Echo state (BR-001), and for
  * collect_or_retain(), the collect-or-retain seam every Echo snapshot-diff
- * source (service, mapdrive, arp) applies on top of that decision.
+ * source (service, user, mapdrive, arp) applies on top of that decision.
  *
  * No test here spawns a process, sleeps, or touches the network -- every
  * case feeds fixed tool_ran/timed_out/output_truncated/exit_code values
@@ -65,6 +65,7 @@
 
 #include "echo_capture_status.hpp"
 #include "echo_collectors.hpp" // ArpEntry/ArpEvent, MapDriveEntry/MapDriveEvent, compute_arp_events, compute_mapdrive_events
+#include "echo_wts_sessions.hpp" // user_sessions_from_wts
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -541,7 +542,7 @@ TEST_CASE("snapshot_phase_outcome: multiple failed phases are all reported, call
 
 // ── snapshot_phase_outcome: has_earlier_skips (round 5, adversarial-review) ──
 //
-// A collect_or_retain skip (arp/service/mapdrive) leaves every phase rc at 0
+// A collect_or_retain skip (arp/service/user/mapdrive) leaves every phase rc at 0
 // -- it is not a persistence failure, so fast_rc/slow_rc/software_rc alone
 // cannot see it. Previously the action's own return code came ONLY from
 // those three integers, so a forced snapshot that silently retained one of
@@ -579,4 +580,108 @@ TEST_CASE("snapshot_phase_outcome: an earlier skip composes with a genuine phase
     REQUIRE(out.failed_phases.size() == 1);
     CHECK(out.failed_phases[0] == "collect_fast");
     CHECK(out.return_code == 1);
+}
+
+// ── user_sessions_from_wts (the Windows `user` snapshot) ────────────────────
+//
+// Pure: a hand-built agent-core session read in place of the bounded Windows call. Anything but a
+// complete list must skip the tick, or the diff records logouts that never happened.
+
+namespace {
+
+using yuzu::agent::BoundedStatus;
+using yuzu::agent::win::WtsSession;
+using yuzu::agent::win::WtsSessionsRead;
+
+/// A complete listing: answered, enumerated, not cut.
+WtsSessionsRead wts_listing(std::vector<WtsSession> sessions) {
+    WtsSessionsRead read;
+    read.status = BoundedStatus::Completed;
+    read.enumerated = true;
+    read.sessions = std::move(sessions);
+    return read;
+}
+
+auto collect_users(const WtsSessionsRead& read) {
+    return collect_or_retain([&read] { return user_sessions_from_wts(read); });
+}
+
+// {session_id, state, station_name, user, domain, client_name}; states: 0 active,
+// 4 disconnected, 6 listening.
+const WtsSession kConsoleA{1, 0, "Console", "user-a", "domain-a", ""};
+const WtsSession kRdpB{2, 0, "RDP-Tcp#0", "user-b", "domain-a", ""};
+
+} // namespace
+
+TEST_CASE("user_sessions_from_wts: a complete read is the logged-on sessions",
+          "[echo_capture_status][bounded_os_call][user]") {
+    const auto users = user_sessions_from_wts(wts_listing({
+        kConsoleA,
+        {2, 4, "", "user-b", "", ""}, // disconnected, no domain
+        {3, 0, "rdp-sxs", "user-c", "domain-a", ""},
+        kRdpB,
+        {4, 0, "Console", "", "domain-a", ""}, // no user: skipped
+        {5, 6, "RDP-Tcp", "user-d", "", ""},   // listening: skipped
+    }));
+    REQUIRE(users.size() == 4);
+    CHECK(users[0].user == "user-a");
+    CHECK(users[0].domain == "domain-a");
+    CHECK(users[0].session_id == "1");
+    CHECK(users[0].logon_type == "interactive");
+    CHECK_FALSE(users[0].disconnected);
+    CHECK(users[1].domain == "local");
+    CHECK(users[1].logon_type == "interactive");
+    CHECK(users[1].disconnected);
+    CHECK(users[2].logon_type == "remote");
+    CHECK(users[3].logon_type == "remote");
+}
+
+TEST_CASE("user_sessions_from_wts: an unanswered or capped read throws",
+          "[echo_capture_status][bounded_os_call][user]") {
+    for (const auto status : {BoundedStatus::TimedOut, BoundedStatus::Busy,
+                              BoundedStatus::Abandoned, BoundedStatus::Rejected}) {
+        auto read = wts_listing({kConsoleA}); // only the status says it is not a list
+        read.status = status;
+        const auto res = collect_users(read);
+        CHECK_FALSE(res.current.has_value());
+        CHECK(res.skip_reason ==
+              "ECHO: user session read " + std::string{yuzu::agent::bounded_cause(status)});
+    }
+    auto cut = wts_listing({kConsoleA});
+    cut.truncated = true;
+    CHECK_THROWS_AS(user_sessions_from_wts(cut), IncompleteCaptureError);
+}
+
+TEST_CASE("collect_or_retain + user_sessions_from_wts: a capped read records no logout",
+          "[echo_capture_status][bounded_os_call][user]") {
+    const auto previous = user_sessions_from_wts(wts_listing({kConsoleA, kRdpB}));
+    auto read = wts_listing({kConsoleA});
+    read.truncated = true;
+    // No current list, so the diff and the state write behind `if (current)` are not reached.
+    CHECK_FALSE(collect_users(read).current.has_value());
+
+    // Control: the same read, complete, is one logout. The guard is what prevents the false one.
+    read.truncated = false;
+    const auto res = collect_users(read);
+    REQUIRE(res.current.has_value());
+    const auto events = compute_user_events(previous, *res.current, /*timestamp=*/1000,
+                                            /*snapshot_id=*/1);
+    REQUIRE(events.size() == 1);
+    CHECK(events[0].action == "logout");
+    CHECK(events[0].user == "user-b");
+}
+
+TEST_CASE("collect_or_retain + user_sessions_from_wts: a failed listing is never nobody logged on",
+          "[echo_capture_status][bounded_os_call][user]") {
+    WtsSessionsRead failed; // answered, but the enumeration itself failed
+    failed.status = BoundedStatus::Completed;
+    failed.win_error = 259; // as measured under a virtual service account
+    const auto skipped = collect_users(failed);
+    CHECK_FALSE(skipped.current.has_value());
+    CHECK(skipped.skip_reason == "ECHO: user session read failed (rc=259)");
+
+    // Control: a successful listing with no session is a real, empty snapshot.
+    const auto empty = collect_users(wts_listing({}));
+    REQUIRE(empty.current.has_value());
+    CHECK(empty.current->empty());
 }

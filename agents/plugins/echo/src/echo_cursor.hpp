@@ -9,7 +9,7 @@
 // and is unit-testable without a live OS subscription (tests/unit/
 // test_echo_cursor.cpp).
 //
-// WHY A SEPARATE MODEL FROM THE SNAPSHOT-DIFF SOURCES (service/mapdrive/arp) --
+// WHY A SEPARATE MODEL FROM THE SNAPSHOT-DIFF SOURCES (service/user/mapdrive/arp) --
 // those sources re-enumerate a full table every tick and diff it against the
 // last COMPLETE snapshot (echo_capture_status.hpp's collect_or_retain). Power
 // and removable-media events are OS-LOGGED TRANSITIONS (event-log records, a

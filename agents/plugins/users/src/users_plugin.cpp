@@ -23,6 +23,7 @@
 #include <spdlog/spdlog.h>
 #include <yuzu/agent/runner_status.hpp> // yuzu::agent::forward_runner_failure (ABI4 result seam)
 #include <yuzu/agent/subprocess_runner.hpp> // yuzu::agent::run_bounded_subprocess / probe_tool_path (K-7/CDX-07, ADR-3002 rung 2)
+#include "users_tool_budget.hpp"            // pure per-account tool budget
 #endif
 
 #if defined(__APPLE__)
@@ -31,10 +32,13 @@
 
 #include <format>
 #include <map>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <string_view>
 #include <vector>
+
+#include "users_win_rows.hpp" // pure Windows row builders (compiled on every OS)
 
 #if defined(__linux__)
 #include <ctime>
@@ -63,12 +67,9 @@
 #include <win_str.hpp>  // shared yuzu::win wide<->UTF-8 helpers (#1681)
 #include <winevt.h>     // EvtQuery / EvtNext / EvtRender / EvtClose
 #include <lm.h>
-#include <wtsapi32.h>
 #include <user_profile_model.hpp> // yuzu::profiles::profile_name_from_path (PR1.7)
 #include <win_profiles.hpp>       // yuzu::win::enumerate_profile_records (PR1.7)
 #include "users_win_events.hpp"   // pure Security-channel XML parsers (Wave-2 WP-A)
-#pragma comment(lib, "wtsapi32.lib")
-#pragma comment(lib, "netapi32.lib")
 #pragma comment(lib, "wevtapi.lib")
 #endif
 
@@ -132,7 +133,8 @@ struct ToolOutcome {
 /// only the FIRST non-exit failure (later calls must not overwrite an
 /// earlier UNAVAILABLE with a later CONSTRAINED — sdk/include/yuzu/plugin.h:
 /// 287-288).
-ToolOutcome run_tool(std::vector<std::string> argv, std::size_t max_lines = 0) {
+ToolOutcome run_tool(std::vector<std::string> argv, std::size_t max_lines = 0,
+                     std::chrono::milliseconds deadline = kUsersCmdDeadline) {
     if (argv.empty() || argv.front().empty()) {
         // A probe_tool_path miss (empty argv[0]) or a programmer error
         // (empty argv): report the same shape run_bounded_subprocess uses
@@ -143,7 +145,7 @@ ToolOutcome run_tool(std::vector<std::string> argv, std::size_t max_lines = 0) {
     }
 
     auto res = yuzu::agent::run_bounded_subprocess(
-        argv, yuzu::agent::SubprocessOptions{.deadline = kUsersCmdDeadline,
+        argv, yuzu::agent::SubprocessOptions{.deadline = deadline,
                                              .max_lines = max_lines,
                                              .stop_after_max_lines = max_lines != 0});
     // A cut-short tool returns empty/partial output that parses as "no users /
@@ -159,12 +161,33 @@ ToolOutcome run_tool(std::vector<std::string> argv, std::size_t max_lines = 0) {
     }
     return ToolOutcome{std::move(output), std::move(res)};
 }
+
+/// One per-account tool of local_users, under a deadline from the tool budget. What its outcome
+/// reports is settle_account_tool's rule (users_tool_budget.hpp).
+ToolOutcome run_account_tool(yuzu::CommandContext& ctx, std::vector<std::string> argv,
+                             std::chrono::milliseconds deadline, bool& status_forwarded,
+                             bool& tool_skipped) {
+    auto out = run_tool(std::move(argv), 0, deadline);
+    yuzu::users::settle_account_tool(ctx, out.res, deadline, kUsersCmdDeadline, out.output,
+                                     status_forwarded, tool_skipped);
+    return out;
+}
 #endif // !_WIN32
 
 #ifdef _WIN32
 // wide->UTF-8 conversion now via the shared win_str.hpp (#1681); from_wide is
 // behaviour-identical to the old NUL-terminated wide_to_utf8 for valid input.
+using yuzu::users_win::declare_partial;
 using yuzu::win::from_wide;
+
+// users_win_rows.hpp names these as plain numbers; pin them to the SDK here so a header that
+// disagrees fails the Windows build instead of misclassifying at runtime.
+static_assert(yuzu::users_win::kUfAccountDisable == static_cast<std::uint32_t>(UF_ACCOUNTDISABLE));
+static_assert(yuzu::users_win::kSidTypeUser == static_cast<std::uint32_t>(SidTypeUser));
+static_assert(yuzu::users_win::kSidTypeGroup == static_cast<std::uint32_t>(SidTypeGroup));
+static_assert(yuzu::users_win::kSidTypeAlias == static_cast<std::uint32_t>(SidTypeAlias));
+static_assert(yuzu::users_win::kSidTypeWellKnownGroup ==
+              static_cast<std::uint32_t>(SidTypeWellKnownGroup));
 
 // Format a Windows FILETIME as "YYYY-MM-DD HH:MM:SS" or "Never" if zero
 std::string format_filetime(DWORD low, DWORD high) {
@@ -371,47 +394,15 @@ int do_logged_on(yuzu::CommandContext& ctx) {
     }
 
 #elif defined(_WIN32)
-    WTS_SESSION_INFOW* sessions = nullptr;
-    DWORD count = 0;
-    if (WTSEnumerateSessionsW(WTS_CURRENT_SERVER_HANDLE, 0, 1, &sessions, &count)) {
-        for (DWORD i = 0; i < count; ++i) {
-            if (sessions[i].State != WTSActive && sessions[i].State != WTSDisconnected)
-                continue;
-
-            LPWSTR user_buf = nullptr;
-            DWORD user_len = 0;
-            LPWSTR domain_buf = nullptr;
-            DWORD domain_len = 0;
-
-            WTSQuerySessionInformationW(WTS_CURRENT_SERVER_HANDLE, sessions[i].SessionId,
-                                        WTSUserName, &user_buf, &user_len);
-            WTSQuerySessionInformationW(WTS_CURRENT_SERVER_HANDLE, sessions[i].SessionId,
-                                        WTSDomainName, &domain_buf, &domain_len);
-
-            auto user = from_wide(user_buf);
-            auto domain = from_wide(domain_buf);
-
-            if (user_buf)
-                WTSFreeMemory(user_buf);
-            if (domain_buf)
-                WTSFreeMemory(domain_buf);
-
-            if (user.empty())
-                continue;
-
-            std::string logon_type = "console";
-            auto session_name = from_wide(sessions[i].pWinStationName);
-            if (session_name.find("RDP") != std::string::npos ||
-                session_name.find("rdp") != std::string::npos) {
-                logon_type = "RDP";
-            }
-
-            ctx.write_output(std::format("user|{}|{}|{}|{}", user,
-                                         domain.empty() ? "local" : domain, logon_type,
-                                         sessions[i].SessionId));
-        }
-        WTSFreeMemory(sessions);
-    }
+    const auto read = yuzu::agent::win::read_wts_sessions(yuzu::agent::win::kWtsSessionsDeadline);
+    if (yuzu::agent::forward_bounded_failure(ctx, read.status, "windows:users:wts_sessions"))
+        return 1;
+    for (const auto& row : yuzu::users_win::logged_on_rows(read))
+        ctx.write_output(row);
+    declare_partial(ctx, yuzu::users_win::wts_degraded_provenance(read));
+    // A refused listing fails the command: no rows at rc 0 reads as nobody signed in.
+    if (!read.enumerated)
+        return 1;
 #endif
     return 0;
 }
@@ -467,71 +458,15 @@ int do_sessions(yuzu::CommandContext& ctx) {
     }
 
 #elif defined(_WIN32)
-    WTS_SESSION_INFOW* sessions = nullptr;
-    DWORD count = 0;
-    if (WTSEnumerateSessionsW(WTS_CURRENT_SERVER_HANDLE, 0, 1, &sessions, &count)) {
-        for (DWORD i = 0; i < count; ++i) {
-            LPWSTR user_buf = nullptr;
-            DWORD user_len = 0;
-            WTSQuerySessionInformationW(WTS_CURRENT_SERVER_HANDLE, sessions[i].SessionId,
-                                        WTSUserName, &user_buf, &user_len);
-            auto user = from_wide(user_buf);
-            if (user_buf)
-                WTSFreeMemory(user_buf);
-
-            if (user.empty())
-                continue;
-
-            const char* state = "unknown";
-            switch (sessions[i].State) {
-            case WTSActive:
-                state = "Active";
-                break;
-            case WTSConnected:
-                state = "Connected";
-                break;
-            case WTSDisconnected:
-                state = "Disconnected";
-                break;
-            case WTSIdle:
-                state = "Idle";
-                break;
-            case WTSListen:
-                state = "Listen";
-                break;
-            default:
-                state = "Other";
-                break;
-            }
-
-            // Get client name for RDP sessions
-            LPWSTR client_buf = nullptr;
-            DWORD client_len = 0;
-            WTSQuerySessionInformationW(WTS_CURRENT_SERVER_HANDLE, sessions[i].SessionId,
-                                        WTSClientName, &client_buf, &client_len);
-            auto client = from_wide(client_buf);
-            if (client_buf)
-                WTSFreeMemory(client_buf);
-
-            // Get idle time
-            WTSINFOEXW* info_buf = nullptr;
-            DWORD info_len = 0;
-            long long idle_secs = 0;
-            if (WTSQuerySessionInformationW(WTS_CURRENT_SERVER_HANDLE, sessions[i].SessionId,
-                                            WTSSessionInfo, reinterpret_cast<LPWSTR*>(&info_buf),
-                                            &info_len) &&
-                info_buf) {
-                // IdleTime is a LARGE_INTEGER representing 100-nanosecond intervals
-                // But WTSINFOEXA has different layout; use CurrentTime - LastInputTime
-                // For simplicity, report 0 for active sessions
-                WTSFreeMemory(info_buf);
-            }
-
-            ctx.write_output(std::format("session|{}|{}|{}|{}|{}", sessions[i].SessionId, user,
-                                         state, client.empty() ? "-" : client, idle_secs));
-        }
-        WTSFreeMemory(sessions);
-    }
+    const auto read = yuzu::agent::win::read_wts_sessions(yuzu::agent::win::kWtsSessionsDeadline);
+    if (yuzu::agent::forward_bounded_failure(ctx, read.status, "windows:users:wts_sessions"))
+        return 1;
+    for (const auto& row : yuzu::users_win::session_rows(read))
+        ctx.write_output(row);
+    declare_partial(ctx, yuzu::users_win::wts_degraded_provenance(read));
+    // As in do_logged_on: a refused listing fails the command.
+    if (!read.enumerated)
+        return 1;
 #endif
     return 0;
 }
@@ -555,6 +490,9 @@ int do_local_users(yuzu::CommandContext& ctx) {
     }
     bool status_forwarded = false;
     auto lastlog_path = yuzu::agent::probe_tool_path({"/usr/bin/lastlog", "/bin/lastlog"});
+    const yuzu::users::ToolBudget budget{std::chrono::steady_clock::now(),
+                                         yuzu::users::kLocalUsersToolBudget};
+    bool tool_skipped = false;
     std::string line;
     while (std::getline(passwd, line)) {
         // Format: username:x:uid:gid:description:home:shell
@@ -589,15 +527,19 @@ int do_local_users(yuzu::CommandContext& ctx) {
         // not be able to reach the lastlog argv as an unexpected flag/token.
         std::string last_logon = "unknown";
         std::string lastlog_out;
+        std::optional<std::chrono::milliseconds> deadline;
         if (is_safe_identifier(user)) {
+            deadline = budget.next_deadline(std::chrono::steady_clock::now(), kUsersCmdDeadline);
+            tool_skipped = tool_skipped || !deadline;
+        }
+        if (deadline) {
             // sink: users/do_local_users#1 — `lastlog` reports per-account
             // last-login time; no /var/log/lastlog reader is wired in this
             // plugin. `| tail -1` is replicated below, in-process: max_lines
             // caps the FIRST N lines, which would invert `tail`'s "last
             // line" selection.
-            auto res = run_tool({lastlog_path, "-u", user});
-            if (!status_forwarded)
-                status_forwarded = yuzu::agent::forward_runner_failure(ctx, res.res);
+            auto res = run_account_tool(ctx, {lastlog_path, "-u", user}, *deadline,
+                                        status_forwarded, tool_skipped);
             std::istringstream ll_ss(res.output);
             std::string ll_line;
             while (std::getline(ll_ss, ll_line)) {
@@ -619,6 +561,7 @@ int do_local_users(yuzu::CommandContext& ctx) {
         ctx.write_output(std::format("local_user|{}|{}|{}|{}", user, enabled ? "true" : "false",
                                      last_logon, desc.empty() ? "-" : desc));
     }
+    yuzu::users::declare_budget_exhausted(ctx, "linux", tool_skipped, status_forwarded);
 
 #elif defined(__APPLE__)
     // M7: macOS dscl output format assumption.
@@ -641,6 +584,16 @@ int do_local_users(yuzu::CommandContext& ctx) {
     // honestly reports is_console_user="unknown" rather than guessing false.
     auto console_login_user = yuzu::macos::console_user();
     auto last_path = yuzu::agent::probe_tool_path({"/usr/bin/last", "/bin/last"});
+    const yuzu::users::ToolBudget budget{std::chrono::steady_clock::now(),
+                                         yuzu::users::kLocalUsersToolBudget};
+    bool tool_skipped = false;
+    // Asked before every per-account tool: nullopt means do not start it.
+    const auto tool_deadline = [&] {
+        const auto deadline =
+            budget.next_deadline(std::chrono::steady_clock::now(), kUsersCmdDeadline);
+        tool_skipped = tool_skipped || !deadline;
+        return deadline;
+    };
     if (!dscl_out.empty()) {
         std::istringstream ss(dscl_out);
         std::string line;
@@ -681,36 +634,27 @@ int do_local_users(yuzu::CommandContext& ctx) {
             }
 
             // Check if account is enabled
-            // sink: users/do_local_users#3 — `dscl . -read UserShell` reads
-            // one account's login shell.
-            auto shell_res = run_tool(
-                {"/usr/bin/dscl", ".", "-read", std::format("/Users/{}", user), "UserShell"});
-            if (!status_forwarded)
-                status_forwarded = yuzu::agent::forward_runner_failure(ctx, shell_res.res);
-            auto& shell = shell_res.output;
-            // Extract second field (the shell path) without piping to awk
-            bool enabled = true;
-            {
-                auto sp = shell.find(' ');
-                if (sp != std::string::npos) {
-                    auto shell_path = shell.substr(sp + 1);
-                    while (!shell_path.empty() && shell_path.front() == ' ')
-                        shell_path.erase(shell_path.begin());
-                    enabled = shell_path.find("false") == std::string::npos &&
-                              shell_path.find("nologin") == std::string::npos;
-                }
+            std::string enabled_state = "unknown";
+            if (const auto deadline = tool_deadline()) {
+                // sink: users/do_local_users#3 — `dscl . -read UserShell` reads
+                // one account's login shell.
+                auto shell_res = run_account_tool(
+                    ctx,
+                    {"/usr/bin/dscl", ".", "-read", std::format("/Users/{}", user), "UserShell"},
+                    *deadline, status_forwarded, tool_skipped);
+                enabled_state = yuzu::users::user_shell_enabled(shell_res.res, shell_res.output);
             }
 
-            // sink: users/do_local_users#4 — `dscl . -read RealName` reads
-            // one account's display name.
-            auto desc_res = run_tool(
-                {"/usr/bin/dscl", ".", "-read", std::format("/Users/{}", user), "RealName"});
-            if (!status_forwarded)
-                status_forwarded = yuzu::agent::forward_runner_failure(ctx, desc_res.res);
-            auto& desc_raw = desc_res.output;
-            // Extract real name: skip first line ("RealName:"), trim leading space
             std::string desc;
-            {
+            if (const auto deadline = tool_deadline()) {
+                // sink: users/do_local_users#4 — `dscl . -read RealName` reads
+                // one account's display name.
+                auto desc_res = run_account_tool(
+                    ctx,
+                    {"/usr/bin/dscl", ".", "-read", std::format("/Users/{}", user), "RealName"},
+                    *deadline, status_forwarded, tool_skipped);
+                auto& desc_raw = desc_res.output;
+                // Extract real name: skip first line ("RealName:"), trim leading space
                 auto nl = desc_raw.find('\n');
                 if (nl != std::string::npos) {
                     desc = desc_raw.substr(nl + 1);
@@ -735,12 +679,13 @@ int do_local_users(yuzu::CommandContext& ctx) {
             // boilerplate to a locale this parser understands. `user` was
             // already validated by is_safe_identifier above before any
             // subprocess use. Default is "unknown": a command failure,
-            // empty output, or unrecognized output leaves it there rather
-            // than fabricating "Never" for an indeterminate result. "Never"
-            // is only assigned once the boilerplate line confirms `last`
-            // actually ran and completed its (empty) search for this user.
+            // empty output, unrecognized output, or a spent tool budget
+            // leaves it there rather than fabricating "Never" for an
+            // indeterminate result. "Never" is only assigned once the
+            // boilerplate line confirms `last` actually ran and completed
+            // its (empty) search for this user.
             std::string last_logon = "unknown";
-            {
+            if (const auto deadline = tool_deadline()) {
                 // sink: users/do_local_users#5 — `last -y -1 <user>` reads
                 // one account's most recent login record. Spawned via
                 // `/usr/bin/env LC_ALL=C <last> ...` rather than a shell:
@@ -750,9 +695,8 @@ int do_local_users(yuzu::CommandContext& ctx) {
                 // exec wrapper, not an interpreter, so this stays rung 2
                 // with no shell involved.
                 auto last_res =
-                    run_tool({"/usr/bin/env", "LC_ALL=C", last_path, "-y", "-1", user});
-                if (!status_forwarded)
-                    status_forwarded = yuzu::agent::forward_runner_failure(ctx, last_res.res);
+                    run_account_tool(ctx, {"/usr/bin/env", "LC_ALL=C", last_path, "-y", "-1", user},
+                                     *deadline, status_forwarded, tool_skipped);
                 auto& last_out = last_res.output;
                 bool saw_record = false;
                 std::istringstream last_ss(last_out);
@@ -809,50 +753,32 @@ int do_local_users(yuzu::CommandContext& ctx) {
             // of which would inject an extra output row or shift columns
             // (K-11/CDX-10). Matches the certificates/event_logs row-safety
             // discipline on the same branch.
-            ctx.write_output(std::format("local_user|{}|{}|{}|{}|{}", user,
-                                         enabled ? "true" : "false", last_logon,
-                                         desc.empty() ? "-" : yuzu::util::safe_output_field(desc),
-                                         console_state));
+            ctx.write_output(std::format(
+                "local_user|{}|{}|{}|{}|{}", user, enabled_state, last_logon,
+                desc.empty() ? "-" : yuzu::util::safe_output_field(desc), console_state));
         }
     }
+    yuzu::users::declare_budget_exhausted(ctx, "macos", tool_skipped, status_forwarded);
 
 #elif defined(_WIN32)
-    LPUSER_INFO_2 buf = nullptr;
-    DWORD entries_read = 0;
-    DWORD total_entries = 0;
-    DWORD resume = 0;
-    NET_API_STATUS status;
-
-    do {
-        status = NetUserEnum(nullptr, 2, FILTER_NORMAL_ACCOUNT, reinterpret_cast<LPBYTE*>(&buf),
-                             MAX_PREFERRED_LENGTH, &entries_read, &total_entries, &resume);
-
-        if (status == NERR_Success || status == ERROR_MORE_DATA) {
-            for (DWORD i = 0; i < entries_read; ++i) {
-                auto& u = buf[i];
-                auto name = from_wide(u.usri2_name);
-                bool enabled = !(u.usri2_flags & UF_ACCOUNTDISABLE);
-                auto comment = from_wide(u.usri2_comment);
-
-                // Format last logon
-                std::string last_logon = "Never";
-                if (u.usri2_last_logon != 0) {
-                    time_t t = static_cast<time_t>(u.usri2_last_logon);
-                    struct tm tm_buf {};
-                    localtime_s(&tm_buf, &t);
-                    char time_str[64]{};
-                    strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S", &tm_buf);
-                    last_logon = time_str;
-                }
-
-                ctx.write_output(std::format("local_user|{}|{}|{}|{}", name,
-                                             enabled ? "true" : "false", last_logon,
-                                             comment.empty() ? "-" : comment));
-            }
-            NetApiBufferFree(buf);
-            buf = nullptr;
-        }
-    } while (status == ERROR_MORE_DATA);
+    const auto read = yuzu::agent::win::read_local_users(yuzu::agent::win::kLocalUsersDeadline);
+    if (yuzu::agent::forward_bounded_failure(ctx, read.status, "windows:users:net_user_enum")) {
+        ctx.write_output(
+            yuzu::users_win::unanswered_local_user_row(yuzu::agent::bounded_cause(read.status)));
+        return 1;
+    }
+    const auto local_time = [](std::uint32_t seconds) -> std::string {
+        time_t t = static_cast<time_t>(seconds);
+        struct tm tm_buf {};
+        localtime_s(&tm_buf, &t);
+        char time_str[64]{};
+        strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S", &tm_buf);
+        return time_str;
+    };
+    for (const auto& row : yuzu::users_win::local_user_rows(read, local_time))
+        ctx.write_output(row);
+    declare_partial(ctx, yuzu::users_win::incomplete_provenance("windows:users:net_user_enum",
+                                                                read.truncated, read.no_progress));
 #endif
     return 0;
 }
@@ -917,51 +843,17 @@ int do_local_admins(yuzu::CommandContext& ctx) {
     }
 
 #elif defined(_WIN32)
-    LPLOCALGROUP_MEMBERS_INFO_2 buf = nullptr;
-    DWORD entries_read = 0;
-    DWORD total_entries = 0;
-    DWORD_PTR resume = 0;
-
-    NET_API_STATUS status =
-        NetLocalGroupGetMembers(nullptr, L"Administrators", 2, reinterpret_cast<LPBYTE*>(&buf),
-                                MAX_PREFERRED_LENGTH, &entries_read, &total_entries, &resume);
-
-    if (status == NERR_Success) {
-        for (DWORD i = 0; i < entries_read; ++i) {
-            auto& m = buf[i];
-            auto name = from_wide(m.lgrmi2_domainandname);
-
-            const char* type_str = "unknown";
-            switch (m.lgrmi2_sidusage) {
-            case SidTypeUser:
-                type_str = "user";
-                break;
-            case SidTypeGroup:
-                type_str = "group";
-                break;
-            case SidTypeWellKnownGroup:
-                type_str = "well_known_group";
-                break;
-            case SidTypeAlias:
-                type_str = "alias";
-                break;
-            default:
-                break;
-            }
-
-            // Split domain\name
-            std::string domain = "local";
-            std::string member_name = name;
-            auto backslash = name.find('\\');
-            if (backslash != std::string::npos) {
-                domain = name.substr(0, backslash);
-                member_name = name.substr(backslash + 1);
-            }
-
-            ctx.write_output(std::format("admin|{}|{}|{}", member_name, type_str, domain));
-        }
-        NetApiBufferFree(buf);
+    const auto read = yuzu::agent::win::read_local_group_members(
+        "Administrators", yuzu::agent::win::kGroupMembersDeadline);
+    if (yuzu::agent::forward_bounded_failure(ctx, read.status,
+                                             "windows:users:local_group_members")) {
+        ctx.write_output("admin|error|query failed");
+        return 1;
     }
+    for (const auto& row : yuzu::users_win::admin_rows(read))
+        ctx.write_output(row);
+    declare_partial(ctx, yuzu::users_win::incomplete_provenance("windows:users:local_group_members",
+                                                                read.truncated, read.no_progress));
 #endif
     return 0;
 }
@@ -1066,59 +958,25 @@ int do_group_members(yuzu::CommandContext& ctx, yuzu::Params params) {
     }
 
 #elif defined(_WIN32)
-    // Convert group name to wide string
-    std::wstring wgroup(group_name.begin(), group_name.end());
-
-    LPLOCALGROUP_MEMBERS_INFO_2 buf = nullptr;
-    DWORD entries_read = 0;
-    DWORD total_entries = 0;
-    DWORD_PTR resume = 0;
-
-    NET_API_STATUS status =
-        NetLocalGroupGetMembers(nullptr, wgroup.c_str(), 2, reinterpret_cast<LPBYTE*>(&buf),
-                                MAX_PREFERRED_LENGTH, &entries_read, &total_entries, &resume);
-
-    if (status == NERR_Success || status == ERROR_MORE_DATA) {
-        for (DWORD i = 0; i < entries_read; ++i) {
-            auto& m = buf[i];
-            auto name = from_wide(m.lgrmi2_domainandname);
-
-            const char* type_str = "unknown";
-            switch (m.lgrmi2_sidusage) {
-            case SidTypeUser:
-                type_str = "user";
-                break;
-            case SidTypeGroup:
-                type_str = "group";
-                break;
-            case SidTypeWellKnownGroup:
-                type_str = "well_known_group";
-                break;
-            case SidTypeAlias:
-                type_str = "alias";
-                break;
-            default:
-                break;
-            }
-
-            // Split domain\name
-            std::string member_name = name;
-            auto backslash = name.find('\\');
-            if (backslash != std::string::npos) {
-                member_name = name.substr(backslash + 1);
-            }
-
-            ctx.write_output(
-                std::format("group_member|{}|{}|{}", member_name, group_name, type_str));
-        }
-        NetApiBufferFree(buf);
-    } else if (status == NERR_GroupNotFound || status == ERROR_NO_SUCH_ALIAS) {
-        ctx.write_output(std::format("group_member|error|Group not found: {}", group_name));
-        return 1;
-    } else {
+    const auto read = yuzu::agent::win::read_local_group_members(
+        std::string{group_name}, yuzu::agent::win::kGroupMembersDeadline);
+    if (yuzu::agent::forward_bounded_failure(ctx, read.status,
+                                             "windows:users:local_group_members")) {
         ctx.write_output(std::format("group_member|error|Failed to query group: {}", group_name));
         return 1;
     }
+    if (read.nerr == NERR_GroupNotFound || read.nerr == ERROR_NO_SUCH_ALIAS) {
+        ctx.write_output(std::format("group_member|error|Group not found: {}", group_name));
+        return 1;
+    }
+    if (read.nerr != NERR_Success) {
+        ctx.write_output(std::format("group_member|error|Failed to query group: {}", group_name));
+        return 1;
+    }
+    for (const auto& row : yuzu::users_win::group_member_rows(read, group_name))
+        ctx.write_output(row);
+    declare_partial(ctx, yuzu::users_win::incomplete_provenance("windows:users:local_group_members",
+                                                                read.truncated, read.no_progress));
 #endif
     return 0;
 }

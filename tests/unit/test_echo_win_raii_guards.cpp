@@ -1,7 +1,7 @@
 // Windows-only unit coverage for the Echo plugin's shared RAII handle
 // guards (agents/plugins/echo/src/echo_win_raii_guards.hpp). Governance
 // (quality-engineer, Gate 3) flagged that ScHandleGuard / MibTableGuard /
-// WNetEnumGuard / NetApiBufGuard had no unit coverage on Windows -- each
+// WNetEnumGuard had no unit coverage on Windows -- each
 // called a real WinAPI closer directly from its destructor, which is safe
 // in production but untestable without a live OS resource. The guards were
 // consolidated into a single template with an INJECTABLE closer so a test
@@ -21,7 +21,7 @@ namespace {
 
 // A dummy opaque handle type -- ScopedWinHandle is a template over Handle,
 // so this exercises the SAME code every production alias (ScHandleGuard,
-// etc.) instantiates, without needing a real SC_HANDLE/HANDLE/LPVOID value.
+// etc.) instantiates, without needing a real SC_HANDLE/HANDLE value.
 struct FakeHandleTag;
 using FakeHandle = FakeHandleTag*;
 
@@ -118,9 +118,6 @@ TEST_CASE("Production aliases (ScHandleGuard etc.) default to their real WinAPI 
 
     WNetEnumGuard wn{static_cast<HANDLE>(nullptr)};
     CHECK_FALSE(static_cast<bool>(wn));
-
-    NetApiBufGuard nb{static_cast<LPVOID>(nullptr)};
-    CHECK_FALSE(static_cast<bool>(nb));
 
     MibTableGuard mt{static_cast<PMIB_IPNET_TABLE2>(nullptr)};
     CHECK_FALSE(static_cast<bool>(mt));

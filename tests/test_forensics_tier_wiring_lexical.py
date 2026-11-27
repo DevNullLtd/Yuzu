@@ -539,9 +539,10 @@ PROVENANCE_EXACT: dict[str, list[tuple[str, str, int, str]]] = {
         ("prov-finalize-one-caller", r"\bfinalize_classified_command\(", 1,
          "the dispatch chokepoint finalizes a command at exactly one site; a second finalizer is a "
          "second place a command can reach the wire without the record being written"),
-        ("prov-classified-command-mentions", r"\bClassifiedCommand\b", 5,
-         "ServerImpl names ClassifiedCommand only in the builder's return type and four by-reference "
-         "parameter types; a new use is a path around the chokepoint and needs this pin"),
+        ("prov-classified-command-mentions", r"\bClassifiedCommand\b", 6,
+         "ServerImpl names ClassifiedCommand only in the builder's return type and five by-reference "
+         "parameter types (the fifth is send_guardian_push, which only forwards an already-minted "
+         "command); a new use is a path around the chokepoint and needs this pin"),
         ("prov-classified-command-no-construction",
          r"\bClassifiedCommand(?:\s+\w+)?\s*[({]|make_(?:unique|shared)<[^>]*ClassifiedCommand", 0,
          "ServerImpl never constructs a ClassifiedCommand itself: only finalize_classified_command does, "
