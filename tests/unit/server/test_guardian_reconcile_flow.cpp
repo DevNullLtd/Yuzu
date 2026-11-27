@@ -66,7 +66,8 @@ namespace {
 constexpr const char* kDash = "\xE2\x80\x94";
 
 constexpr const char* kResultFamily = "yuzu_server_guardian_reconciles_total";
-constexpr const char* kLabels[] = {"sent", "rate_limited", "shed", "degraded", "no_session"};
+constexpr const char* kLabels[] = {"sent",    "rate_limited", "shed",        "degraded",
+                                   "no_session", "sent_remote", "undelivered"};
 
 // Manual steady clock, shared by the gate, the budget and both caches. Atomic because the
 // single-flight tests drive it from a helper thread.
@@ -269,13 +270,15 @@ public:
                 return false;
             },
             .send_push = [this](const std::string& agent_id, const std::string& command_id,
-                                const std::string& bytes) {
+                                const std::string& bytes) -> yuzu::server::GuardianPushOutcome {
                 if (send_hook)
                     send_hook();
                 std::lock_guard lk(fx_mu);
                 note("send_push");
                 sent.push_back({agent_id, command_id, bytes});
-                return send_result;
+                if (send_override)
+                    return *send_override;
+                return send_result ? yuzu::server::GuardianPushOutcome::sent : yuzu::server::GuardianPushOutcome::undelivered;
             },
             .audit = [this](const AuditEvent& ev) {
                 if (audit_hook)
@@ -366,6 +369,8 @@ public:
     std::vector<std::string> session_id_agents;
     std::unordered_map<std::string, ScopeOutcome> scope_outcomes;
     bool send_result{true};
+    // Wins over `send_result` when set: the directory-routed outcomes (HA WS-5, #5685).
+    std::optional<yuzu::server::GuardianPushOutcome> send_override;
     std::function<void()> list_hook;
     std::function<void()> eval_hook;
     // Run at the top of the matching stub, before it records anything; a test makes one throw.
@@ -1112,12 +1117,14 @@ TEST_CASE("GuardianReconcileFlow: a successful reconcile pushes exactly the appl
     CHECK(rig.duration_count() == 1);
 }
 
-TEST_CASE("GuardianReconcileFlow: a failed send counts, gauges and audits nothing", "[guardian][reconcile_flow]") {
+TEST_CASE("GuardianReconcileFlow: an undelivered send counts only result=undelivered, and gauges and audits nothing", "[guardian][reconcile_flow]") {
     Rig rig;
     rig.send_result = false;
     rig.run();
     REQUIRE(rig.sent.size() == 1);  // it was attempted
-    CHECK(rig.total() == 0.0);       // documented: a send that fails has no label of any kind
+    CHECK(rig.count("undelivered") == 1.0);  // it had no series of any kind before HA WS-5
+    CHECK(rig.count("sent") == 0.0);
+    CHECK(rig.total() == 1.0);
     CHECK(rig.dispatched() == 0.0);
     CHECK(rig.generation_gauge() == 0.0);
     CHECK(rig.audits.empty());
@@ -1125,6 +1132,42 @@ TEST_CASE("GuardianReconcileFlow: a failed send counts, gauges and audits nothin
     CHECK(rig.duration_count() == 1);
     CHECK(rig.gate.claims_size() == 1);  // the claim is kept: at most one attempt per interval
     CHECK(rig.suffix_calls == 1);
+}
+
+TEST_CASE("GuardianReconcileFlow: a directory-routed push counts sent_remote, not sent, and the audit row says so",
+          "[guardian][reconcile_flow]") {
+    Rig rig;
+    rig.send_override = yuzu::server::GuardianPushOutcome::sent_remote;
+    rig.run();
+    REQUIRE(rig.sent.size() == 1);
+    CHECK(rig.count("sent_remote") == 1.0);
+    CHECK(rig.count("sent") == 0.0);
+    CHECK(rig.total() == 1.0);
+    CHECK(rig.dispatched() == 1.0);
+    REQUIRE(rig.audits.size() == 1);
+    CHECK(rig.audits[0].result == "success");
+    CHECK(rig.audits[0].detail.find("via the route directory") != std::string::npos);
+    CHECK(rig.gate.in_flight() == 0);
+}
+
+TEST_CASE("GuardianReconcileFlow: a degraded route-directory read sends as nothing, counts degraded and audits ABORTED",
+          "[guardian][reconcile_flow]") {
+    Rig rig;
+    rig.send_override = yuzu::server::GuardianPushOutcome::route_unreadable;
+    rig.run();
+    REQUIRE(rig.sent.size() == 1);  // the attempt reached the send seam
+    CHECK(rig.count("degraded") == 1.0);
+    CHECK(rig.count("sent") == 0.0);
+    CHECK(rig.count("sent_remote") == 0.0);
+    CHECK(rig.total() == 1.0);
+    CHECK(rig.dispatched() == 0.0);  // nothing was dispatched
+    CHECK(rig.generation_gauge() == 0.0);
+    REQUIRE(rig.audits.size() == 1);
+    CHECK(rig.audits[0].result == "degraded");
+    CHECK(rig.audits[0].detail.find("ABORTED") != std::string::npos);
+    CHECK(rig.audits[0].detail.find("route directory unreadable") != std::string::npos);
+    CHECK(rig.gate.in_flight() == 0);
+    CHECK(rig.gate.claims_size() == 1);  // claim kept: one attempt per interval
 }
 
 TEST_CASE("GuardianReconcileFlow: the rule bundle is keyed by the FRESH generation, never the cached one",
@@ -1692,7 +1735,7 @@ std::vector<Scenario> all_exits() {
          true,
          1},
         {"success", {}, [](Rig&) {}, true, 1},
-        {"send fails", {}, [](Rig& r) { r.send_result = false; }, true, 0},
+        {"send fails", {}, [](Rig& r) { r.send_result = false; }, true, 1},
     };
 }
 

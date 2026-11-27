@@ -161,6 +161,7 @@
 #include "baseline_store.hpp"
 #include "guardian_push_builder.hpp"
 #include "guardian_rule_scope_preflight.hpp"
+#include "guardian_directory_route.hpp" // HA WS-5 (#5685) the route-directory decision for the reconcile send
 #include "guardian_reconcile_flow.hpp" // #5513 the heartbeat reconcile control flow (unit tested)
 #include "guardian_generation_cache.hpp" // #5513 short-TTL generation read
 #include "guardian_reconcile_gate.hpp" // #5513 claim map + admission budget
@@ -7323,9 +7324,13 @@ public:
                               "dispatched), rate_limited (per-agent 25 s slot), shed (admission "
                               "budget or per-second ceiling exhausted, or in-flight cap reached, "
                               "nothing sent, no audit row), degraded "
-                              "(a store read failed, re-push aborted), no_session",
+                              "(a store read failed, re-push aborted, incl. the route directory), "
+                              "no_session, sent_remote (queued through the route directory "
+                              "for the cluster owning the agent's session), undelivered "
+                              "(no delivery path, nothing queued)",
                               "counter");
-            for (auto result : {"sent", "rate_limited", "shed", "degraded", "no_session"})
+            for (auto result : {"sent", "rate_limited", "shed", "degraded", "no_session",
+                                "sent_remote", "undelivered"})
                 metrics_.counter("yuzu_server_guardian_reconciles_total", {{"result", result}});
             metrics_.describe("yuzu_server_guardian_reconcile_invalidated_total",
                               "Guardian heartbeat reconciles withheld because a rule or policy "
@@ -7432,18 +7437,13 @@ public:
                 // not operator instruction dispatch - deliberately NOT
                 // quarantine-gated (see dispatch_confined_arms.hpp).
                 .send_push = [this](const std::string& agent_id, const std::string& command_id,
-                                    const std::string& push_bytes) -> bool {
+                                    const std::string& push_bytes) -> GuardianPushOutcome {
                     auto classified = build_classified_command(
                         yuzu::server::DispatchCaller{.system = true}, "__guard__", "push_rules",
                         command_id, /*parameters=*/{}, push_bytes);
-                    if (classified &&
-                        send_system_reserved(
-                            agent_id, *classified,
-                            yuzu::server::SystemReservedPush::guardian_push_rules)) {
-                        forward_gateway_pending();
-                        return true;
-                    }
-                    return false;
+                    if (!classified)
+                        return GuardianPushOutcome::undelivered;
+                    return send_guardian_push(agent_id, *classified);
                 },
                 .audit = [this](const AuditEvent& ev) {
                     if (audit_store_ && audit_store_->is_open())
@@ -14938,6 +14938,62 @@ private:
                       {"result", ok ? "sent" : "undelivered"}})
             .increment();
         return ok;
+    }
+
+    /// HA WS-5 (#5685): the Guardian reconcile's send, with the route-directory consult
+    /// `send_system_reserved` deliberately lacks (see its KNOWN LIMITATION above).
+    ///
+    /// A local session with no delivery path of its own (`needs_directory_consult`: empty
+    /// `gateway_node` and no stream, the shape a replay-adopted session has until its
+    /// re-announced CONNECTED lands on THIS replica) cannot take a push through `send_to`.
+    /// For that shape, and only that shape, read the agent's durable route once and queue the
+    /// push for the cluster that owns it. Every guard fails CLOSED:
+    ///  - a degraded directory read sends nothing (`route_unreadable`);
+    ///  - the row must be `routable` (session present, lease live, cluster set);
+    ///  - the row's `session_id` must equal this replica's session id for the agent, or the
+    ///    push would go to a superseded registration's cluster. That match is point-in-time:
+    ///    a re-registration between the read and the send can still queue for the old
+    ///    cluster, which the agent's generation check and the next heartbeat absorb. If a
+    ///    CONNECTED lands in that gap `send_via_directory` hands the push to `send_to`, and
+    ///    the outcome is still labelled `sent_remote`.
+    /// A direct-connected agent never has a route row, so it stays `undelivered` here exactly
+    /// as before. This path does not repeat `send_to`'s gateway-capability check (the session
+    /// has no advertised capabilities yet); `send_via_directory` applies the per-OS kill
+    /// switch. Both replicas may push one agent: the claim and budget are per replica.
+    [[nodiscard]] GuardianPushOutcome send_guardian_push(const std::string& agent_id,
+                                                         const detail::ClassifiedCommand& cmd) {
+        constexpr auto kPush = yuzu::server::SystemReservedPush::guardian_push_rules;
+        auto count = [&](const char* result) {
+            metrics_
+                .counter("yuzu_server_system_reserved_push_total",
+                         {{"capability", std::string(yuzu::server::system_reserved_push_label(kPush))},
+                          {"result", result}})
+                .increment();
+        };
+        const auto route =
+            yuzu::server::resolve_guardian_directory_route(registry_, gateway_route_store_.get(),
+                                                           agent_id);
+        switch (route.kind) {
+        case yuzu::server::GuardianDirectoryRoute::Kind::not_needed:
+            if (send_system_reserved(agent_id, cmd, kPush)) {
+                forward_gateway_pending();
+                return GuardianPushOutcome::sent;
+            }
+            return GuardianPushOutcome::undelivered;
+        case yuzu::server::GuardianDirectoryRoute::Kind::unreadable:
+            return GuardianPushOutcome::route_unreadable;
+        case yuzu::server::GuardianDirectoryRoute::Kind::routed:
+            if (registry_.send_via_directory(agent_id, cmd, route.cluster_id)) {
+                count("sent");
+                forward_gateway_pending();
+                return GuardianPushOutcome::sent_remote;
+            }
+            break;
+        case yuzu::server::GuardianDirectoryRoute::Kind::no_route:
+            break;
+        }
+        count("undelivered");
+        return GuardianPushOutcome::undelivered;
     }
 
     [[nodiscard]] static std::string mint_sync_now_command_id() {

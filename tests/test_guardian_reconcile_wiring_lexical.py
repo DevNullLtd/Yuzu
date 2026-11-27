@@ -571,17 +571,38 @@ def flow_problems(src):
         out.append("the bundle loader is no longer guardian::load_reconcile_bundle( (o)")
     out.extend(move_filter_problems(t, "guardian_reconcile_flow.hpp"))
 
-    # (s) sent / success audit only on a delivered push.
-    sent_if = re.search(r"\bif \( ?send_push_\([^;{}]*\) ?\) ?\{(.*)", b)
-    if not sent_if:
-        out.append("the push is no longer gated by `if (send_push_(...))` (s)")
+    # (s) sent / success audit only on a delivered push. HA WS-5 (#5685): the send has FOUR
+    # outcomes; a degraded route-directory read aborts through abort_degraded and returns, an
+    # undelivered push is counted on its own series and returns, and only the two delivered
+    # outcomes reach the `sent`/`sent_remote` counter and the success audit row.
+    outcome = re.search(r"\bconst GuardianPushOutcome (\w+) ?= ?send_push_\([^;{}]*\) ?;(.*)", b)
+    if not outcome:
+        out.append("the push is no longer `const GuardianPushOutcome x = send_push_(...)` (s)")
     else:
-        tail = sent_if.group(1)
-        if not re.search(r'^ ?metrics_ ?\.counter\( ?"yuzu_server_guardian_reconciles_total", ?\{ ?\{ ?"result", ?"sent" ?\} ?\} ?\)'
-                         r' ?\.increment\(\)', tail):
-            out.append('the `sent` counter is no longer the first statement of the delivered-push branch (s)')
-        if not re.search(r'\bev\.result = "success" ?; ?audit_\( ?ev ?\) ?;', tail):
-            out.append("the success audit row is no longer written inside the delivered-push branch (s)")
+        var, tail = outcome.group(1), outcome.group(2)
+        unreadable = re.match(r"^ ?if \( ?" + var + r" ?== ?GuardianPushOutcome::route_unreadable ?\) ?\{([^{}]*)\}", tail)
+        if not unreadable or not re.search(r'\babort_degraded\( ?"route_directory_unreadable"[^;]*;[^{}]*?\breturn ?;',
+                                           unreadable.group(1)):
+            out.append("a degraded route-directory read no longer aborts through abort_degraded and returns "
+                       "before anything is counted as sent (s)")
+        undelivered = re.search(r"\bif \( ?" + var + r" ?== ?GuardianPushOutcome::undelivered ?\) ?\{(.*?\breturn ?;)", tail)
+        if not undelivered or not re.search(r'"result", ?"undelivered"', undelivered.group(1)) or not re.search(
+                r"\breturn ?;", undelivered.group(1)):
+            out.append("an undelivered push no longer counts result=undelivered and returns before the "
+                       "sent counter and the success audit row (s)")
+        elif unreadable and undelivered.start() < unreadable.end():
+            out.append("the undelivered arm moved before the route_unreadable arm (s)")
+        delivered = re.search(r'\.counter\( ?"yuzu_server_guardian_reconciles_total", ?\{ ?\{ ?"result", ?'
+                              r'remote ?\? ?"sent_remote" ?: ?"sent" ?\} ?\} ?\) ?\.increment\(\)(.*)', tail)
+        if not delivered:
+            out.append('the delivered-push counter is no longer `remote ? "sent_remote" : "sent"` (s)')
+        else:
+            if not re.search(r"\bconst bool remote ?= ?" + var + r" ?== ?GuardianPushOutcome::sent_remote ?;", tail):
+                out.append("`remote` is no longer derived from GuardianPushOutcome::sent_remote (s)")
+            if not re.search(r'\bev\.result = "success" ?; ?audit_\( ?ev ?\) ?;', delivered.group(1)):
+                out.append("the success audit row is no longer written inside the delivered-push branch (s)")
+            if undelivered and undelivered.start() > delivered.start():
+                out.append("the sent counter now precedes the undelivered return (s)")
 
     # (w) an invalidated bundle is never sent.
     epoch_read = re.search(r"\b(?:const )?(?:auto|std::uint64_t) bundle_epoch = (?:this ?-> ?)?"
@@ -836,7 +857,7 @@ def problems(src):
                 ("random_suffix", (r"AuthManager::bytes_to_hex\( ?(?:auth::)?AuthManager::random_bytes\(8\) ?\)",)),
                 ("audit", (r"\baudit_store_(?: ?!= ?nullptr)? ?&& ?audit_store_ ?-> ?is_open\(\)", r"\baudit_store_ ?-> ?log\(")),
                 ("send_push", (r"yuzu::server::DispatchCaller ?\{ ?\.system = true ?\}", r'"__guard__"', r'"push_rules"',
-                               r"SystemReservedPush::guardian_push_rules"))):
+                               r"\bsend_guardian_push\("))):
             blk = field_block(name)
             if blk is None:
                 out.append(f"could not isolate the .{name} dependency in the flow construction (u)")
@@ -895,10 +916,8 @@ def problems(src):
             exact.append(("send_push",
                           r"^\{ ?(?:const )?auto classified = build_classified_command\( ?yuzu::server::DispatchCaller ?\{ ?"
                           r"\.system = true ?\} ?, ?\"__guard__\", ?\"push_rules\", ?" + cmd_p + r", ?\{ ?\} ?, ?" + bytes_p +
-                          r" ?\) ?; ?if ?\( ?(?:classified|classified ?\. ?has_value\( ?\)|classified ?!= ?std::nullopt) ?&& ?"
-                          r"send_system_reserved\( ?" + agent_p + r", ?\* ?classified, ?"
-                          r"yuzu::server::SystemReservedPush::guardian_push_rules ?\) ?\) ?\{ ?forward_gateway_pending\( ?\) ?; ?"
-                          r"return true ?; ?\} ?return false ?; ?\}$"))
+                          r" ?\) ?; ?if ?\( ?! ?classified ?\) ?(?:\{ ?)?return GuardianPushOutcome::undelivered ?; ?(?:\} ?)?"
+                          r"return send_guardian_push\( ?" + agent_p + r", ?\* ?classified ?\) ?; ?\}$"))
         else:
             out.append("could not read the .send_push lambda's parameters (u)")
         for name, pat in exact:
@@ -906,13 +925,43 @@ def problems(src):
             if blk is not None and not re.search(pat, blk.strip()):
                 out.append(f"the .{name} dependency body is no longer exactly its reviewed form `{pat}` (u)")
         sp = field_block("send_push")
-        if sp is not None:
-            # (The command id, the push bytes and the target being the lambda's OWN parameters is
-            # pinned by the whole-body match above, under whatever names the lambda declares.)
-            if len(re.findall(r"\bforward_gateway_pending\(\)", sp)) != 1 or not re.search(
-                    r"\bsend_system_reserved\([^{}]*?\) ?\) ?\{ ?forward_gateway_pending\(\) ?; ?return true ?;", sp):
-                out.append("the .send_push dependency must call forward_gateway_pending() exactly once, and only "
-                           "inside the send_system_reserved success branch (u)")
+        if sp is not None and re.search(r"\bforward_gateway_pending\(", sp):
+            out.append("the .send_push dependency calls forward_gateway_pending() itself: only "
+                       "send_guardian_push may, inside a success branch (u)")
+        # HA WS-5 (#5685): the route-directory decision is `resolve_guardian_directory_route`
+        # (guardian_directory_route.hpp, behavioural tests in test_guardian_directory_route.cpp:
+        # a degraded read, another session's row, an expired lease and a tombstone are each their
+        # own outcome). What stays lexical is how ServerImpl::send_guardian_push CONSUMES it.
+        sg = block_after(t, "GuardianPushOutcome send_guardian_push(")
+        if sg is None:
+            out.append("could not isolate ServerImpl::send_guardian_push (u)")
+        else:
+            if not re.search(r"\bconstexpr auto kPush ?= ?yuzu::server::SystemReservedPush::guardian_push_rules ?;", sg):
+                out.append("send_guardian_push no longer pushes as SystemReservedPush::guardian_push_rules (u)")
+            if not re.search(r"\bconst auto route ?= ?yuzu::server::resolve_guardian_directory_route\( ?registry_, ?"
+                             r"gateway_route_store_ ?\. ?get\( ?\), ?agent_id ?\) ?;", sg):
+                out.append("send_guardian_push no longer takes its route from resolve_guardian_directory_route"
+                           "(registry_, gateway_route_store_.get(), agent_id) (u)")
+            K = r"yuzu::server::GuardianDirectoryRoute::Kind::"
+            if not re.search(r"\bcase " + K + r"not_needed ?: ?if \( ?send_system_reserved\( ?agent_id, ?cmd, ?kPush ?\) ?\) ?\{ ?"
+                             r"forward_gateway_pending\( ?\) ?; ?return GuardianPushOutcome::sent ?; ?\} ?"
+                             r"return GuardianPushOutcome::undelivered ?;", sg):
+                out.append("send_guardian_push no longer sends a not_needed route through send_system_reserved, "
+                           "forwarding the queue only on success (u)")
+            if not re.search(r"\bcase " + K + r"unreadable ?: ?return GuardianPushOutcome::route_unreadable ?;", sg):
+                out.append("an unreadable route directory no longer returns route_unreadable (u)")
+            if not re.search(r"\bcase " + K + r"routed ?: ?if \( ?registry_ ?\. ?send_via_directory\( ?agent_id, ?cmd, ?"
+                             r"route ?\. ?cluster_id ?\) ?\) ?\{ ?count\( ?\"sent\" ?\) ?; ?forward_gateway_pending\( ?\) ?; ?"
+                             r"return GuardianPushOutcome::sent_remote ?; ?\} ?break ?;", sg):
+                out.append("a routed push no longer goes through send_via_directory with the route's cluster, "
+                           "counting, forwarding the queue and returning sent_remote only on success (u)")
+            if not re.search(r"\bcase " + K + r"no_route ?: ?break ?;", sg):
+                out.append("a no_route outcome no longer falls through to undelivered (u)")
+            if len(re.findall(r"\bforward_gateway_pending\(", sg)) != 2:
+                out.append("send_guardian_push must call forward_gateway_pending() exactly twice, once per "
+                           "success branch (u)")
+            if not re.search(r'\bcount\( ?"undelivered" ?\) ?; ?return GuardianPushOutcome::undelivered ?; ?\}$', sg.strip()):
+                out.append("send_guardian_push no longer ends on an undelivered fall-through (u)")
 
     # (i) whole-file items.
     # (?<![\w"])/(?![\w"]): a string literal that is exactly the name is data, not a member.
@@ -923,6 +972,10 @@ def problems(src):
     if not re.search(r'for \( ?auto \w+ : \{[^{}]*"shed"[^{}]*\} ?\) ?metrics_\.counter\( ?'
                      r'"yuzu_server_guardian_reconciles_total"', t):
         out.append('the yuzu_server_guardian_reconciles_total pre-seed loop no longer includes "shed" (i)')
+    if not re.search(r'for \( ?auto \w+ : \{[^{}]*"sent_remote"[^{}]*"undelivered"[^{}]*\} ?\) ?metrics_\.counter\( ?'
+                     r'"yuzu_server_guardian_reconciles_total"', t):
+        out.append('the yuzu_server_guardian_reconciles_total pre-seed loop no longer includes "sent_remote" '
+                   'and "undelivered" (i)')
 
     out.extend(move_filter_problems(t, "server.cpp"))
 
@@ -1558,14 +1611,24 @@ MUTATIONS += [
 ]
 
 # (s) the delivered-push branch.
-SEND = "if (send_push_(agent_id, command_id, push.SerializeAsString())) {"
+SEND = "if (push_outcome == GuardianPushOutcome::undelivered) {"
 MUTATIONS += [
     ("sent counted without the send succeeding",
-     _sub(SEND, "if (true) { (void)send_push_(agent_id, command_id, push.SerializeAsString());"), "(s)"),
+     _sub(SEND, "if (false) {"), "(s)"),
+    ("an undelivered push no longer returns",
+     _sub('{{"result", "undelivered"}})\n                .increment();\n            return;', '{{"result", "undelivered"}})\n                .increment();'), "(s)"),
+    ("a degraded route read is no longer an aborted reconcile",
+     _sub('abort_degraded("route directory unreadable", "gateway route store degraded");',
+          'spdlog::debug("route directory unreadable");'), "(s)"),
+    ("a degraded route read no longer returns",
+     _sub('abort_degraded("route directory unreadable", "gateway route store degraded");\n            return;',
+          'abort_degraded("route directory unreadable", "gateway route store degraded");'), "(s)"),
+    ("the remote outcome is counted as plain sent",
+     _sub('remote ? "sent_remote" : "sent"', '"sent"'), "(s)"),
     ("success audit dropped from the delivered-push branch",
      _after('ev.result = "success";', "audit_(ev);", "(void)0;"), "(s)"),
     ("sent counter label changed",
-     _sub('{{"result", "sent"}})', '{{"result", "sent_"}})'), "(s)"),
+     _sub('{{"result", remote ? "sent_remote" : "sent"}})', '{{"result", remote ? "sent_remote" : "sent_"}})'), "(s)"),
 ]
 
 # (aa) member declaration order. Each declaration as a pattern over the RAW source (so a mutation
@@ -1659,6 +1722,7 @@ FLOW_MUTATIONS = [m for m in MUTATIONS if m[2] not in SERVER_LETTERS]
 # (t)/(u): the wiring in server.cpp.
 LAMBDA_CALL = "reconcile_flow->run(agent_id_sv, agent_gen);"
 FLOW_CTOR = "std::make_shared<GuardianReconcileFlow>("
+SGP = "GuardianPushOutcome send_guardian_push("
 SERVER_MUTATIONS = [m for m in MUTATIONS if m[2] in SERVER_LETTERS] + [
     ("lambda stops calling the flow", _sub(LAMBDA_CALL, "(void)0;"), "(t)"),
     ("lambda runs the flow and then more",
@@ -1685,7 +1749,7 @@ SERVER_MUTATIONS = [m for m in MUTATIONS if m[2] in SERVER_LETTERS] + [
      _sub("auto classified = build_classified_command(\n                        yuzu::server::DispatchCaller{.system = true}",
           "forward_gateway_pending();\n                    auto classified = build_classified_command(\n                        yuzu::server::DispatchCaller{.system = true}"), "(u)"),
     ("push dependency never forwards the gateway queue",
-     _after(FLOW_CTOR, "forward_gateway_pending();\n                        return true;", "return true;"), "(u)"),
+     _after(SGP, "forward_gateway_pending();\n                return GuardianPushOutcome::sent;", "return GuardianPushOutcome::sent;"), "(u)"),
     ("audit dependency loses the is_open check",
      _after(FLOW_CTOR, "if (audit_store_ && audit_store_->is_open())", "if (audit_store_)"), "(u)"),
     ("rule source reads something else",
@@ -1702,7 +1766,7 @@ SERVER_MUTATIONS = [m for m in MUTATIONS if m[2] in SERVER_LETTERS] + [
     ("push dependency uses a CONSTANT command id (ignores its command_id parameter)",
      _wafter(FLOW_CTOR, '"push_rules", command_id,', '"push_rules", std::string("fixed-id"),'), "(u)"),
     ("push dependency sends to the wrong agent_id",
-     _wafter(FLOW_CTOR, "send_system_reserved( agent_id, *classified,", "send_system_reserved( other_agent_id_, *classified,"), "(u)"),
+     _wafter(FLOW_CTOR, "send_guardian_push(agent_id, *classified);", "send_guardian_push(other_agent_id_, *classified);"), "(u)"),
     ("scope dependency passes null tag and property stores",
      _wafter(FLOW_CTOR, "evaluate_scope_for_agent(agent_id, expr, tag_store_.get(), custom_properties_store_.get())",
              "evaluate_scope_for_agent(agent_id, expr, nullptr, nullptr)"), "(u)"),
@@ -1735,13 +1799,33 @@ SERVER_MUTATIONS = [m for m in MUTATIONS if m[2] in SERVER_LETTERS] + [
             "if (audit_store_ && (audit_store_->is_open() || true))"), "(u)"),
     ("audit dependency logs unconditionally",
      _after(FLOW_CTOR, "if (audit_store_ && audit_store_->is_open())\n", "if (true)\n"), "(u)"),
-    ("push dependency admits an unclassified command (classified ||)",
-     _wafter(FLOW_CTOR, "if (classified &&", "if (classified ||"), "(u)"),
-    ("push dependency reports success on its final fall-through",
-     _after(FLOW_CTOR, "return false;", "return true;"), "(u)"),
-    ("push dependency reports success without waiting for the send",
-     _wafter(FLOW_CTOR, "forward_gateway_pending(); return true; } return false;",
-             "forward_gateway_pending(); } return true;"), "(u)"),
+    ("push dependency admits an unclassified command",
+     _wafter(FLOW_CTOR, "if (!classified)", "if (classified)"), "(u)"),
+    ("push dependency forwards the gateway queue itself",
+     _wafter(FLOW_CTOR, "return send_guardian_push(agent_id, *classified);",
+             "forward_gateway_pending(); return send_guardian_push(agent_id, *classified);"), "(u)"),
+    # HA WS-5 (#5685): the route-directory consult in ServerImpl::send_guardian_push.
+    ("send_guardian_push reports success on its final fall-through",
+     _after(SGP, 'count("undelivered");\n        return GuardianPushOutcome::undelivered;',
+            'count("undelivered");\n        return GuardianPushOutcome::sent;'), "(u)"),
+    ("send_guardian_push reports sent without waiting for the local send",
+     _after(SGP, "if (send_system_reserved(agent_id, cmd, kPush)) {",
+            "(void)send_system_reserved(agent_id, cmd, kPush);\n            if (true) {"), "(u)"),
+    ("send_guardian_push sends on a degraded directory read",
+     _after(SGP, "case yuzu::server::GuardianDirectoryRoute::Kind::unreadable:\n            return GuardianPushOutcome::route_unreadable;",
+            "case yuzu::server::GuardianDirectoryRoute::Kind::unreadable:\n            return GuardianPushOutcome::undelivered;"), "(u)"),
+    ("send_guardian_push sends a no_route outcome anyway",
+     _after(SGP, "case yuzu::server::GuardianDirectoryRoute::Kind::no_route:\n            break;",
+            "case yuzu::server::GuardianDirectoryRoute::Kind::no_route:\n            return GuardianPushOutcome::sent_remote;"), "(u)"),
+    ("send_guardian_push routes to a hard-coded cluster",
+     _after(SGP, "send_via_directory(agent_id, cmd, route.cluster_id)", 'send_via_directory(agent_id, cmd, "cluster-a")'), "(u)"),
+    ("send_guardian_push never forwards a directory-routed push",
+     _after(SGP, 'count("sent");\n                forward_gateway_pending();', 'count("sent");'), "(u)"),
+    ("send_guardian_push pushes as another capability",
+     _after(SGP, "SystemReservedPush::guardian_push_rules;", "SystemReservedPush::asset_tags_sync;"), "(u)"),
+    ("send_guardian_push takes the route from another agent",
+     _after(SGP, "gateway_route_store_.get(),\n                                                           agent_id);",
+            "gateway_route_store_.get(),\n                                                           other_agent_id_);"), "(u)"),
 ]
 
 # Mutations over guardian_push_builder.cpp (the bundle loader's evaluation order).
@@ -1786,8 +1870,10 @@ BENIGN_SERVER = [
     ("push command built on one line with a comment on each argument",
      _wafter(FLOW_CTOR, 'build_classified_command( yuzu::server::DispatchCaller{.system = true}, "__guard__", "push_rules", command_id, /*parameters=*/{}, push_bytes);',
              'build_classified_command(yuzu::server::DispatchCaller{.system = true}, /*caller*/ "__guard__", "push_rules", /*id*/ command_id, {}, /*bytes*/ push_bytes);')),
-    ("send_system_reserved call re-wrapped",
-     _wafter(FLOW_CTOR, "send_system_reserved( agent_id, *classified,", "send_system_reserved(\n agent_id,\n *classified,")),
+    ("send_guardian_push call re-wrapped",
+     _wafter(FLOW_CTOR, "send_guardian_push(agent_id, *classified);", "send_guardian_push(\n agent_id,\n *classified);")),
+    ("send_guardian_push local send re-wrapped",
+     _wafter(SGP, "send_system_reserved(agent_id, cmd, kPush)", "send_system_reserved(\n agent_id,\n cmd,\n kPush)")),
     ("store_wired body split across lines with a comment",
      _wafter(FLOW_CTOR, "[this] { return static_cast<bool>(guaranteed_state_store_); }",
              "[this] {\n // the store pointer is reset by stop()\n return static_cast<bool>(guaranteed_state_store_);\n }")),
@@ -1806,8 +1892,8 @@ BENIGN_SERVER = [
      _wafter(FLOW_CTOR, "[this](const AuditEvent& ev) { if (audit_store_ && audit_store_->is_open()) (void)audit_store_->log(ev); }",
              "[this](const AuditEvent& event) { if (audit_store_ && audit_store_->is_open()) (void)audit_store_->log(event); }")),
     ("send_push parameters renamed",
-     _wafter(FLOW_CTOR, "[this](const std::string& agent_id, const std::string& command_id, const std::string& push_bytes) -> bool { auto classified = build_classified_command( yuzu::server::DispatchCaller{.system = true}, \"__guard__\", \"push_rules\", command_id, /*parameters=*/{}, push_bytes); if (classified && send_system_reserved( agent_id, *classified,",
-             "[this](const std::string& target, const std::string& cid, const std::string& bytes) -> bool { auto classified = build_classified_command( yuzu::server::DispatchCaller{.system = true}, \"__guard__\", \"push_rules\", cid, /*parameters=*/{}, bytes); if (classified && send_system_reserved( target, *classified,")),
+     _wafter(FLOW_CTOR, "[this](const std::string& agent_id, const std::string& command_id, const std::string& push_bytes) -> GuardianPushOutcome { auto classified = build_classified_command( yuzu::server::DispatchCaller{.system = true}, \"__guard__\", \"push_rules\", command_id, /*parameters=*/{}, push_bytes); if (!classified) return GuardianPushOutcome::undelivered; return send_guardian_push(agent_id, *classified);",
+             "[this](const std::string& target, const std::string& cid, const std::string& bytes) -> GuardianPushOutcome { auto classified = build_classified_command( yuzu::server::DispatchCaller{.system = true}, \"__guard__\", \"push_rules\", cid, /*parameters=*/{}, bytes); if (!classified) return GuardianPushOutcome::undelivered; return send_guardian_push(target, *classified);")),
     ("rule-mutation hook calling the wrapper through this->",
      _wafter("set_on_rule_mutation(",
              "invalidate_guardian_reconcile_caches();", "this->invalidate_guardian_reconcile_caches();")),
