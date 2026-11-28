@@ -71,9 +71,11 @@ guide in `docs/plugin-author-guide.md` (if present). In short:
 1. Copy `agents/plugins/example/` as a starting point.
 2. Implement your plugin class using the `YUZU_PLUGIN_EXPORT` macro
    from `plugin.hpp`.
-3. Add a `meson.build` that produces a shared library, assigns it to a
-   variable and appends it with `yuzu_plugin_libs += <variable>`, so the
-   Windows build waits for it before copying plugin DLLs (#8926).
+3. Add a `meson.build` that produces a shared library. A plugin built in
+   this tree also assigns it to a variable and appends it with
+   `yuzu_plugin_libs += <variable>`, so the Windows build waits for it before
+   copying plugin DLLs (#8926). A plugin built outside this tree skips the
+   append, because that list exists only in the root `meson.build`.
 4. Register the plugin directory with `subdir('agents/plugins/<name>')`
    in the root `meson.build` (or distribute your plugin independently and
    drop it into the agent's plugin directory at runtime).
