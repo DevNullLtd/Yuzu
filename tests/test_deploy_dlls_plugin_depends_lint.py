@@ -52,6 +52,9 @@ Not caught (green):
 Either way: block depth is read line by line, so a multi-line string with a
 line that starts with `if`, `foreach`, `endif` or `endforeach` skews it. That
 can fail a correct file, or pass an append that is really inside a block.
+
+Each check also runs against a mutated copy of the sources and must fail
+there, so a check that has stopped matching anything cannot pass silently.
 """
 
 import re
