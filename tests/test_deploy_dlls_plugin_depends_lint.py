@@ -128,7 +128,9 @@ def plugin_problems(d: str, text) -> list:
     code = strip_meson_comments(text)
     where = f"agents/plugins/{d}/meson.build"
     calls = LIB_CALL_RE.findall(code)
-    if len(calls) != 1:
+    if not calls:
+        return [f"{where}: no library call (shared_library, shared_module, both_libraries or library) found"]
+    if len(calls) > 1:
         return [f"{where}: expected one library call (shared_library, shared_module, both_libraries or library), found {len(calls)}; this lint allows one library per plugin directory, because deploy_dlls copies every DLL in it, so a second library needs this lint widened to check it too"]
     assigned = LIB_ASSIGN_RE.search(code)
     if not assigned:
@@ -266,6 +268,7 @@ class DeployDllsPluginDepends(unittest.TestCase):
             "append before the library is assigned": lambda t: append + t.replace(append, ""),
             "a second library": lambda t: t + "shared_library('wol2', name_prefix: '')\n",
             "meson.build missing": lambda t: None,
+            "no library call": lambda t: t.replace("= shared_library(", "= foo("),
             "unindented append inside if/endif": lambda t: t.replace(append, "if false\n" + append + "endif\n"),
             "append only in an else branch": lambda t: t.replace(append, "if false\nelse\n" + append + "endif\n"),
             "subdir_done before the append": lambda t: t.replace(append, "subdir_done()\n" + append),
