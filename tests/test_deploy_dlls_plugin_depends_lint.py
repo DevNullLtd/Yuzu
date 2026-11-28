@@ -118,12 +118,12 @@ def plugin_problems(d: str, text) -> list:
         return [f"{where}: expected one library call (shared_library, shared_module, both_libraries or library), found {len(calls)}; deploy_dlls copies every DLL in the directory, so each must be in yuzu_plugin_libs"]
     assigned = LIB_ASSIGN_RE.search(code)
     if not assigned:
-        return [f"{where}: the shared_library is not assigned to a variable, so it cannot be appended to yuzu_plugin_libs"]
+        return [f"{where}: the library call is not assigned to a variable, so it cannot be appended to yuzu_plugin_libs"]
     var = assigned.group(1)
     found = []
     if block_depth_at(code, assigned.start()) != 0:
         found.append(f"{where}: {var} is assigned inside an if/foreach block; put the condition on the plugin's subdir() in the root meson.build instead")
-    appends = list(re.finditer(rf"^[ \t]*yuzu_plugin_libs\s*\+=\s*(?:\[\s*{var}\s*,?\s*\]|{var})\s*$", code, re.M))
+    appends = list(re.finditer(rf"^[ \t]*yuzu_plugin_libs\s*\+=\s*(?:\[\s*{var}\s*(?:,\s*)?\]|{var})\s*$", code, re.M))
     top = [a for a in appends if block_depth_at(code, a.start()) == 0]
     if not top:
         if appends:
