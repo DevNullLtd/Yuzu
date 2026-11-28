@@ -4488,10 +4488,13 @@ bool ExecutionTracker::mark_targets_expected(const std::string& execution_id) {
             // An earlier send that never saved its list makes the run's list incomplete.
             "targets_incomplete = targets_incomplete OR attempt_open, attempt_open = true, "
             "deadline_at = GREATEST(deadline_at, extract(epoch FROM now())::bigint + " +
-            kWindowSql + ") WHERE id = $1 AND status = 'running'";
+            kWindowSql + ") WHERE id = $1 AND status = 'running' RETURNING id";
         pg::PgResult res =
             pg::exec_params(conn, sql.c_str(), std::vector<std::string>{execution_id});
-        return res.status() == PGRES_COMMAND_OK;
+        // Announced only if a running run was changed. An update that matched nothing (a
+        // cancelled or finished run, or no run) would otherwise let this send close or complete
+        // an earlier send's unsaved list.
+        return res.status() == PGRES_TUPLES_OK && PQntuples(res.get()) == 1;
     });
 }
 

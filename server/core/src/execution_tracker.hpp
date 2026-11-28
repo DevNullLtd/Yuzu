@@ -647,7 +647,8 @@ public:
     /// #2673: say that a dispatch for this running run is about to send. Until
     /// `record_dispatch_targets` completes, the run cannot finish `succeeded`, and it has a
     /// deadline so the sweep can end it. Called again before the earlier send's list was saved,
-    /// it marks the run's list incomplete for good. False on a store failure.
+    /// it marks the run's list incomplete for good. False when nothing was announced: a store
+    /// failure, no such run, or a run that is no longer running.
     [[nodiscard]] bool mark_targets_expected(const std::string& execution_id);
 
     /// #2673: record who one dispatch was meant for and what happened to each, and set the run's

@@ -6067,6 +6067,66 @@ TEST_CASE("dispatch announcement: a send that could not announce itself neither 
     }
 }
 
+TEST_CASE("dispatch announcement: a re-drive against a run that is no longer running cannot "
+          "cover for an earlier unsaved send",
+          "[pg][execution_tracker][coverage]") {
+    StuckExecPg db;
+    auto& t = db.tracker();
+    auto exec = make_execution();
+    exec.expects_targets = true;
+    auto id = t.create_execution(exec);
+    REQUIRE(id.has_value());
+    const auto flag = [&](const std::string& column) {
+        auto conn = db.pool().acquire();
+        REQUIRE(conn);
+        auto res = pg::exec_params(
+            conn.get(),
+            ("SELECT " + column + " FROM execution_tracker.executions WHERE id = $1").c_str(),
+            std::vector<std::string>{*id});
+        REQUIRE(res.status() == PGRES_TUPLES_OK);
+        REQUIRE(PQntuples(res.get()) == 1);
+        return std::string(PQgetvalue(res.get(), 0, 0)) == "t";
+    };
+    const std::vector<DispatchTarget> first{{"a", TargetDisposition::Contacted}};
+    const std::vector<DispatchTarget> redrive{{"a", TargetDisposition::Contacted},
+                                              {"c", TargetDisposition::Contacted}};
+    REQUIRE(t.mark_targets_expected(*id)); // attempt one: saved
+    REQUIRE(t.record_dispatch_targets(*id, first, false));
+    REQUIRE(t.mark_targets_expected(*id)); // attempt two: reached more, never saved
+
+    for (const bool cancelled : {true, false}) {
+        DYNAMIC_SECTION((cancelled ? "cancelled run" : "finished run")) {
+            if (cancelled) {
+                REQUIRE(t.mark_cancelled(*id, "admin"));
+            } else {
+                REQUIRE(t.set_agents_targeted(*id, 1));
+                report(t, *id, "a", "success");
+                REQUIRE(status_of(t, *id) == "completed");
+            }
+            REQUIRE(flag("attempt_open"));
+            CHECK_FALSE(t.mark_targets_expected(*id));
+
+            DispatchAnnouncement send(&t, *id, "test");
+            SECTION("a re-drive that reaches nobody leaves the send open") {
+                send.close_if_empty(true);
+                CHECK(flag("attempt_open"));
+                CHECK_FALSE(coverage_of(t, *id).recorded);
+            }
+            SECTION("a re-drive that reaches devices saves an incomplete list") {
+                REQUIRE(send.record(redrive, false, /*partial_list=*/false));
+                CHECK(flag("targets_incomplete"));
+                CHECK_FALSE(coverage_of(t, *id).recorded);
+            }
+        }
+    }
+}
+
+TEST_CASE("ExecutionTracker coverage: only a running run can be announced",
+          "[pg][execution_tracker][coverage]") {
+    StuckExecPg db;
+    CHECK_FALSE(db.tracker().mark_targets_expected("no-such-run"));
+}
+
 TEST_CASE("dispatch announcement: every fan-out that records targets goes through it",
           "[execution_tracker][coverage]") {
     // Wiring pin: the rules above hold for a fan-out only while it uses the one copy. Counted in

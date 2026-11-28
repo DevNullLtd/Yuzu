@@ -6,8 +6,8 @@
 // the software-sync push), so the rules exist once:
 //   1. announce BEFORE anything is sent, so an unrecorded send cannot let the run read
 //      `succeeded`;
-//   2. only a send whose announcement was stored may close an attempt that named nobody: an open
-//      attempt it did not announce is somebody else's;
+//   2. only a send whose announcement was stored (on a run still running) may close an attempt
+//      that named nobody: an open attempt it did not announce is somebody else's;
 //   3. a list saved by an unannounced send is marked incomplete: it cannot tell whether an
 //      earlier list was never saved.
 // There is deliberately no destructor action: a send that throws must leave the attempt open.
@@ -32,7 +32,8 @@ public:
           caller_(caller),
           announced_(tracker_ != nullptr && tracker_->mark_targets_expected(execution_id_)) {
         if (tracked() && !announced_)
-            spdlog::warn("{}: could not mark execution_id={} as awaiting its target list",
+            spdlog::warn("{}: execution_id={} was not marked as awaiting its target list (not "
+                         "running, or the write failed); this send's list is saved as incomplete",
                          caller_, execution_id_);
     }
     DispatchAnnouncement(const DispatchAnnouncement&) = delete;
