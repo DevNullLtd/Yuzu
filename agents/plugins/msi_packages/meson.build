@@ -21,3 +21,5 @@ msi_packages_plugin_lib = shared_library(
   install: true,
   install_dir: get_option('libdir') / 'yuzu' / 'plugins',
 )
+# deploy_dlls (root meson.build) waits for every library in this list (#8926).
+yuzu_plugin_libs += msi_packages_plugin_lib

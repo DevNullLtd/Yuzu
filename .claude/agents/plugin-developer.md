@@ -25,7 +25,7 @@ You implement new plugins for roadmap phases 4-7, maintain the SDK ABI boundary,
 ## Key Files
 
 - `agents/plugins/` — All 29+ plugins
-  - Each plugin: `agents/plugins/<name>/` with `src/*.cpp` and a `meson.build`, registered in the root `meson.build`
+  - Each plugin: `agents/plugins/<name>/` with `src/*.cpp` and a `meson.build`, registered in the root `meson.build`. The plugin's `meson.build` assigns its `shared_library` to a variable and appends it to `yuzu_plugin_libs`, which the Windows `deploy_dlls` target depends on (#8926; `tests/test_deploy_dlls_plugin_depends_lint.py`). Both lines sit outside any `if`/`foreach` block and the file never calls `subdir_done()`; OS gating goes on the plugin's root `subdir()` (`docs/user-manual/agent-plugins.md` step 3)
 - `sdk/include/yuzu/plugin.h` — Stable C ABI (DO NOT BREAK)
 - `sdk/include/yuzu/plugin.hpp` — C++ CRTP wrapper
 - `sdk/include/yuzu/sdk_utilities.hpp` + `agents/core/src/sdk_utilities.cpp` — SDK utility functions (the header holds the implementation; the `.cpp` holds the `YUZU_EXPORT` C ABI wrappers `plugin.h` declares)
