@@ -6121,6 +6121,68 @@ TEST_CASE("dispatch announcement: a re-drive against a run that is no longer run
     }
 }
 
+TEST_CASE("dispatch announcement: a send on a finished run that stops before saving leaves the "
+          "list incomplete",
+          "[pg][execution_tracker][coverage]") {
+    StuckExecPg db;
+    auto& t = db.tracker();
+    auto exec = make_execution();
+    exec.expects_targets = true;
+    auto id = t.create_execution(exec);
+    REQUIRE(id.has_value());
+    const auto incomplete = [&] {
+        auto conn = db.pool().acquire();
+        REQUIRE(conn);
+        auto res = pg::exec_params(
+            conn.get(),
+            "SELECT targets_incomplete FROM execution_tracker.executions WHERE id = $1",
+            std::vector<std::string>{*id});
+        REQUIRE(res.status() == PGRES_TUPLES_OK);
+        REQUIRE(PQntuples(res.get()) == 1);
+        return std::string(PQgetvalue(res.get(), 0, 0)) == "t";
+    };
+    REQUIRE(t.mark_targets_expected(*id));
+    REQUIRE(t.record_dispatch_targets(*id, {{"a", TargetDisposition::Contacted}}, false));
+    REQUIRE(t.set_agents_targeted(*id, 1));
+
+    for (const bool cancelled : {true, false}) {
+        DYNAMIC_SECTION((cancelled ? "cancelled run" : "finished run")) {
+            if (cancelled)
+                REQUIRE(t.mark_cancelled(*id, "admin"));
+            else
+                report(t, *id, "a", "success");
+            REQUIRE(status_of(t, *id) == (cancelled ? "cancelled" : "succeeded"));
+            REQUIRE(coverage_of(t, *id).recorded);
+            REQUIRE_FALSE(incomplete());
+            // Announced, then nothing: the send threw, or the process stopped.
+            DispatchAnnouncement send(&t, *id, "test");
+            CHECK(incomplete());
+            CHECK_FALSE(coverage_of(t, *id).recorded);
+        }
+    }
+}
+
+TEST_CASE("ExecutionTracker coverage: announcing leaves a finished run that tracks no targets "
+          "alone",
+          "[pg][execution_tracker][coverage]") {
+    StuckExecPg db;
+    auto& t = db.tracker();
+    auto id = t.create_execution(make_execution());
+    REQUIRE(id.has_value());
+    REQUIRE(t.mark_cancelled(*id, "admin"));
+    CHECK_FALSE(t.mark_targets_expected(*id));
+    auto conn = db.pool().acquire();
+    REQUIRE(conn);
+    auto res = pg::exec_params(conn.get(),
+                               "SELECT targets_incomplete, targets_state FROM "
+                               "execution_tracker.executions WHERE id = $1",
+                               std::vector<std::string>{*id});
+    REQUIRE(res.status() == PGRES_TUPLES_OK);
+    REQUIRE(PQntuples(res.get()) == 1);
+    CHECK(std::string(PQgetvalue(res.get(), 0, 0)) == "f");
+    CHECK(std::string(PQgetvalue(res.get(), 0, 1)).empty());
+}
+
 TEST_CASE("ExecutionTracker coverage: only a running run can be announced",
           "[pg][execution_tracker][coverage]") {
     StuckExecPg db;

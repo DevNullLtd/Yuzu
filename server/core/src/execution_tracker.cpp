@@ -4480,7 +4480,8 @@ bool ExecutionTracker::record_dispatch_targets(const std::string& execution_id,
 bool ExecutionTracker::mark_targets_expected(const std::string& execution_id) {
     if (!open_)
         return false;
-    return pool_.with_txn_for(kWriteTimeout, [&](PGconn* conn) -> bool {
+    bool announced = false;
+    const bool committed = pool_.with_txn_for(kWriteTimeout, [&](PGconn* conn) -> bool {
         const std::string sql =
             "UPDATE execution_tracker.executions SET "
             "targets_state = CASE WHEN targets_state = '' THEN 'expected' ELSE targets_state "
@@ -4491,11 +4492,25 @@ bool ExecutionTracker::mark_targets_expected(const std::string& execution_id) {
             kWindowSql + ") WHERE id = $1 AND status = 'running' RETURNING id";
         pg::PgResult res =
             pg::exec_params(conn, sql.c_str(), std::vector<std::string>{execution_id});
+        if (res.status() != PGRES_TUPLES_OK)
+            return false;
         // Announced only if a running run was changed. An update that matched nothing (a
         // cancelled or finished run, or no run) would otherwise let this send close or complete
         // an earlier send's unsaved list.
-        return res.status() == PGRES_TUPLES_OK && PQntuples(res.get()) == 1;
+        announced = PQntuples(res.get()) == 1;
+        if (announced)
+            return true;
+        // A finished run takes no open attempt, so nothing else would be written before this
+        // send: say now that its list may be short, in case it stops before saving it. This
+        // write must commit although nothing was announced.
+        pg::PgResult late = pg::exec_params(
+            conn,
+            "UPDATE execution_tracker.executions SET targets_incomplete = true "
+            "WHERE id = $1 AND status <> 'running' AND targets_state <> ''",
+            std::vector<std::string>{execution_id});
+        return late.status() == PGRES_COMMAND_OK;
     });
+    return committed && announced;
 }
 
 bool ExecutionTracker::close_empty_attempt(const std::string& execution_id) {

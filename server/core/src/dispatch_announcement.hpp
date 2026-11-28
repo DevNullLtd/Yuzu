@@ -9,7 +9,8 @@
 //   2. only a send whose announcement was stored (on a run still running) may close an attempt
 //      that named nobody: an open attempt it did not announce is somebody else's;
 //   3. a list saved by an unannounced send is marked incomplete: it cannot tell whether an
-//      earlier list was never saved.
+//      earlier list was never saved. A tracked run that is no longer running is marked
+//      incomplete by the announcement itself, so a send that stops before saving is covered.
 // There is deliberately no destructor action: a send that throws must leave the attempt open.
 
 #include "execution_tracker.hpp"
@@ -33,7 +34,7 @@ public:
           announced_(tracker_ != nullptr && tracker_->mark_targets_expected(execution_id_)) {
         if (tracked() && !announced_)
             spdlog::warn("{}: execution_id={} was not marked as awaiting its target list (not "
-                         "running, or the write failed); this send's list is saved as incomplete",
+                         "running, or the write failed); a list this send saves is incomplete",
                          caller_, execution_id_);
     }
     DispatchAnnouncement(const DispatchAnnouncement&) = delete;
