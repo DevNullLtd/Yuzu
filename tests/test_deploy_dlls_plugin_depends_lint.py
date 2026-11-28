@@ -262,7 +262,8 @@ class DeployDllsPluginDepends(unittest.TestCase):
             "append indented under a condition": lambda t: t.replace(append, "if false\n  " + append + "endif\n"),
             "append names another variable": lambda t: t.replace(append, "yuzu_plugin_libs += wol_deps\n"),
             "library not assigned": lambda t: t.replace("wol_plugin_lib = shared_library(", "shared_library("),
-            "list reset": lambda t: t.replace(append, "yuzu_plugin_libs = [wol_plugin_lib]\n"),
+            "list reset after the append": lambda t: t.replace(append, append + "yuzu_plugin_libs = [wol_plugin_lib]\n"),
+            "append before the library is assigned": lambda t: append + t.replace(append, ""),
             "a second library": lambda t: t + "shared_library('wol2', name_prefix: '')\n",
             "meson.build missing": lambda t: None,
             "unindented append inside if/endif": lambda t: t.replace(append, "if false\n" + append + "endif\n"),
@@ -277,6 +278,19 @@ class DeployDllsPluginDepends(unittest.TestCase):
             with self.subTest(mutation=name):
                 self.assertIn(append, read_plugin_meson_from_tree("wol"), "mutation anchor not found")
                 self.assertNotEqual(problems(self.meson, reader_with("wol", transform)), [], f"{name!r} was not caught")
+
+    def test_discovery_mutations_are_caught(self):
+        # Each mutation trips only the check it targets: an empty on-disk set
+        # switches off the parity check, which would otherwise also fire.
+        too_few = re.sub(r"subdir\(\s*'agents/plugins/", "subdir('agents/plug_moved/", self.meson)
+        self.assertNotEqual(too_few, self.meson, "too-few mutation no longer changes meson.build")
+        self.assertNotEqual(problems(too_few, read_plugin_meson_from_tree, on_disk_dirs=[]), [],
+                            "a discovery that matches too few subdirs was not caught")
+        line = "  subdir('agents/plugins/wol')\n"
+        self.assertIn(line, self.meson, "duplicate-subdir anchor not found")
+        duplicated = self.meson.replace(line, line + line, 1)
+        self.assertNotEqual(problems(duplicated, read_plugin_meson_from_tree), [],
+                            "a plugin subdir listed twice was not caught")
 
     def test_list_form_append_is_accepted(self):
         def reader(d):
