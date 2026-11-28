@@ -1,0 +1,573 @@
+## Component Inventory Definitions
+## Reports Java archives and the libraries nested inside them (action scan), versioned shared
+## libraries (action native), installed Python distributions (action python) and Node packages
+## (action node), found by reading application trees. Read-only, zero subprocess.
+## Plugin: component_inventory | Actions: scan, native, python, node (one definition each, in that order)
+##
+## ---- scan ----
+##
+## SHIPPED LEGS: Linux, macOS and Windows, machine-wide roots only (the root list holds no per-user
+## location). The Windows leg is declared supported on the measured scope (one host, Windows 11 build 26200,
+## elevated administrator session) and may answer constrained when a directory is refused or a bound is reached.
+##   Linux:   /opt, /usr/share/java, /usr/lib/jvm, /usr/local/lib, /usr/local/share and
+##            /usr/share/maven.
+##   macOS:   /Applications, /Library/Java, /usr/local and /opt/homebrew.
+##   Windows: the Program Files and Program Files (x86) directories, from the shell's known-folder
+##            lookup (never an environment variable), on fixed local drives only. Paths are written
+##            with `/` separators (C:/Program Files/app/lib/app.jar).
+##   Linux and macOS: a root that is missing is not an error; a root reached through a link or
+##            sitting on a network mount is dropped and reported. No link is followed at any path
+##            component, so a link inside a tree is not entered or listed; that is reported too
+##            (`link_skipped`). Network mounts are read from /proc/<pid>/mountinfo (Linux) or
+##            getmntinfo_r_np (macOS).
+##   Windows: no reparse point (junction, symbolic link, mount point) is followed at any path
+##            component, and one met inside a tree is counted (`link_skipped`) and never opened. A root
+##            on a drive that is not a fixed local disk (a mapped network drive, removable or optical
+##            media) is dropped and reported as `network_fs_skipped`. A root that cannot be listed, or is itself a
+##            reparse point, is refused and answers constrained (`dir_unreadable`; the POSIX legs drop a
+##            missing root silently); a Program Files location
+##            the shell cannot name answers constrained (`mount_table_unreadable`). The WindowsApps
+##            directory directly under each root (the Store packages) is not entered, matched by
+##            exact path without regard to case; it is counted and reported as
+##            `package_tree_skipped`. Python and Node components are not read on Windows yet.
+## Candidates are files ending .jar, .war or .ear. For each one the archive's central directory
+## is read in-process; the libraries nested one level deep (BOOT-INF/lib/, WEB-INF/lib/ or lib/)
+## are listed from that directory alone, none is unpacked. The version is the file name's; the
+## archive's pom.properties or manifest is read when the name gave none or is ambiguous, and
+## replaces the name's split only when the name carries that version. A nested row, and an archive
+## with no pom or manifest, take the file name's word; a qualifier word the parser does not know
+## reads as a classifier (nested guava 31.1-jre reads 31.1).
+##
+## BOUNDS: 400,000 directory entries, 45 seconds for the whole scan, 32 directory levels, 50,000
+## entries per directory listing, 3,000 rows per top-level application folder, 20,000 rows in all,
+## a 16 MiB archive directory, 64 KiB per version entry read.
+##
+## Output: one `status|scan|<level>|<tokens>` row FIRST, then zero or more
+## `comp|java|<name>|<version>|<version_source>|<path>|<size>|<mtime>|<anchor_app>` rows.
+## A `supported` status means the scan finished with no bound reached and every directory and
+## archive it opened read in full; it does not mean nothing is installed outside the roots above.
+## What it passed over on purpose rides a `supported` status row as an informational token, never
+## silent: `root_link_skipped`, `link_skipped`, `network_fs_skipped`, `version_unreadable` and, on
+## Windows, `package_tree_skipped` (the WindowsApps directories above).
+## A `constrained` status means a bound was hit, a directory
+## or an archive could not be read in full, or the mount table was unreadable: the list may be
+## incomplete, and it names its one cause. The rows already read are still returned, but when time
+## runs out archives not yet read give no rows, and a walk that used the whole budget returns none.
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: crossplatform.components.scan
+  displayName: Component Inventory
+  version: 1.0.0
+  description: >
+    Reports Java archives (.jar, .war, .ear) and the libraries nested one level inside them,
+    found under the machine-wide application roots: one row per archive and per nested library
+    (name, version and where the version came from, path, size, modification time and the
+    application folder it sits under). Linux, macOS and Windows (Program Files and Program Files
+    (x86) on fixed drives, WindowsApps not entered; the Windows leg was measured on one host,
+    Windows 11 build 26200, in an elevated administrator session); per-user locations are not read. No process is started, no reparse
+    point is followed on Windows and no nested archive is unpacked. A
+    `supported` status means the scan finished and read everything it opened in full, naming in a
+    token any link, network mount or package tree it passed over; a `constrained` status means a bound was hit
+    or something could not be read in full, so the list may be incomplete, and it names its one
+    cause. When time runs out, archives not yet read give no rows, and a walk that used the whole
+    budget returns none. Use it for software no package manager owns; for packaged applications
+    use crossplatform.software.inventory and for installed Java runtimes crossplatform.runtimes.jvm.
+    `supported` with no component rows means none was found at the roots, not that none is
+    installed. The result is a live read made when the instruction runs, not a stored snapshot,
+    at a cost of up to 45 seconds and 400,000 directory entries, and it cannot be cancelled once
+    started. Terminal causes (a repeat gives the same answer): budget_entries, section_rows,
+    anchor_rows, depth, dir_truncated, archive_unenumerated. Retryable causes: budget_time,
+    dir_unreadable, archive_changed, mount_table_unreadable, internal_error. The version comes from
+    the file name; the archive corrects it only when the name carries the archive's version.
+  tags: [components, java, inventory]
+
+spec:
+  type: question
+  platforms: [darwin, linux, windows]
+
+  execution:
+    plugin: component_inventory
+    action: scan
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    # status|scan|<level>|<tokens or ->   (always first)
+    # comp|java|<name>|<version>|<version_source>|<path>|<size>|<mtime>|<anchor_app>
+    columns:
+      - name: row_kind
+        type: string
+        description: 'Row shape discriminator (the wire row''s leading tag). Values: status (exactly one per result, always first), comp (one per archive or nested library found).'
+        values: [status, comp]
+        example: comp
+        platforms: [darwin, linux, windows]
+      - name: kind
+        type: string
+        description: 'Component kind. Values: java. Status rows: the action name (scan).'
+        example: java
+        platforms: [darwin, linux, windows]
+      - name: name
+        type: string
+        description: 'Artifact name taken from the file name, without the version and extension (log4j-core-2.17.1.jar reads log4j-core). A name with bytes outside printable ASCII is kept with those bytes shown as ?; pipes, backslashes and line breaks are escaped or flattened on the wire. Status rows: the level (supported, constrained or unsupported).'
+        example: log4j-core
+        platforms: [darwin, linux, windows]
+      - name: version
+        type: string
+        description: 'Version from the file name, corrected by the archive''s pom.properties or MANIFEST.MF only when the file name carries that version; when the name gives none, from pom.properties, else MANIFEST.MF; empty when none gives one. Nested libraries take it from the entry name only. A pre-release or build qualifier (rc, beta, M1, snapshot, a build number) stays in it. Status rows: the comma-joined cause tokens, or -.'
+        example: 2.17.1
+        platforms: [darwin, linux, windows]
+      - name: version_source
+        type: string
+        description: 'Where the version came from. Values: filename, pom, manifest, unreadable (no source gave a version; the row is still listed and the scan is not made incomplete by it).'
+        values: [filename, pom, manifest, unreadable]
+        example: filename
+        platforms: [darwin, linux, windows]
+      - name: path
+        type: string
+        description: 'Absolute path of the archive; a nested library is <archive path>!<entry name>. On Windows the separators are / (C:/Program Files/app/lib/app.war). A NUL, another control character or a byte outside valid UTF-8 in a folder, file or entry name is shown as ?.'
+        example: /opt/app/lib/app.war!WEB-INF/lib/log4j-core-2.17.1.jar
+        platforms: [darwin, linux, windows]
+      - name: size
+        type: int64
+        description: 'Size in bytes: the archive file size, or the nested entry''s uncompressed size.'
+        example: "1789769"
+        platforms: [darwin, linux, windows]
+      - name: mtime
+        type: int64
+        description: 'Modification time of the archive file as Unix seconds; a nested library carries its archive''s.'
+        example: "1700000000"
+        platforms: [darwin, linux, windows]
+      - name: anchor_app
+        type: string
+        description: 'First path component below the scanned root: the application folder the archive sits under (the file name itself when it sits directly in a root). A NUL, another control character or a byte outside valid UTF-8 in the name is shown as ?.'
+        example: app
+        platforms: [darwin, linux, windows]
+
+  readablePayload: "Scan application trees for Java components"
+
+  gather:
+    ttlSeconds: 300
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 1.0.0
+    requiredPlugins: [component_inventory]
+
+status:
+  phase: active
+
+## ---- native ----
+## Versioned shared libraries shipped inside applications: ELF .so files on Linux, Mach-O .dylib
+## files on macOS, PE .dll files on Windows. Read-only, zero subprocess. SWITCHED OFF BY DEFAULT: the server refuses this
+## action until an operator enables it with PUT /api/v1/plugin-config/component_inventory/kill-switch
+## and action=native (an action-level row; component_inventory.scan is unaffected).
+##
+## SHIPPED LEGS: Linux, macOS and Windows, machine-wide roots only. The Windows leg is declared
+## supported on the measured scope (one host, Windows 11 build 26200, elevated administrator session)
+## and may answer constrained when a directory is refused or the row cap is reached.
+##   Linux:   /opt and /usr/local/lib. The package manager's own trees (/usr/lib and the other
+##            system library directories) are not walked at all.
+##   macOS:   /Applications, /usr/local and /opt/homebrew. The Homebrew package trees
+##            /usr/local/Cellar and /opt/homebrew/Cellar are not entered; they are counted and
+##            reported as the informational token `package_tree_skipped`, never skipped silently.
+##   Windows: the Program Files and Program Files (x86) directories, on fixed local drives. The
+##            WindowsApps directory under each (the Store packages) is not entered; it is counted
+##            and reported as `package_tree_skipped`.
+##   All:     the same root, link and network-mount rules as scan. Linux and macOS: a missing root
+##            is not an error, and a root reached through a link or on a network mount is dropped
+##            and reported. Windows: a root that cannot be listed, or is a reparse point, answers
+##            constrained (`dir_unreadable`), a Program Files location the shell cannot name answers
+##            `mount_table_unreadable`, and a root on a drive that is not a fixed local disk is
+##            dropped and reported. No link (on Windows: no reparse point) is followed at any
+##            path component.
+## Candidates are files named <stem>.so or <stem>.so.<digits and dots> (Linux), <stem>.dylib
+## (macOS) and <stem>.dll (Windows, the extension compared without regard to case; `.dll.mui` is not
+## a candidate). Each candidate is opened once and its header is read in-process by the shared bounded
+## readers within fixed bounds (at most 128 ELF program headers, 4,096 dynamic entries, 1,024
+## Mach-O load commands in 512 KiB; a universal file uses its first readable dynamic-library slice;
+## a PE's section table and its three-level resource directory, 256 KiB of version data).
+## The name and version a file declares are its own claim; no signature is checked. A file whose name matches
+## but whose header says it is not a shared library gives no row, whatever fails after that. A shared
+## library (or a file whose file header cannot be read whole) whose header
+## cannot be read inside those bounds still gives a row, named from its file name, with the version
+## the file name carries or `unreadable`. Extension-less macOS framework binaries are not read.
+## The name is the SONAME (Linux) or install name (macOS) without its .so or .dylib suffix and
+## version; on Windows it is the file name without its .dll extension. Linux: the version is the
+## file name's .so.<version> suffix, else the SONAME's suffix. macOS: the version is the Mach-O
+## current_version when it is not 0.0.0, else the file name's version (libfoo.1.2.dylib reads 1.2).
+## Windows: the version is the fixed file version of the PE's version resource (a.b.c.d, version_source
+## `pe`); a DLL with no version resource, or a fixed version of 0.0.0.0, is a row with an empty version
+## and `unreadable`, and a file named .dll without the MZ and PE signatures, or whose COFF header is
+## read and does not set IMAGE_FILE_DLL, gives no row.
+##
+## BOUNDS: 400,000 directory entries, 45 seconds for the whole scan, 32 directory levels, 50,000
+## entries per directory listing, 3,000 rows per top-level application folder, 5,000 rows in all.
+##
+## Output: one `status|native|<level>|<tokens>` row FIRST, then zero or more
+## `comp|native|<name>|<version>|<version_source>|<path>|<size>|<mtime>|<anchor_app>` rows.
+## A `supported` status means the scan finished with no bound reached; informational tokens ride it
+## (`root_link_skipped`, `link_skipped`, `network_fs_skipped`, `version_unreadable`,
+## `package_tree_skipped`). A `constrained` status names its one cause; the rows already read are
+## still returned. A reparse point on Windows (a junction, a symbolic link, and also a file stored
+## behind a reparse point such as a cloud placeholder) is counted in `link_skipped` and never read.
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: crossplatform.components.native
+  displayName: Native Library Inventory
+  version: 1.0.0
+  description: >
+    Reports versioned shared libraries (ELF .so on Linux, Mach-O .dylib on macOS, PE .dll on
+    Windows) shipped inside
+    applications under the machine-wide application roots: one row per library (name, version and
+    where the version came from, path, size, modification time and the application folder it sits
+    under), at most 5,000 rows. This action is switched off until an operator enables it with PUT
+    /api/v1/plugin-config/component_inventory/kill-switch and action=native; until then the server
+    refuses it. Linux reads /opt and /usr/local/lib and never the package manager's own trees;
+    macOS reads /Applications, /usr/local and /opt/homebrew and does not enter the Homebrew Cellar
+    trees, naming that in the package_tree_skipped token; Windows reads Program Files and Program
+    Files (x86) on fixed drives, takes the version from the file's fixed file version, does not
+    enter WindowsApps (also named in package_tree_skipped) and was measured on one host, Windows 11
+    build 26200, in an elevated administrator session. Extension-less macOS framework binaries are not read; per-user locations are not
+    read. No process is started and no reparse point is followed.
+    A `supported` status means the scan finished with no bound reached; a `constrained` status
+    means a bound was hit or something could not be read in full, so the list may be incomplete,
+    and it names its one cause. A library whose header cannot be read inside the fixed bounds still
+    gets a row from its file name. `supported` with no rows means none was found at those roots,
+    not that none is installed. The result is a live read made when the instruction runs, not a
+    stored snapshot, at a cost of up to 45 seconds and 400,000 directory entries, and it cannot be
+    cancelled once started. For Java archives use crossplatform.components.scan, and for packaged
+    applications crossplatform.software.inventory. Terminal causes (a repeat gives the same
+    answer): budget_entries, section_rows, anchor_rows, depth, dir_truncated. Retryable causes:
+    budget_time, dir_unreadable, archive_changed (a library changed or vanished while read),
+    mount_table_unreadable, internal_error.
+  tags: [components, native, inventory]
+
+spec:
+  type: question
+  platforms: [darwin, linux, windows]
+
+  execution:
+    plugin: component_inventory
+    action: native
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    # status|native|<level>|<tokens or ->   (always first)
+    # comp|native|<name>|<version>|<version_source>|<path>|<size>|<mtime>|<anchor_app>
+    columns:
+      - name: row_kind
+        type: string
+        description: 'Row shape discriminator (the wire row''s leading tag). Values: status (exactly one per result, always first), comp (one per shared library found).'
+        values: [status, comp]
+        example: comp
+        platforms: [darwin, linux, windows]
+      - name: kind
+        type: string
+        description: 'Component kind. Values: native. Status rows: the action name (native).'
+        example: native
+        platforms: [darwin, linux, windows]
+      - name: name
+        type: string
+        description: 'Library name: the SONAME (Linux) or install-name leaf (macOS) without its .so or .dylib suffix and version, or the file name''s equivalent when the library declares none (libssl.so.3 reads libssl); on Windows the file name without .dll. A name with bytes outside printable ASCII is kept with those bytes shown as ?; pipes, backslashes and line breaks are escaped or flattened on the wire. Status rows: the level (supported, constrained or unsupported).'
+        example: libssl
+        platforms: [darwin, linux, windows]
+      - name: version
+        type: string
+        description: 'Linux: the version in the file name (libssl.so.3.0.13 reads 3.0.13), else the SONAME suffix. macOS: the Mach-O current_version when it is not 0.0.0, else the version in the file name (libfoo.1.2.dylib reads 1.2). Windows: the fixed file version of the PE version resource (10.0.26100.1), unless it is 0.0.0.0. Empty when none gives one. Status rows: the comma-joined cause tokens, or -.'
+        example: 3.0.13
+        platforms: [darwin, linux, windows]
+      - name: version_source
+        type: string
+        description: 'Where the version came from. Values: filename, elf (the SONAME, Linux), macho (current_version, macOS), pe (the fixed file version, Windows), unreadable (no source gave a version, or the header could not be read inside the fixed bounds; the row is still listed and the scan is not made incomplete by it).'
+        values: [filename, elf, macho, pe, unreadable]
+        example: filename
+        platforms: [darwin, linux, windows]
+      - name: path
+        type: string
+        description: 'Absolute path of the library file. On Windows the separators are / (C:/Program Files/app/lib/app.dll). A NUL, another control character or a byte outside valid UTF-8 in a folder or file name is shown as ?.'
+        example: /opt/app/lib/libssl.so.3.0.13
+        platforms: [darwin, linux, windows]
+      - name: size
+        type: int64
+        description: 'Size of the library file in bytes.'
+        example: "3086784"
+        platforms: [darwin, linux, windows]
+      - name: mtime
+        type: int64
+        description: 'Modification time of the library file as Unix seconds.'
+        example: "1700000000"
+        platforms: [darwin, linux, windows]
+      - name: anchor_app
+        type: string
+        description: 'First path component below the scanned root: the application folder the library sits under (the file name itself when it sits directly in a root). A NUL, another control character or a byte outside valid UTF-8 in the name is shown as ?.'
+        example: app
+        platforms: [darwin, linux, windows]
+
+  readablePayload: "Scan application trees for native libraries"
+
+  gather:
+    ttlSeconds: 300
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 1.0.0
+    requiredPlugins: [component_inventory]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: crossplatform.components.python
+  displayName: Python Distribution Inventory
+  version: 1.0.0
+  description: >
+    Reports installed Python distributions found under the machine-wide interpreter and application
+    roots: one row per distribution (name, version and where the version came from, path of its
+    metadata file, size, modification time and the application folder it sits under). Linux reads
+    the python3 and python3.N directories of /usr/local/lib, and /opt in full; macOS reads
+    /Library/Frameworks/Python.framework/Versions and the python3.N directories of /opt/homebrew/lib
+    and /usr/local/lib. The system interpreter trees under /usr/lib are not read on Linux: the
+    package manager owns them and their distributions are already package rows. Only the first
+    16 KiB of a METADATA, PKG-INFO or single-file .egg-info is read, and nothing inside a
+    distribution's own source tree is listed. Per-user locations are not read; Windows is not read
+    yet. No process is started and no Python code is run. This action ships enabled and is dispatched
+    by an operator; it is not part of the daily report.
+    A `supported` status means the scan finished with no bound reached; a `constrained` status
+    means a bound was hit or something could not be read in full, so the list may be incomplete,
+    and it names its one cause. A metadata file that cannot be read gets a row anyway, with
+    version_source `unreadable`; that does not make the scan incomplete. The directories the walk
+    skips by design are not named on the status row; their count is logged by the plugin at info level. `supported`
+    with no rows means none was found at those roots, not that none is installed. The result is a
+    live read made when the instruction runs, not a stored snapshot, at a cost of up to 45 seconds
+    and 400,000 directory entries, and it cannot be cancelled once started. Terminal causes (a
+    repeat gives the same answer): budget_entries, section_rows, anchor_rows, depth, dir_truncated.
+    Retryable causes: budget_time, dir_unreadable, archive_changed (a file's size or modification
+    time changed while it was read), mount_table_unreadable, internal_error.
+  tags: [components, python, inventory]
+
+spec:
+  type: question
+  platforms: [darwin, linux]
+
+  execution:
+    plugin: component_inventory
+    action: python
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    # status|python|<level>|<tokens or ->   (always first)
+    # comp|python|<name>|<version>|<version_source>|<path>|<size>|<mtime>|<anchor_app>
+    columns:
+      - name: row_kind
+        type: string
+        description: 'Row shape discriminator (the wire row''s leading tag). Values: status (exactly one per result, always first), comp (one per distribution found).'
+        values: [status, comp]
+        example: comp
+        platforms: [darwin, linux]
+      - name: kind
+        type: string
+        description: 'Component kind. Values: python. Status rows: the action name (python).'
+        example: python
+        platforms: [darwin, linux]
+      - name: name
+        type: string
+        description: 'Distribution name from its metadata (Name: of a METADATA or PKG-INFO), else the name in the .dist-info or .egg-info directory name, else that directory or file name itself. A name with bytes outside printable ASCII is kept with those bytes shown as ?; pipes, backslashes and line breaks are escaped or flattened on the wire. Status rows: the level (supported, constrained or unsupported).'
+        example: requests
+        platforms: [darwin, linux]
+      - name: version
+        type: string
+        description: 'The Version: of its metadata, else the version in the .dist-info or .egg-info directory name (requests-2.31.0.dist-info reads 2.31.0). Empty when none gives one. Status rows: the comma-joined cause tokens, or -.'
+        example: 2.31.0
+        platforms: [darwin, linux]
+      - name: version_source
+        type: string
+        description: 'Where the version came from. Values: metadata (the Version: header), filename (the directory name carried it), unreadable (neither gave a version; the row is still listed and the scan is not made incomplete by it).'
+        values: [metadata, filename, unreadable]
+        example: metadata
+        platforms: [darwin, linux]
+      - name: path
+        type: string
+        description: 'Absolute path of the distribution metadata file. A NUL, another control character or a byte outside valid UTF-8 in a folder or file name is shown as ?.'
+        example: /usr/local/lib/python3.12/site-packages/requests-2.31.0.dist-info/METADATA
+        platforms: [darwin, linux]
+      - name: size
+        type: int64
+        description: 'Size of the distribution metadata file in bytes.'
+        example: "6300"
+        platforms: [darwin, linux]
+      - name: mtime
+        type: int64
+        description: 'Modification time of the distribution metadata file as Unix seconds.'
+        example: "1700000000"
+        platforms: [darwin, linux]
+      - name: anchor_app
+        type: string
+        description: 'First path component below the scanned root: the application folder the distribution metadata file sits under (the folder name itself when it sits directly in a root). A NUL, another control character or a byte outside valid UTF-8 in the name is shown as ?.'
+        example: site-packages
+        platforms: [darwin, linux]
+
+  readablePayload: "Scan interpreter trees for Python distributions"
+
+  gather:
+    ttlSeconds: 300
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 1.0.0
+    requiredPlugins: [component_inventory]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: crossplatform.components.node
+  displayName: Node Package Inventory
+  version: 1.0.0
+  description: >
+    Reports installed Node packages found under the machine-wide module roots: one row per package
+    (name, version and where the version came from, path of its package.json, size, modification
+    time and the application folder it sits under). Linux reads /usr/lib/node_modules,
+    /usr/local/lib/node_modules and /opt; macOS reads /opt/homebrew/lib/node_modules,
+    /usr/local/lib/node_modules and /Applications. Packages nested inside other packages'
+    node_modules are listed down to 8 levels of node_modules; a package's own source tree and .bin
+    are not read. At most 64 KiB of a package.json is read. Packages packed into an asar archive and
+    per-user installs are not read; Windows is not read yet. No process is started and no script is
+    run. This action ships enabled and is dispatched by an operator; it is not part of the daily
+    report.
+    A `supported` status means the scan finished with no bound reached; a `constrained` status
+    means a bound was hit or something could not be read in full, so the list may be incomplete,
+    and it names its one cause. A metadata file that cannot be read gets a row anyway, with
+    version_source `unreadable`; that does not make the scan incomplete. The directories the walk
+    skips by design are not named on the status row; their count is logged by the plugin at info level. `supported`
+    with no rows means none was found at those roots, not that none is installed. The result is a
+    live read made when the instruction runs, not a stored snapshot, at a cost of up to 45 seconds
+    and 400,000 directory entries, and it cannot be cancelled once started. Terminal causes (a
+    repeat gives the same answer): budget_entries, section_rows, anchor_rows, depth, dir_truncated.
+    Retryable causes: budget_time, dir_unreadable, archive_changed (a file's size or modification
+    time changed while it was read), mount_table_unreadable, internal_error.
+  tags: [components, node, inventory]
+
+spec:
+  type: question
+  platforms: [darwin, linux]
+
+  execution:
+    plugin: component_inventory
+    action: node
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    # status|node|<level>|<tokens or ->   (always first)
+    # comp|node|<name>|<version>|<version_source>|<path>|<size>|<mtime>|<anchor_app>
+    columns:
+      - name: row_kind
+        type: string
+        description: 'Row shape discriminator (the wire row''s leading tag). Values: status (exactly one per result, always first), comp (one per package found).'
+        values: [status, comp]
+        example: comp
+        platforms: [darwin, linux]
+      - name: kind
+        type: string
+        description: 'Component kind. Values: node. Status rows: the action name (node).'
+        example: node
+        platforms: [darwin, linux]
+      - name: name
+        type: string
+        description: 'Package name from its package.json, else the directory name (scoped packages keep their @scope/). A name with bytes outside printable ASCII is kept with those bytes shown as ?; pipes, backslashes and line breaks are escaped or flattened on the wire. Status rows: the level (supported, constrained or unsupported).'
+        example: express
+        platforms: [darwin, linux]
+      - name: version
+        type: string
+        description: 'The version field of its package.json. Empty when none gives one. Status rows: the comma-joined cause tokens, or -.'
+        example: 4.19.2
+        platforms: [darwin, linux]
+      - name: version_source
+        type: string
+        description: 'Where the version came from. Values: package_json (the file was read and parsed; the version may still be empty when it declares none), unreadable (the file could not be read in full, is not a JSON object or nests too deep; the row is still listed, named from the directory, and the scan is not made incomplete by it).'
+        values: [package_json, unreadable]
+        example: package_json
+        platforms: [darwin, linux]
+      - name: path
+        type: string
+        description: 'Absolute path of the package.json. A NUL, another control character or a byte outside valid UTF-8 in a folder or file name is shown as ?.'
+        example: /usr/local/lib/node_modules/express/package.json
+        platforms: [darwin, linux]
+      - name: size
+        type: int64
+        description: 'Size of the package.json in bytes.'
+        example: "1800"
+        platforms: [darwin, linux]
+      - name: mtime
+        type: int64
+        description: 'Modification time of the package.json as Unix seconds.'
+        example: "1700000000"
+        platforms: [darwin, linux]
+      - name: anchor_app
+        type: string
+        description: 'First path component below the scanned root: the application folder the package.json sits under (the folder name itself when it sits directly in a root). A NUL, another control character or a byte outside valid UTF-8 in the name is shown as ?.'
+        example: express
+        platforms: [darwin, linux]
+
+  readablePayload: "Scan module roots for Node packages"
+
+  gather:
+    ttlSeconds: 300
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 1.0.0
+    requiredPlugins: [component_inventory]
+
+status:
+  phase: active

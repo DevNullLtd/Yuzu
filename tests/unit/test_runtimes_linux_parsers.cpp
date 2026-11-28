@@ -45,6 +45,7 @@
 #include "runtimes_linux_parsers.hpp"
 #include "runtimes_parsers.hpp"
 
+#include "runtimes_fixture_tree.hpp" // manifest decoder + materializer (shared with the python tests)
 #include "test_helpers.hpp" // yuzu::test::TempDir
 
 #include <cstddef>
@@ -74,84 +75,9 @@
 namespace rt = yuzu::runtimes;
 namespace lnx = yuzu::runtimes::lnx;
 namespace fs = std::filesystem;
+using namespace runtimes_fixture;
 
 namespace {
-
-// -- manifest line decoder (pure; portable) ----------------------------------------
-
-enum class ManifestKind { text, symlink, directory };
-
-struct ManifestEntry {
-    std::string rel;
-    ManifestKind kind = ManifestKind::text;
-    std::string payload; // decoded text | link target | (unused)
-};
-
-enum class LineOutcome { skipped, entry, malformed };
-
-struct ParsedLine {
-    LineOutcome outcome = LineOutcome::skipped;
-    ManifestEntry entry;
-    std::string error;
-};
-
-/// Decodes the escapes of a `T:` payload (\n, \t, \\). nullopt on a dangling
-/// backslash or an unknown escape.
-std::optional<std::string> unescape_text(std::string_view s) {
-    std::string out;
-    for (std::size_t i = 0; i < s.size(); ++i) {
-        if (s[i] != '\\') {
-            out += s[i];
-            continue;
-        }
-        if (++i >= s.size()) return std::nullopt;
-        switch (s[i]) {
-        case 'n':  out += '\n'; break;
-        case 't':  out += '\t'; break;
-        case '\\': out += '\\'; break;
-        default:   return std::nullopt;
-        }
-    }
-    return out;
-}
-
-ParsedLine parse_manifest_line(std::string line) {
-    ParsedLine r;
-    if (!line.empty() && line.back() == '\r') line.pop_back(); // CRLF checkout tolerance
-    if (line.empty() || line.front() == '#') return r;
-    const auto bad = [&r](std::string msg) {
-        r.outcome = LineOutcome::malformed;
-        r.error = std::move(msg);
-        return r;
-    };
-    const auto tab = line.find('\t');
-    if (tab == std::string::npos || tab == 0) return bad("no tab separator: " + line);
-    r.entry.rel = line.substr(0, tab);
-    if (r.entry.rel.front() == '/' || r.entry.rel.find("..") != std::string::npos)
-        return bad("path must be relative and inside the tree: " + r.entry.rel);
-    const std::string payload = line.substr(tab + 1);
-    if (payload.size() < 2 || payload[1] != ':') return bad("payload lacks a kind prefix: " + line);
-    const std::string body = payload.substr(2);
-    switch (payload[0]) {
-    case 'T': {
-        auto t = unescape_text(body);
-        if (!t) return bad("bad escape in T: payload: " + line);
-        r.entry.kind = ManifestKind::text;
-        r.entry.payload = std::move(*t);
-        break;
-    }
-    case 'L':
-        r.entry.kind = ManifestKind::symlink;
-        r.entry.payload = body;
-        break;
-    case 'D': r.entry.kind = ManifestKind::directory; break;
-    default: return bad("unknown payload kind: " + line);
-    }
-    if (r.entry.kind == ManifestKind::symlink && r.entry.payload.empty())
-        return bad("empty L: payload: " + line);
-    r.outcome = LineOutcome::entry;
-    return r;
-}
 
 bool token_matches_leg_grammar(std::string_view t) {
     // ^linux:[a-z0-9_]+(:[a-z0-9_]+)*$
@@ -347,54 +273,10 @@ TEST_CASE("runtimes linux: a path touches a network mount when on, under or cont
 
 namespace {
 
-/// Materializes tree.manifest under `root`. Returns false with `error` set on any
-/// failure so the caller can REQUIRE with a useful message.
+/// Materializes a manifest from the fixture directory (default tree.manifest) under `root`.
 bool materialize_manifest(const fs::path& root, std::string& error,
                           const char* manifest_name = "tree.manifest") {
-    const auto manifest_file = fixture_dir() / manifest_name;
-    std::ifstream in(manifest_file, std::ios::binary);
-    if (!in) {
-        error = "could not open " + manifest_file.string();
-        return false;
-    }
-    std::string line;
-    while (std::getline(in, line)) {
-        const auto p = parse_manifest_line(line);
-        if (p.outcome == LineOutcome::skipped) continue;
-        if (p.outcome == LineOutcome::malformed) {
-            error = p.error;
-            return false;
-        }
-        const fs::path target = root / p.entry.rel;
-        std::error_code ec;
-        fs::create_directories(p.entry.kind == ManifestKind::directory ? target
-                                                                        : target.parent_path(),
-                               ec);
-        if (ec) {
-            error = "create_directories failed for " + target.string() + ": " + ec.message();
-            return false;
-        }
-        switch (p.entry.kind) {
-        case ManifestKind::directory: break;
-        case ManifestKind::symlink:
-            fs::create_symlink(p.entry.payload, target, ec);
-            if (ec) {
-                error = "create_symlink failed for " + target.string() + ": " + ec.message();
-                return false;
-            }
-            break;
-        case ManifestKind::text: {
-            std::ofstream out(target, std::ios::binary);
-            if (!out) {
-                error = "could not create " + target.string();
-                return false;
-            }
-            out << p.entry.payload;
-            break;
-        }
-        }
-    }
-    return true;
+    return materialize_manifest_file(root, error, fixture_dir() / manifest_name);
 }
 
 void write_text(const fs::path& p, const std::string& text) {
@@ -491,7 +373,8 @@ TEST_CASE("runtimes linux: jvm_rows_at reads both roots' release files, skips th
     Acc acc;
     const auto rows = lnx::jvm_rows_at(dir.path, acc);
     CHECK_FALSE(acc.any_failure());
-    // Root order: /usr/lib/jvm (Debian, no IMAGE_TYPE -> unmodelled), then /opt/java (Temurin).
+    // Root order: /usr/lib/jvm (Debian, no IMAGE_TYPE and this tree has no bin/ -> unmodelled), then
+    // /opt/java (Temurin).
     // java-1.17.0-openjdk-arm64 is a symlink alias of java-17-openjdk-arm64: not a second row.
     REQUIRE(rows.size() == 2);
     CHECK(rows[0] == kDebianRow);
@@ -1101,16 +984,16 @@ TEST_CASE("runtimes linux: an OpenJDK 8 home with no release file is still a row
           "[runtimes][linux][walk][jdk8]") {
     // Ubuntu, Rocky and Alpine OpenJDK 8 packages ship NO `release` file (jdk_layouts.manifest).
     // MUTATION: dropping the java-binary probe leaves zero rows and `supported`; probing only
-    // bin/java fails Rocky (jre/bin/java only). The bin/java-only branch has no real capture, so the
-    // last case is SYNTHETIC.
+    // bin/java fails Rocky (jre/bin/java only). All three are JRE packages (no bin/javac), so the
+    // flavour is jre. The bin/java-only branch has no real capture, so the last case is SYNTHETIC.
     yuzu::test::TempDir dir{"yuzu_test_runtimes_jdk8_"};
     std::string err;
     REQUIRE(materialize_manifest(dir.path, err, "jdk_layouts.manifest"));
     struct Layout { const char* root; const char* row; };
     for (const Layout& l :
-         {Layout{"ubuntu2204-openjdk8", "jvm|unmodelled|-|/usr/lib/jvm/java-8-openjdk-arm64|-"},
-          Layout{"rocky9-openjdk8", "jvm|unmodelled|-|/usr/lib/jvm/java-1.8.0-openjdk-1.8.0.504.b01-1.2.el9_8.aarch64|-"},
-          Layout{"alpine320-openjdk8", "jvm|unmodelled|-|/usr/lib/jvm/java-1.8-openjdk|-"}}) {
+         {Layout{"ubuntu2204-openjdk8", "jvm|jre|-|/usr/lib/jvm/java-8-openjdk-arm64|-"},
+          Layout{"rocky9-openjdk8", "jvm|jre|-|/usr/lib/jvm/java-1.8.0-openjdk-1.8.0.504.b01-1.2.el9_8.aarch64|-"},
+          Layout{"alpine320-openjdk8", "jvm|jre|-|/usr/lib/jvm/java-1.8-openjdk|-"}}) {
         INFO("layout: " << l.root);
         Acc acc;
         const auto rows = lnx::jvm_rows_at(dir.path / "roots" / l.root, acc); // aliases and .jinfo: no rows
@@ -1125,7 +1008,7 @@ TEST_CASE("runtimes linux: an OpenJDK 8 home with no release file is still a row
     Acc acc;
     const auto rows = lnx::jvm_rows_at(syn.path, acc);
     REQUIRE(rows.size() == 1);
-    CHECK(rows[0] == "jvm|unmodelled|-|/opt/java/only-bin|-");
+    CHECK(rows[0] == "jvm|jre|-|/opt/java/only-bin|-");
 }
 
 TEST_CASE("runtimes linux: a release-less home's java probe records what it cannot check (SYNTHETIC)",
@@ -1143,7 +1026,9 @@ TEST_CASE("runtimes linux: a release-less home's java probe records what it cann
     probe([&](const fs::path& j) { write_text(j / "h/real/java", ""); link("real", j / "h/bin"); },
           {}, lnx::kTokSymlinkRefused); // a symlinked bin is never followed, but never silent
     probe([&](const fs::path& j) { write_text(j / "g/jre/bin/java", ""); link("jre/bin", j / "g/bin"); },
-          {"jvm|unmodelled|-|/opt/java/g|-"}, lnx::kTokReleaseMissing); // found via jre: no refusal
+          {"jvm|unmodelled|-|/opt/java/g|-"},
+          std::string{lnx::kTokReleaseMissing} + "," + std::string{lnx::kTokSymlinkRefused});
+    // found via jre: the home is listed, but the symlinked bin leaves the flavour undecided and says so
     probe([&](const fs::path& j) {
               make_dir(j / "d/bin/java");
               make_dir(j / "f/bin");
@@ -1172,7 +1057,208 @@ TEST_CASE("runtimes linux: openSUSE keeps JVMs under /usr/lib64/jvm (REAL CAPTUR
     const auto rows = lnx::jvm_rows_at(dir.path / "roots/opensuse156-openjdk17", acc);
     CHECK_FALSE(acc.any_failure());
     REQUIRE(rows.size() == 1); // the four jre* alias symlinks are no rows
-    CHECK(rows[0] == "jvm|unmodelled|17.0.18|/usr/lib64/jvm/java-17-openjdk-17|N/A");
+    CHECK(rows[0] == "jvm|jre|17.0.18|/usr/lib64/jvm/java-17-openjdk-17|N/A"); // headless: no javac
+}
+
+TEST_CASE("runtimes linux: JDK and JRE packages without IMAGE_TYPE read jdk or jre from bin/javac (REAL CAPTURE)",
+          "[runtimes][linux][walk][flavour]") {
+    // Debian 12, Ubuntu 24.04 and openSUSE Leap 15.6 JDK and JRE packages (provenance.txt): none of
+    // their release files has IMAGE_TYPE; every JDK has bin/javac and no JRE does. Vendor is the
+    // captured IMPLEMENTOR as written ("N/A" on SUSE). MUTATION: dropping the bin/javac probe turns
+    // every row back to unmodelled; testing bin/java instead of bin/javac makes every JRE a jdk.
+    yuzu::test::TempDir dir{"yuzu_test_runtimes_javac_"};
+    std::string err;
+    REQUIRE(materialize_manifest(dir.path, err, "jdk_layouts.manifest"));
+    struct Layout { const char* root; const char* row; };
+    for (const Layout& l : {
+             Layout{"debian12-openjdk17-jdk", "jvm|jdk|17.0.21.1|/usr/lib/jvm/java-17-openjdk-arm64|Debian"},
+             Layout{"debian12-openjdk17-jre", "jvm|jre|17.0.21.1|/usr/lib/jvm/java-17-openjdk-arm64|Debian"},
+             Layout{"ubuntu2404-openjdk21-jdk", "jvm|jdk|21.0.13.1|/usr/lib/jvm/java-21-openjdk-arm64|Ubuntu"},
+             Layout{"ubuntu2404-openjdk21-jre", "jvm|jre|21.0.13.1|/usr/lib/jvm/java-21-openjdk-arm64|Ubuntu"},
+             Layout{"opensuse156-openjdk17-devel", "jvm|jdk|17.0.18|/usr/lib64/jvm/java-17-openjdk-17|N/A"},
+             Layout{"opensuse156-openjdk17", "jvm|jre|17.0.18|/usr/lib64/jvm/java-17-openjdk-17|N/A"}}) {
+        INFO("layout: " << l.root);
+        Acc acc;
+        const auto rows = lnx::jvm_rows_at(dir.path / "roots" / l.root, acc); // aliases: no rows
+        CHECK_FALSE(acc.any_failure());
+        REQUIRE(rows.size() == 1);
+        CHECK(rows[0] == l.row);
+    }
+}
+
+TEST_CASE("runtimes linux: the bin/javac flavour fallback is exact about what it reads (SYNTHETIC)",
+          "[runtimes][linux][walk][flavour]") {
+    // Each case builds one home under /opt/java/h and checks its row and reason. MUTATIONS: letting
+    // the fallback override IMAGE_TYPE; counting a directory named javac; following a symlinked bin;
+    // reading an undecidable bin as "no javac" (a jre).
+    const auto probe = [](auto&& setup, const char* release, std::string_view row,
+                          std::string_view reason) {
+        yuzu::test::TempDir d{"yuzu_test_runtimes_flavour_"};
+        const fs::path home = d.path / "opt/java/h";
+        make_dir(home);
+        if (*release != '\0') write_text(home / "release", release);
+        setup(home);
+        Acc acc;
+        const auto rows = lnx::jvm_rows_at(d.path, acc);
+        REQUIRE(rows.size() == 1);
+        CHECK(rows[0] == row);
+        CHECK(acc.reason() == reason);
+    };
+    const char* const kNoType = "JAVA_VERSION=\"17.0.1\"\nIMPLEMENTOR=\"Vendor\"\n";
+    const auto both = [](const fs::path& h) { write_text(h / "bin/java", ""); write_text(h / "bin/javac", ""); };
+    const auto java_only = [](const fs::path& h) { write_text(h / "bin/java", ""); };
+
+    probe(both, kNoType, "jvm|jdk|17.0.1|/opt/java/h|Vendor", "");
+    probe(java_only, kNoType, "jvm|jre|17.0.1|/opt/java/h|Vendor", "");
+    // no IMPLEMENTOR in the release file: vendor is `-`, never derived from the path
+    probe(both, "JAVA_VERSION=\"17.0.1\"\n", "jvm|jdk|17.0.1|/opt/java/h|-", "");
+    // IMAGE_TYPE present still decides, whatever bin/ says
+    probe(both, "JAVA_VERSION=\"17.0.1\"\nIMAGE_TYPE=\"JRE\"\n", "jvm|jre|17.0.1|/opt/java/h|-", "");
+    probe(java_only, "JAVA_VERSION=\"17.0.1\"\nIMAGE_TYPE=\"JDK\"\n", "jvm|jdk|17.0.1|/opt/java/h|-", "");
+    // an unrecognised IMAGE_TYPE value is still the file's word: unmodelled, bin/ not consulted
+    probe(both, "JAVA_VERSION=\"17.0.1\"\nIMAGE_TYPE=\"SDK\"\n", "jvm|unmodelled|17.0.1|/opt/java/h|-", "");
+    // A BLANK IMAGE_TYPE says nothing: bin/ decides, exactly as if the key were absent. The quoted
+    // run of spaces is the case that tells has_image_type's trim from a bare empty() test (the
+    // parser keeps the inside of the quotes); the unquoted and empty-quoted spellings must agree.
+    // MUTATION (checked): has_image_type -> !image_type.empty() turns the spaces case into
+    // `unmodelled`, because the file would then be taken to have spoken.
+    probe(both, "JAVA_VERSION=\"17.0.1\"\nIMAGE_TYPE=\"   \"\n", "jvm|jdk|17.0.1|/opt/java/h|-", "");
+    probe(java_only, "JAVA_VERSION=\"17.0.1\"\nIMAGE_TYPE=\"   \"\n", "jvm|jre|17.0.1|/opt/java/h|-", "");
+    probe(both, "JAVA_VERSION=\"17.0.1\"\nIMAGE_TYPE=\"\"\n", "jvm|jdk|17.0.1|/opt/java/h|-", "");
+    probe(both, "JAVA_VERSION=\"17.0.1\"\nIMAGE_TYPE=\n", "jvm|jdk|17.0.1|/opt/java/h|-", "");
+    // a symlink named javac is an entry (not followed, may dangle); a directory named javac is not a compiler
+    probe([&](const fs::path& h) { java_only(h); fs::create_symlink("/nonexistent/javac", h / "bin/javac"); },
+          kNoType, "jvm|jdk|17.0.1|/opt/java/h|Vendor", "");
+    probe([&](const fs::path& h) { java_only(h); make_dir(h / "bin/javac"); },
+          kNoType, "jvm|jre|17.0.1|/opt/java/h|Vendor", "");
+    // A FIFO named javac must not block (the probe only stats the entry, it never opens it). It is
+    // neither a regular file nor a symlink, so by the code's own rule (S_ISREG || S_ISLNK) it is not
+    // a present javac: the home reads as a JRE, with no constraint token.
+    probe([&](const fs::path& h) {
+              java_only(h);
+              REQUIRE(::mkfifo((h / "bin/javac").c_str(), 0644) == 0);
+          },
+          kNoType, "jvm|jre|17.0.1|/opt/java/h|Vendor", "");
+    // neither binary: the file alone cannot say, and nothing is guessed
+    probe([](const fs::path& h) { make_dir(h / "bin"); }, kNoType, "jvm|unmodelled|17.0.1|/opt/java/h|Vendor", "");
+    probe([](const fs::path&) {}, kNoType, "jvm|unmodelled|17.0.1|/opt/java/h|Vendor", "");
+    // a symlinked bin is refused, never followed: unmodelled, token recorded
+    probe([&](const fs::path& h) { both(h / "real"); fs::create_symlink("real/bin", h / "bin"); },
+          kNoType, "jvm|unmodelled|17.0.1|/opt/java/h|Vendor", lnx::kTokSymlinkRefused);
+    // a bin that is not a directory fails its open: undecided, not "no javac", even with a java at jre/bin
+    probe([&](const fs::path& h) { write_text(h / "bin", ""); write_text(h / "jre/bin/java", ""); },
+          kNoType, "jvm|unmodelled|17.0.1|/opt/java/h|Vendor", lnx::kTokNotADirectory);
+    // no release file, java and javac present: the release_missing row carries the flavour
+    probe(both, "", "jvm|jdk|-|/opt/java/h|-", lnx::kTokReleaseMissing);
+    probe(java_only, "", "jvm|jre|-|/opt/java/h|-", lnx::kTokReleaseMissing);
+}
+
+TEST_CASE("runtimes linux: an unsearchable bin leaves the flavour unmodelled and says why (SYNTHETIC)",
+          "[runtimes][linux][walk][flavour]") {
+    if (running_privileged()) SKIP("euid 0: permission bits are bypassed, the unsearchable-bin case is not run");
+    yuzu::test::TempDir dir{"yuzu_test_runtimes_flavour_perm_"};
+    // bin opens (read permission) but fstatat(javac) is EACCES. jre/bin/java is there so that a stat
+    // failure read as "no javac" would fall through to the java probe and answer `jre`.
+    write_text(dir.path / "opt/java/h/release", "JAVA_VERSION=\"17.0.1\"\n");
+    write_text(dir.path / "opt/java/h/bin/javac", "");
+    write_text(dir.path / "opt/java/h/jre/bin/java", "");
+    REQUIRE(::chmod((dir.path / "opt/java/h/bin").c_str(), 0644) == 0); // listable, not searchable
+    const PermRestore restore{dir.path / "opt/java/h/bin"};
+    Acc acc;
+    const auto rows = lnx::jvm_rows_at(dir.path, acc);
+    REQUIRE(rows.size() == 1);
+    CHECK(rows[0] == "jvm|unmodelled|17.0.1|/opt/java/h|-");
+    CHECK(acc.reason() == std::string{lnx::kTokPermissionDenied});
+}
+
+namespace {
+
+/// Two homes under /opt/java, probed in name order: `a-bad` (the caller breaks its bin) then
+/// `b-good` (release without IMAGE_TYPE, bin/java and bin/javac). The expected rows are the same
+/// whatever broke `a-bad`'s bin: its row is kept with an undecided (`unmodelled`) flavour, and the
+/// walk goes on to `b-good`.
+const std::vector<std::string> kBadThenGoodRows{"jvm|unmodelled|17.0.1|/opt/java/a-bad|Vendor",
+                                                "jvm|jdk|17.0.1|/opt/java/b-good|Vendor"};
+
+void write_bad_then_good(const fs::path& jvm) {
+    const std::string release = "JAVA_VERSION=\"17.0.1\"\nIMPLEMENTOR=\"Vendor\"\n";
+    write_text(jvm / "a-bad/release", release);
+    write_text(jvm / "b-good/release", release);
+    write_text(jvm / "b-good/bin/java", "");
+    write_text(jvm / "b-good/bin/javac", "");
+}
+
+} // namespace
+
+TEST_CASE("runtimes linux: a symlinked bin does not stop the walk of later homes (SYNTHETIC)",
+          "[runtimes][linux][walk][flavour]") {
+    // Homes are listed by name, so `a-bad` is probed before `b-good`. The bad home keeps its row (its
+    // flavour is undecided, never guessed) and the host is CONSTRAINED with the bin token; the good
+    // home after it is still read and still gets its flavour. MUTATIONS: breaking out of the walk
+    // when a probe is undecided drops the `b-good` row; recording no token loses the constraint.
+    yuzu::test::TempDir dir{"yuzu_test_runtimes_flavour_multi_"};
+    const fs::path jvm = dir.path / "opt/java";
+    write_bad_then_good(jvm);
+    write_text(jvm / "a-bad/real/java", "");
+    fs::create_symlink("real", jvm / "a-bad/bin"); // refused, never followed
+    Acc acc;
+    CHECK(lnx::jvm_rows_at(dir.path, acc) == kBadThenGoodRows);
+    CHECK(acc.reason() == std::string{lnx::kTokSymlinkRefused});
+}
+
+TEST_CASE("runtimes linux: an unreadable bin does not stop the walk of later homes (SYNTHETIC)",
+          "[runtimes][linux][walk][flavour]") {
+    // As above, with a bin whose open is refused (mode 000): permission_denied, same rows.
+    if (running_privileged()) SKIP("euid 0: permission bits are bypassed, the unreadable-bin case is not run");
+    yuzu::test::TempDir dir{"yuzu_test_runtimes_flavour_multi_perm_"};
+    const fs::path jvm = dir.path / "opt/java";
+    write_bad_then_good(jvm);
+    write_text(jvm / "a-bad/bin/javac", "");
+    REQUIRE(::chmod((jvm / "a-bad/bin").c_str(), 0000) == 0);
+    const PermRestore restore{jvm / "a-bad/bin"};
+    Acc acc;
+    CHECK(lnx::jvm_rows_at(dir.path, acc) == kBadThenGoodRows);
+    CHECK(acc.reason() == std::string{lnx::kTokPermissionDenied});
+}
+
+TEST_CASE("runtimes linux: each bin flavour probe is charged to the entries-visited budget (SYNTHETIC)",
+          "[runtimes][linux][walk][flavour][cap]") {
+    // Five homes: listing them costs 5 entries and each flavour probe one more, so
+    // entries_visited = 5 + k admits exactly k rows and then reports row_cap (the home whose probe
+    // cannot be paid gets no row and the walk stops). MUTATION: charging nothing for the probe
+    // returns all five rows with no row_cap at every limit below 10; charging a probe that
+    // IMAGE_TYPE made unnecessary fails the typed case; probing a home that can never yield a row
+    // (no version key) turns the version-less case into row_cap.
+    const char* const kNoType = "JAVA_VERSION=\"17.0.1\"\n";
+    const char* const kNoVersion = "IMPLEMENTOR=\"Vendor\"\n";
+    const char* const kTyped = "JAVA_VERSION=\"17.0.1\"\nIMAGE_TYPE=\"JDK\"\n";
+    const std::string missing_then_cap = std::string{lnx::kTokReleaseMissing} + "," + std::string{lnx::kTokRowCap};
+    struct Case { const char* release; std::size_t entries, rows; std::string reason; };
+    for (const Case& c : {
+             Case{kNoType, 10, 5, ""},                                  // five homes + five probes: exact fit
+             Case{kNoType, 9, 4, std::string{lnx::kTokRowCap}},         // one probe short
+             Case{kNoType, 7, 2, std::string{lnx::kTokRowCap}},
+             Case{kNoType, 5, 0, std::string{lnx::kTokRowCap}},         // the listing spends it all
+             Case{"", 7, 2, missing_then_cap},                          // no release file: the same charge
+             Case{kTyped, 5, 5, ""},                                    // IMAGE_TYPE decides: no probe, no charge
+             Case{kNoVersion, 5, 0, std::string{lnx::kTokReleaseUnparsable}}}) { // no row: no probe, no charge
+        INFO("entries_visited=" << c.entries << " has_release=" << (*c.release != '\0')
+                                << " has_image_type=" << (c.release == kTyped));
+        yuzu::test::TempDir dir{"yuzu_test_runtimes_flavour_cap_"};
+        for (const char* n : {"a", "b", "c", "d", "e"}) {
+            const fs::path home = dir.path / "usr/lib/jvm" / n;
+            if (*c.release != '\0') write_text(home / "release", c.release);
+            write_text(home / "bin/java", "");
+            write_text(home / "bin/javac", "");
+        }
+        lnx::WalkLimits l;
+        l.entries_visited = c.entries;
+        Acc acc;
+        const auto rows = lnx::jvm_rows_at(dir.path, acc, limits_cfg(l));
+        CHECK(rows.size() == c.rows);
+        for (const auto& r : rows) CHECK(r.rfind("jvm|jdk|", 0) == 0);
+        CHECK(acc.reason() == c.reason);
+    }
 }
 
 TEST_CASE("runtimes linux: /opt -> var/opt (rpm-ostree) is a covered alias, not a refusal (SYNTHETIC)",
@@ -1457,6 +1543,171 @@ TEST_CASE("runtimes linux: an action with no walk arm is a visible failure, neve
     Acc acc;
     CHECK(lnx::action_rows_at(static_cast<rt::Action>(99), "/nonexistent", acc).empty());
     CHECK(acc.reason() == "internal_error");
+}
+
+// == python ===================================================================================
+
+namespace {
+const char* kDebianPythonRow = "python|unmodelled|3.11|/usr/bin/python3.11|-";
+}
+
+TEST_CASE("runtimes linux: python_rows_at reads python3.<minor> regular files from the captured tree "
+          "(REAL CAPTURE structure)",
+          "[runtimes][linux][walk][python]") {
+    // debian:bookworm + python3-minimal: python3.11 regular, python3 -> python3.11 symlink,
+    // pdb3.11 / py3versions symlinks, /usr/local/bin present and empty. Only the regular file is a
+    // row; the version is major.minor from the NAME (the patch level is not available).
+    // MUTATION: matching symlinks too adds `python3` (no minor) or duplicates; dropping the regular
+    // filter lets the pdb3.11 / py3versions links through the name test only by accident.
+    yuzu::test::TempDir dir{"yuzu_test_runtimes_py_"};
+    std::string err;
+    REQUIRE(materialize_manifest(dir.path, err));
+    Acc acc;
+    const auto rows = lnx::python_rows_at(dir.path, acc);
+    CHECK_FALSE(acc.any_failure());
+    CHECK(rows == std::vector<std::string>{kDebianPythonRow});
+}
+
+TEST_CASE("runtimes linux: python_rows_at lists both roots, exact names only, root order (SYNTHETIC)",
+          "[runtimes][linux][walk][python]") {
+    yuzu::test::TempDir dir{"yuzu_test_runtimes_py_syn_"};
+    for (const char* f : {"usr/bin/python3.12", "usr/bin/python3.9", "usr/bin/python3.12-config",
+                          "usr/bin/python3.12m", "usr/bin/python2.7", "usr/bin/python312",
+                          "usr/bin/python3", "usr/local/bin/python3.13"})
+        write_text(dir.path / f, "");
+    make_dir(dir.path / "usr/bin/python3.8"); // a directory is not an interpreter
+    std::error_code ec;
+    fs::create_symlink("python3.12", dir.path / "usr/bin/python3.10", ec); // a distro alias: skipped
+    REQUIRE_FALSE(ec);
+    Acc acc;
+    CHECK(lnx::python_rows_at(dir.path, acc) ==
+          std::vector<std::string>{"python|unmodelled|3.12|/usr/bin/python3.12|-",
+                                   "python|unmodelled|3.9|/usr/bin/python3.9|-",
+                                   "python|unmodelled|3.13|/usr/local/bin/python3.13|-"});
+    CHECK_FALSE(acc.any_failure());
+}
+
+TEST_CASE("runtimes linux: python roots: absent is supported, a foreign symlink is refused, an in-set "
+          "alias is silent (SYNTHETIC)",
+          "[runtimes][linux][walk][python]") {
+    SECTION("neither root exists") {
+        yuzu::test::TempDir dir{"yuzu_test_runtimes_py_absent_"};
+        Acc acc;
+        CHECK(lnx::python_rows_at(dir.path, acc).empty());
+        CHECK_FALSE(acc.any_failure());
+    }
+    SECTION("/usr/local points outside the candidate set: refused, and the target is never listed") {
+        yuzu::test::TempDir dir{"yuzu_test_runtimes_py_foreign_"};
+        write_text(dir.path / "usr/bin/python3.11", "");
+        write_text(dir.path / "usr/nfs/local/bin/python3.99", ""); // canary
+        std::error_code ec;
+        fs::create_symlink("../nfs/local", dir.path / "usr/local", ec);
+        REQUIRE_FALSE(ec);
+        Acc acc;
+        const auto rows = lnx::python_rows_at(dir.path, acc);
+        CHECK(rows == std::vector<std::string>{kDebianPythonRow});
+        CHECK(acc.reason() == std::string{lnx::kTokSymlinkRefused});
+    }
+    SECTION("/usr/local/bin names the other candidate: a covered alias, listed once via usr/bin") {
+        yuzu::test::TempDir dir{"yuzu_test_runtimes_py_alias_"};
+        write_text(dir.path / "usr/bin/python3.11", "");
+        make_dir(dir.path / "usr/local");
+        std::error_code ec;
+        fs::create_symlink("../bin", dir.path / "usr/local/bin", ec);
+        REQUIRE_FALSE(ec);
+        Acc acc;
+        CHECK(lnx::python_rows_at(dir.path, acc) == std::vector<std::string>{kDebianPythonRow});
+        CHECK_FALSE(acc.any_failure());
+    }
+}
+
+TEST_CASE("runtimes linux: python walk honours the network-mount guard, the dir-entry cap and the "
+          "shared row budget (SYNTHETIC)",
+          "[runtimes][linux][walk][python][cap]") {
+    yuzu::test::TempDir dir{"yuzu_test_runtimes_py_caps_"};
+    for (const char* f : {"usr/bin/python3.10", "usr/bin/python3.11", "usr/bin/python3.12",
+                          "usr/local/bin/python3.13"})
+        write_text(dir.path / f, "");
+    SECTION("a network-mounted /usr/bin is skipped and /usr/local/bin is still read") {
+        lnx::WalkConfig cfg;
+        cfg.network_mounts = {"/usr/bin"};
+        Acc acc;
+        CHECK(lnx::python_rows_at(dir.path, acc, cfg) ==
+              std::vector<std::string>{"python|unmodelled|3.13|/usr/local/bin/python3.13|-"});
+        CHECK(acc.reason() == std::string{lnx::kTokNetworkFsSkipped});
+    }
+    SECTION("the per-directory cap bounds the listing and reports row_cap") {
+        Acc acc;
+        // The cap is per directory: two of /usr/bin's three entries are read, /usr/local/bin's one
+        // still is. MUTATION: ignoring the cap lists all four.
+        const auto rows = lnx::python_rows_at(dir.path, acc, dir_cap(2));
+        CHECK(rows.size() == 3);
+        CHECK(acc.reason() == std::string{lnx::kTokRowCap});
+    }
+    SECTION("the row budget is one budget across both roots") {
+        lnx::WalkLimits l;
+        l.rows = 3;
+        Acc acc;
+        CHECK(lnx::python_rows_at(dir.path, acc, limits_cfg(l)).size() == 3);
+        CHECK(acc.reason() == std::string{lnx::kTokRowCap});
+    }
+}
+
+TEST_CASE("runtimes linux: run_linux_at(python) emits the status row first and OK/FULL through a real "
+          "CommandContext",
+          "[runtimes][linux][walk][wire][python]") {
+    yuzu::test::TempDir dir{"yuzu_test_runtimes_py_leg_"};
+    std::string err;
+    REQUIRE(materialize_manifest(dir.path, err));
+    const auto run = run_leg(rt::Action::python, dir.path);
+    CHECK(run.rc == 0);
+    CHECK(run.rows == std::vector<std::string>{"status|python|supported|-", kDebianPythonRow});
+    CHECK(run.status == YUZU_RESULT_STATUS_OK);
+    CHECK(run.completeness == YUZU_RESULT_COMPLETENESS_FULL);
+    CHECK(run.provenance.empty());
+}
+
+TEST_CASE("runtimes linux: /usr/local -> ../var/usrlocal (rpm-ostree) is a covered alias through the "
+          "leg, not a constraint (SYNTHETIC)",
+          "[runtimes][linux][walk][python][wire]") {
+    // Fedora CoreOS/Silverblue/RHCOS/RHEL Edge link /usr/local to ../var/usrlocal. MUTATION: dropping
+    // var/usrlocal/bin from kPythonRoots reports symlink_refused (status constrained) on EVERY python
+    // dispatch of such a host, and the python3.13 installed there is lost.
+    yuzu::test::TempDir dir{"yuzu_test_runtimes_py_ostree_"};
+    write_text(dir.path / "usr/bin/python3.11", "");
+    std::error_code ec;
+    fs::create_symlink("../var/usrlocal", dir.path / "usr/local", ec);
+    REQUIRE_FALSE(ec);
+    SECTION("nothing installed under /var/usrlocal: silent, supported, only the distro interpreter") {
+        const auto run = run_leg(rt::Action::python, dir.path);
+        CHECK(run.rc == 0);
+        CHECK(run.rows == std::vector<std::string>{"status|python|supported|-", kDebianPythonRow});
+        CHECK(run.status == YUZU_RESULT_STATUS_OK);
+        CHECK(run.completeness == YUZU_RESULT_COMPLETENESS_FULL);
+    }
+    SECTION("a python3.13 under var/usrlocal/bin is found once, through its own candidate") {
+        write_text(dir.path / "var/usrlocal/bin/python3.13", "");
+        const auto run = run_leg(rt::Action::python, dir.path);
+        CHECK(run.rc == 0);
+        CHECK(run.rows == std::vector<std::string>{"status|python|supported|-", kDebianPythonRow,
+                                                   "python|unmodelled|3.13|/var/usrlocal/bin/python3.13|-"});
+        CHECK(run.status == YUZU_RESULT_STATUS_OK);
+        CHECK(run.completeness == YUZU_RESULT_COMPLETENESS_FULL);
+        CHECK(run.provenance.empty());
+    }
+}
+
+TEST_CASE("runtimes linux: a refused python root is a recorded failure through the dispatch (SYNTHETIC)",
+          "[runtimes][linux][walk][python]") {
+    yuzu::test::TempDir dir{"yuzu_test_runtimes_py_refused_"};
+    make_dir(dir.path / "usr");
+    make_dir(dir.path / "srv");
+    std::error_code ec;
+    fs::create_symlink("../srv", dir.path / "usr/bin", ec);
+    REQUIRE_FALSE(ec);
+    Acc acc;
+    CHECK(lnx::action_rows_at(rt::Action::python, dir.path, acc).empty());
+    CHECK(acc.reason() == std::string{lnx::kTokSymlinkRefused});
 }
 
 #endif // !defined(_WIN32)

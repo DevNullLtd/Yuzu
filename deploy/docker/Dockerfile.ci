@@ -30,7 +30,7 @@ RUN apt-get update && apt-get install -y \
     && pip3 install --break-system-packages --require-hashes -r /tmp/requirements-meson.txt \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
-ENV VCPKG_COMMIT=4b77da7fed37817f124936239197833469f1b9a8
+ENV VCPKG_COMMIT=9eec002df1cd109f8f104cd966a763daf9751489
 
 # ── Bootstrap vcpkg ──────────────────────────────────────────────────────
 RUN git clone https://github.com/microsoft/vcpkg.git /opt/vcpkg \

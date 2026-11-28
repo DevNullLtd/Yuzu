@@ -552,7 +552,7 @@ constexpr char kDashOverlays[] = R"HTM(  <!-- ── About Modal ─────
       <p id="about-details">Loading...</p>
       <p>Built with C++23, gRPC, Protobuf, SQLite</p>
       <p>
-        <a href="https://github.com/anthropics/yuzu" target="_blank">GitHub</a>
+        <a href="https://github.com/DevNullLtd/Yuzu" target="_blank" rel="noopener noreferrer">GitHub</a>
         &nbsp;&middot;&nbsp;
         <a href="/help">Documentation</a>
       </p>
@@ -1156,8 +1156,8 @@ constexpr char kDashJs6[] = R"HTM(
 
           var activeCls = i === cmdPalette.selectedIndex ? ' active' : '';
           html += '<div class="cmd-result' + activeCls + '" data-index="' + i + '"'
-            + ' onmouseenter="cmdPalette.selectedIndex=' + i + ';cmdPalette.render()"'
-            + ' onclick="cmdPalette.select()">'
+            + ' onmouseenter="cmdPalette.highlight(' + i + ')"'
+            + ' onclick="cmdPalette.selectedIndex=' + i + ';cmdPalette.select()">'
             + '<span class="cmd-result-name">' + escapeHtml(r.name) + '</span>'
             + '<span class="cmd-result-desc">' + escapeHtml(r.desc) + '</span>'
             + '<span class="cmd-result-type badge ' + badgeCls + '">' + escapeHtml(r.type) + '</span>'
@@ -1169,6 +1169,20 @@ constexpr char kDashJs6[] = R"HTM(
         /* Scroll active item into view */
         var active = container.querySelector('.cmd-result.active');
         if (active) active.scrollIntoView({ block: 'nearest' });
+      },
+
+      /* Hover moves the highlight in place. It must never re-render: rebuilding
+         #cmd-results replaces the row under the pointer, the next mouse move fires
+         mouseenter on the new row and rebuilds again, so mousedown and mouseup land
+         on different elements and the browser never fires click. No scrolling here
+         either: scrolling under a hovering pointer would move it onto another row. */
+      highlight: function(i) {
+        if (i === cmdPalette.selectedIndex) return;
+        cmdPalette.selectedIndex = i;
+        var rows = document.querySelectorAll('#cmd-results .cmd-result');
+        for (var j = 0; j < rows.length; j++) {
+          rows[j].classList.toggle('active', rows[j].getAttribute('data-index') === String(i));
+        }
       },
 
       navigate: function(delta) {
@@ -1345,6 +1359,70 @@ constexpr char kDashJs7[] = R"HTM(    /* ── Global Keyboard Shortcuts ──
       });
     }
 
+    /* Results summary/pager follow responses as they arrive. The server stamps #result-pagination
+       with the view (data-sort/dir/page/per-page); a refresh re-reads
+       /fragments/results with the LIVE filter bar and swap:none, so only the OOB summary, pager
+       and header land (rows are untouched). The filter bar is hx-sync="this:drop": htmx discards
+       a refresh issued while a request is in flight and never queues it, so the page defers it
+       itself (below). Throttled (not debounced) to one call per second: a trailing-only debounce
+       never fires under continuous output. /events is the global bus with no per-command filter,
+       so the refresh is armed only by THIS tab's own Send and only for a bounded window (below):
+       an idle tab, or one showing a finished command, never reads. */
+    function refreshResultsSummary() {
+      var f = document.getElementById('filter-bar');
+      var nav = document.getElementById('result-pagination');
+      if (!f || f.tagName !== 'FORM' || !nav || !nav.dataset.page) return;
+      var p = new URLSearchParams({refresh: '1', sort: nav.dataset.sort, dir: nav.dataset.dir,
+                                   page: nav.dataset.page, per_page: nav.dataset.perPage});
+      htmx.ajax('GET', '/fragments/results?' + p, {source: f, swap: 'none'});
+    }
+    /* The drop has no retry, so the page tracks the scope itself: a request that parks on the
+       filter bar (a results fragment or the Create Group form GET, a refresh included) counts as
+       busy from htmx:beforeSend (the last event before send(), after any listener could cancel the request) to its XHR's loadend, which fires for load, error, abort and
+       timeout and does not depend on the DOM (htmx:afterRequest is delivered to the request's
+       source element, so a detached source never reaches a body listener). A refresh that falls
+       due while one is in flight is marked dirty and re-armed once the scope is idle, so the
+       last event is never left unrendered. The re-arm is a timer, not a call. Nothing is
+       captured: the retry reads the pager stamp and the live filter bar when it fires, so a
+       dispatch in between turns it into a no-op. */
+    var rrTimer = null, rrBusy = 0, rrDirty = false, rrArmedUntil = 0;
+    /* 300 s: the gateway forward's default per-command timeout (SendCommand). Direct dispatch has
+       no bound, so a command that outlives this stops refreshing on its own (the next sort, page
+       or filter renders the summary). Frames after the window get one trailing refresh, then the
+       tab stops reading. */
+    var RR_WINDOW_MS = 300000;
+    function scheduleResultsRefresh() {
+      if (rrTimer || !rrArmedUntil) return;
+      rrTimer = setTimeout(function() {
+        rrTimer = null;
+        if (rrBusy > 0) { rrDirty = true; return; }
+        if (Date.now() >= rrArmedUntil) rrArmedUntil = 0; /* this refresh is the trailing one */
+        refreshResultsSummary();
+      }, 1000);
+    }
+    document.body.addEventListener('htmx:beforeSend', function(e) {
+      var cfg = e.detail && e.detail.requestConfig, x = e.detail && e.detail.xhr;
+      if (!x || !cfg || !/^\/fragments\/(results|create-group-form)\b/.test(cfg.path || '')) return;
+      rrBusy++;
+      x.addEventListener('loadend', function() {
+        rrBusy--; /* one loadend per counted request */
+        if (rrBusy === 0 && rrDirty) { rrDirty = false; scheduleResultsRefresh(); }
+      });
+    });
+    /* Armed by this tab's own Send that was actually dispatched (X-Yuzu-Dispatched is set on a
+       dispatch only: a refusal and help also answer 200 but carry no such header). */
+    if (instrForm) {
+      instrForm.addEventListener('htmx:afterRequest', function(e) {
+        var x = e.detail && e.detail.xhr;
+        if (e.target === instrForm && x && x.getResponseHeader('X-Yuzu-Dispatched'))
+          rrArmedUntil = Date.now() + RR_WINDOW_MS;
+      });
+    }
+    ['[sse-swap="output"]', '[sse-swap="command-status"]'].forEach(function(sel) {
+      var el = document.querySelector(sel);
+      if (el) el.addEventListener('htmx:sseMessage', scheduleResultsRefresh);
+    });
+
     /* Agent online/offline → trigger agentChanged on body */
     ['[sse-swap="agent-online"]', '[sse-swap="agent-offline"]'].forEach(function(sel) {
       var el = document.querySelector(sel);
@@ -1437,8 +1515,13 @@ constexpr char kDashJs8[] = R"HTM(
         body: form.toString()
       }).then(function(resp) {
         if (!resp.ok) {
-          alert('MFA step-up failed — verify your code and try again.');
-          return;
+          /* 503: the server names the cause (the code was not checked, or it was spent and
+             could not be recorded), so show its own message rather than guess. */
+          var fallback = 'MFA step-up failed: verify your code and try again.';
+          if (resp.status !== 503) { alert(fallback); return; }
+          return resp.json().then(function(b) {
+            alert((b && b.error && typeof b.error.message === 'string' && b.error.message) || fallback);
+          }, function() { alert(fallback); });
         }
         /* Replay the original request via htmx.ajax. The original
            triggering element is in evt.detail.elt; pass it as the

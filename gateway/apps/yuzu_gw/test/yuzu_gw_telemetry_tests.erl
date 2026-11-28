@@ -337,6 +337,47 @@ mgmt_auth_reasons_precreated_test_() ->
        end}
      ]}.
 
+%% yuzu_gw_mgmt_crl_rejected_total (#7070): every reason of the closed set the watcher counts has a
+%% series at 0 from startup, the set is fourteen, and the two policy reasons (`unsupported',
+%% `validity_too_long') count under their own label rather than being folded into another.
+mgmt_crl_reasons_precreated_test_() ->
+    {setup,
+     fun() ->
+        {ok, S1} = application:ensure_all_started(prometheus),
+        {ok, S2} = application:ensure_all_started(telemetry),
+        catch telemetry:detach(yuzu_gw_prometheus),
+        ok = yuzu_gw_telemetry:setup(),
+        S1 ++ S2
+     end,
+     fun(_) -> catch telemetry:detach(yuzu_gw_prometheus) end,
+     [{"every reason has a series from startup, and the set is the fourteen",
+       fun() ->
+           Reasons = yuzu_gw_mgmt_crl_source:reject_reasons(),
+           ?assertEqual(14, length(Reasons)),
+           ?assertEqual(lists:sort([malformed, unsupported, too_large, unverified, issuer_mismatch,
+                                    validity_too_long, future_dated, replay, fetch_timeout,
+                                    fetch_connect, fetch_tls, fetch_status, fetch_error,
+                                    file_unreadable]),
+                        lists:sort(Reasons)),
+           Out = prometheus_text_format:format(),
+           [?assertNotEqual(nomatch,
+                            binary:match(Out, iolist_to_binary(
+                              ["yuzu_gw_mgmt_crl_rejected_total{reason=\"",
+                               atom_to_binary(R, utf8), "\"}"])))
+            || R <- Reasons]
+       end},
+      {"the two policy reasons count under their own label",
+       fun() ->
+           V = fun(R) -> prometheus_counter:value(yuzu_gw_mgmt_crl_rejected_total, [R]) end,
+           [begin
+                B0 = V(atom_to_binary(R, utf8)),
+                M0 = V(<<"malformed">>),
+                telemetry:execute([yuzu, gw, mgmt_crl, rejected], #{count => 1}, #{reason => R}),
+                ?assertEqual(B0 + 1, V(atom_to_binary(R, utf8))),
+                ?assertEqual(M0, V(<<"malformed">>))
+            end || R <- [unsupported, validity_too_long]]
+       end}]}.
+
 %% Every literal atom passed to a local reject/1 call, or returned as a
 %% `{reject, Atom}' decision (yuzu_gw_authz hands the latter to reject/1), found
 %% in the module's parsed source.

@@ -214,15 +214,22 @@ std::vector<HostEntry> host_list(PGconn* c) {
     return out;
 }
 
-/// libpq's message on one line (a multi-host failure lists one line per host).
-/// Server log only — never the /readyz body.
+/// A FIXED cause for a libpq failure, never libpq's text (F56): the message quotes the host, port
+/// and dbname libpq parsed from the DSN, and a URI password holding an unescaped '/' or '@' lands
+/// part of itself in those. `fallback` names the failing step when the text matches no known
+/// cause. Server log only -- never the /readyz body.
 std::string pq_error(PGconn* c, const char* fallback) {
     const char* m = c ? PQerrorMessage(c) : nullptr;
-    std::string s = (m && *m) ? std::string(m) : std::string(fallback);
-    std::ranges::replace_if(s, [](char ch) { return ch == '\n' || ch == '\r' || ch == '\t'; }, ' ');
-    while (!s.empty() && s.back() == ' ')
-        s.pop_back();
-    return s;
+    const std::string_view raw = m ? std::string_view{m} : std::string_view{};
+    const char* cause = pg::connect_failure_cause(raw);
+    if (std::string_view{cause} == pg::kConnectFailureGeneric)
+        return std::string(fallback) + " (libpq details withheld)";
+    return cause;
+}
+
+std::string pq_query_error(PGconn* c, const char* step) {
+    const char* m = c ? PQerrorMessage(c) : nullptr;
+    return pg::query_failure_detail(step, m ? std::string_view{m} : std::string_view{});
 }
 
 /// The production ping: owns the dedicated connection between ticks.
@@ -366,7 +373,7 @@ private:
                     if (auto ok = pg::check_effective_connection(c, hosts.size()); !ok)
                         return ok.error();
                     if (PQsetnonblocking(c, 1) != 0)
-                        return pq_error(c, "could not set non-blocking mode");
+                        return pq_query_error(c, "could not set non-blocking mode");
                     return std::nullopt;
                 }
                 if (st == PGRES_POLLING_FAILED) // libpq ended the walk
@@ -494,20 +501,20 @@ private:
                                                                     : "query timed out");
         };
         if (PQsendQuery(c, sql_.c_str()) == 0)
-            return pq_error(c, "could not send probe query");
+            return pq_query_error(c, "could not send probe query");
         for (;;) {
             const int f = PQflush(c);
             if (f == 0)
                 break;
             if (f < 0)
-                return pq_error(c, "could not flush probe query");
+                return pq_query_error(c, "could not flush probe query");
             if (!wait_socket(PQsocket(c), Want::Write, deadline, stop))
                 return timed_out();
         }
         std::optional<std::string> result_error;
         for (;;) {
             if (PQconsumeInput(c) == 0)
-                return pq_error(c, "connection lost during probe");
+                return pq_query_error(c, "connection lost during probe");
             bool done = false;
             while (PQisBusy(c) == 0) {
                 PGresult* raw = PQgetResult(c);
@@ -522,7 +529,8 @@ private:
                     read_only = v != nullptr && v[0] == 't';
                 } else if (!result_error) {
                     const char* m = PQresultErrorMessage(r.get());
-                    result_error = (m && *m) ? std::string(m) : std::string("unexpected result");
+                    result_error = (m && *m) ? pg::query_failure_detail("probe query failed", m)
+                                             : std::string("unexpected result");
                 }
             }
             if (done)

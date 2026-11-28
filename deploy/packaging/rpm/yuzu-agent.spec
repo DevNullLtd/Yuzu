@@ -14,6 +14,12 @@ system queries, actions, and compliance monitoring.
 %install
 install -D -m 0755 %{_sourcedir}/yuzu-agent %{buildroot}%{_bindir}/yuzu-agent
 install -D -m 0644 %{_sourcedir}/yuzu-agent.service %{buildroot}%{_unitdir}/yuzu-agent.service
+install -D -m 0755 %{_sourcedir}/yuzu-agent-dmi-snapshot.sh %{buildroot}%{_datadir}/yuzu/scripts/yuzu-agent-dmi-snapshot.sh
+# Read-only firewall snapshot broker (ADR-3007). No %post step: the agent unit's Wants= pulls the
+# socket in whenever the agent starts, and the socket's PartOf= stops it with the agent.
+install -D -m 0644 %{_sourcedir}/yuzu-fw-snapshot.socket %{buildroot}%{_unitdir}/yuzu-fw-snapshot.socket
+install -D -m 0644 %{_sourcedir}/yuzu-fw-snapshot@.service %{buildroot}%{_unitdir}/yuzu-fw-snapshot@.service
+install -D -m 0755 %{_sourcedir}/yuzu-fw-snapshot.sh %{buildroot}%{_datadir}/yuzu/scripts/yuzu-fw-snapshot.sh
 install -d -m 0755 %{buildroot}%{_libdir}/yuzu/plugins
 install -d -m 0750 %{buildroot}/var/lib/yuzu-agent
 # OTA update trust anchor (#416/#3807), at parity with debian/postinst. root-owned
@@ -62,6 +68,10 @@ ldconfig
 %files
 %{_bindir}/yuzu-agent
 %{_unitdir}/yuzu-agent.service
+%{_datadir}/yuzu/scripts/yuzu-agent-dmi-snapshot.sh
+%{_unitdir}/yuzu-fw-snapshot.socket
+%{_unitdir}/yuzu-fw-snapshot@.service
+%{_datadir}/yuzu/scripts/yuzu-fw-snapshot.sh
 %dir %{_libdir}/yuzu
 %{_libdir}/yuzu/libyuzu_agent_core.so*
 %dir %{_libdir}/yuzu/plugins

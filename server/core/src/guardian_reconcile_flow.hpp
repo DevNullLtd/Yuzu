@@ -69,6 +69,14 @@
 
 namespace yuzu::server {
 
+/// What `GuardianReconcileFlowDeps::send_push` did with one push (HA WS-5, #5685).
+enum class GuardianPushOutcome {
+    sent,              ///< accepted by this replica's registry (local session, or its gateway queue)
+    sent_remote,       ///< queued through the route directory (local session cannot deliver)
+    undelivered,       ///< not classified, or no delivery path: nothing was queued
+    route_unreadable,  ///< the route directory read degraded: nothing was sent
+};
+
 /// Everything the flow reads that is not constructed by it. The references are the
 /// header-only collaborators (concrete, so a test drives the real gate, caches and budget with
 /// manual clocks); the callables are the pieces that stay in `ServerImpl`. Every callable except
@@ -102,9 +110,12 @@ struct GuardianReconcileFlowDeps {
                                                       const ::yuzu::scope::Expression& expr)>
         eval_scope;
     /// Classify, send and (on success only) forward the gateway queue for a
-    /// `__guard__.push_rules` command. false = not classified or not delivered.
-    std::function<bool(const std::string& agent_id, const std::string& command_id,
-                       const std::string& push_bytes)>
+    /// `__guard__.push_rules` command. `undelivered` = not classified, or no delivery path.
+    /// `sent_remote` = queued through the route directory for the cluster that owns the agent's
+    /// session (the local session has no delivery path of its own: HA WS-5, #5685).
+    /// `route_unreadable` = the directory read degraded, nothing was sent.
+    std::function<GuardianPushOutcome(const std::string& agent_id, const std::string& command_id,
+                                      const std::string& push_bytes)>
         send_push;
     /// Write one audit row. Empty = discard. The "store is open" check lives in the callable.
     std::function<void(const AuditEvent&)> audit;
@@ -569,11 +580,31 @@ public:
         const auto command_id = "__guard__-reconcile-" + std::to_string(fresh_generation) + "-" +
                                 random_suffix_();
         // send_push_ classifies (system caller, PR1.9c), sends and, on success only,
-        // forwards the gateway queue (server.cpp).
-        if (send_push_(agent_id, command_id, push.SerializeAsString())) {
+        // forwards the gateway queue (server.cpp). A degraded route-directory read sends
+        // nothing and is an ABORTED reconcile like any other post-admission store failure; an
+        // undelivered push is counted on its own series (it was invisible here before).
+        const GuardianPushOutcome push_outcome =
+            send_push_(agent_id, command_id, push.SerializeAsString());
+        if (push_outcome == GuardianPushOutcome::route_unreadable) {
+            spdlog::warn("Guardian heartbeat reconcile: route directory unreadable - "
+                         "withholding the re-push for agent_id={} (retried on a later "
+                         "heartbeat)",
+                         ::yuzu::log_id_token(agent_id));
+            abort_degraded("route directory unreadable", "gateway route store degraded");
+            return;
+        }
+        if (push_outcome == GuardianPushOutcome::undelivered) {
             metrics_
                 .counter("yuzu_server_guardian_reconciles_total",
-                         {{"result", "sent"}})
+                         {{"result", "undelivered"}})
+                .increment();
+            return;
+        }
+        {
+            const bool remote = push_outcome == GuardianPushOutcome::sent_remote;
+            metrics_
+                .counter("yuzu_server_guardian_reconciles_total",
+                         {{"result", remote ? "sent_remote" : "sent"}})
                 .increment();
             metrics_
                 .counter("yuzu_server_guardian_pushes_dispatched_total",
@@ -595,7 +626,8 @@ public:
             ev.target_id = agent_id;
             ev.detail = "heartbeat reconcile re-push (generation " +
                         std::to_string(agent_gen) + " -> " +
-                        std::to_string(fresh_generation) + ")";
+                        std::to_string(fresh_generation) + ")" +
+                        (remote ? " via the route directory" : "");
             ev.result = "success";
             audit_(ev);
             spdlog::info("Guardian: reconciled agent {} (generation {} -> {})",
@@ -669,7 +701,8 @@ private:
     const std::function<std::expected<bool, ScopeEvalError>(const std::string&,
                                                             const ::yuzu::scope::Expression&)>
         eval_scope_;
-    const std::function<bool(const std::string&, const std::string&, const std::string&)>
+    const std::function<GuardianPushOutcome(const std::string&, const std::string&,
+                                            const std::string&)>
         send_push_;
     const std::function<void(const AuditEvent&)> audit_;
     const std::function<std::string()> random_suffix_;

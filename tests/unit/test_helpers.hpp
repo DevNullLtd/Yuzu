@@ -90,7 +90,8 @@ inline std::uint64_t process_random_salt() {
 }
 
 /// The name prefix of every scratch registry key the registry plugin's Windows tests create under HKLM\SOFTWARE or
-/// HKCU\Software: `YuzuTest-<scope>-` when YUZU_TEST_REGISTRY_SCOPE is set and non-empty, else `YuzuTest-`. CI sets the
+/// HKCU\Software (and the Echo bam-exclusion live case under HKLM\SYSTEM\CurrentControlSet\Services\bam and
+/// ...\bam\State\UserSettings): `YuzuTest-<scope>-` when YUZU_TEST_REGISTRY_SCOPE is set and non-empty, else `YuzuTest-`. CI sets the
 /// scope per job (run id, attempt, build type), so its leftover-key tripwire can tell this job's keys from a
 /// concurrent job's on the same box (two test phases may share one runner machine); the per-process salt the fixtures
 /// append is unchanged. The scope must be registry-name-safe (no backslash). `scope` is a parameter only so a pure
@@ -281,6 +282,48 @@ template <typename F> ScopeExit(F) -> ScopeExit<F>;
 inline const char* pg_admin_dsn_env() {
     const char* v = std::getenv("YUZU_TEST_POSTGRES_DSN");
     return (v != nullptr && v[0] != '\0') ? v : nullptr;
+}
+
+/// Clone-strategy knob for the template clone (PostgresTestDb's
+/// `CREATE DATABASE ... TEMPLATE`): YUZU_TEST_PG_CLONE_STRATEGY selects the
+/// PostgreSQL 15+ `STRATEGY` clause. Pure parse of the raw env value:
+///   - nullptr or ""                    -> ok, empty clause (SQL byte-identical
+///                                         to the knob not existing; the server
+///                                         default, WAL_LOG on PG 15+, applies);
+///   - "wal_log" / "file_copy", any case -> ok, " STRATEGY WAL_LOG" / " STRATEGY FILE_COPY";
+///   - anything else                     -> NOT ok, with a message naming the
+///                                         variable and the accepted values.
+/// An invalid value fails the fixture (PostgresTestDb::error(), surfaced by the
+/// YUZU_REQUIRE_PG_DB* macros' REQUIRE) rather than being silently ignored, so
+/// a typo can never silently run the default strategy instead.
+/// The Linux CI test step's pg half sets it to file_copy; no other CI job sets
+/// it (tests/unit/server/test_pg_template_cleanup.cpp sets it per case with
+/// ScopedEnv; docs/testing/unit-test-conventions.md).
+struct PgCloneStrategy {
+    bool ok = true;
+    std::string clause; ///< appended verbatim after the TEMPLATE clause
+    std::string error;  ///< set when !ok
+};
+
+inline PgCloneStrategy parse_pg_clone_strategy(const char* raw) {
+    PgCloneStrategy out;
+    if (raw == nullptr || raw[0] == '\0')
+        return out;
+    std::string v{raw};
+    std::transform(v.begin(), v.end(), v.begin(), [](unsigned char c) {
+        return static_cast<char>((c >= 'A' && c <= 'Z') ? c - 'A' + 'a' : c);
+    });
+    if (v == "wal_log") {
+        out.clause = " STRATEGY WAL_LOG";
+    } else if (v == "file_copy") {
+        out.clause = " STRATEGY FILE_COPY";
+    } else {
+        out.ok = false;
+        out.error = std::string("YUZU_TEST_PG_CLONE_STRATEGY='") + raw +
+                    "' is not a clone strategy; accepted: wal_log or file_copy "
+                    "(case-insensitive), or unset for the server default";
+    }
+    return out;
 }
 
 /// ── Stale test-database sweeping ─────────────────────────────────────────
@@ -667,8 +710,17 @@ private:
             return;
         }
         std::string create = "CREATE DATABASE \"" + db_name_ + "\"";
-        if (tpl_name != nullptr)
+        if (tpl_name != nullptr) {
             create += " TEMPLATE \"" + *tpl_name + "\"";
+            // Clone-strategy knob: unset -> no clause, SQL unchanged.
+            const PgCloneStrategy strategy =
+                parse_pg_clone_strategy(std::getenv("YUZU_TEST_PG_CLONE_STRATEGY"));
+            if (!strategy.ok) {
+                error_ = strategy.error;
+                return;
+            }
+            create += strategy.clause;
+        }
         // Clone-from-template refuses while ANY connection to the template
         // is open (SQLSTATE 55006). The builder's PgPool has PQfinish()ed by
         // the time ensure() returns, but the backend teardown can lag a
@@ -1399,6 +1451,53 @@ static_assert(kSqliteOwnerIsSealed<struct SqliteOwnerSealCheck>);
     (void)timeout;
     return true;
 #endif
+}
+
+/// An ISO-8601 UTC instant ("2026-04-19T12:00:00Z", whole seconds) as nanoseconds since the epoch;
+/// 0 when the text does not parse or the instant is past what int64 nanoseconds can hold. The
+/// Guardian census orders by a key the ingest boundary derives from the agent's wire stamp, so a
+/// test that builds an event row directly and wants its timestamp to decide the order supplies the
+/// same instant as `agent_ns`.
+inline std::int64_t iso8601_to_ns(const std::string& ts) {
+    // "YYYY-MM-DDTHH:MM:SSZ": a strtol walk with range checks (the scanf family is not used in
+    // new code, docs/cpp-conventions.md).
+    const char* p = ts.c_str();
+    const auto field = [&p](char sep, long lo, long hi, long& out) {
+        char* end = nullptr;
+        out = std::strtol(p, &end, 10);
+        if (end == p || out < lo || out > hi)
+            return false;
+        if (sep != '\0') {
+            if (*end != sep)
+                return false;
+            ++end;
+        }
+        p = end;
+        return true;
+    };
+    long year_v = 0, month_v = 0, day_v = 0, hour_v = 0, minute_v = 0, second_v = 0;
+    if (!field('-', 1970, 9999, year_v) || !field('-', 1, 12, month_v) ||
+        !field('T', 1, 31, day_v) || !field(':', 0, 23, hour_v) || !field(':', 0, 59, minute_v) ||
+        !field('\0', 0, 60, second_v) || *p != 'Z' || p[1] != '\0')
+        return 0;
+    using namespace std::chrono;
+    const year_month_day ymd{year{static_cast<int>(year_v)},
+                             month{static_cast<unsigned>(month_v)},
+                             day{static_cast<unsigned>(day_v)}};
+    if (!ymd.ok())
+        return 0;
+    const sys_days date{ymd};
+    // 64-bit arithmetic throughout: MSVC's std::chrono::hours and minutes use a 32-bit int, so
+    // summing them as durations wraps for a far-future year (found on Windows CI, PR #7151).
+    const seconds secs{static_cast<std::int64_t>(date.time_since_epoch().count()) * 86400LL +
+                       static_cast<std::int64_t>(hour_v) * 3600LL +
+                       static_cast<std::int64_t>(minute_v) * 60LL +
+                       static_cast<std::int64_t>(second_v)};
+    // Past 2262-04-11 the nanosecond count no longer fits in int64: report it as unparsed rather
+    // than overflow (the same bound guardian_ingest.cpp applies to an agent stamp).
+    if (secs.count() > INT64_MAX / 1'000'000'000LL)
+        return 0;
+    return static_cast<std::int64_t>(secs.count()) * 1'000'000'000LL;
 }
 
 } // namespace yuzu::test

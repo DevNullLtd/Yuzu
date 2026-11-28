@@ -1,15 +1,17 @@
 Directory: tests/unit/fixtures/wave10/runtimes/linux/
 Fixtures for the runtimes Linux-leg tests (tests/unit/test_runtimes_parsers.cpp loads the
-three capture files; tests/unit/test_runtimes_linux_parsers.cpp materializes tree.manifest and
+capture files; tests/unit/test_runtimes_linux_parsers.cpp materializes tree.manifest and
 jdk_layouts.manifest and reads mountinfo_docker_nfs4.txt).
-One directory-level provenance file; every fixture below is labelled. The three capture
-files are REAL CAPTURE from command-only Docker containers (no long-running service,
-nothing installed beyond the stated apt packages); tree.manifest carries per-section
-labels, including two RECONSTRUCTION lines named in the file itself.
+One directory-level provenance file; every fixture below is labelled. The six capture
+files (temurin17_release.txt, debian_openjdk17_release.txt, dotnet_shared_listing.txt and
+the three SAM-48 release files named below) are REAL CAPTURE from command-only Docker
+containers (no long-running service, nothing installed beyond the stated packages);
+tree.manifest and jdk_layouts.manifest carry per-section labels, including RECONSTRUCTION
+lines named in the files themselves.
 
 host:      Docker Desktop (linux/arm64 containers) on macOS
 identity:  root inside the container (the images' default)
-date:      2026-09-21
+date:      2026-09-21 (applies unless a section states its own date)
 
 -- temurin17_release.txt --
 status:    REAL CAPTURE
@@ -24,9 +26,11 @@ image:     debian:bookworm, after `apt-get install -y openjdk-17-jre-headless py
            since-cut python action and does not affect the release file)
 command:   cat /usr/lib/jvm/java-17-openjdk-*/release   (resolved to
            /usr/lib/jvm/java-17-openjdk-arm64/release)
-note:      Debian's release file has NO IMAGE_TYPE key (the test asserts flavour
-           `unmodelled` for it); /usr/lib/jvm/java-1.17.0-openjdk-arm64 is a second entry
-           for the same install.
+note:      Debian's release file has NO IMAGE_TYPE key. The tests assert flavour `unmodelled`
+           for it only where nothing supplies a flavour: the bare jvm_row (no fallback) and the
+           tree.manifest walk, whose Debian home has no bin/ directory. Where bin/ exists the
+           bin/javac fallback decides (the SAM-48 captures below).
+           /usr/lib/jvm/java-1.17.0-openjdk-arm64 is a second entry for the same install.
 lines:     9 (budget 25)
 
 -- dotnet_shared_listing.txt --
@@ -46,10 +50,14 @@ loaded by: tests/unit/test_runtimes_linux_parsers.cpp (materialized under a yuzu
            TempDir per case)
 
 -- jdk_layouts.manifest --
-status:    REAL CAPTURE structure of four package layouts (each under its own roots/<distro>/
-           directory), trimmed to the paths the walk reads. RECONSTRUCTION: every regular file
-           other than the SUSE `release` is an EMPTY placeholder (the capture recorded names,
-           not contents), and the Ubuntu .jinfo file is empty.
+status:    REAL CAPTURE structure of the four package layouts captured 2026-09-24
+           (roots/ubuntu2204-openjdk8, rocky9-openjdk8, alpine320-openjdk8 and
+           opensuse156-openjdk17; each under its own roots/<distro>/ directory), trimmed to the
+           paths the walk reads. RECONSTRUCTION in these four roots: every regular file other
+           than the SUSE `release` is an EMPTY placeholder (the capture recorded names, not
+           contents), and the Ubuntu .jinfo file is empty. The roots added for SAM-48 are
+           described in the SAM-48 section below; their Debian and Ubuntu roots also carry real
+           `release` payloads.
 host:      Docker Desktop (linux/arm64 containers, kernel Linux 7.0.12-linuxkit), root in the
            container, command-only `docker run --rm`, 2026-09-24
 commands:  ls -la <jvm root>; find <jvm root> -maxdepth 4 \( -name release -o -name java -o
@@ -69,6 +77,45 @@ opensuse156-openjdk17:  opensuse/leap:15.6 after `zypper -n in --no-recommends
            IMPLEMENTOR="N/A").
 note:      none of the three OpenJDK 8 homes contains a `release` file (the find prints none).
 
+-- debian12_openjdk17_jre_release.txt, ubuntu2404_openjdk21_release.txt, opensuse156_openjdk17_release.txt --
+status:    REAL CAPTURE (each file is the package's `release` file verbatim)
+host:      Docker Desktop (linux/arm64 containers) on macOS, root in the container, command-only
+           `docker run --rm`, one throwaway container per package, 2026-11-21
+images:    debian:12        (digest sha256:268fb24c39bca92d326dd83ea3abebe4a3f7751c804ffef23bb6d857dd343ff8)
+           ubuntu:24.04     (digest sha256:73b999393d07f2bf65a40373778a44dc9a6d54ad7718d29247d8ff9413c4d6a8)
+           opensuse/leap:15.6 (digest sha256:79be7751205ea84559990fb76b1bec71e38d6fad41c70a4f6c921b803b58f421)
+files:     debian12_openjdk17_jre_release.txt   <- openjdk-17-jre-headless 17.0.21.1+2-1~deb12u1
+                                                   (the openjdk-17-jdk-headless home's release payload,
+                                                   roots/debian12-openjdk17-jdk in jdk_layouts.manifest,
+                                                   is byte-identical to this file)
+           ubuntu2404_openjdk21_release.txt     <- openjdk-21-jdk-headless 21.0.13.1+2-1~24.04.1
+                                                   (byte-identical to the openjdk-21-jre-headless one)
+           opensuse156_openjdk17_release.txt    <- java-17-openjdk-devel 17.0.18.0-150400.3.63.1
+                                                   (same fields as java-17-openjdk-headless, which also
+                                                   has no IMAGE_TYPE and IMPLEMENTOR="N/A")
+           Of the five release files among this directory's captures (temurin17_release.txt,
+           debian_openjdk17_release.txt and the three above), only temurin17_release.txt carries an
+           IMAGE_TYPE key; the four Debian, Ubuntu and SUSE files have none.
+
+-- SAM-48 captures in jdk_layouts.manifest (roots/debian12-openjdk17-{jdk,jre}, roots/ubuntu2404-openjdk21-{jdk,jre},
+   roots/opensuse156-openjdk17-devel, and the existing roots/opensuse156-openjdk17 as the SUSE JRE) --
+status:    REAL CAPTURE structure and release payloads; regular files other than `release` are EMPTY
+           placeholders (names were recorded, not contents); JDK-only directories are trimmed.
+host:      as above (Docker Desktop, linux/arm64, root, command-only `docker run --rm`, 2026-11-21)
+install:   debian:12        apt-get update && apt-get install -y --no-install-recommends openjdk-17-jdk-headless
+                            (and, separately, openjdk-17-jre-headless)
+           ubuntu:24.04     apt-get update && apt-get install -y --no-install-recommends openjdk-21-jdk-headless
+                            (and, separately, openjdk-21-jre-headless)
+           opensuse/leap:15.6  zypper -n in --no-recommends java-17-openjdk-devel
+                            (and, separately, java-17-openjdk-headless 17.0.18.0-150400.3.63.1)
+commands:  ls -la <jvm root>; for each home: ls -la <home>; ls -la <home>/bin; cat <home>/release
+           (<jvm root> = /usr/lib/jvm on Debian and Ubuntu, /usr/lib64/jvm on SUSE). No java binary was run.
+measured:  every JDK package has <home>/bin/javac (regular file) next to bin/java; every JRE package
+           has bin/java and NO bin/javac (Debian and Ubuntu JRE bin/: java jpackage keytool rmiregistry;
+           SUSE headless bin/: java). Debian and Ubuntu release IMPLEMENTOR is "Debian" / "Ubuntu";
+           SUSE's is "N/A". On SUSE the jre-17-openjdk alias symlink points at the same home, so the
+           `ls` of the alias shows javac too; it is an alias entry and the walk skips it.
+
 -- mountinfo_docker_nfs4.txt --
 status:    REAL CAPTURE (the file verbatim, 12 lines; the nfs4 mount is the last line)
 host:      Docker Desktop VM (Linux 7.0.12-linuxkit aarch64); a privileged alpine:3.20 container
@@ -76,3 +123,16 @@ host:      Docker Desktop VM (Linux 7.0.12-linuxkit aarch64); a privileged alpin
            named volume) at /mnt/nfs
 command:   mount -t nfs4 -o vers=4,proto=tcp,port=2049 <server>:/ /mnt/nfs ; cat /proc/self/mountinfo
 date:      2026-09-24
+
+-- python entries in tree.manifest --
+status:    REAL CAPTURE of names, types and link targets (file contents are empty placeholders)
+image:     debian:bookworm (Debian 12.15), after `apt-get update` and
+           `apt-get install -y python3-minimal` (python3-minimal 3.11.2-1+b1)
+host:      Docker Desktop (linux/arm64 containers) on macOS, root in the container,
+           command-only `docker run --rm`, 2026-10-28
+commands:  ls -l /usr/bin | grep -i python      (pdb3.11 -> ../lib/python3.11/pdb.py,
+                                                 py3versions -> ../share/python3/py3versions.py,
+                                                 python3 -> python3.11, python3.11 regular file)
+           ls -la /usr/local/bin                (empty directory)
+note:      the macOS framework fixture has its own provenance header in
+           ../macos/python_framework.manifest.

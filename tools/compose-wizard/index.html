@@ -346,9 +346,12 @@
           </div>
 
           <div class="field">
-            <label for="grafana-pass">Grafana Admin Password</label>
-            <input type="text" id="grafana-pass" value="admin">
-            <small>⚠️ Change this! Default is <code>admin</code>.</small>
+            <label for="grafana-pass">Grafana Admin Password (YUZU_GRAFANA_ADMIN_PASSWORD)</label>
+            <div class="input-row">
+              <input type="text" id="grafana-pass" value="" placeholder="set a strong value">
+              <button type="button" onclick="genSecret('grafana-pass')" class="btn small">🎲 Generate</button>
+            </div>
+            <small>Required. Printable ASCII without spaces, <code>$</code> or quotes (it is written unquoted to <code>.env</code>, the only place it is stored; the compose file refuses to start without it). Grafana applies it only when it first creates its database (#4817).</small>
           </div>
         </fieldset>
 

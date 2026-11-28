@@ -1,9 +1,11 @@
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
+#include <cstdint>
 #include <expected>
 #include <functional>
 #include <memory>
@@ -29,6 +31,14 @@
 #include <openssl/evp.h>
 
 #include "oidc_egress_policy.hpp"
+
+// Declared only: the full definitions are in bounded_resolver.hpp, which pulls in the socket
+// headers and stays out of this one.
+namespace yuzu::server::net {
+struct ResolverPool;
+struct ResolveResult;
+class HostLookupAdmission;
+} // namespace yuzu::server::net
 
 namespace yuzu::server::oidc {
 
@@ -330,12 +340,10 @@ public:
     /// this instance's binding SHA-256 fail exactly as a broken crypto provider would;
     /// `add_test_pending_flow` plants a pending flow with a chosen binding hash (hex), bypassing
     /// `start_auth_flow`, so the stored-hash validation can be driven with a value no honest
-    /// flow stores. TEST-ONLY: none of the test seams in this block (these two,
-    /// `set_http_timeouts_for_test`, `set_discovery_negative_cache_for_test`,
-    /// `set_resolver_for_test`,
-    /// `clear_nat64_discovery_cache_for_test` and `pending_flow_count_for_test`) has
-    /// a production caller, and tests/unit/server/ test_oidc_provider.cpp pins (source scan) that
-    /// no other file in server/core/src references them.
+    /// flow stores. TEST-ONLY: no `*_for_test` member of this block (the two above and every
+    /// seam declared after them) has a production caller, and
+    /// tests/unit/server/test_oidc_provider.cpp pins (source scan) that no other file in
+    /// server/core/src references them.
     void set_binding_digest_failure_for_test(bool fail);
     void add_test_pending_flow(const std::string& state, std::string binding_hash);
     /// Test-only seam: replaces the 5 s per-operation connect/read/write timeouts of every IdP
@@ -351,9 +359,29 @@ public:
     /// Process-wide: a test must restore it. Same source-scan pin.
     using ResolverForTest = std::function<std::vector<std::string>(const std::string& host)>;
     static void set_resolver_for_test(ResolverForTest resolver);
+    /// Test-only seam: replaces the lookup function and the pool the POSIX name-resolution
+    /// adapter passes to `net::bounded_resolve` (bounded_resolver.hpp), BELOW
+    /// `set_resolver_for_test`, so a test can block a lookup behind a latch, fill a small pool or
+    /// fail a lookup without DNS. An empty `lookup` and a null `pool` restore the system lookup and
+    /// the OIDC pool. `admission` is the per-name limit and refusal memory the adapter consults: a
+    /// test that installs a lookup or a pool and passes none gets no admission, so only a test that
+    /// asks for it sees it. Process-wide: a test must restore it. Same source-scan pin.
+    using BoundedLookupForTest = std::function<net::ResolveResult(const std::string& host)>;
+    static void set_bounded_lookup_for_test(
+        BoundedLookupForTest lookup, std::shared_ptr<net::ResolverPool> pool,
+        std::shared_ptr<net::HostLookupAdmission> admission = {});
+    /// Test-only seam: the process-wide admission the POSIX adapter uses when no test has installed
+    /// a lookup or a pool (null on Windows, whose lookup has none). A test reads its limits and
+    /// that it is one object; the adapter's choice of it is checked by a source-text test. Same
+    /// source-scan check.
+    [[nodiscard]] static std::shared_ptr<net::HostLookupAdmission>
+    production_lookup_admission_for_test();
     /// Test-only seam: replaces the 30 s window during which a failed discovery is not retried
     /// (0 = retry on the next call) and clears any window already running. Same source-scan pin.
     void set_discovery_negative_cache_for_test(int ms);
+    /// Test-only seam: forgets the once-per-60-s throttle of the pool-full and NAT64 "not started"
+    /// warnings, so the next one of each is written at warn level again. Same source-scan rule.
+    static void reset_resolver_log_throttle_for_test();
     /// Test-only seam: forgets the process-wide cache of NAT64 prefixes learned from
     /// `ipv4only.arpa`, so the next eligible fetch looks them up again. Same source-scan pin.
     static void clear_nat64_discovery_cache_for_test();
@@ -454,8 +482,10 @@ public:
     /// fixed `kEgressRefused` text and names no address. Plain http (an `http://` URL) to a PUBLIC
     /// address is refused outright, with the distinct fixed `kEgressCleartextPublicRefused` text,
     /// whatever `allow_private_networks` says; plain http to a loopback/private address still
-    /// needs that flag. Name resolution is inside the total bound. Up to four permitted addresses
-    /// are tried in order while the connect fails (any other outcome is final).
+    /// needs that flag. Name resolution is inside the total bound: on POSIX the lookup runs on a
+    /// detached worker through `net::bounded_resolve` and the caller stops waiting at the bound.
+    /// Up to four permitted addresses are tried in order while the connect fails (any other
+    /// outcome is final).
     ///
     /// NAT64. An IPv6 address the policy would otherwise permit is also decoded under
     /// `nat64_prefixes` (the operator's `--oidc-nat64-prefix`) and under the prefixes the server
@@ -549,5 +579,21 @@ private:
 
     static constexpr auto kChallengeTtl = std::chrono::minutes(10);
 };
+
+/// Name lookups currently outstanding in the pool the OIDC egress path owns (cap
+/// `net::kMaxInFlightLookups`). A lookup that has timed out for its caller still holds its slot
+/// until the resolver returns. Feeds `yuzu_server_oidc_resolver_in_flight`. The pool is used only
+/// on POSIX builds, so it is non-zero only there.
+[[nodiscard]] int oidc_resolver_in_flight();
+
+/// The pool's slot count. Feeds `yuzu_server_oidc_resolver_pool_capacity`.
+[[nodiscard]] int oidc_resolver_pool_capacity();
+
+/// How many lookups through the pool ended in each `net::ResolveStatus`, in enumerator order (five
+/// members; oidc_provider.cpp asserts the length against `net::kResolveStatusCount`, which this
+/// header cannot name because bounded_resolver.hpp stays out of it). Feeds
+/// `yuzu_server_oidc_resolver_lookups_total`. A lookup that goes through the test-resolver seam
+/// does not use the pool and is not counted.
+[[nodiscard]] std::array<std::uint64_t, 5> oidc_resolver_outcome_counts();
 
 } // namespace yuzu::server::oidc

@@ -4,7 +4,8 @@
 ##
 ## Sources by platform:
 ##   Windows: Registry Uninstall keys (64-bit, 32-bit WoW64, current user)
-##   Linux:   dpkg-query, rpm, or pacman (auto-detected)
+##   Linux:   dpkg status and rpm database (read in-process), else pacman (its tool);
+##            apk is read by the daily-sync inventory action only, not by list or query
 ##   macOS:   system_profiler SPApplicationsDataType
 ##
 ## The `list` action carries six columns: name, version, publisher,
@@ -86,8 +87,8 @@ spec:
         platforms: [windows, darwin]
       - name: install_location
         type: string
-        description: "Where the application lives on disk, as the OS reports it. Windows: the Uninstall key's InstallLocation value, returned raw — a REG_EXPAND_SZ value such as %ProgramFiles%\\Vendor is NOT expanded — or \"-\" when the value is absent (many MSI-registered products, SDK/runtime component packages and NSIS/portable installers write none — 182 of 241 rows on one developer workstation), longer than 64 KiB (the registry reader's bound; a value between 4 KiB and 64 KiB is cut to 4 KiB at a character boundary), or not a string type. Applications installed only into a logged-in user's own hive are not listed by this machine-scope action at all (use list_per_user); entries in the agent service account's own HKCU Uninstall key keep their InstallLocation. Where the same product is registered in more than one hive the smallest populated value wins. Unlike windows.software.msi.list, separators are \"/\": backslashes are emitted as \"/\" (a UNC path reads //srv/share; not reversible), so C:\\Program Files\\7-Zip\\ reads C:/Program Files/7-Zip/. macOS: the location system_profiler reports, normally the .app bundle path and occasionally a non-bundle directory; this can lie under a user's home (/Users/<account>/...). Always \"-\" on Linux by design: a package installs files to many prefixes, so there is no single install location. Values: path or \"-\". The value is as reported by the OS: untrusted and non-canonical."
-        example: "C:/Program Files/7-Zip/"
+        description: "Where the application lives on disk, as the OS reports it. Windows: the Uninstall key's InstallLocation value, returned raw — a REG_EXPAND_SZ value such as %ProgramFiles%\\Vendor is NOT expanded — or \"-\" when the value is absent (many MSI-registered products, SDK/runtime component packages and NSIS/portable installers write none — 182 of 241 rows on one developer workstation), longer than 64 KiB (the registry reader's bound; a value between 4 KiB and 64 KiB is cut to 4 KiB at a character boundary), or not a string type. Applications installed only into a logged-in user's own hive are not listed by this machine-scope action at all (use list_per_user); entries in the agent service account's own HKCU Uninstall key keep their InstallLocation. Where the same product is registered in more than one hive the smallest populated value wins. Backslashes are kept as the OS reports them (a UNC path reads \\\\srv\\share); only a TRAILING backslash is emitted as \"/\" so it cannot glue onto the field delimiter, so C:\\Program Files\\7-Zip\\ reads C:\\Program Files\\7-Zip/. macOS: the location system_profiler reports, normally the .app bundle path and occasionally a non-bundle directory; this can lie under a user's home (/Users/<account>/...). Always \"-\" on Linux by design: a package installs files to many prefixes, so there is no single install location. Values: path or \"-\". The value is as reported by the OS: untrusted and non-canonical."
+        example: "C:\\Program Files\\7-Zip/"
         platforms: [windows, darwin]
       - name: bundle_id
         type: string
@@ -219,7 +220,8 @@ metadata:
     HKEY_USERS\<SID> hive when that user is logged in, falling back to an
     offline mount of their NTUSER.DAT only when it is not loaded.
     On Linux, reports system-wide packages (dpkg/rpm). On macOS, reports
-    system apps plus per-user Homebrew packages. Output includes the
+    system apps only (Homebrew packages are listed by pkg_inventory.packages;
+    this action no longer executes brew). Output includes the
     username (or "system") alongside each application record.
   tags: [software, inventory, per-user, compliance]
 
@@ -240,7 +242,7 @@ spec:
     columns:
       - name: username
         type: string
-        description: 'The resolved local profile name on Windows (never the SID), the literal "system" for the machine-scope Linux/macOS leg, or "brew" for macOS per-user Homebrew formulae. Values: profile name, "system", "brew", or "-".'
+        description: 'The resolved local profile name on Windows (never the SID), the literal "system" for the machine-scope Linux/macOS leg, or "-". Values: profile name, "system", or "-".'
         example: "jsmith"
         platforms: [windows, linux, darwin]
       - name: name
@@ -255,12 +257,12 @@ spec:
         platforms: [windows, linux, darwin]
       - name: publisher
         type: string
-        description: 'The vendor or maintainer name; always "-" on macOS and for Homebrew rows. Values: free text or "-".'
+        description: 'The vendor or maintainer name; always "-" on macOS. Values: free text or "-".'
         example: "Signal Messenger, LLC"
         platforms: [windows, linux]
       - name: install_date
         type: string
-        description: "Install date in the OS's native format; \"-\" when the source reports none, which dpkg-based Linux hosts and Homebrew rows always do. Values: free text or \"-\"."
+        description: "Install date in the OS's native format; \"-\" when the source reports none, which dpkg-based Linux hosts always do. Values: free text or \"-\"."
         example: "20260714"
         platforms: [windows, darwin]
     aggregation:

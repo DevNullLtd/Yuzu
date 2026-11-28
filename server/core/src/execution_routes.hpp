@@ -44,8 +44,11 @@
 /// `authz::VisibleSet` (`authz_model.hpp`) likewise.
 ///
 /// NEW DEPS FIELD — `resolve_session_fn`. Every route under an ENGAGED
-/// scope (`gate.scope` truthy) needs the caller's username for the
-/// ownership disjunct in `execution_visible`/`admit_confined_mutation`, via
+/// scope (`gate.scope` truthy) needs the resolved session to derive its
+/// `ExecutionOwnerKey` (`execution_owner_key`, `execution_scope_rules.hpp`) for
+/// the ownership disjunct in `execution_visible`/`admit_confined_mutation`
+/// (the key is empty for a service-scoped session; the raw `username` stays
+/// the real principal for audit and attribution), via
 /// `auth_routes_->resolve_session(req)` — a NON-BLOCKING resolve that never
 /// writes to `res` on failure (unlike `deps.auth_fn`, which wraps
 /// `require_auth` and DOES write a 401 on failure). Substituting `auth_fn`
@@ -86,8 +89,9 @@
 ///     with NO audit call at all; only a genuine SUCCESS is audited.
 ///   - `cancel`: the confined-mutation-denied branch audits `"denied"`; the
 ///     unconfined + unknown-id 404 branch is NOT audited (mirrors the GET
-///     routes' unconfined-404 rule); `mark_cancelled` returning `false`
-///     audits `"failure"` (503); success audits `"success"`.
+///     routes' unconfined-404 rule); `mark_cancelled_checked` returning
+///     `kFailed` audits `"failure"` (503) and `kNoOp` (already terminal) audits
+///     `"denied"` (409, #3845); success audits `"success"`.
 ///   - **Target-type casing split (pre-existing, not this move's doing):**
 ///     the GET routes' denial rows use PascalCase `"Execution"` as
 ///     `target_type`; `rerun`/`cancel`'s rows use lowercase `"execution"`.

@@ -56,7 +56,9 @@ forces (its caches start empty):
 - Pre-created shared `yuzu-ci-postgres` container (no per-leg creation race) + job-env
   `YUZU_GW_ALLOW_DEFAULT_COOKIE=1` (harmless defence; the cookie reports were red herrings).
 - The per-runner `.env` (HOME/ERL_EPMD_PORT) was tried but the runner ignored it; it
-  proved unnecessary once the above landed.
+  proved unnecessary once the above landed. (Superseded: by 2026-11-17 each runner's
+  `.env` sets `HOME=/home/runner/rN/home` and jobs run with it; see
+  `docs/ci-architecture.md` "Build speed (Big Tam)".)
 
 The self-hosted Linux CI is moving from Shulgi (`yuzu-wsl2-linux`, WSL2 Ubuntu
 24.04, GCC 13 / Clang 19) to the Big Tam pool (`yuzu-bigtam-linux-{0..3}`, native
@@ -180,7 +182,10 @@ Incremental order: do ci.yml first, prove it green on Big Tam, then the rest.
    COMPLETE, and a "Build speed" section added.
 8. **Big Tam host provisioning (build speed)** — **DONE (2026-06-21).** On the
    `runner` user (shared `HOME=/home/runner` across r0–r3): ccache `max_size=50G`
-   (host default 5 GiB is far too small); `mold` (`apt install mold`) wired via
+   (host default 5 GiB is far too small; superseded: jobs now run with a
+   per-runner HOME, so this `ccache.conf` is not read and the cap is the
+   workflows' `CCACHE_MAXSIZE=30G`, see `docs/ci-architecture.md` "Build speed
+   (Big Tam)"); `mold` (`apt install mold`) wired via
    `-fuse-ld=mold` in the gcc-15/clang-21 native files; `rpm` (rpmbuild) for
    release packaging (absent on fresh 26.04 — was the first-release blocker);
    `requirements-ci.txt` (incl. meson 1.11.1) pre-installed in `~/.local` so the

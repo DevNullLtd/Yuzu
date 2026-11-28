@@ -188,6 +188,24 @@ multi-hour archaeology dig, and no script hardcodes one host's layout.
   WAL/buffer pool (the 2026-07-12 server-suite timeouts). No runner `.env` or
   wrapper change is involved — re-running the provisioning script is the whole
   cutover.
+
+  **No `ci.yml` job on this box connects to these clusters since ADR-0035 ladder
+  step 1, but they are not yet unused: do not stop them before ladder step 4.**
+  `cache-prune.yml`'s weekly `prune-windows` job still sweeps them
+  (`scripts/ci/sweep-test-databases.sh`), `Assert-Toolchain.ps1` still
+  health-checks them (see below), `main` pushes still run the old `ci.yml`
+  with its Windows `Ensure Postgres` and pg-shard steps against them until the
+  next `dev`→`main` promotion carries step 1, and so does each open PR until it
+  is rebased past step 1.
+  The server is Linux-only: `ci.yml`'s Windows leg builds the agent only
+  (no server switch: the `server` option is `auto`, off on Windows; into `build-windows-agent-{debug,release}`; the job
+  deletes the older `build-windows-{debug,release}` dirs on every run) and no
+  longer runs `Ensure Postgres` or any server suite. The clusters stay
+  provisioned until ladder step 4 removes them together with the `postgres`
+  pin in `toolchain-contract.json`. Until then `Assert-Toolchain.ps1` still
+  health-checks every cluster, both at provision time and in the Windows job's
+  `Assert toolchain manifest (self-hosted)` step, so a stopped or broken
+  cluster still fails that job even though nothing in it connects.
 - **Per-agent PostgreSQL binaries (#2354).** Each cluster also gets a **private
   copy of the whole PostgreSQL install tree** under `D:\ci\pgbin\agent-<n>`, and
   its Windows-service `ImagePath` is repointed at that copy's `pg_ctl.exe` (the
@@ -266,7 +284,7 @@ verified by `Assert-Toolchain.ps1`:
   "runner_count": 4,
   "pins":  { "python": "3.14.6", "meson": "1.11.1", "erlang": "28.4.2",
              "rebar3": "3.24.0", "postgres": "18.4", "windows_sdk": "10.0.26100.0", "build_jobs": 16,
-             "vcpkg_baseline": "4b77da7..." },
+             "vcpkg_baseline": "9eec002df1cd" },
   "env":   { "VCPKG_ROOT": "C:\\vcpkg", "CCACHE_DIR": "D:\\ci\\ccache",
              "RUNNER_TOOL_CACHE": "D:\\ci\\tool_cache",
              "YUZU_BUILD_JOBS": "16",

@@ -153,7 +153,7 @@ lifecycle `event_id`s are boot-nonce'd (`guardian_spark_runtime.cpp:435`) and pr
 | eviction, sent-unacked | aged out, sent-label present, never server-confirmed | `journal_evicted_sent_unacked` | monitor |
 | quarantine | corrupt/unparseable value removed from replay | `journal_quarantined` | integrity gap, alert |
 | quarantine-rename-fail | could not even quarantine a corrupt batch | `journal_quarantine_failures` | integrity gap, alert |
-| field rejection | NUL/oversized field kept an entry out of the journal | `journal_field_rejected` | integrity gap, alert |
+| field rejection | NUL/oversized field or empty rule_id kept an entry out of the journal | `journal_field_rejected` | integrity gap, alert |
 | skewed-clock reject | normalized event ts floors to `seconds<=0` → would replay as server-receipt-now → false Conflict (rev-4.1 #2) | `journal_clock_rejected` | integrity gap, alert |
 | key-collision overwrite | boot-nonce+seq collision upserted over a batch (~2^-64) | `journal_key_collisions` | integrity gap, alert |
 
@@ -338,7 +338,7 @@ wires these to the heartbeat → Prometheus (unlabeled/low-cardinality).
 ## 9. Failure posture
 `set()` fail → `journal_write_failures`, per-push circuit-break, snapshot retained, retried by the maintenance
 tick; `pending_journal_` bounded → `journal_stage_dropped`. Parse/unknown-`v` → **quarantine** (`quarantine:<key>`,
-bounded/pruned) `journal_quarantined`; rename failure → `journal_quarantine_failures`. Field NUL/oversized →
+bounded/pruned) `journal_quarantined`; rename failure → `journal_quarantine_failures`. Field NUL/oversized or empty rule_id →
 `journal_field_rejected`. Fallible read error (§3) is distinguished from empty and retried, never treated as
 "journal empty". Prune failure → count, continue.
 

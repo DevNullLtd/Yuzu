@@ -306,7 +306,7 @@ dispatch_and_poll firewall state
 dispatch_and_poll firewall rules
 dispatch_and_poll bitlocker state
 dispatch_and_poll certificates list
-dispatch_and_poll quarantine status
+dispatch_and_poll firewall quarantine_status
 echo ""
 
 # ── Group 10: Windows Updates ───────────────────────────────────────────

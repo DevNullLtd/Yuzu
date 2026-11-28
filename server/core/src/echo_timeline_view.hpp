@@ -8,7 +8,7 @@
 ///  - Every time is epoch seconds, UTC.
 ///  - Each lane's `regions` are clipped to [window_from_ts, window_to_ts] and must cover
 ///    that window. A stretch no region covers renders "Coverage not stated"; the renderer
-///    never assumes a stretch is exact (empty is not exact).
+///    never assumes a stretch is covered (empty is not covered).
 ///  - Items outside the window are ignored by layout.
 ///  - `moment_ts == 0` means "the newest event boundary in the window" (a bar's start or end, a
 ///    tick, a bucket's or sample's start); the renderers resolve it with
@@ -20,17 +20,14 @@
 ///  - Item ids are unique across the model. An empty id is not selectable, and of two items
 ///    with one id the renderer shows the first.
 ///  - Within a lane, the region drawn on top where regions overlap is the one that starts
-///    later (a tie goes to the later in vector order); echo_timeline_region_at agrees. An
-///    exact region draws nothing, so where one overlaps a non-exact region the non-exact one
-///    must be the one on top: an exact region on top would leave the lane showing the
-///    non-exact state while the moment panel says nothing is lost.
+///    later (a tie goes to the later in vector order); echo_timeline_region_at agrees.
 ///  - EchoKeptBand::oldest_ts is MEASURED coverage: the oldest row or bucket the engine
 ///    observed for that tier on this device (0 = none observed). It is an absolute
 ///    boundary, never a duration, and never a projected reach.
 ///  - EchoKeptBand::policy_s is the tier's CONFIGURED retention duration from the registry
-///    defaults (0 = row-limited for the exact tier, otherwise not stated). The renderer
-///    states the policy as text and never derives an expiry or a remaining lifetime from
-///    oldest_ts.
+///    defaults (0 = not stated). For the hourly tier, 0 means the depth depends on the device's
+///    byte budget and the renderer says so. The renderer states the policy as text and never
+///    derives an expiry or a remaining lifetime from oldest_ts.
 ///  - process_capture_method is copied from the device's `echo status` key of the same
 ///    name (etw | endpoint_security | polling | empty = unknown). It is the LIVE path at
 ///    read time and the only source of the capture claim; the renderer never infers it
@@ -55,11 +52,11 @@
 
 namespace yuzu::server {
 
-/// Retention tier of a record, newest-detail first.
-enum class EchoTier { exact, hourly, daily, monthly };
+/// Retention tier of a record, newest-detail first. Roll-up is the only mode: no raw tier.
+enum class EchoTier { hourly, daily, monthly };
 
 /// What the engine can say about one stretch of one lane.
-enum class EchoRegionKind { exact, rolled_up, pruned, paused, not_readable, capped };
+enum class EchoRegionKind { rolled_up, pruned, paused, not_readable };
 
 /// Why a stretch could not be read (kind == not_readable).
 enum class EchoUnreadableReason { offline, read_failed, agent_too_old };
@@ -71,12 +68,10 @@ enum class EchoItemShape { bar, tick, count, column };
 struct EchoTimelineRegion {
     std::int64_t from_ts = 0;
     std::int64_t to_ts = 0;
-    EchoRegionKind kind = EchoRegionKind::exact;
-    EchoTier tier = EchoTier::exact;                         ///< rolled_up: which roll-up
+    EchoRegionKind kind = EchoRegionKind::rolled_up;
+    EchoTier tier = EchoTier::hourly;                         ///< rolled_up: which roll-up
     EchoUnreadableReason reason = EchoUnreadableReason::offline; ///< not_readable only
     std::int64_t paused_since_ts = 0;                      ///< paused only
-    std::int64_t cap_rows = 0;                             ///< capped only: the row limit hit
-    std::int64_t coverage_from_ts = 0;                     ///< capped only: oldest time shown
 };
 
 /// One drawable thing on a lane.
@@ -90,7 +85,7 @@ struct EchoTimelineItem {
     std::string title;
     /// count: events in the bucket. column: 0..100.
     std::int64_t count = 0;
-    EchoTier tier = EchoTier::exact;
+    EchoTier tier = EchoTier::hourly;
     bool flagged = false;
     /// Engine-supplied rows for the selected panel.
     std::vector<std::pair<std::string, std::string>> facts;
@@ -128,16 +123,15 @@ struct EchoSourceState {
 
 /// Measured coverage and configured policy for one tier of one source.
 struct EchoKeptBand {
-    EchoTier tier = EchoTier::exact;
+    EchoTier tier = EchoTier::hourly;
     std::int64_t oldest_ts = 0; ///< measured, absolute; 0 = none observed
-    std::int64_t policy_s = 0;  ///< configured duration; 0 = row-limited (exact) or not stated
+    std::int64_t policy_s = 0;  ///< configured duration; 0 = not stated (hourly: budget-dependent)
 };
 
 /// One row of the "what is kept" chart.
 struct EchoKeptRow {
     std::string source;
     std::string label;
-    std::int64_t row_limit = 0; ///< exact tier row limit; 0 = time-limited
     std::vector<EchoKeptBand> bands;
     /// As EchoSourceState::paused / paused_since_ts.
     bool paused = false;

@@ -6,15 +6,24 @@
  *   "query" — Searches for a specific app by name (partial match).
  *             Params: name (required).
  *   "list_inventory" — machine-scope software inventory for the daily sync
- *             (blob contract v2, ADR-0016). Emits the extended 12-field rows;
+ *             (ADR-0016). Emits the 12 blob fields plus install_location;
  *             fields an ecosystem does not store are EMPTY, never synthesised
- *             (no "-" placeholders, no sentinel row on an empty result).
+ *             (no "-" placeholders, no sentinel row on an empty result). A clean
+ *             pass declares result status OK / completeness FULL; a degraded
+ *             acquisition declares CONSTRAINED / PARTIAL, rc 1 and no rows.
  *
  * Output is pipe-delimited, one record per line via write_output():
  *   app|name|version|publisher|install_date|install_location|bundle_id  (list, every field escape-aware)
  *   app|name|version|publisher                                (query)
  *   inv|name|version|publisher|install_date|kind|ecosystem|epoch|release|arch|
- *       signature_status|distro_id|distro_version                 (list_inventory)
+ *       signature_status|distro_id|distro_version|install_location  (list_inventory)
+ *
+ * Linux acquisition (SAM-45): the dpkg and rpm package databases are read IN-PROCESS and
+ * read-only -- the dpkg status text (+ status.d), and the rpm database in whichever of its three
+ * formats the host uses (sqlite, ndb, Berkeley DB) -- by installed_apps_pkgdb_read.hpp over the
+ * pure parsers in agents/shared. This plugin runs no dpkg-query or rpm process. pacman and apk have no
+ * database reader and keep their bounded argv-runner legs. The rows are byte-identical to what
+ * the old subprocess output produced on every captured host.
  *
  * `list`/`query`/`list_per_user` output is a stable operator-facing contract
  * (content/definitions/installed_apps.yaml et al.). `list`'s two trailing
@@ -36,7 +45,7 @@
 #include <tuple>
 #include <vector>
 
-// Pure parse/format helpers for the list_inventory action (v2 rows). In a
+// Pure parse/format helpers for the list_inventory action (blob rows). In a
 // header so the unit test exercises the same code (pattern: #1662).
 #include "installed_apps_inventory.hpp"
 // Pure parse helpers for list/query/list_per_user's acquisition legs, plus
@@ -66,7 +75,14 @@
 #endif
 
 #ifdef __linux__
+#include <atomic>
+#include <ctime>
 #include <fstream>
+#include <thread>
+
+// The Linux dpkg/rpm database readers and their wall-clock-bounded form (SAM-45); a header so the
+// unit test drives the same code.
+#include "installed_apps_pkgdb_read.hpp"
 #endif
 
 #ifdef _WIN32
@@ -109,7 +125,10 @@ static_assert(yuzu::agent::kMaxCFStringBytes == parsers::kMaxListFieldBytes,
               "cfstring_to_utf8 cap must equal installed_apps kMaxListFieldBytes");
 #endif
 
-// ── subprocess helper (Linux / macOS) ──────────────────────────────────────
+// ── subprocess helper (Linux pacman/apk, macOS) ───────────────────────────
+//
+// Linux dpkg and rpm no longer come through here (SAM-45 reads their databases in-process); this
+// serves pacman and apk on Linux and every tool on macOS.
 //
 // Direct-argv, shell-free replacement for the old popen()-based run_command/
 // command_exists helpers (Wave 4 PR4.3a, ADR-3002 rung 2): argv[0] is exec'd
@@ -122,7 +141,7 @@ static_assert(yuzu::agent::kMaxCFStringBytes == parsers::kMaxListFieldBytes,
 #if defined(__linux__) || defined(__APPLE__)
 // The inner per-call capture cap. The runner's 1 MB default is BELOW the
 // 3.5 MiB capture cap sync_source_installed_software.cpp deliberately sets for
-// this very action, so the default would truncate a dense host's dpkg/rpm
+// this very action, so the default would truncate a dense host's package
 // enumeration *inside* the plugin -- before the outer cap that exists to
 // detect exactly that could ever see it, and the outer skip-the-cycle guard
 // would never fire. Sized above the outer cap so the OUTER one stays the
@@ -176,7 +195,7 @@ struct ToolOutcome {
 // removed between the enumerating `--pkgs` call and this lookup exits 1
 // (verified on macOS 26: a nonexistent receipt id gives rc=1). That is a
 // single missing row, not a truncated enumeration. Every TOP-LEVEL enumerator
-// leaves it false: dpkg-query -W, rpm -qa, pacman -Q, apk info, brew list,
+// leaves it false: pacman -Q, apk info,
 // system_profiler and pkgutil --pkgs all exit 0 on a healthy host (verified),
 // so a nonzero exit there means the enumeration did not complete and its
 // output is a prefix -- which must never be published as the whole truth.
@@ -198,7 +217,7 @@ ToolOutcome run_tool(std::vector<std::string> argv,
     // covers only `deadline` and `spawn_error` -- three of the enum's six
     // states slip through with all three flags clear (phase-2 review):
     //   signaled   -- the child was killed by a signal it received itself
-    //                 (the OOM killer taking dpkg-query/rpm on a dense host),
+    //                 (the OOM killer taking an enumerator on a dense host),
     //   cancelled  -- shutdown or the global subprocess cancel fired,
     //   line_limit -- a deliberate bounded stop.
     // Each yields a TRUNCATED enumeration that would have been published as
@@ -243,11 +262,16 @@ using AppInfo = parsers::AppRowFields;
 struct AppCollection {
     std::vector<AppInfo> apps;
     bool degraded = false;
+    // Why the acquisition degraded, when the leg knows: "<source>:<cause>" from the Linux
+    // package-database reader (e.g. rpm_sqlite:locked). Empty for a subprocess leg, whose
+    // degradation keeps the generic provenance. Wire-safe (the readers' closed vocabulary).
+    std::string reason;
 };
 
 struct InvCollection {
     std::vector<yuzu::installed_apps::inventory::InvRecord> records;
     bool degraded = false;
+    std::string reason; // as AppCollection::reason
 };
 
 // Case-insensitive substring match
@@ -279,23 +303,29 @@ namespace reg_walk = yuzu::installed_apps::reg_walk;
 const std::wstring kUninstallKey = L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall";
 
 std::span<const reg_walk::UninstallRoot> windows_roots() {
+    // Columns: root, subkey, extra_sam, absent_ok, degrades_walk. The plugin ships x64 only, so a
+    // 64-bit process always runs on a 64-bit OS and the WoW64 view always exists.
     static const reg_walk::UninstallRoot roots[] = {
-        {HKEY_LOCAL_MACHINE, kUninstallKey, KEY_WOW64_64KEY, false}, // 64-bit HKLM
-        // 32-bit HKLM (WoW6432Node): absent on a host without WoW64. A key that does not
-        // exist has no entries, so ERROR_FILE_NOT_FOUND cannot under-report (every other
-        // status still degrades). HKLM-64 stays strict: setup always creates it, so its
-        // absence is a broken hive.
-        {HKEY_LOCAL_MACHINE, kUninstallKey, KEY_WOW64_32KEY, true},
-        {HKEY_CURRENT_USER, kUninstallKey, 0, true}, // current user
+        // 64-bit HKLM: setup always creates it, so its absence is a broken hive.
+        {HKEY_LOCAL_MACHINE, kUninstallKey, KEY_WOW64_64KEY, false, true},
+        // 32-bit HKLM (WoW6432Node): absent only on a 32-bit OS (a key that does not exist has no
+        // entries), which this plugin never runs on; on a 64-bit OS a missing view is a broken
+        // one. Every other status degrades.
+        {HKEY_LOCAL_MACHINE, kUninstallKey, KEY_WOW64_32KEY, false, true},
+        // The agent identity's OWN HKCU: per-user data. Its absence is normal and its failure
+        // never degrades the machine-scope collection.
+        {HKEY_CURRENT_USER, kUninstallKey, 0, true, false},
     };
     return roots;
 }
 
 void log_failed_root(std::size_t i) {
     static constexpr const char* kRootNames[] = {"HKLM-64", "HKLM-32", "HKCU"};
-    spdlog::warn("installed_apps: Uninstall root {} could not be fully read -- the "
-                 "collection is degraded",
-                 kRootNames[i]);
+    // Row 3 (the agent identity's own HKCU) never degrades the walk (windows_roots()): its
+    // entries may be missing from a section sent as complete, which is what the line says.
+    spdlog::warn("installed_apps: Uninstall root {} could not be fully read -- {}", kRootNames[i],
+                 windows_roots()[i].degrades_walk ? "the collection is degraded"
+                                                  : "its entries may be missing");
 }
 
 AppCollection get_installed_apps_windows() {
@@ -304,56 +334,128 @@ AppCollection get_installed_apps_windows() {
         log_failed_root(i);
     auto apps = std::move(walk.apps);
 
-    // Sort, `list`-only location layer, unique(): one pure pass shared with the
-    // tests (installed_apps_parsers.hpp). The comparator and survivor are the
-    // pre-ADR-0028 code byte-for-byte, so the ADR-0016 `inv|` rows and `query`
+    // Sort, location layer, unique(): one pure pass shared with the tests
+    // (installed_apps_parsers.hpp). The comparator and survivor are the pre-ADR-0028
+    // code byte-for-byte, so the hashed fields of the ADR-0016 `inv|` rows and `query`
     // cannot move; only the survivor's install_location changes (it becomes the
-    // lexicographically smallest populated one in its run).
+    // lexicographically smallest populated one in its run), and that value now feeds
+    // the `inv|` row's 14th token (wire slot 13) as well as `list`.
     parsers::dedupe_uninstall_records(apps);
 
-    return AppCollection{std::move(apps), walk.degraded};
+    return AppCollection{std::move(apps), walk.degraded, {}};
 }
 #endif
 
 // ── Linux: detect package manager and list packages ───────────────────────
 
 #ifdef __linux__
+namespace pkgdb = yuzu::installed_apps::pkgdb;
+
+// ── bounded in-process package-database read ──────────────────────────────
+//
+// The dpkg/rpm database read has no cancellation of its own (a pread on a wedged volume cannot be
+// interrupted), so pkgdb::read_host_packages_bounded (installed_apps_pkgdb_read.hpp, compiled and
+// tested on every POSIX host) runs it under yuzu::shared::bounded_call_ex: the caller waits at most
+// Limits::wall and gives up, and the worker polls the same deadline and TWO stop signals through the
+// readers' budget and ends itself, so an abandoned worker is bounded too. The signals are the plugin's
+// own g_pkgdb_stop (raised by quiesce_pkgdb_calls() from shutdown()) and the agent's sticky shutdown
+// latch, yuzu::agent::subprocess_cancel_requested(): the old dpkg-query and rpm leg ran through
+// run_bounded_subprocess, which polls that latch, so a read must end at an agent stop as promptly.
+//
+// Tracked-call + bounded shutdown quiesce: the tracked-call shape of printing_plugin.cpp and
+// power_health_plugin.cpp (see printing_plugin.cpp's long comment on why the guard counts the
+// WAIT, on the calling thread, never from inside the detached worker), PLUS two things those do not
+// have: the stop flag the readers poll, and a fixed 5 s quiesce (kPkgDbShutdownQuiesce). shutdown()
+// raises the flag, so any worker still running ends at its next poll, then waits a bounded time for
+// callers still inside a read. What it cannot close is bounded_wait.hpp's own accepted residual: a
+// worker the kernel never returns from may outlive the unload. The guard, the flag and the quiesce
+// are the only part that lives here; tests/test_installed_apps_pkgdb_wiring_lexical.py pins their
+// wiring.
+std::atomic<int> g_outstanding_pkgdb_calls{0};
+std::atomic<bool> g_pkgdb_stop{false};
+constexpr std::chrono::seconds kPkgDbShutdownQuiesce{5};
+
+class PkgDbCallGuard {
+public:
+    PkgDbCallGuard() noexcept { ++g_outstanding_pkgdb_calls; }
+    ~PkgDbCallGuard() noexcept { --g_outstanding_pkgdb_calls; }
+    PkgDbCallGuard(const PkgDbCallGuard&) = delete;
+    PkgDbCallGuard& operator=(const PkgDbCallGuard&) = delete;
+};
+
+void quiesce_pkgdb_calls() noexcept {
+    g_pkgdb_stop.store(true, std::memory_order_relaxed);
+    const auto deadline = std::chrono::steady_clock::now() + kPkgDbShutdownQuiesce;
+    while (g_outstanding_pkgdb_calls.load(std::memory_order_relaxed) > 0 &&
+           std::chrono::steady_clock::now() < deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    if (const int residue = g_outstanding_pkgdb_calls.load(std::memory_order_relaxed); residue > 0)
+        spdlog::warn("installed_apps: shutdown quiesce timed out with {} package-database read(s) "
+                     "still outstanding",
+                     residue);
+}
+
+// Re-reads the process time zone, once per collection and before any local_tm call. glibc caches the
+// zone for the life of the process, while every old-path collection ran a fresh `rpm` process in the
+// CURRENT zone; the install_date text is a hashed field, so without this a zone change would leave
+// rows rendered in the zone the agent started with until it restarts. One collection never straddles
+// a zone change (tzset is not called per package). Serialised with localtime_r by glibc.
+void refresh_local_zone() noexcept { ::tzset(); }
+
+// std::tm for an rpm INSTALLTIME in the agent's local zone -- what `rpm -qa` formatted with. A
+// failed conversion leaves tm_wday at -1, which rpm_date_c_locale renders as empty.
+std::tm local_tm(std::int64_t t) {
+    std::tm out{};
+    out.tm_wday = -1;
+    const std::time_t tt = static_cast<std::time_t>(t);
+    if (::localtime_r(&tt, &out) == nullptr) {
+        out = std::tm{};
+        out.tm_wday = -1;
+    }
+    return out;
+}
+
+// One bounded read of the host's dpkg or rpm database. A failure (timeout, ceiling, or any
+// reader failure) comes back as `failure` with no packages: the caller reports a degraded answer.
+pkgdb::HostPackages read_host_packages_bounded() {
+    PkgDbCallGuard guard; // counts the wait on THIS thread, never from inside the detached worker
+    return pkgdb::read_host_packages_bounded("/", pkgdb::Limits{}, [] {
+        return g_pkgdb_stop.load(std::memory_order_relaxed) || yuzu::agent::subprocess_cancel_requested();
+    });
+}
+
 AppCollection get_installed_apps_linux() {
     std::vector<AppInfo> apps;
     bool degraded = false;
 
-    if (auto path = yuzu::agent::probe_tool_path({"/usr/bin/dpkg-query", "/bin/dpkg-query", "/usr/local/bin/dpkg-query"});
-        !path.empty()) {
-        // installed_apps/get_installed_apps_linux#1 (docs/agent-spawn-sink-manifest.md)
-        // Debian/Ubuntu. Format-string byte-for-byte matches the old shell
-        // command's single-quoted argument: the "\n" below is the LITERAL
-        // two-byte escape dpkg-query's own format interpreter expands (not a
-        // real newline byte) -- contrast get_inventory_linux's tab-separated
-        // sibling call, which embeds real tab/newline bytes instead.
-        auto res = run_tool({path, "-W", "-f=${Package}|${Version}|${Maintainer}|${Status}\\n"});
-        degraded = degraded || res.degraded;
-        auto out = std::move(res.output);
-        for (auto& rec : parsers::parse_dpkg_list(out)) {
-            // parse_dpkg_list already filters to "install ok installed" rows.
-            apps.push_back({std::move(rec.name), std::move(rec.version),
-                            std::move(rec.publisher), "-", {}, {}});
+    // installed_apps/get_installed_apps_linux: dpkg and rpm are read in-process (SAM-45), by DATABASE
+    // file rather than by tool binary; pacman keeps its bounded argv leg below.
+    auto host = read_host_packages_bounded();
+    if (!host.failure.empty()) {
+        spdlog::warn("installed_apps: package database read failed ({}) -- reporting the collection "
+                     "as degraded, no rows",
+                     host.failure);
+        return AppCollection{{}, true, std::move(host.failure)};
+    }
+
+    if (host.ecosystem == pkgdb::HostPackages::Ecosystem::dpkg) {
+        for (const auto& pkg : host.dpkg) {
+            if (auto rec = parsers::app_record_from_dpkg(pkg))
+                apps.push_back({std::move(rec->name), std::move(rec->version),
+                                std::move(rec->publisher), "-", {}, {}});
         }
-    } else if (auto path = yuzu::agent::probe_tool_path({"/usr/bin/rpm", "/bin/rpm", "/usr/local/bin/rpm"});
-              !path.empty()) {
-        // installed_apps/get_installed_apps_linux#2
-        // RHEL/Fedora/SUSE.
-        auto res = run_tool({path, "-qa", "--queryformat",
-                             "%{NAME}|%{VERSION}-%{RELEASE}|%{VENDOR}|%{INSTALLTIME:date}\\n"});
-        degraded = degraded || res.degraded;
-        auto out = std::move(res.output);
-        for (auto& rec : parsers::parse_rpm_list(out)) {
-            apps.push_back({std::move(rec.name), std::move(rec.version),
-                            std::move(rec.publisher), std::move(rec.install_date), {}, {}});
+    } else if (host.ecosystem == pkgdb::HostPackages::Ecosystem::rpm) {
+        refresh_local_zone();
+        for (const auto& pkg : host.rpm) {
+            auto rec = parsers::app_record_from_rpm(pkg, local_tm);
+            apps.push_back({std::move(rec.name), std::move(rec.version), std::move(rec.publisher),
+                            std::move(rec.install_date), {}, {}});
         }
     } else if (auto path = yuzu::agent::probe_tool_path({"/usr/bin/pacman", "/bin/pacman", "/usr/local/bin/pacman"});
-              !path.empty()) {
-        // installed_apps/get_installed_apps_linux#3
-        // Arch Linux. Format: "name version".
+               !path.empty()) {
+        // installed_apps/get_installed_apps_linux#3 (docs/agent-spawn-sink-manifest.md)
+        // Arch Linux. Format: "name version". (The id keeps its number: the dpkg-query and rpm sinks
+        // #1/#2 are gone with SAM-45, and a sink id is never renumbered.)
         auto res = run_tool({path, "-Q"});
         degraded = degraded || res.degraded;
         auto out = std::move(res.output);
@@ -363,7 +465,7 @@ AppCollection get_installed_apps_linux() {
 
     std::sort(apps.begin(), apps.end(),
               [](const AppInfo& a, const AppInfo& b) { return a.name < b.name; });
-    return AppCollection{std::move(apps), degraded};
+    return AppCollection{std::move(apps), degraded, {}};
 }
 #endif
 
@@ -406,11 +508,11 @@ AppCollection get_installed_apps_macos() {
     std::sort(apps.begin(), apps.end(), [](const AppInfo& a, const AppInfo& b) {
         return std::tie(a.name, a.install_location) < std::tie(b.name, b.install_location);
     });
-    return AppCollection{std::move(apps), degraded};
+    return AppCollection{std::move(apps), degraded, {}};
 }
 #endif
 
-// ── list_inventory collectors (blob contract v2) ──────────────────────────
+// ── list_inventory collectors (blob contract v3) ──────────────────────────
 
 namespace inv = yuzu::installed_apps::inventory;
 
@@ -418,6 +520,17 @@ namespace inv = yuzu::installed_apps::inventory;
 InvCollection get_inventory_linux() {
     bool degraded = false;
     std::vector<inv::InvRecord> recs;
+
+    // installed_apps/get_inventory_linux: dpkg and rpm are read in-process (SAM-45), by database file;
+    // a failed read yields NO rows and a named reason, so the daily sync reports the facet constrained
+    // (the server keeps the stored rows) instead of committing a smaller roster as the whole host.
+    auto host = read_host_packages_bounded();
+    if (!host.failure.empty()) {
+        spdlog::warn("installed_apps: package database read failed ({}) -- reporting the collection "
+                     "as degraded, no rows",
+                     host.failure);
+        return InvCollection{{}, true, std::move(host.failure)};
+    }
 
     const auto collect = [&recs, &degraded](std::vector<std::string> argv, auto parse_line) {
         auto res = run_tool(std::move(argv));
@@ -435,52 +548,36 @@ InvCollection get_inventory_linux() {
         }
     };
 
-    if (auto path = yuzu::agent::probe_tool_path({"/usr/bin/dpkg-query", "/bin/dpkg-query", "/usr/local/bin/dpkg-query"});
-        !path.empty()) {
-        // installed_apps/get_inventory_linux#1 (docs/agent-spawn-sink-manifest.md)
-        // ${db:Status-Abbrev} (want+status+eflag, 3 chars incl. a trailing
-        // space for the usual empty eflag -- verified against debian:12, which
-        // emits "ii ") keeps installed AND held
-        // packages via its 2nd char == 'i' ("ii" want=install, "hi" want=hold)
-        // — matches vuln_scan's vuln_identity.hpp (PR #1804) exactly, so the
-        // two collectors agree on which packages are present. "rc"
-        // (removed, config-files) and "un" (unknown) are correctly excluded;
-        // this also supersedes the legacy `list` filter's narrower
-        // "install ok installed" substring check, which excludes held.
-        // The tabs/newline below are REAL bytes (single-backslash \t/\n,
-        // compiled by C++ into actual TAB/LF characters) -- contrast the
-        // legacy list format's literal two-byte "\n" escape above, which
-        // dpkg-query's own interpreter expands instead.
-        collect({path, "-W",
-                "-f=${Package}\t${db:Status-Abbrev}\t${Version}\t${Architecture}\t${Maintainer}\n"},
-                inv::parse_dpkg_inv_line);
-    } else if (auto path = yuzu::agent::probe_tool_path({"/usr/bin/rpm", "/bin/rpm", "/usr/local/bin/rpm"});
-              !path.empty()) {
-        // installed_apps/get_inventory_linux#2
-        // Raw SIGPGP (payload) + RSAHEADER (header) signature tags; signed vs
-        // unsigned is computed in C++ by parse_rpm_inv_line/rpm_sig_present —
-        // matches vuln_scan's vuln_identity.hpp (PR #1804) exactly, so the two
-        // collectors agree on this field for the same rpm. Never a live
-        // `rpm -K` verification. PACKAGER per the v2 spec (`list` keeps VENDOR
-        // for its stable operator contract).
-        collect({path, "-qa", "--queryformat",
-                "%{NAME}\t%{EPOCH}\t%{VERSION}\t%{RELEASE}\t%{ARCH}\t%{PACKAGER}\t"
-                "%{INSTALLTIME:date}\t%{SIGPGP}\t%{RSAHEADER}\n"},
-                inv::parse_rpm_inv_line);
+    if (host.ecosystem == pkgdb::HostPackages::Ecosystem::dpkg) {
+        // inv_record_from_dpkg keeps installed AND held packages (state `installed`, any want) and
+        // drops removed-with-config ("rc"), unknown ("un") and every half-installed state -- the old
+        // `${db:Status-Abbrev}` second-character rule, and vuln_scan's vuln_identity.hpp (PR #1804)
+        // agrees with it, so the two collectors agree on which packages are present.
+        for (const auto& pkg : host.dpkg)
+            if (auto r = inv::inv_record_from_dpkg(pkg))
+                recs.push_back(std::move(*r));
+    } else if (host.ecosystem == pkgdb::HostPackages::Ecosystem::rpm) {
+        // Signed vs unsigned is computed from the STORED SIGPGP (payload) + RSAHEADER (header)
+        // signature tags, never a live `rpm -K` verification, exactly as vuln_scan's
+        // vuln_identity.hpp (PR #1804) does, so the two collectors agree on this field. The
+        // publisher is the declared VENDOR, falling back to PACKAGER (a person) when VENDOR is unset.
+        refresh_local_zone();
+        for (const auto& pkg : host.rpm)
+            recs.push_back(inv::inv_record_from_rpm(pkg, local_tm));
     } else if (auto path = yuzu::agent::probe_tool_path({"/usr/bin/pacman", "/bin/pacman", "/usr/local/bin/pacman"});
-              !path.empty()) {
+               !path.empty()) {
         // installed_apps/get_inventory_linux#3
         collect({path, "-Q"}, inv::parse_pacman_inv_line);
     } else if (auto path = yuzu::agent::probe_tool_path({"/sbin/apk", "/usr/sbin/apk", "/bin/apk", "/usr/bin/apk", "/usr/local/bin/apk"});
-              !path.empty()) {
+               !path.empty()) {
         // installed_apps/get_inventory_linux#4
         // Alpine — first apk enumeration on the sync path (the legacy `list`
         // has no apk branch; precedent is vuln_scan's enumerator).
         collect({path, "info", "-v"}, inv::parse_apk_inv_line);
     }
 
-    // Host-level distro identity, read once and stamped on every row (v2
-    // contract). Honest-empty when /etc/os-release is absent (minimal
+    // Host-level distro identity, read once and stamped on every row (blob
+    // contract v3). Honest-empty when /etc/os-release is absent (minimal
     // containers) or the keys are missing.
     std::string osrel;
     if (std::ifstream f{"/etc/os-release"}; f) {
@@ -494,7 +591,7 @@ InvCollection get_inventory_linux() {
         r.distro_id = distro_id;
         r.distro_version = distro_version;
     }
-    return InvCollection{std::move(recs), degraded};
+    return InvCollection{std::move(recs), degraded, {}};
 }
 #endif
 
@@ -593,12 +690,13 @@ InvCollection get_inventory_macos_uncached() {
             r.name = std::move(app.name);
             r.version = std::move(app.version);
             r.install_date = std::move(app.install_date); // Last Modified
+            r.install_location = app.location; // the .app path; read again below for enrichment
             r.kind = "app";
             r.ecosystem = "macos";
             // #2273 native enrichment: CFBundle + SecStaticCode, in-process,
             // no subprocess (installed_apps_macos_enrich.hpp). Fills ONLY the
             // pre-existing, currently-honest-empty publisher/signature_status
-            // fields -- ADR-0016: the hashed 12-field row is NEVER
+            // fields -- ADR-0016: the hashed 13-field row is NEVER
             // added-to/reordered. bundle_id has no home in this row; see that
             // header's comment.
             if (!app.location.empty() && enriched < kMaxEnrichApps) {
@@ -752,7 +850,7 @@ InvCollection get_inventory_macos_uncached() {
         }
     }
 
-    return InvCollection{std::move(recs), degraded};
+    return InvCollection{std::move(recs), degraded, {}};
 }
 
 // ── Round-3 sync-speed fix: memoize the whole macOS collection ─────────────
@@ -921,14 +1019,23 @@ void clear_profiler_cache() {
 }
 #endif
 
+// The typed-result provenance for a degraded answer: installed_apps:<source>:<cause> when the
+// leg named one, else the generic token every other leg uses.
+[[maybe_unused]] std::string provenance_for(std::string_view reason) {
+    if (reason.empty())
+        return parsers::kDegradedProvenance;
+    return "installed_apps:" + std::string{reason};
+}
+
 int do_list_inventory(yuzu::CommandContext& ctx) {
     // A degraded acquisition yields a SMALLER-but-well-formed inventory, and
     // the daily sync (ADR-0016) replaces the host's authoritative software set
     // with whatever it receives. The server cannot tell an incomplete snapshot
     // from a complete one -- it hashes bytes, not completeness -- so the only
     // place this can be caught is here. sync_source_installed_software.cpp
-    // already skips the whole cycle on a nonzero rc; this reports into that
-    // existing contract rather than inventing a new signal.
+    // reports the facet constrained (status-only, stored rows kept) on a nonzero
+    // rc; this reports into that existing contract rather than inventing a new
+    // signal.
 #ifdef _WIN32
     // Windows acquires natively (registry). A root that could not be opened or
     // enumerated to the end, or an app key that was denied, marks the walk
@@ -946,16 +1053,20 @@ int do_list_inventory(yuzu::CommandContext& ctx) {
 #endif
 
     if (collected.degraded)
-        spdlog::warn("installed_apps: list_inventory acquisition was degraded -- reporting "
-                     "rc=1 so the daily sync skips this cycle instead of committing a "
-                     "partial inventory as authoritative");
+        spdlog::warn("installed_apps: list_inventory acquisition was degraded{} -- reporting "
+                     "rc=1 so the daily sync reports it constrained instead of committing a "
+                     "partial inventory as authoritative",
+                     collected.reason.empty() ? std::string{} : " (" + collected.reason + ")");
 
     // No sentinel row: an empty result is empty output + rc 0. The sync
-    // source's empty-parse guard skips the cycle rather than wiping state.
+    // source's empty-parse guard reports the facet constrained (`no_rows`)
+    // rather than wiping state. A degraded answer carries its named reason in the typed
+    // result's provenance when the leg knows it (the Linux database readers do).
     return parsers::emit_inventory(ctx, collected.degraded, collected.records,
                                    [](const inv::InvRecord& r) {
                                        return yuzu::util::sanitize_utf8(inv::format_inv_row(r));
-                                   });
+                                   },
+                                   provenance_for(collected.reason));
 #endif
 }
 
@@ -963,15 +1074,21 @@ int do_list_inventory(yuzu::CommandContext& ctx) {
 // the caller to bail. Returns true when the collection is healthy and the
 // action should proceed. Kept as one helper so `list`, `query` and
 // `list_per_user` cannot drift apart on the wording or the rc.
-bool report_if_degraded(yuzu::CommandContext& ctx, bool degraded, std::string_view action) {
+// `reason` is the leg's named cause when it has one ("<source>:<cause>" from the Linux database
+// reader): the typed status and the error row then both name installed_apps:<reason>.
+bool report_if_degraded(yuzu::CommandContext& ctx, bool degraded, std::string_view action,
+                        [[maybe_unused]] std::string_view reason = {}) {
     if (degraded)
-        spdlog::warn("installed_apps: '{}' acquisition was degraded -- reporting an error "
+        spdlog::warn("installed_apps: '{}' acquisition was degraded{} -- reporting an error "
                      "rather than presenting a partial or empty list as authoritative",
-                     action);
+                     action, reason.empty() ? std::string{} : " (" + std::string{reason} + ")");
 #ifdef _WIN32
     return parsers::report_degraded(ctx, degraded, parsers::kRegistryCauses);
 #else
-    return parsers::report_degraded(ctx, degraded);
+    if (reason.empty())
+        return parsers::report_degraded(ctx, degraded);
+    const std::string provenance = provenance_for(reason);
+    return parsers::report_degraded(ctx, degraded, provenance, provenance);
 #endif
 }
 
@@ -993,7 +1110,7 @@ int do_list(yuzu::CommandContext& ctx) {
     // when the tool was actually killed at its deadline or by the OOM killer.
     // Report it instead, matching services_plugin.cpp's precedent. The emitted
     // ROW format is untouched; only the failure signal is new.
-    if (!report_if_degraded(ctx, apps.degraded, "list"))
+    if (!report_if_degraded(ctx, apps.degraded, "list", apps.reason))
         return 1;
 
 #if defined(__APPLE__)
@@ -1039,7 +1156,7 @@ int do_query(yuzu::CommandContext& ctx, yuzu::Params params) {
 
     // Same reasoning as `list`: "found|false" from a killed enumerator is a
     // wrong answer presented as a correct one.
-    if (!report_if_degraded(ctx, apps.degraded, "query"))
+    if (!report_if_degraded(ctx, apps.degraded, "query", apps.reason))
         return 1;
 
     bool found = false;
@@ -1050,8 +1167,7 @@ int do_query(yuzu::CommandContext& ctx, yuzu::Params params) {
                 found = true;
             }
             ctx.write_output(yuzu::util::sanitize_utf8(
-                std::format("app|{}|{}|{}", app.name, app.version.empty() ? "-" : app.version,
-                            app.publisher.empty() ? "-" : app.publisher)));
+                parsers::format_query_row(app.name, app.version, app.publisher)));
         }
     }
 
@@ -1064,17 +1180,21 @@ int do_query(yuzu::CommandContext& ctx, yuzu::Params params) {
 // ABI4 capability declarations (#2204). Windows reads the registry
 // Uninstall key(s) natively for all four actions (including the
 // RegLoadKeyW-mounted per-user hive walk in "list_per_user") — rung 1.
-// Linux and macOS now collect through the shared bounded argv runner
-// (yuzu::agent::run_bounded_subprocess, ADR-3002 rung 2) — dpkg-query/rpm/
-// pacman/apk on Linux, system_profiler(+brew for list_per_user)(+pkgutil +
-// native SecCode/CFBundle enrichment for list_inventory, + CFBundle for `list`'s
-// bundle_id) on macOS — Wave 4 PR4.3a's de-shell migration off the prior
-// ungoverned rung-3 popen()/system() acquisition.
+// macOS collects through the shared bounded argv runner
+// (yuzu::agent::run_bounded_subprocess, ADR-3002 rung 2) — system_profiler
+// (+pkgutil + native SecCode/CFBundle enrichment for list_inventory, + CFBundle for
+// `list`'s bundle_id) — Wave 4 PR4.3a's de-shell migration off the prior
+// ungoverned rung-3 popen()/system() acquisition. Linux reads the dpkg and rpm package
+// databases in-process (SAM-45) and runs only pacman (and apk for list_inventory) through
+// the runner, so the leg stays rung 2 while a subprocess leg remains.
 const YuzuActionDescriptor kActionDescriptors[] = {
     {
         /* .action      = */ "list",
         /* .linux_leg   = */
-        {YUZU_SUPPORT_SUPPORTED, 2, "dpkg-query/rpm/pacman via bounded argv runner", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 2,
+         "dpkg status and rpm database (sqlite, ndb, bdb) read in-process; pacman via bounded "
+         "argv runner",
+         nullptr},
         /* .macos_leg   = */
         {YUZU_SUPPORT_SUPPORTED, 2,
          "system_profiler via bounded argv runner + native CFBundle enrichment",
@@ -1085,7 +1205,10 @@ const YuzuActionDescriptor kActionDescriptors[] = {
     {
         /* .action      = */ "query",
         /* .linux_leg   = */
-        {YUZU_SUPPORT_SUPPORTED, 2, "dpkg-query/rpm/pacman via bounded argv runner", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 2,
+         "dpkg status and rpm database (sqlite, ndb, bdb) read in-process; pacman via bounded "
+         "argv runner",
+         nullptr},
         /* .macos_leg   = */
         {YUZU_SUPPORT_SUPPORTED, 2, "system_profiler via bounded argv runner", nullptr},
         /* .windows_leg = */
@@ -1094,9 +1217,12 @@ const YuzuActionDescriptor kActionDescriptors[] = {
     {
         /* .action      = */ "list_per_user",
         /* .linux_leg   = */
-        {YUZU_SUPPORT_SUPPORTED, 2, "dpkg-query/rpm/pacman via bounded argv runner", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 2,
+         "dpkg status and rpm database (sqlite, ndb, bdb) read in-process; pacman via bounded "
+         "argv runner",
+         nullptr},
         /* .macos_leg   = */
-        {YUZU_SUPPORT_SUPPORTED, 2, "system_profiler + brew via bounded argv runner", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 2, "system_profiler via bounded argv runner", nullptr},
         /* .windows_leg = */
         {YUZU_SUPPORT_SUPPORTED, 1,
          "Reg*W enumeration of HKU\\<SID>'s Uninstall key, mounting NTUSER.DAT via "
@@ -1106,7 +1232,10 @@ const YuzuActionDescriptor kActionDescriptors[] = {
     {
         /* .action      = */ "list_inventory",
         /* .linux_leg   = */
-        {YUZU_SUPPORT_SUPPORTED, 2, "dpkg-query/rpm/pacman/apk via bounded argv runner", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 2,
+         "dpkg status and rpm database (sqlite, ndb, bdb) read in-process; pacman/apk via bounded "
+         "argv runner",
+         nullptr},
         /* .macos_leg   = */
         {YUZU_SUPPORT_SUPPORTED, 2,
          "system_profiler + pkgutil via bounded argv runner + native SecCode/CFBundle "
@@ -1140,9 +1269,17 @@ public:
         return sizeof(kActionDescriptors) / sizeof(kActionDescriptors[0]);
     }
 
-    yuzu::Result<void> init(yuzu::PluginContext& /*ctx*/) override { return {}; }
+    yuzu::Result<void> init(yuzu::PluginContext& /*ctx*/) override {
+#ifdef __linux__
+        g_pkgdb_stop.store(false, std::memory_order_relaxed); // a re-init'd instance in one process reads again
+#endif
+        return {};
+    }
 
     void shutdown(yuzu::PluginContext& /*ctx*/) noexcept override {
+#ifdef __linux__
+        quiesce_pkgdb_calls();
+#endif
 #ifdef __APPLE__
         clear_profiler_cache();
 #endif
@@ -1181,10 +1318,15 @@ private:
             ctx.write_output("error|profile_list_unreadable");
             return 1;
         }
-        const auto hku_subkeys = yuzu::win::enumerate_hku_subkeys();
+        const auto hku = yuzu::win::enumerate_hku_subkeys_checked();
+        if (!hku.error.empty()) {
+            spdlog::warn("installed_apps: HKEY_USERS listing incomplete ({})", hku.error);
+            ctx.write_output("error|hku_list_incomplete");
+            return 1;
+        }
         // System SIDs are filtered here, BEFORE any per-profile read, rather
         // than after reading ProfileImagePath as the old walk did.
-        const auto profiles = yuzu::profiles::build_profile_list(records, hku_subkeys);
+        const auto profiles = yuzu::profiles::build_profile_list(records, hku.names);
 
         std::size_t privilege_missing = 0;
         std::size_t hive_read_failed = 0;
@@ -1235,10 +1377,8 @@ private:
                 // registry list_profiles case, where a leading tag caused the
                 // hp-B1 column shift. Do not strip it.
                 ctx.write_output(yuzu::util::sanitize_utf8(
-                    std::format("user_app|{}|{}|{}|{}|{}", username,
-                                app.name, app.version.empty() ? "-" : app.version,
-                                app.publisher.empty() ? "-" : app.publisher,
-                                app.install_date.empty() ? "-" : app.install_date)));
+                    parsers::format_user_app_row(username, app.name, app.version, app.publisher,
+                                                 app.install_date)));
             }
         }
 
@@ -1261,45 +1401,28 @@ private:
         // List packages installed per-user via dpkg or per-user snap/flatpak
         // For dpkg-based systems, packages are system-wide. Report them as system.
         auto apps = get_installed_apps_linux();
-        if (!report_if_degraded(ctx, apps.degraded, "list_per_user"))
+        if (!report_if_degraded(ctx, apps.degraded, "list_per_user", apps.reason))
             return 1;
         for (const auto& app : apps.apps) {
-            ctx.write_output(yuzu::util::sanitize_utf8(
-                std::format("user_app|system|{}|{}|{}|{}", app.name,
-                            app.version.empty() ? "-" : app.version,
-                            app.publisher.empty() ? "-" : app.publisher,
-                            app.install_date.empty() ? "-" : app.install_date)));
+            ctx.write_output(yuzu::util::sanitize_utf8(parsers::format_user_app_row(
+                "system", app.name, app.version, app.publisher, app.install_date)));
         }
         return 0;
 
 #elif defined(__APPLE__)
-        // On macOS, use brew list per user if Homebrew is installed
-        // First list system apps
+        // On macOS the per-user action reports the system apps only (see the F19 note below).
         auto apps = get_installed_apps_macos();
         if (!report_if_degraded(ctx, apps.degraded, "list_per_user"))
             return 1;
         for (const auto& app : apps.apps) {
-            ctx.write_output(yuzu::util::sanitize_utf8(
-                std::format("user_app|system|{}|{}|{}|{}", app.name,
-                            app.version.empty() ? "-" : app.version,
-                            app.publisher.empty() ? "-" : app.publisher,
-                            app.install_date.empty() ? "-" : app.install_date)));
+            ctx.write_output(yuzu::util::sanitize_utf8(parsers::format_user_app_row(
+                "system", app.name, app.version, app.publisher, app.install_date)));
         }
 
-        // installed_apps/do_list_per_user#1 (docs/agent-spawn-sink-manifest.md)
-        // Try Homebrew per-user (runs under current user).
-        if (auto brew_path =
-                yuzu::agent::probe_tool_path({"/opt/homebrew/bin/brew", "/usr/local/bin/brew"});
-            !brew_path.empty()) {
-            auto brew_res = run_tool({brew_path, "list", "--versions"});
-            if (!report_if_degraded(ctx, brew_res.degraded, "list_per_user"))
-                return 1;
-            auto brew_out = std::move(brew_res.output);
-            for (auto& rec : parsers::parse_brew_list(brew_out)) {
-                ctx.write_output(yuzu::util::sanitize_utf8(std::format(
-                    "user_app|brew|{}|{}|-|-", rec.name, rec.version.empty() ? "-" : rec.version)));
-            }
-        }
+        // F19 (WP13): no Homebrew rows and NO brew subprocess here. The agent is root on macOS
+        // and a Homebrew prefix is owned by the installing user, so executing its `brew` script
+        // would run a user-controlled file as root. The Homebrew inventory is
+        // pkg_inventory.packages (no-follow directory reads, no subprocess).
         return 0;
 #else
         ctx.write_output("error|per-user app inventory not supported on this platform");

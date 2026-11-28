@@ -42,22 +42,27 @@ in confusing ways.
 ### 1. The system GCC cannot build this project
 
 RHEL 9's `gcc` is 11. Yuzu is C++23 and the documented floor is **GCC 13+ / Clang 18+**. The fix is
-a **Software Collection**: `gcc-toolset-14` ships GCC 14.2.1 *and its own libstdc++ 14 headers*,
+a **Software Collection**: `gcc-toolset-15` ships GCC 15.2.1 *and its own libstdc++ 15 headers*,
 which is the part that matters — `<expected>` and the C++23 `<format>` additions live in libstdc++,
 and the base system's `libstdc++-devel` is 11.5.
 
+The recipe uses **15, not 14**, because 15 is what CI's Linux leg builds with. `dev` code that
+gcc-15 accepts can fail on libstdc++ 14 (a `std::string` set built from a `string_view` range is one
+example), and CI never builds with 14, so a gcc-toolset-14 host is the only place such a break
+shows. GCC 13 stays the documented floor; 15 is the toolchain this recipe tests.
+
 This also rules out the obvious-looking alternative: AppStream carries `clang` 21, but Clang uses
 the *system* libstdc++ headers, so a bare `clang++ -std=c++23` still gets the 11.5 library. Using
-Clang here means installing `gcc-toolset-14` anyway and pointing Clang at it with
+Clang here means installing `gcc-toolset-15` anyway and pointing Clang at it with
 `--gcc-install-dir`. Not worth it unless you specifically want a second-opinion compile.
 
 A Software Collection must be activated **per shell**:
 
 ```bash
-source /opt/rh/gcc-toolset-14/enable
+source /opt/rh/gcc-toolset-15/enable
 ```
 
-Inside the collection the binaries are plain **`gcc` / `g++`** — *not* `gcc-14` / `g++-14`. That
+Inside the collection the binaries are plain **`gcc` / `g++`** — *not* `gcc-15` / `g++-15`. That
 detail drives trap 2. (gcc-toolset links the newer libstdc++ bits statically, so the binaries you
 build still run on the base system without the collection activated.)
 
@@ -175,7 +180,7 @@ where `mold` and Erlang live, if you later want either.
 
 ```bash
 sudo dnf install -y \
-  gcc-toolset-14 \
+  gcc-toolset-15 \
   cmake ninja-build pkgconf-pkg-config make \
   bison flex autoconf automake libtool \
   perl perl-IPC-Cmd perl-FindBin perl-File-Compare perl-Pod-Html \
@@ -191,7 +196,7 @@ package conflict that aborts `dnf`. The script adds `curl` only when no `curl` b
 
 | Package(s) | Why |
 |---|---|
-| `gcc-toolset-14` | C++23. See trap 1. |
+| `gcc-toolset-15` | C++23, and the GCC that CI's Linux leg uses. See trap 1. |
 | `cmake` | Not a build system here — Meson's `dependency(..., method: 'cmake')` resolution needs it, which is how gRPC/protobuf/SQLite/PostgreSQL/Catch2 are all found. |
 | `ninja-build` | Meson's backend (CRB). |
 | `bison`, `flex` | vcpkg's `libpq` port builds PostgreSQL from source and cannot auto-acquire these on Linux. |
@@ -220,7 +225,7 @@ hard-errors if it fails, because content embedding (`embed_content.py`) needs it
 
 > Do not install the hash-pinned `requirements-ci.txt` here: its meson pin needs Python 3.10+, so
 > under Python 3.9 pip refuses it outright. Install the two packages that matter explicitly.
-> (`gcovr` from that file is only for the nightly coverage job.)
+> (`gcovr` from that file is for the nightly coverage job and the local `/test` coverage gate.)
 
 ### The Python 3.9 ceiling
 
@@ -283,10 +288,10 @@ behind a guard block, so it is safe on re-run. (To undo, delete the block betwee
 `rm ~/.config/yuzu/toolchain-env.sh`; the cluster, role and `~/vcpkg` are left to you.)
 
 ```bash
-source /opt/rh/gcc-toolset-14/enable   # guarded: no stacked PATH entries
+source /opt/rh/gcc-toolset-15/enable   # guarded: no stacked PATH entries
 PATH="$HOME/.local/bin:$PATH"          # meson
 export VCPKG_ROOT="$HOME/vcpkg"
-export CC="ccache gcc" CXX="ccache g++"
+export CC="/usr/lib64/ccache/gcc" CXX="/usr/lib64/ccache/g++"   # ccache symlinks; plain gcc/g++ when ccache is absent
 export YUZU_TEST_POSTGRES_DSN="postgresql://yuzu:yuzu@127.0.0.1:5432/yuzu_test"   # --with-postgres only, once verified
 ```
 
@@ -348,15 +353,27 @@ tests-build-server-linux_x64/yuzu_server_tests "[pg]"
 
 ## Verified reference run
 
-**Re-verified 2026-08-31 (script as of `5bc96ea73`)** in a Rocky 9.8 KVM guest (12 vCPU /
+**Re-verified 2026-11-22 for the gcc-toolset-15 switch** on an existing gcc-14 recipe host (a Rocky 9.8
+Hyper-V guest, 16 vCPU / 46 GB, SELinux enforcing), so no `initdb` ran. The recipe
+(`--with-postgres --manifest`) completed with zero failed steps, installed gcc-toolset-15 and rewrote
+the env file to it, and `--check --with-postgres` passed every check. After `setup.sh --tests --wipe`,
+`meson test --suite server --suite agent --suite echo` gave 62 OK / 5 skipped / 0 failed of 67
+targets; the skips are the five browser-script behaviour tests (no `node` on the host), and all 15
+`[pg]` shards passed. This run is **not** a stock-recipe run in three ways, all recorded in
+`docs/rhel9-toolchain-manifest.json`: the cluster had CI's durability-off settings and
+`max_connections=400` (at the defaults, 13 of 15 `[pg]` shards hit their 700 s timeout on this host),
+the test role was a superuser, and the vcpkg tree was the one built under gcc-14. The device-inventory
+test that needs a superuser was also run under the recipe's least-privilege role: it skips, 0 failed.
+
+**Previously re-verified 2026-08-31 (script as of `5bc96ea73`)** in a Rocky 9.8 KVM guest (12 vCPU /
 23 GB) with SELinux **enforcing** and real systemd - the `postgresql-setup --initdb` + `systemctl`
 path ran genuinely, not shimmed. The recipe (`--with-postgres --manifest`) completed with zero
 failed steps, `--check --with-postgres` passed every check, and the full
 `setup.sh --tests` → `meson compile` → `meson test` sequence gave 35 OK / 2 skipped / 2 failed -
 the same two pre-existing failures as the original run below (the SQLite `RETURNING` telemetry
 limitation, and the known Linux-only MCP case, #2610 family). All 11 `[pg]` shards passed against
-the recipe-provisioned cluster. `docs/rhel9-toolchain-manifest.json` now records this run; the
-original bare-metal record remains in that file's git history. Still unexercised: the RHEL
+the recipe-provisioned cluster. That run's record, and the original bare-metal
+record, remain in `docs/rhel9-toolchain-manifest.json`'s git history. Still unexercised: the RHEL
 `subscription-manager` and EPEL-on-RHEL branches, and arm64.
 
 ### Original reference run (2026-08-15)
@@ -435,7 +452,7 @@ today this is a documented limitation rather than something the setup script can
 ## Out of scope
 
 - **The Erlang gateway.** With no rebar3 on `PATH` the configure step prints `Erlang gateway:
-  skipped` and the C++ build proceeds normally; the `gateway eunit shard A` / `gateway eunit shard B` / `gateway ct` meson tests simply
+  skipped` and the C++ build proceeds normally; the `gateway eunit shard A` / `B` / `C` / `gateway ct` meson tests simply
   never register. With rebar3 but no Erlang/OTP **28.4 or later 28.x** (EPEL's OTP 26 does not
   qualify), configure prints `WARNING: Erlang gateway: SKIPPED.` with every install it inspected.
   Neither `meson setup` nor `scripts/ensure-erlang.sh` downloads an OTP; they only find one.
@@ -444,7 +461,8 @@ today this is a documented limitation rather than something the setup script can
 - **The UAT rigs.** No container runtime is installed. `podman` + `podman-docker` are available in
   AppStream if you later want `scripts/start-UAT.sh` et al.; `scripts/ci/ensure-postgres.sh` prefers
   a `docker` binary but falls through to the native cluster this recipe provisions.
-- **Sanitizer / coverage builds.** `-Db_sanitize=...` works with gcc-toolset-14; the nightly coverage
+- **Sanitizer / coverage builds.** `-Db_sanitize=...` was verified with gcc-toolset-14 and has not been
+  re-run under 15 on this recipe (CI's sanitizer legs build with gcc-15); the nightly coverage
   job additionally needs `gcovr==8.6`.
 
 ## Troubleshooting
@@ -455,7 +473,8 @@ today this is a documented limitation rather than something the setup script can
 | `PyYAML is required to embed shipped InstructionDefinitions but is not importable from ...` at configure time | `python3` resolved to an interpreter without PyYAML. Check `python3 -c 'import yaml'` with the *same* `python3` meson found. |
 | `ERROR: Unknown compiler(s): [['gcc-14']]` | You passed `--native-file meson/native/linux-gcc14.ini`. Use `linux-gcc13.ini`. See trap 2. |
 | `collect2: fatal error: cannot find 'ld'` right after `-fuse-ld=mold` | You passed the gcc15 or clang21 native file and mold is not installed. See trap 2. |
-| `fatal error: expected: No such file or directory` | gcc-toolset not activated — you are on the system GCC 11. `source /opt/rh/gcc-toolset-14/enable`. |
+| `fatal error: expected: No such file or directory` | gcc-toolset not activated — you are on the system GCC 11. `source /opt/rh/gcc-toolset-15/enable`. |
+| `could not convert ... basic_string_view ... to ... basic_string` in `std/hashtable.h`, or server tests that pass in CI failing locally | The build is on gcc-toolset-14. Re-run `setup-rhel9.sh` (installs 15 and rewrites the env file), open a new shell, then `./scripts/setup.sh --tests --wipe`: a build dir records its compiler, so it keeps 14 until wiped. |
 | `FATAL: Ident authentication failed for user "yuzu"` | `pg_hba.conf` trap 3. |
 | `server pg unit tests shard B` TIMEOUT / SIGKILL at its meson timeout | Missing `pg_signal_backend`, trap 4. Check for leaked `yuzu_test_*` databases. |
 | `permission denied to terminate process` in test output | Same — trap 4. |

@@ -1511,6 +1511,7 @@ CursorCollectResult RemovableCursorSource::collect(EchoDatabase& db,
                classify_partition_transition(rec) == PartitionTransition::kAttach;
             re.action = is_attach ? "attached" : "detached";
             re.size_bytes = rec.capacity;
+            re.partition_count = rec.partition_count;
             re.evidence = "win:Microsoft-Windows-Partition/Diagnostic:EventRecordID=" +
                          std::to_string(rec.event_record_id) +
                          (key.used_serial ? "" : ":anonymous-serial-fallback");

@@ -210,7 +210,12 @@ TEST_CASE("operate pages: Approvals copy is exact and claims no second person",
     CHECK(has(js, "field(detail, 'actions').hidden = !(pending && !mine && canDecide);"));
     CHECK(has(js, "field(detail, 'excluded').hidden = !(pending && !mine && excluded && canDecide);"));
     CHECK(has(js, "d.excluded === '1'"));
-    CHECK(has(js, "approveBtn.hidden = excluded || d.unreadable === '1';"));
+    CHECK(has(js, "approveBtn.hidden = excluded || d.unreadable === '1' || !!clipped;"));
+    // D3: a clipped scope shows the notice naming where the full scope is, and the dialog
+    // refuses to open for Approve even if the button were reached another way.
+    CHECK(has(js, "field(detail, 'scope-clipped')"));
+    CHECK(has(js, "if (approve && d.scopeClipped) return;"));
+    CHECK(has(body, "data-f=\"scope-clipped\""));
     CHECK_FALSE(has(js, "!(pending && !mine && !excluded && canDecide)"));
     // The dialog copy does not claim the reviewer saw everything when the summary was cut.
     CHECK(has(js, "d.request && d.shortened === '1' ?"));
@@ -487,6 +492,21 @@ TEST_CASE("operate pages: the Workflows action controller keeps its guards",
     // The copy never claims the run was stopped or that it finished when it may still run.
     CHECK(has(js, "The run may keep running on the server."));
     CHECK_FALSE(has(js, "keeps running on the server"));
+    // A refused run (429 cap, 503 draining or store) says when to retry from Retry-After instead
+    // of a bare status, and a 429/503 is never folded into the generic "Could not start" text.
+    CHECK(has(js, "function runRefusalText(status, message, retryAfter, remediation) {"));
+    CHECK(has(js, "if (r.status === 429 || r.status === 503) {"));
+    CHECK(has(js, "return runRefusalText(r.status, msg, r.headers.get('Retry-After'), rem);"));
+    CHECK(has(js, "' Try again in ' + secs + ' seconds.' : ' Try again shortly.'"));
+    // The server message and the follow-up read as separate sentences (capitalised, closed with a
+    // full stop), and a 503 (a draining server is stopping) returns BEFORE the retry-in-N hint:
+    // it shows the server's own remediation, or "Try again shortly." when it sent none.
+    CHECK(has(js, "t = t.charAt(0).toUpperCase() + t.slice(1);"));
+    CHECK(has(js, "return /[.!?]$/.test(t) ? t : t + '.';"));
+    CHECK(has(js, "if (status === 503) return why + ' ' + (sentence(remediation) || 'Try again shortly.');"));
+    CHECK(js.find("if (status === 503) return why + ' '") < js.find("' Try again in ' + secs + ' seconds.'"));
+    CHECK(has(js, "starting another run may be refused for up to a minute."));
+    CHECK(js.find("r.status === 429 || r.status === 503") < js.find("'Could not start the run (HTTP '"));
     // A key on the row's own button is the button's, not a row selection.
     CHECK(has(js, "if (e.target && e.target.tagName === 'BUTTON') return;"));
     // New workflow posts the YAML as JSON; delete is the id-only DELETE; neither is retried.

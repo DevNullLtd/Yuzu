@@ -92,7 +92,7 @@
     var created = '';
     YuzuDialog.form({
       title: 'Open review campaign',
-      fields: [{ name: 'title', label: 'Campaign title', required: true, maxlength: 200,
+      fields: [{ name: 'title', label: 'Campaign title', required: true, maxlength: 256,
                  placeholder: 'e.g. Q3 2026 access review' }],
       note: 'Freezes every current grant (one row per principal and role) for attestation. ' +
             'Closed campaigns are kept permanently.',
@@ -149,10 +149,18 @@
     var d = row.dataset;
     return post(API + '/' + encodeURIComponent(id) + '/attestations', {
       principal_type: d.principalType, principal_id: d.principalId, role_name: d.roleName,
+      scope: d.scope, scope_group_id: d.scopeGroupId,
       decision: btn.dataset.decision, justification: justification
     }).then(function (r) {
       if (!r.ok) return failure(r);
+      // The success body is the A4 envelope {data: {recorded, decision_seq, previous_decision}}.
+      // A grant another reviewer already decided is replaced, not refused: say so.
+      var d2 = r.data && r.data.data;
+      var prev = d2 && typeof d2.previous_decision === 'string' ? d2.previous_decision : '';
       written(r);
+      if (prev && prev !== 'pending' && !r.auditFailed)
+        banner('That grant already held a "' + prev + '" decision. Yours is now the current ' +
+               'one; the earlier decision stays in the history.');
       loadCampaign(id);
       return null;
     });
@@ -176,10 +184,12 @@
     if (!row) return;
     var d = row.dataset;
     var just = justificationOf(btn);
+    var where = d.scope === 'management_group' ? 'on management group "' + d.scopeGroupId + '"'
+                                               : 'fleet-wide';
     YuzuDialog.form({
       title: 'Flag for revocation',
       body: 'Flag ' + d.principalType + ' "' + d.principalId + '" role "' + d.roleName +
-            '" for revocation? This records evidence only. It does NOT revoke the grant.',
+            '" (' + where + ') for revocation? This records evidence only. It does NOT revoke the grant.',
       submitLabel: 'Flag for revocation',
       danger: true,
       submit: function () { return decide(btn, just); }

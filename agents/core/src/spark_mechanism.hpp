@@ -6,12 +6,26 @@
  *
  * Interval / Startup / Disk are timer-driven and serviced by the SparkEngine's
  * wheel (spark_engine.cpp). File / Registry / Service are EVENT-driven: they do
- * not sit on the wheel — a kernel notification, not a deadline, is the trigger.
+ * not sit on the wheel — a kernel notification, not a deadline, is the trigger,
+ * with one Windows File exception stated below.
  * Each such type is serviced by one `ISparkMechanism` that multiplexes EVERY
  * armed spark of its type onto O(mechanism) OS resources — one IOCP + thread
  * for file changes, one TP_WAIT pool for registry changes, one sd-bus
  * connection + thread (Linux) or one alertable-wait thread + one SCM
- * connection (Windows) for service changes — never O(rules).
+ * connection (Windows) for service changes, never O(rules). That bound is on
+ * the resident watch resources: since #5719 item 5 the Windows File mechanism
+ * ALSO does O(watched directories) periodic work (one short-lived detached
+ * identity-verification thread per watched directory per path_verify_interval),
+ * so its steady-state CPU and thread-creation cost is not O(mechanism). That
+ * verification is deadline-driven, not notification-driven: each watched
+ * directory is sampled on its own 5 s schedule (path_verify_interval), run by the
+ * File mechanism itself and NOT coalesced onto the SparkEngine's timer wheel.
+ * The Windows Registry mechanism does the same per idle, healthy Target-mode watch
+ * (#7836) WHEN ENABLED (off by default; opt-in at boot, floor 5 s): at the operator's
+ * interval it re-opens the key's path on its existing probe lane (one
+ * short-lived detached worker per watched key per interval; the detection bound is
+ * one interval plus a sweep wake plus the probe latency, plus the admission backoff
+ * when the lane refused a launch).
  *
  * The seam is what keeps this PR testable off Windows: the real IOCP / TP_WAIT
  * impls are Windows-only (spark_file.cpp / spark_registry.cpp), but a test
@@ -49,6 +63,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
 
 namespace yuzu::agent {
 
@@ -331,12 +346,37 @@ public:
 [[nodiscard]] YUZU_EXPORT std::unique_ptr<ISparkMechanism>
 make_file_mechanism(std::shared_ptr<std::atomic<std::size_t>> f3_counter);
 
+/// The Registry mechanism's periodic path verification (#5719 item 5, #7836) is OFF
+/// by default: each verification opens the watched key by path, which on a key
+/// carrying an auditing SACL writes a Security-log event (an open per key per
+/// interval can evict older events: irreversible, not measured). The operator opts
+/// in at boot with --spark-registry-path-verify-interval SECONDS; the value reaches
+/// the factory below through this pure helper. Zero is off. A non-zero value below
+/// the floor is raised to it (a 1 s setting would be five times the audit volume of
+/// the documented minimum), a value above the ceiling is lowered to it, and a
+/// negative value is treated as off (the CLI validator already refuses one). The flag
+/// governs only these periodic verification opens: the failure-driven retry opens
+/// (30 s doubling to 300 s) are unchanged by it and can write failure-audit events on
+/// an audited key.
+inline constexpr std::chrono::milliseconds kRegistryPathVerifyFloor{5'000};
+inline constexpr std::int64_t kRegistryPathVerifyMaxSeconds = 86'400;
+
+[[nodiscard]] constexpr std::chrono::milliseconds
+clamp_registry_path_verify(std::int64_t seconds) noexcept {
+    if (seconds <= 0)
+        return std::chrono::milliseconds{0};
+    if (seconds > kRegistryPathVerifyMaxSeconds)
+        seconds = kRegistryPathVerifyMaxSeconds;
+    const std::chrono::milliseconds requested{seconds * 1000};
+    return requested < kRegistryPathVerifyFloor ? kRegistryPathVerifyFloor : requested;
+}
+
 /// Platform factory: a real TP_WAIT + RegNotifyChangeKeyValue registry-change
 /// mechanism on Windows, `nullptr` on every other platform. This zero-argument
 /// form constructs the mechanism with NO shared F3 counter (its detached probe
-/// and drain workers are then counted only lane-locally) - it exists for tests
-/// and for the platform-capability cross-check; production wiring uses the
-/// counter-taking overload below.
+/// and drain workers are then counted only lane-locally) and with periodic path
+/// verification OFF - it exists for tests and for the platform-capability
+/// cross-check; production wiring uses the counter-taking overload below.
 [[nodiscard]] YUZU_EXPORT std::unique_ptr<ISparkMechanism> make_registry_mechanism();
 
 /// Production factory (#2012/#3840 PR-B1): the same mechanism, with every
@@ -347,8 +387,16 @@ make_file_mechanism(std::shared_ptr<std::atomic<std::size_t>> f3_counter);
 /// "F3 / §24"). Same platform contract as the zero-argument form: real on
 /// Windows, `nullptr` elsewhere (the argument is ignored off Windows). A null
 /// counter is accepted and behaves like the zero-argument form.
+///
+/// `path_verify` seeds the periodic path verification interval at construction
+/// (#5719 item 5, #7836). The DEFAULT, zero, is OFF: the mechanism opens no key
+/// for verification. A caller passes clamp_registry_path_verify(seconds) of the
+/// operator's opt-in. The default lives HERE (not in the agent.cpp glue) so a test
+/// calling this exact factory observes what production gets when the operator
+/// sets nothing. Ignored off Windows.
 [[nodiscard]] YUZU_EXPORT std::unique_ptr<ISparkMechanism>
-make_registry_mechanism(std::shared_ptr<std::atomic<std::size_t>> f3_counter);
+make_registry_mechanism(std::shared_ptr<std::atomic<std::size_t>> f3_counter,
+                        std::chrono::milliseconds path_verify = std::chrono::milliseconds{0});
 
 /// Platform factory: a real multiplexed service/unit run-state mechanism — one
 /// sd-bus connection servicing N `PropertiesChanged` matches on Linux built
@@ -587,6 +635,56 @@ struct FileMechanismTestControls {
     std::chrono::milliseconds backend_retry_base{0};
     std::chrono::milliseconds admission_backoff_seed{0};
     std::chrono::milliseconds traversal_budget{0};
+    /// How often an idle, healthy watch re-opens its directory PATH and compares
+    /// the identity of what it finds with the identity its handle was opened on
+    /// (#5719 item 5: a renamed or replaced parent directory is otherwise silent).
+    /// Production default 5 s. Zero leaves the current value unchanged; a
+    /// shortened value takes effect at the next wake (the control call nudges the
+    /// worker), so a test can hold it long, change the world, then shorten it.
+    std::chrono::milliseconds path_verify_interval{0};
+    /// How long a lost path may wait for its cancelled read's completion before
+    /// the stuck-drain observation (a counter and one warn) is made. Production
+    /// default 30 s. Zero leaves the current value unchanged.
+    std::chrono::milliseconds path_lost_stuck_deadline{0};
+    /// Runs on the detached verification worker, with no lock, before the real
+    /// check. Returns 0 to run the real check, or a Win32 error to fail the open
+    /// step with (ERROR_PATH_NOT_FOUND or ERROR_FILE_NOT_FOUND reads as lost,
+    /// anything else as undecidable). May park (a hung path); the test must
+    /// release it before stopping. Throwing reads as undecidable. The worker is
+    /// detached and never joined, and the hook is copied into it: capture shared
+    /// state by value, never a test local by reference. Null clears it.
+    std::function<unsigned long(std::wstring_view dir)> verify_hook;
+    /// Runs on the owner worker for every dequeued completion of a watched
+    /// directory or of an ancestor shelter, under the mechanism's lock (it must not
+    /// call back into the mechanism), with the completion's result and byte count.
+    /// Returning true swallows the completion: nothing processes it, as if the OS
+    /// never delivered it (the read is not outstanding any more, and not reissued).
+    /// Hand swallowed completions back with release_suppressed_completions. Null
+    /// clears it (swallowed ones stay). It runs inside run() but outside run()'s
+    /// try, so it must NEVER throw (a throw ends the process): a test-only seam.
+    /// It is consulted only for a completion that is NOT itself a handed-back one,
+    /// whose watch is not being removed, while the mechanism is not stopping, and
+    /// only while fewer than the stash capacity are stashed (8 on the MSVC STL, the
+    /// reserve(8) result; the stash is sized once, so the worker never allocates): a
+    /// swallow beyond that does not happen, the completion is processed normally. The
+    /// stash names a watch by a never-reused id, never by address, and nothing is
+    /// posted to the IOCP, so releasing after the watch was unwatched or after stop()
+    /// is memory-safe: nothing is dereferenced for an entry whose watch is gone. An
+    /// entry whose watch is gone, is being removed, or has been re-armed since (a read
+    /// outstanding) is dropped, not replayed, and counted in
+    /// FileMechanismDebugCounters::stash_dropped. An entry for a watch that was
+    /// unwatched still occupies a stash slot until a release or stop() clears it, so
+    /// such stale entries count against the capacity. stop() discards the stash.
+    /// By-construction hardening: the removing and io_pending predicates of the lookup
+    /// have no test observer (a mutation to id-only keeps every case green).
+    std::function<bool(std::wstring_view dir, bool ok, unsigned long bytes)> completion_suppress_hook;
+    /// One-shot: hand every swallowed completion back so the worker processes it
+    /// with its original result and byte count, in the order swallowed, when its
+    /// watch is still armed. Memory-safe at any time (see completion_suppress_hook:
+    /// what it guarantees and when an entry is dropped). A completion handed back
+    /// for a watch that has since been retired to the drain list is dropped, not
+    /// replayed.
+    bool release_suppressed_completions{false};
 };
 
 /// Mechanism-internal counters the public SparkMechanismStats does not carry.
@@ -612,6 +710,29 @@ struct FileMechanismDebugCounters {
     std::size_t live_dirs{0};
     std::size_t live_ancestors{0};
     std::size_t retiring{0};
+    /// Directory-identity verification results (#5719 item 5), all-time. `same`:
+    /// the path still names the directory the watch holds. `lost`: it names a
+    /// different directory or nothing (the watch is faulted). `unverifiable`: the
+    /// check could not decide (open refused, identity unavailable, worker threw);
+    /// a fault only when kVerifyUnverifiableFaultStreak of them come in a row.
+    std::uint64_t verify_same{0};
+    std::uint64_t verify_lost{0};
+    std::uint64_t verify_unverifiable{0};
+    std::uint64_t verify_refused{0};       ///< verify launches refused by a full lane (expected 0:
+                                           ///< admission is room-aware, so a nonzero value is a tripwire)
+    std::uint64_t verify_launch_failed{0}; ///< verify launches attempted and failed to start a thread
+                                           ///< (retried); a launch never attempted is not counted
+    std::uint64_t path_lost_stuck{0};      ///< lost paths whose drain outlasted the stuck deadline
+    std::uint64_t path_lost_drained_ok{0}; ///< lost-path drains whose completion carried `ok`
+    std::uint64_t path_lost_flaps{0};      ///< path losses with no decided verify since the re-establishment
+                                           ///< (the retry doubles 30 s to 300 s across them)
+    std::uint64_t verify_starved{0};       ///< due verifications not launched for 3 intervals (once per episode)
+    std::uint64_t sweep_passes{0};         ///< sweep passes run (debug: a test asserts the sweep does not spin)
+    std::uint64_t stash_dropped{0};        ///< test-control stash entries handed back but dropped, not replayed
+                                           ///< (watch gone, removing or re-armed); a replayed entry is not counted.
+                                           ///< A second entry for the same watch id (swallow, re-arm, swallow
+                                           ///< again) is legitimately dropped after the first replay re-arms it,
+                                           ///< so a test asserting an exact count must allow for it
 };
 
 /// Returns true if `mech` is the Windows File mechanism and the controls were
@@ -658,6 +779,48 @@ struct RegistryMechanismTestControls {
     std::chrono::milliseconds backend_retry_base{0};
     std::chrono::milliseconds admission_backoff_seed{0};
     std::chrono::milliseconds sweep_cadence{0};
+    /// How often an idle, healthy Target-mode watch re-opens its registered path
+    /// and checks it still resolves to a key (#5719 item 5, #7836: a renamed
+    /// parent key is otherwise silent; since #7877 item 31 R1 the check also compares the
+    /// held handle's canonical name with the name recorded at commit, and the fresh
+    /// open's name with the held one - see resolve_verify_locked in spark_registry.cpp).
+    /// Production default is OFF (zero, opt-in
+    /// at boot: see clamp_registry_path_verify). Zero here leaves the
+    /// current value unchanged (it cannot switch verification off); a shortened value takes effect
+    /// at the next wake (the control call nudges the sweeper), so a test can hold it long, change
+    /// the world, then shorten it.
+    std::chrono::milliseconds path_verify_interval{0};
+    /// Name-capture seam (#7877 item 31, R1). Runs on the detached probe worker
+    /// IMMEDIATELY BEFORE each NtQueryKey name query, after the open and the notify arm:
+    /// `held == false` is the fresh key the probe just armed, `held == true` is the
+    /// duplicate of the watch's held handle (verification probes only). Parking here lets
+    /// a test land a rename between the fresh open and the fresh-name query, or between the
+    /// two queries. Return `nullopt` to run the real query; return a value to SKIP the query
+    /// and use that raw NTSTATUS (and, when the status is 0, that name). A throw is a
+    /// capture failure (status set, name empty), never a probe failure. State must be owned
+    /// by value (the hook is captured into the job as a shared_ptr, like `probe_hook`). Like
+    /// `probe_hook`, a call that leaves it null clears any installed hook.
+    ///
+    /// CALL ORDER for a result that can be COMMITTED (an establishment, a re-arm, a retry:
+    /// a probe that is not a verification, whose fresh key is a Target and whose first read
+    /// succeeded), WHILE THE CHECK IS ON at launch (`path_verify_ms > 0`): the fresh read
+    /// (`held == false`), then the CONFIRMING read (`held == false` again), which runs
+    /// BEFORE its second by-path open, so a parked test lands a change between the first read
+    /// and the second open. With the check OFF there is the fresh read only: no confirming
+    /// read, no second open. The interval is fixed when each probe is launched. A value
+    /// returned for the confirming read is its name and skips the open (it confirms when its
+    /// status is 0 and the name equals the first read); `nullopt` runs the real open and
+    /// query. A verification (duplicate present, or one whose duplicate failed) makes the
+    /// fresh read, then the held read (`held == true`) when it has a duplicate, and no
+    /// confirming read. Because the first read follows the probe's own open, parking the
+    /// FIRST `held == false` call is how a test lands a rename between the open and the read
+    /// that a confirmed commit must survive.
+    std::function<std::optional<std::pair<long, std::wstring>>(std::string_view subkey, bool held)>
+        name_hook;
+    /// The sweeper treats DuplicateHandle of the held key as failed for every verification
+    /// it stages: the path check still runs, the name check is undecided, no fault. Assigned
+    /// (not "leave unchanged") on every control call, so a later call clears it.
+    bool verify_fail_duplicate{false};
 };
 
 /// Mechanism-internal counters the public SparkMechanismStats does not carry
@@ -682,6 +845,59 @@ struct RegistryMechanismDebugCounters {
     std::uint64_t emit_failed{0};    ///< emit() threw on submit (fire callback or sweeper)
     std::uint64_t resync_retries{0}; ///< restored resync debt re-staged by the sweeper
     std::uint64_t established_failed{0}; ///< established() threw when invoked
+    /// Periodic path verification probes actually launched. It also counts a
+    /// verification probe that is converted to the re-arm when a fire lands while the
+    /// verification is still Deferred or Pending (the launch path is shared, and the
+    /// probe is then the re-arm, not a judged verification): a test asserting an exact
+    /// number of opens per key must not run a fire concurrently.
+    std::uint64_t verify_launched{0};
+    std::uint64_t verify_lost{0};        ///< periodic path verifications that found the path lost
+    std::uint64_t verify_undecided{0};   ///< periodic path verifications that could not decide
+    /// Name verdicts (#7877 item 31, R1), all test-only like the rest. `verify_lost` and
+    /// `verify_undecided` keep their PATH-level meaning: `verify_undecided` is counted for
+    /// every verification whose probe did not produce an `ok` result, BEFORE the name verdict,
+    /// so it is also counted when that verdict then faults. `verify_name_lost` counts the
+    /// held-versus-commit-time verdict, the fresh-versus-held verdict and the hive-unloaded
+    /// verdict. `verify_name_undecided` counts a verification where a name query (or the
+    /// duplicate it needs) was attempted and could not yield a comparable pair; equal names,
+    /// a root-key (empty subkey) watch, and a held name that reads fine against an EMPTY
+    /// committed name (the held-versus-commit-time compare is disabled for that watch, and
+    /// `commit_name_missing` is its discriminator) increment nothing.
+    std::uint64_t verify_name_lost{0};
+    std::uint64_t verify_name_undecided{0};
+    /// Commits that recorded a non-empty canonical name on the watch, and Target commits of a
+    /// non-root watch that could not (capture failed: the held-versus-commit-time compare is
+    /// then disabled for that watch until a later commit records a name).
+    std::uint64_t commit_name_recorded{0};
+    std::uint64_t commit_name_missing{0};
+    /// DuplicateHandle of the held key failed (or `verify_fail_duplicate`) for a verification.
+    std::uint64_t verify_dup_failed{0};
+    /// Commits not accepted and retried (#7877 item 31, R1). It counts BOTH of two different
+    /// causes: an UNCONFIRMED deferral (a probe result whose confirming second by-path name
+    /// read did not agree with the first, or could not be made; retried on the admission
+    /// schedule), and a FIRE-CONVERTED verification retry (a verification result that a
+    /// concurrent fire converted into the re-arm; it ran no confirming read and is retried
+    /// at once as an ordinary re-arm). This counter alone cannot tell a flapping path from a
+    /// benign fire collision, and only one direction is decisive: a NONZERO
+    /// `warns_claimed_commit_unconfirmed` proves the unconfirmed cause occurred (only that
+    /// cause warns), but a ZERO does NOT prove the fire-converted cause (a deferral made
+    /// inside watch() is counted here and never warns, and the warn is once per episode), so
+    /// also look at whether a fire preceded the retry. The confirming read runs
+    /// only while the check is on (`path_verify_ms > 0` at launch). Counts retries, not
+    /// watches.
+    std::uint64_t commit_capture_retry{0};
+    /// Per-watch warnings (test-only), counted when the per-watch flag was claimed and the log
+    /// call returned without throwing (the counter cannot see whether a sink wrote the line):
+    /// a watch with no recorded canonical name (at a commit, or at a verification; only while
+    /// verification is on), a verification that could not decide (once per blind episode of a
+    /// watch), a DuplicateHandle failure, and a commit that could not be confirmed (once per
+    /// deferral episode; never from watch(), which logs nothing).
+    std::uint64_t warns_claimed_name_missing{0};
+    std::uint64_t warns_claimed_undecided{0};
+    std::uint64_t warns_claimed_dup_failed{0};
+    std::uint64_t warns_claimed_commit_unconfirmed{0};
+    /// The effective verification interval in ms (0 = off). Production default 0.
+    std::int64_t path_verify_ms{0};
     std::size_t probe_workers_active{0};
     std::size_t drain_workers_active{0};
     std::size_t live_watches{0};
@@ -698,6 +914,17 @@ set_registry_test_controls_for_test(ISparkMechanism& mech, RegistryMechanismTest
 /// nullopt on every non-Windows platform and for any other mechanism type.
 [[nodiscard]] YUZU_EXPORT std::optional<RegistryMechanismDebugCounters>
 registry_debug_counters_for_test(const ISparkMechanism& mech);
+
+/// The canonical NT name (UTF-16, `\REGISTRY\...`) the Registry mechanism recorded at the
+/// last commit of `spark_key`'s watch (#7877 item 31, R1): `nullopt` if `mech` is not the
+/// Windows Registry mechanism or holds no watch for the key; an EMPTY string if the watch
+/// exists but its last commit recorded no name (capture failed, or a root-key watch). Read
+/// under the mechanism's lock. Exists so a test can tell a dropped store from a compare that
+/// merely still faults through the other path. (An owning std::wstring crosses the DLL boundary
+/// here, which relies on the agent library and its caller sharing the dynamic CRT, as the other
+/// std:: types in this header do.)
+[[nodiscard]] YUZU_EXPORT std::optional<std::wstring>
+registry_committed_name_for_test(const ISparkMechanism& mech, const std::string& spark_key);
 
 /// Test controls for the Windows Service mechanism (#2012/#3840 PR-B3 - the
 /// probe-only `OpenServiceW` establishment restructure; unlike Registry/File

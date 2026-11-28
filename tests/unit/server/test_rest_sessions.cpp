@@ -1,5 +1,5 @@
 /**
- * test_rest_sessions.cpp — HTTP-level tests for session revocation REST.
+ * test_rest_sessions.cpp — Route-handler tests for session revocation REST.
  *
  * Covers:
  *   - DELETE /api/v1/sessions?username=<name>     (admin force-logout)
@@ -36,6 +36,7 @@
 #include <httplib.h>
 #include <nlohmann/json.hpp>
 
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -59,11 +60,11 @@ struct RevokeCall {
 };
 
 struct RestSessionsHarness {
-    yuzu::server::test::TestRouteSink sink;
-
     // Mock session state. The auth_fn closure captures by reference and
     // returns a session reflecting the current values.
-    std::string session_user;
+    // Disengaged means unauthenticated; an engaged empty string is a malformed
+    // authenticated session and must reach the handler's defensive check.
+    std::optional<std::string> session_user;
     auth::Role session_role{auth::Role::user};
     std::string session_mcp_tier;    // non-empty = MCP-tier token
     std::string session_token_scope; // non-empty = service-scoped token
@@ -90,16 +91,17 @@ struct RestSessionsHarness {
     std::vector<std::string> lockout_clear_calls;
 
     RestApiV1 api;
+    yuzu::server::test::TestRouteSink sink; // release borrowed route closures before api
 
     RestSessionsHarness() {
         auto auth_fn = [this](const httplib::Request&,
                               httplib::Response& res) -> std::optional<auth::Session> {
-            if (session_user.empty()) {
+            if (!session_user) {
                 res.status = 401;
                 return std::nullopt;
             }
             auth::Session s;
-            s.username = session_user;
+            s.username = *session_user;
             s.role = session_role;
             s.mcp_tier = session_mcp_tier;
             s.token_scope_service = session_token_scope;
@@ -377,28 +379,24 @@ TEST_CASE("REST DELETE /api/v1/sessions: 503 when callback unwired",
 TEST_CASE("REST DELETE /api/v1/sessions: empty session username defended",
           "[rest][session][revoke][sec-m1]") {
     RestSessionsHarness h;
-    h.session_user = " "; // non-empty -> auth_fn returns a session
+    h.session_user = "";
     h.session_role = auth::Role::admin;
-    // Override auth_fn behaviour by setting session_user to a special
-    // sentinel handled below. Easier path: clone the harness logic but
-    // emit an empty username session. The harness's auth_fn rejects
-    // empty session_user with 401 before the handler runs, so we have
-    // to reach inside.
-    //
-    // For sec-M1 we test that the HANDLER rejects an empty
-    // session->username — to construct that, set session_user to a
-    // single space (non-empty, passes auth_fn) and rely on the
-    // is_valid_username() check at the handler. But session->username
-    // and the request username are different — sec-M1 is about the
-    // CALLER's session being empty, not the target.
-    //
-    // Punt on this: the harness's auth_fn always returns a non-empty
-    // username. Verifying sec-M1 requires either modifying auth_fn or
-    // a wider mock. The handler-level check is short and reviewable;
-    // unit coverage here would be low-signal.
-    SUCCEED("sec-M1 verified by code review; handler returns 500 if "
-            "session->username is empty. Mock harness cannot easily "
-            "synthesise an empty-username session.");
+    const char* path = nullptr;
+    SECTION("admin force logout with a valid target") {
+        path = "/api/v1/sessions?username=alice";
+    }
+    SECTION("self logout") {
+        path = "/api/v1/sessions/me";
+    }
+    REQUIRE(path != nullptr);
+    auto res = h.sink.Delete(path);
+    REQUIRE(res);
+    CHECK(res->status == 500);
+    CHECK(res->body.find("session has empty username") != std::string::npos);
+    CHECK_FALSE(res->has_header("Set-Cookie"));
+    CHECK(h.revoke_calls.empty());
+    CHECK(h.audit_log.empty());
+    CHECK(h.lockout_clear_calls.empty());
 }
 
 // ── Self-revoke DELETE /api/v1/sessions/me ───────────────────────────────
@@ -494,7 +492,7 @@ TEST_CASE("REST DELETE /api/v1/sessions/me: service-scoped tokens rejected",
 TEST_CASE("REST DELETE /api/v1/sessions/me: unauthenticated request is rejected",
           "[rest][session][revoke][me][auth]") {
     RestSessionsHarness h;
-    // session_user empty -> auth_fn returns nullopt and sets 401.
+    // No session_user -> auth_fn returns nullopt and sets 401.
 
     auto res = h.sink.Delete("/api/v1/sessions/me");
     REQUIRE(res);

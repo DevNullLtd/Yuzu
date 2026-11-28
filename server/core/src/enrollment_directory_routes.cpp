@@ -182,7 +182,8 @@ void EnrollmentDirectoryRoutes::register_routes(HttpRouteSink& sink, AuthFn auth
     // NOT enforced by the data model: `management_group_members.agent_id`
     // carries no enrollment/agent-registry foreign key, and
     // `POST /api/v1/management-groups/{id}/members` accepts any non-empty
-    // caller-supplied id with no existence check (management_group_store.cpp,
+    // caller-supplied id of at most 256 bytes of clean text (no control byte, valid
+    // UTF-8; mgmt_group_limits.hpp) with no existence check (management_group_store.cpp,
     // rest_api_v1.cpp), so an admin who pre-assigns a not-yet-approved
     // agent's id to a group produces a non-empty, correctly-confined result
     // via the same `authz::in_scope` filter below — never a widening either

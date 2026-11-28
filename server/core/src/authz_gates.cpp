@@ -8,7 +8,10 @@
 #include "rest_a4_envelope_http.hpp"
 #include "service_scope_policy.hpp" // authz::kServiceTagKey — #3289 single confinement-key definition
 
-#include <yuzu/metrics.hpp> // MetricsRegistry — #4031 topology-floor-denied counter
+#include <yuzu/log_token.hpp>
+#include <yuzu/metrics.hpp> // MetricsRegistry: #4031 topology-floor-denied counter
+
+#include <spdlog/spdlog.h>
 
 #include <cassert>
 #include <expected>
@@ -17,6 +20,21 @@
 #include <unordered_set>
 
 namespace yuzu::server {
+
+void authz::seed_service_scope_unrestricted_refusal_metrics(yuzu::MetricsRegistry& metrics) {
+    metrics.describe("yuzu_server_authz_service_scope_unrestricted_refused_total",
+                     "Requests refused because a service-scoped session would have been handed "
+                     "unrestricted list authority, by gate (fleet_read, list_read) and site "
+                     "(engine_entry = a corrupted scope_service on an engine credential, "
+                     "refused 403; postcondition = the admit would have been unrestricted, "
+                     "refused 500). Any non-zero value is an authorization invariant violation: "
+                     "investigate the audit trail for the principal.",
+                     "counter");
+    for (const char* gate : {"fleet_read", "list_read"})
+        for (const char* site : {"engine_entry", "postcondition"})
+            metrics.counter("yuzu_server_authz_service_scope_unrestricted_refused_total",
+                            {{"gate", gate}, {"site", site}});
+}
 
 const char* authz::ceiling_degrade_reason(std::string_view read_error) noexcept {
     // Closed label set of yuzu_server_rbac_read_degrade_total for the ceiling read:
@@ -76,6 +94,57 @@ void AuthRoutes::respond_ceiling_degraded(const httplib::Request& req, httplib::
                     "application/json");
 }
 
+void AuthRoutes::refuse_service_scoped_unrestricted(const httplib::Request& req,
+                                                    httplib::Response& res,
+                                                    const auth::Session& session,
+                                                    const std::string& perm,
+                                                    authz::UnrestrictedRefusalGate gate,
+                                                    authz::UnrestrictedRefusalSite site) {
+    // Shared by both list gates; each caller still refuses the request itself (fail CLOSED).
+    // Fixed audit text: the scope value is never echoed. Not retryable, so no retry hint. The
+    // postcondition site also covers an admit with no session to check; the audit text is the
+    // same for that case.
+    const bool entry = site == authz::UnrestrictedRefusalSite::kEngineEntry;
+    const bool fleet = gate == authz::UnrestrictedRefusalGate::kFleetRead;
+    if (auto* m = auth_mgr_.metrics_registry()) {
+        m->counter("yuzu_server_authz_service_scope_unrestricted_refused_total",
+                   {{"gate", fleet ? "fleet_read" : "list_read"},
+                    {"site", entry ? "engine_entry" : "postcondition"}})
+            .increment();
+    }
+    spdlog::log(entry ? spdlog::level::err : spdlog::level::critical,
+                "{}: refused service-scoped session principal={} for {} ({})",
+                fleet ? "fleet_read" : "list_read", ::yuzu::log_token(session.username), perm,
+                entry ? "corrupted scope_service on an engine credential"
+                      : "admit would have been unrestricted, or carried no session");
+    audit_log(req, fleet ? "auth.fleet_read_required" : "auth.permission_required",
+              entry ? "denied" : "failure", "", "",
+              entry ? "engine principal denied: corrupted scope_service on engine session"
+                    : "service-scoped session admitted with unrestricted authority: "
+                      "authorization invariant violated");
+    // No `.permission` (routed-concern clause 5): no grant of `perm` admits this caller.
+    res.status = entry ? 403 : 500;
+    res.set_content(detail::a4_denial(res, res.status,
+                                      entry ? "permission denied: " + perm
+                                            : std::string("authorization invariant violated")),
+                    "application/json");
+}
+
+std::expected<authz::ListAuthority, authz::GateFailure>
+AuthRoutes::admit_fleet_read(const httplib::Request& req, httplib::Response& res,
+                             const auth::Session& session, const std::string& perm,
+                             authz::VisibleSet scope) {
+    // The ONLY ListAuthority construction in this gate, so a branch added later cannot hand a
+    // service-scoped session unrestricted authority (the constructor is AuthRoutes-private).
+    if (!authz::service_scope_authority_ok(session, scope)) {
+        refuse_service_scoped_unrestricted(req, res, session, perm,
+                                           authz::UnrestrictedRefusalGate::kFleetRead,
+                                           authz::UnrestrictedRefusalSite::kPostcondition);
+        return std::unexpected(authz::GateFailure::InvariantViolated);
+    }
+    return authz::ListAuthority(std::move(scope));
+}
+
 std::expected<authz::ListAuthority, authz::GateFailure>
 AuthRoutes::require_fleet_read(const httplib::Request& req, httplib::Response& res,
                                const std::string& securable_type, const std::string& operation) {
@@ -123,21 +192,26 @@ AuthRoutes::require_fleet_read(const httplib::Request& req, httplib::Response& r
     // be denied (the regression the first #3038 fix attempt shipped,
     // closed in require_list_read and mirrored here).
     if (auth::is_elevated(*session) && session->token_scope_service.empty())
-        return authz::ListAuthority(std::nullopt); // TOP — unfiltered
+        return admit_fleet_read(req, res, *session, perm, std::nullopt); // TOP: unfiltered
 
     // Engine principals have NO legacy or service-scoped authority — their
     // only authority is an explicit RBAC assignment (design §4.2
     // default-deny). authorize_list_read's own legacy-open branch would
     // otherwise hand an engine credential fleet-wide read the moment RBAC
     // is disabled (the default) — resolve engine sessions here, RBAC-only,
-    // or deny. Mirrors require_list_read's engine branch, not
-    // require_permission's: this gate has no service-scope allow-list
-    // concept for a belt-and-braces corrupted-row check to guard, since an
-    // engine session never reaches the service axis below (it returns
-    // here). A successful admit stays TOP — "current engine grants are
-    // fleet-wide only" (require_list_read), no per-tag scoping concept
-    // applies to engine principals.
+    // or deny. Mirrors require_list_read's engine branch. A service-scoped
+    // engine session (a corrupted row: minting refuses it) is refused FIRST,
+    // before any store read, so grant and RBAC state do not matter; the
+    // branch order is unchanged. A successful admit stays TOP ("current engine grants are
+    // fleet-wide only", as in require_list_read: no per-tag scoping concept
+    // applies to engine principals).
     if (session->is_engine()) {
+        if (!session->token_scope_service.empty()) {
+            refuse_service_scoped_unrestricted(req, res, *session, perm,
+                                               authz::UnrestrictedRefusalGate::kFleetRead,
+                                               authz::UnrestrictedRefusalSite::kEngineEntry);
+            return std::unexpected(authz::GateFailure::Forbidden);
+        }
         if (!rbac_store_ || !rbac_store_->is_open()) {
             audit_log(req, "auth.fleet_read_required", "denied", "", "",
                       "engine principal denied: RBAC store unavailable");
@@ -175,7 +249,7 @@ AuthRoutes::require_fleet_read(const httplib::Request& req, httplib::Response& r
                             "application/json");
             return std::unexpected(authz::GateFailure::Forbidden);
         }
-        return authz::ListAuthority(std::nullopt); // TOP — fleet-wide only
+        return admit_fleet_read(req, res, *session, perm, std::nullopt); // TOP: fleet-wide only
     }
 
     // MCP-tier tokens: tier policy precedes RBAC (matches
@@ -439,7 +513,7 @@ AuthRoutes::require_fleet_read(const httplib::Request& req, httplib::Response& r
         service_scope = std::unordered_set<std::string>(tagged->begin(), tagged->end());
     }
 
-    return authz::ListAuthority(authz::meet(mgmt_scope, service_scope));
+    return admit_fleet_read(req, res, *session, perm, authz::meet(mgmt_scope, service_scope));
 }
 
 bool AuthRoutes::confine_agent_target(const httplib::Request& req, httplib::Response& res,

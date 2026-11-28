@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """test-durations-summary.py — per-invocation test-duration report (Yuzu, #4884).
 
-Reads meson-logs/testlog.json (written by the `meson test` that just ran), and
+Reads meson-logs/<logbase>.json (written by the `meson test` that just ran;
+`--logbase` defaults to meson's own `testlog`), and
 appends two tables to $GITHUB_STEP_SUMMARY (stdout when unset):
 
   * one row per meson test() entry: wall seconds, meson timeout, % of timeout;
@@ -30,6 +31,11 @@ leaves no file and lands in the ::warning path rather than reporting a stale
 log. (If a second testlog.json consumer appears, clear it inside flake-retry.py
 instead.) On a red invocation `bash -e` stops before this runs; the uploaded
 meson-logs artifact carries testlog.json, so run this script against it locally.
+
+Linux runs its test invocations concurrently in one build dir, each under its
+own meson `--logbase` (testlog-nonpg-cheap / testlog-nonpg-server / testlog-pg),
+and passes the same name here via `--logbase` so each summary reads its own
+invocation's file; ci.yml removes `<logbase>.json` before each invocation.
 """
 import argparse
 import json
@@ -174,8 +180,8 @@ def introspect_tests(builddir):
     return json.loads(p.stdout) if p.returncode == 0 else []
 
 
-def report(builddir, label):
-    path = os.path.join(builddir, "meson-logs", "testlog.json")
+def report(builddir, label, logbase="testlog"):
+    path = os.path.join(builddir, "meson-logs", f"{logbase}.json")
     records = read_records(path)
     tests = introspect_tests(builddir)
     rows = summarise(records, tests, collect_cases(records, tests, builddir), TOP)
@@ -300,6 +306,13 @@ def _checks():
             rc = main(["--builddir", d, "--label", "bad"])
         check("main: malformed JSON line -> ::warning and exit 0",
               rc == 0 and "::warning::" in buf.getvalue())
+        # --logbase selects <logbase>.json: the malformed testlog.json above
+        # must not be read when another logbase is named (none exists -> warn).
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = main(["--builddir", d, "--label", "lb", "--logbase", "testlog-pg"])
+        check("main: --logbase reads <logbase>.json, not testlog.json",
+              rc == 0 and "testlog-pg.json" in buf.getvalue())
         if before is not None:
             os.environ["GITHUB_STEP_SUMMARY"] = before
     return res
@@ -318,12 +331,14 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
     ap.add_argument("--builddir", default="build")
     ap.add_argument("--label", default="tests")
+    ap.add_argument("--logbase", default="testlog",
+                    help="meson test --logbase of the invocation to report (default: testlog)")
     ap.add_argument("--selftest", action="store_true")
     args = ap.parse_args(argv)
     if args.selftest:  # before and outside the warning-only handler below
         return selftest()
     try:
-        report(args.builddir, args.label)
+        report(args.builddir, args.label, args.logbase)
     except Exception as ex:  # reporting only: never fail the job (#4884 AC2)
         print(f"::warning::test-durations-summary: report skipped ({type(ex).__name__}: {ex})",
               flush=True)

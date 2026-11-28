@@ -114,11 +114,11 @@ inline constexpr std::array<CommandCapability, 4> kFixture{{
         .system_reserved = false,
         .execute_gate = ExecuteGate::AdminOrApproval,
     },
-    // A protective pair (the quarantine plugin's read-only status), so the plugin-presence
+    // A protective pair (the firewall plugin's read-only quarantine_status), so the plugin-presence
     // carve-out can be driven through the route.
     {
-        .plugin = "quarantine",
-        .action = "status",
+        .plugin = "firewall",
+        .action = "quarantine_status",
         .dispatch_class = DispatchClass::ReadOnly,
         .mutability = Mutability::None,
         .securable = "Security",
@@ -398,7 +398,7 @@ void grant_visibility(ManagementGroupStore& mg, std::initializer_list<std::strin
     ra.group_id = *gid;
     ra.principal_type = "user";
     ra.principal_id = "tester";
-    ra.role_name = "ITServiceOwner";
+    ra.role_name = "Operator";
     REQUIRE(mg.assign_role(ra).has_value());
 }
 
@@ -753,11 +753,11 @@ TEST_CASE("/api/command: a protective action reaches an agent whose inventory la
           "[command_routes][protective]") {
     CommandHarness h;
     auto info = make_agent_info("inv-A");
-    info.add_plugins()->set_name("firewall"); // non-empty inventory without quarantine/noop
+    info.add_plugins()->set_name("ioc"); // non-empty inventory without firewall/noop
     (void)h.registry.register_agent(info);
 
     auto protective = h.sink.Post(
-        "/api/command", R"({"plugin":"quarantine","action":"status","agent_ids":["inv-A"]})");
+        "/api/command", R"({"plugin":"firewall","action":"quarantine_status","agent_ids":["inv-A"]})");
     REQUIRE(protective);
     CHECK(protective->status == 200);
     CHECK(h.send_to_ids_called == std::vector<std::string>{"inv-A"});
@@ -765,6 +765,37 @@ TEST_CASE("/api/command: a protective action reaches an agent whose inventory la
     h.send_to_ids_called.clear();
     auto ordinary =
         h.sink.Post("/api/command", R"({"plugin":"noop","action":"run","agent_ids":["inv-A"]})");
+    REQUIRE(ordinary);
+    CHECK(ordinary->status == 503);
+    CHECK(nlohmann::json::parse(ordinary->body)["error"]["reason"] == "plugin_not_found");
+    CHECK(h.send_to_ids_called.empty());
+}
+
+// The firewall plugin's four containment actions are protective too (owner decision 2026-11-12):
+// reached with the plugin missing from the inventory and through a per-OS kill switch, while the
+// plugin's ordinary actions are not. Exhaustive over the closed set.
+TEST_CASE("/api/command: every firewall containment action is protective; an ordinary firewall "
+          "action is withheld",
+          "[command_routes][protective]") {
+    for (const char* action : {"quarantine", "release", "quarantine_status", "quarantine_allow"}) {
+        INFO(action);
+        CommandHarness h;
+        auto info = make_agent_info("inv-A");
+        info.add_plugins()->set_name("noop"); // non-empty inventory without the firewall plugin
+        (void)h.registry.register_agent(info);
+        auto res = h.sink.Post("/api/command",
+                               std::string(R"({"plugin":"firewall","action":")") + action +
+                                   R"(","agent_ids":["inv-A"]})");
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        CHECK(h.send_to_ids_called == std::vector<std::string>{"inv-A"});
+    }
+    CommandHarness h;
+    auto info = make_agent_info("inv-A");
+    info.add_plugins()->set_name("noop");
+    (void)h.registry.register_agent(info);
+    auto ordinary = h.sink.Post("/api/command",
+                                R"({"plugin":"firewall","action":"state","agent_ids":["inv-A"]})");
     REQUIRE(ordinary);
     CHECK(ordinary->status == 503);
     CHECK(nlohmann::json::parse(ordinary->body)["error"]["reason"] == "plugin_not_found");
@@ -1197,4 +1228,34 @@ TEST_CASE("/api/command: stagger and delay are strict integers; a bad value disp
     CHECK(h.last_stagger == 0);
     CHECK(h.last_delay == 0);
     CHECK(h.send_to_ids_called.size() == 2);
+}
+
+// sg10 / UP-1: the legacy route refuses a params key the agent would truncate with a 400 before
+// anything is built or sent (not the chokepoint's misleading "permission denied").
+TEST_CASE("/api/command: a params key with a NUL or control byte is refused 400 and dispatches nothing "
+          "(sg10)",
+          "[command_routes][security][sg10]") {
+    CommandHarness h;
+    for (const std::string& key : {std::string("targets\\u0000x"), std::string("a\\u0007b")}) {
+        const std::string body = std::string(R"({"plugin":"noop","action":"run","agent_ids":["dev-A"],)") +
+                                 R"("params":{")" + key + R"(":"10.0.0.1"}})";
+        auto res = h.sink.Post("/api/command", body);
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        auto j = nlohmann::json::parse(res->body);
+        CHECK(j["error"]["reason"] == "param_key_invalid");
+    }
+    CHECK(h.send_to_ids_called.empty());
+    CHECK(h.last_stagger == -1);
+    // Audited and counted like every sibling targeting refusal (route=command).
+    int denied_rows = 0;
+    for (const auto& a : h.audit_calls)
+        if (a.action == "command.dispatch" && a.result == "denied" &&
+            a.detail.find("reason=param_key_invalid") != std::string::npos)
+            ++denied_rows;
+    CHECK(denied_rows == 2);
+    CHECK(h.metrics
+              .counter("yuzu_server_dispatch_target_rejected_total",
+                       {{"route", "command"}, {"reason", "param_key_invalid"}})
+              .value() == 2.0);
 }

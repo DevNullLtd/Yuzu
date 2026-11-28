@@ -197,6 +197,11 @@ TEST_CASE("windows_optional_features plugin: list -- real DISM rows on Windows, 
         CHECK(kClosedStates.contains(f[2]));
         CHECK((f[3] == "0" || f[3] == "1"));
     }
+    // A clean DISM enumeration declares itself complete. The sync collector reads an undeclared
+    // answer as UNKNOWN and withholds the rows, so this is what lets the facet carry any.
+    // (Windows leg only: runs on the Windows agent leg, not on a macOS or Linux host.)
+    CHECK(result.result_status == YUZU_RESULT_STATUS_OK);
+    CHECK(result.result_completeness == YUZU_RESULT_COMPLETENESS_FULL);
 }
 
 TEST_CASE("windows_optional_features plugin: info feature=NetFx3 -- one real row on Windows",

@@ -1,12 +1,13 @@
 /**
- * echo_aggregator.cpp -- Rollup aggregation and retention engine
+ * echo_aggregator.cpp -- retention, the byte budget and the source enable gates
  *
- * Rollup chain: Live -> Hourly -> Daily -> Monthly
- * Each tier aggregates from the tier directly below it.
- * Rollup marks (last-processed timestamp) stored in echo_config.
+ * Roll-up is the only storage model: the fold writes every tier as events arrive, so there is
+ * no aggregation pass and no rollup mark. Retention prunes the tiers by age over their physical
+ * `<src>_<tier>_r` tables; the budget evicts the oldest hourly buckets by size.
  */
 
 #include "echo_aggregator.hpp"
+#include "echo_fold_schema.hpp"
 #include "echo_schema_registry.hpp"
 #include "echo_usage.hpp"
 
@@ -19,6 +20,7 @@
 #include <chrono>
 #include <ctime>
 #include <format>
+#include <functional>
 #include <limits>
 #include <memory>
 #include <tuple>
@@ -32,117 +34,6 @@
 #include <vector>
 
 namespace yuzu::echo {
-
-namespace {
-
-// Boundary computation helpers
-int64_t hour_boundary(int64_t epoch) {
-    return (epoch / 3600) * 3600;
-}
-int64_t day_boundary(int64_t epoch) {
-    return (epoch / 86400) * 86400;
-}
-
-// M2: Use calendar-month boundary via gmtime instead of fixed 30-day approximation
-int64_t month_boundary(int64_t epoch) {
-    time_t t = static_cast<time_t>(epoch);
-    struct tm tm_val {};
-#ifdef _WIN32
-    gmtime_s(&tm_val, &t);
-#else
-    gmtime_r(&t, &tm_val);
-#endif
-    tm_val.tm_mday = 1;
-    tm_val.tm_hour = 0;
-    tm_val.tm_min = 0;
-    tm_val.tm_sec = 0;
-#ifdef _WIN32
-    return static_cast<int64_t>(_mkgmtime(&tm_val));
-#else
-    return static_cast<int64_t>(timegm(&tm_val));
-#endif
-}
-
-// Maximum expected interval between rollup marks (H11: clock skew protection)
-constexpr int64_t kMaxHourlyGap = 7200;     // 2 hours
-constexpr int64_t kMaxDailyGap = 172800;    // 2 days
-constexpr int64_t kMaxMonthlyGap = 5400000; // ~62 days
-
-// Rollup one tier for one source.
-// Returns true if any data was rolled up.
-bool rollup_tier(EchoDatabase& db, std::string_view source_name, std::string_view target_suffix,
-                 int64_t now_epoch) {
-
-    auto sql = rollup_sql(source_name, target_suffix);
-    if (sql.empty())
-        return false;
-
-    int64_t boundary;
-    int64_t max_gap;
-    if (target_suffix == "hourly") {
-        boundary = hour_boundary(now_epoch);
-        max_gap = kMaxHourlyGap;
-    } else if (target_suffix == "daily") {
-        boundary = day_boundary(now_epoch);
-        max_gap = kMaxDailyGap;
-    } else if (target_suffix == "monthly") {
-        boundary = month_boundary(now_epoch);
-        max_gap = kMaxMonthlyGap;
-    } else
-        return false;
-
-    auto mark_key = std::format("rollup_{}_{}_at", source_name, target_suffix);
-    auto mark_str = db.get_config(mark_key, "0");
-    int64_t last_mark = 0;
-    try {
-        last_mark = std::stoll(mark_str);
-    } catch (...) {}
-
-    if (last_mark >= boundary)
-        return false;
-
-    // H11: Clock skew protection — if the gap is abnormally large, clamp it
-    if (boundary - last_mark > max_gap && last_mark > 0) {
-        spdlog::warn("Echo rollup: {}_{} gap {}s exceeds max {}s, possible clock jump — clamping",
-                     source_name, target_suffix, boundary - last_mark, max_gap);
-        last_mark = boundary - max_gap;
-    }
-
-    bool ok = db.execute_sql_range(sql, last_mark, boundary);
-    if (ok) {
-        db.set_config(mark_key, std::to_string(boundary));
-        spdlog::debug("Echo rollup: {}_{} processed [{}, {})", source_name, target_suffix, last_mark,
-                      boundary);
-    }
-
-    return ok;
-}
-
-} // namespace
-
-int run_aggregation(EchoDatabase& db, int64_t now_epoch) {
-    int ops = 0;
-
-    // Data-driven over the registry — symmetric with run_retention() below, which
-    // also walks capture_sources(). Every source's non-live granularities roll up
-    // in declaration order (hourly → daily → monthly), so the Live→Hourly→Daily→
-    // Monthly chain runs in dependency order within a tick (daily reads hourly,
-    // monthly reads daily). rollup_tier() is a no-op when the (source, tier) pair
-    // has no rollup_sql, so a source that lacks a tier — or has none, e.g. the
-    // single-tier netqual — is skipped automatically. This replaces a
-    // hand-maintained steps[] array that silently omitted any newly-registered
-    // source: the $Module rollup SQL was dead until this loop (governance UP-1).
-    for (const auto& src : capture_sources()) {
-        for (const auto& g : src.granularities) {
-            if (g.suffix == "live")
-                continue;
-            if (rollup_tier(db, src.name, g.suffix, now_epoch))
-                ++ops;
-        }
-    }
-
-    return ops;
-}
 
 namespace {
 
@@ -173,6 +64,14 @@ bool bind_upsert(TransactionHandle& h, const char* sql, std::span<const std::str
     if (!ok)
         h.fail(sqlite3_errmsg(h.raw()));
     return ok;
+}
+
+// One line per errored->true recovery, whichever arm of apply_source_enabled_transition
+// committed it (#1624). Worded for every source: only some of them keep a stored baseline.
+void log_errored_recovery(std::string_view source) {
+    spdlog::warn("Echo: source '{}' recovered from an errored enable flag; collection restarts "
+                 "from a fresh baseline",
+                 source);
 }
 
 } // namespace
@@ -220,6 +119,8 @@ bool apply_source_enabled_transition(EchoDatabase& db, std::string_view source,
             return true; // idempotent re-assert -- nothing to invalidate
         if (!yuzu::echo::usage::usage_set_enabled(db, new_value == "true", now_epoch))
             return false;
+        if (new_value == "true" && prev_canon == "errored")
+            log_errored_recovery(source);
         if (new_value == "true") {
             // Boot, configure (here), and every fast tick all call this SAME
             // function -- see echo_usage.hpp. Best-effort: run_usage_fold()
@@ -251,7 +152,15 @@ bool apply_source_enabled_transition(EchoDatabase& db, std::string_view source,
 
     const bool disable_edge = new_value == "false" && prev_canon != "false";
     const bool enable_edge = new_value == "true" && prev_canon != "true";
-    const std::string_view clear_key = disable_edge ? diff_state_key(source) : std::string_view{};
+    // Recovering from "errored" (#1624): the baseline was last written before the
+    // flag went bad, and nothing since has maintained it -- collection is gated
+    // closed on a non-canonical flag, exactly as it is while paused. Resuming
+    // against it would diff the whole errored interval into ghost events, the
+    // same storm the disable edge clears for (#538). So an errored->true edge
+    // clears it in the same transaction. true->true and false->true do not.
+    const bool errored_recovery = enable_edge && prev_canon == "errored";
+    const std::string_view clear_key =
+        (disable_edge || errored_recovery) ? diff_state_key(source) : std::string_view{};
 
     const std::string now_str = std::to_string(now_epoch);
     auto result = db.checked_transaction(
@@ -281,6 +190,8 @@ bool apply_source_enabled_transition(EchoDatabase& db, std::string_view source,
             }
             return {};
         });
+    if (result.has_value() && errored_recovery)
+        log_errored_recovery(source);
     return result.has_value();
 }
 
@@ -325,6 +236,49 @@ std::string_view diff_state_key(std::string_view source) {
     // OS event log recovers the paused window); module is stream-drained. None
     // of these has a snapshot-diff baseline to clear here.
     return {};
+}
+
+std::string encode_process_baseline(const std::vector<yuzu::agent::ProcessInfo>& procs) {
+    nlohmann::json arr = nlohmann::json::array();
+    for (const auto& p : procs)
+        arr.push_back({{"pid", p.pid}, {"ppid", p.ppid}, {"name", p.name}, {"user", p.user}});
+    return arr.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
+}
+
+std::vector<yuzu::agent::ProcessInfo> decode_process_baseline(const std::string& s) {
+    std::vector<yuzu::agent::ProcessInfo> result;
+    if (s.empty())
+        return result;
+    try {
+        for (const auto& j : nlohmann::json::parse(s)) {
+            yuzu::agent::ProcessInfo p;
+            p.pid = j.value("pid", 0u);
+            p.ppid = j.value("ppid", 0u);
+            p.name = j.value("name", "");
+            p.user = j.value("user", "");
+            result.push_back(std::move(p));
+        }
+    } catch (...) {}
+    return result;
+}
+
+bool scrub_process_baseline(EchoDatabase& db) {
+    const std::string key{diff_state_key("process")};
+    const auto stored = db.try_get_state(key);
+    if (!stored) {
+        spdlog::warn("ECHO: process baseline scrub skipped, state unreadable: {}", stored.error());
+        return false;
+    }
+    if (!stored->has_value() || (*stored)->empty())
+        return false;
+    const std::string clean = encode_process_baseline(decode_process_baseline(**stored));
+    if (clean == **stored)
+        return false;
+    if (!db.set_state(key, clean)) {
+        spdlog::error("ECHO: process baseline scrub failed to rewrite the row; retried at next start");
+        return false;
+    }
+    return true;
 }
 
 namespace {
@@ -416,8 +370,8 @@ std::string_view canonical_source_enabled(std::string_view stored_value) {
 // "true", so collection STOPS (fail closed). The bare `!= "false"` treated every
 // such value as enabled, so a source an operator paused for forensics whose
 // `_enabled` value was corrupted or tampered kept collecting — and disagreed
-// with the tri-state `status` reports. run_retention() shares the same canonical
-// gate so an "errored" source's rows are preserved, not pruned. Also the
+// with the tri-state `status` reports. Retention does NOT share this gate for an
+// "errored" source: see source_retention_exempt() (#1572). Also the
 // authoritative paused-guard for the Phase 15.An `echo.purge_source` action.
 //
 // `nullopt` = unreadable flag; source_enabled() fails closed (contract: echo_aggregator.hpp).
@@ -432,6 +386,29 @@ std::optional<bool> source_enabled_state(EchoDatabase& db, std::string_view sour
 
 bool source_enabled(EchoDatabase& db, std::string_view source) {
     return source_enabled_state(db, source).value_or(false);
+}
+
+// #1572 — retention/budget exemption. Mirrors source_enabled_state()'s read (including the
+// registry default for an absent flag). An "errored" flag is exempt ONLY when `_paused_at`
+// says the source was paused when the flag went bad (> 0) or the marker itself is unreadable
+// or malformed: a damaged hold marker never ages out a forensic hold. An absent or exactly
+// "0" marker means no pause was in force, so the normal ceiling applies.
+bool source_retention_exempt(EchoDatabase& db, std::string_view source) {
+    auto r = db.try_get_config(std::format("{}_enabled", source));
+    if (!r)
+        return true; // unreadable flag: preserve
+    const char* def = source_default_enabled(source) ? "true" : "false";
+    const auto state = canonical_source_enabled(r->value_or(def));
+    if (state == "true")
+        return false;
+    if (state == "false")
+        return true; // operator pause (or a default-off source's default)
+    auto pa = db.try_get_config(std::format("{}_paused_at", source));
+    if (!pa)
+        return true;
+    if (!pa->has_value())
+        return false; // errored, never paused
+    return **pa != "0"; // a pause timestamp exempts the source; "0" is the re-enable marker
 }
 
 namespace {
@@ -457,22 +434,28 @@ namespace audit_retention = yuzu::server::audit_retention;
 // warehouse table can collide with.
 constexpr std::string_view kClockStateFailureKey = "__clock_state__";
 
-// UPPER bound only, same role as the audit sibling's `kMaxPlausibleNow`
-// (audit_store.cpp) -- a NEGATIVE reading is the legitimate dead-CMOS case this
-// whole guard exists for and must never be rejected on sign alone. Guards two
-// things: `horizon = now_epoch + kEchoRetentionFutureSlackSec` below, one
-// addition away from signed overflow with no clamp at all; and the durable
-// anchor write a few lines down, which -- unlike the arithmetic -- is not a UB
-// concern but a PERSISTENCE one: an implausible `now_epoch` persisted as
-// `kRetentionLastPassKey` poisons every future pass's elapsed-time check, not
-// just this one.
-constexpr int64_t kEchoMaxPlausibleNow = std::numeric_limits<int64_t>::max() / 4;
+// kEchoMaxPlausibleNow (echo_aggregator.hpp): UPPER bound only, same role as the audit
+// sibling's `kMaxPlausibleNow` (audit_store.cpp) -- a NEGATIVE reading is the legitimate
+// dead-CMOS case this whole guard exists for and must never be rejected on sign alone. Guards
+// two things: `horizon = now_epoch + kEchoRetentionFutureSlackSec` below, one addition away
+// from signed overflow with no clamp at all; and the durable anchor write a few lines down,
+// which -- unlike the arithmetic -- is not a UB concern but a PERSISTENCE one: an implausible
+// `now_epoch` persisted as `kRetentionLastPassKey` poisons every future pass's elapsed-time
+// check, not just this one.
 
 // Reported when `now_epoch` itself is implausible, BEFORE anything about the
 // stored anchor is examined. Deliberately a distinct sentinel from
 // `kClockStateFailureKey`: that one means "the write failed", this one means
 // "the value handed to this pass was never trustworthy enough to write".
 constexpr std::string_view kImplausibleNowKey = "__implausible_now__";
+
+// Reported when the STORED comparison point is unparseable, negative or ahead of
+// now (#3104). The per-table decline for a corrupt stored reading fires only when
+// a table has expired rows, so a tampered row on an idle device produced no
+// signal at all; this one is counted once per pass whatever any table holds.
+// Distinct from `kClockStateFailureKey` (the write failed) and from
+// `kImplausibleNowKey` (the value handed to this pass was bad).
+constexpr std::string_view kImplausibleStoredKey = "__implausible_stored__";
 
 // Does any row match? Runs through the TRUSTED connection. `execute_user_query`
 // is the authorizer-sandboxed path for untrusted operator SQL (echo.sql, #760)
@@ -481,7 +464,7 @@ constexpr std::string_view kImplausibleNowKey = "__implausible_now__";
 //
 // EXISTS, not COUNT(*). A COUNT has to walk every matching row, and the
 // `datable` predicate matches essentially the whole table, so on a 400k-row
-// procperf_live it measured ~7.8ms -- times two probes times twenty granularities
+// a 400k-row raw table it measured ~7.8ms -- times two probes times the tier count
 // every 900 seconds, on a user's laptop, against a previous cost of zero reads.
 // The guard only ever asks yes/no questions, and EXISTS short-circuits on the
 // first hit: ~0.004ms.
@@ -536,10 +519,21 @@ RetentionGuardCounters retention_guard_counters(const RetentionGuardState& guard
     // Probe failures and delete failures are merged: both mean "this table is
     // not being retained", which is the only distinction the operator surface
     // needs to draw against a clock decline.
-    RetentionGuardCounters out{guard.declines, guard.failures};
+    RetentionGuardCounters out{guard.declines, guard.failures, guard.budget_skips};
     for (const auto& [table, count] : guard.delete_failures)
         out.failures[table] += count;
     return out;
+}
+
+int64_t retention_clock_events(const RetentionGuardState& guard) {
+    std::lock_guard lock(guard.mu);
+    // `delete_failures` is deliberately left out: see the header comment.
+    int64_t n = 0;
+    for (const auto& kv : guard.declines)
+        n += kv.second;
+    for (const auto& kv : guard.failures)
+        n += kv.second;
+    return n;
 }
 
 std::vector<std::string> format_retention_guard_lines(const RetentionGuardState& guard) {
@@ -558,6 +552,10 @@ std::vector<std::string> format_retention_guard_lines(const RetentionGuardState&
         total_failures += count;
         lines.push_back(std::format("retention_guard_failed|{}|{}", table, count));
     }
+    // Not a table, and in neither total: a skipped byte-budget pass is the consequence of a
+    // decline or failure already counted above.
+    if (counters.budget_skips > 0)
+        lines.push_back(std::format("retention_guard|__budget__|{}", counters.budget_skips));
     // Both totals are ALWAYS emitted, including zeros: an absent line is
     // ambiguous between "no declines" and "an agent too old to report", and the
     // failures total is what stops a zero declines total from being read as
@@ -664,6 +662,17 @@ void run_retention(EchoDatabase& db, int64_t now_epoch, RetentionGuardState& gua
             prev_pass_now.reset();
         }
     }
+    // #3104: say so once per pass, whether or not any table has expired rows to
+    // decline. The re-anchor below overwrites the bad reading, so the next pass
+    // counts nothing more unless the row is corrupted again or that write fails
+    // (then the bad reading stays, and this repeats beside kClockStateFailureKey).
+    if (prev_implausible) {
+        spdlog::warn("Echo retention: the stored comparison point ({}) is not plausible (unparseable, "
+                     "negative or ahead of this pass); re-anchoring it to the current reading",
+                     kRetentionLastPassKey);
+        std::lock_guard lock(guard.mu);
+        ++guard.failures[std::string{kImplausibleStoredKey}];
+    }
     // Record the reading for the NEXT pass before any early exit: it is an honest
     // observation of the clock whatever this pass goes on to do, and re-anchoring
     // here is what lets a poisoned or stale value self-heal.
@@ -690,11 +699,15 @@ void run_retention(EchoDatabase& db, int64_t now_epoch, RetentionGuardState& gua
     // expired), and unreadable alike -- the caller does not need to
     // distinguish them, only `plans`/counters do, and this function already
     // recorded whichever applies.
-    auto decide_time_based_table = [&](const std::string& table_name, std::string_view ts_col,
-                                       int64_t cutoff, int64_t horizon) -> bool {
-        auto has_expired = exists_where(db, table_name, std::format("{} < {}", ts_col, cutoff));
+    // `table_name` keys the guard's bookkeeping and the `echo status` lines (the name an operator
+    // sees); `probe_table` is the physical table the probes read.
+    auto decide_time_based_table = [&](const std::string& table_name, const std::string& probe_table,
+                                       std::string_view ts_col, int64_t cutoff,
+                                       int64_t horizon) -> bool {
+        auto has_expired =
+            exists_where(db, probe_table, std::format("{} < {}", ts_col, cutoff));
         auto has_survivor = exists_where(
-            db, table_name, std::format("{} BETWEEN {} AND {}", ts_col, cutoff, horizon));
+            db, probe_table, std::format("{} BETWEEN {} AND {}", ts_col, cutoff, horizon));
 
         std::lock_guard lock(guard.mu);
         if (!has_expired || !has_survivor) {
@@ -739,7 +752,7 @@ void run_retention(EchoDatabase& db, int64_t now_epoch, RetentionGuardState& gua
         bool cap_will_bind = false;
         if (would_wipe) {
             const auto more = exists_where(
-                db, table_name,
+                db, probe_table,
                 std::format("{} < {} LIMIT 1 OFFSET {}", ts_col, cutoff,
                             kMaxEchoDeletesPerTablePerPass));
             cap_will_bind = !more || *more;
@@ -757,20 +770,18 @@ void run_retention(EchoDatabase& db, int64_t now_epoch, RetentionGuardState& gua
         // queryable." Without this guard, time-based retention drains hourly
         // within 24h, daily within 31d, monthly within ~365d after disable —
         // breaking the forensic-preservation use case. See issue #539.
-        // #539/#560 — preserve rows whenever the source is NOT actively-and-
-        // validly enabled. Gating on the canonical tri-state (not `== "false"`)
-        // means a paused source ("false") AND a corrupt/tampered one ("errored")
-        // both skip retention, so the forensic window an operator paused — or one
-        // whose `_enabled` value was clobbered — is never pruned. This matches the
-        // collect-time source_enabled() gate, which also fails closed on "errored"
-        // and on a failed config read (rows preserved, never pruned, on a read error).
+        // #539/#560/#1572 — preserve rows of a paused source ("false"), an unreadable flag,
+        // and an errored flag whose `_paused_at` shows it was paused when the flag went bad
+        // (or cannot be read as 0). An errored source that was never paused is NOT exempt:
+        // collection has stopped (source_enabled() fails closed) but its rows age out under
+        // the normal ceiling, so a flag that stays bad cannot hold the warehouse forever.
         //
         // This gate stays STRICTLY AHEAD of any guard bookkeeping: a paused or
         // errored source whose rows are all past their cutoff must neither
         // delete nor decline. Declining would burn a per-table decline counter
         // (and an operator-facing warn) on a source that was never going to be
         // pruned in the first place.
-        if (!source_enabled(db, src.name)) {
+        if (source_retention_exempt(db, src.name)) {
             // Clear this source's recorded fact sets while it is skipped. An
             // entry left recorded across a pause is spent: the first pass
             // after the operator re-enables the source would delete capped
@@ -782,8 +793,16 @@ void run_retention(EchoDatabase& db, int64_t now_epoch, RetentionGuardState& gua
                 guard.last_reported.erase(std::format("{}_{}", src.name, g.suffix));
             continue;
         }
+        if (!source_enabled(db, src.name))
+            spdlog::warn("ECHO: source '{}' has an errored enable flag and was not paused; "
+                         "the retention ceiling applies to its rows",
+                         src.name);
         for (const auto& g : src.granularities) {
+            // `table_name` is the name an operator sees (the guard counters and `echo status` key on
+            // it); `phys` is where the rows live. A roll-up tier name is a VIEW over its `_r`
+            // table, and a DELETE goes to the table.
             auto table_name = std::format("{}_{}", src.name, g.suffix);
+            const std::string phys = is_fold_view(table_name) ? table_name + "_r" : table_name;
             // Row-count retention needs no CLOCK guard -- it trims only the
             // excess over a fixed ceiling, computed with no clock at all, so no
             // reading can make it delete more than it always would. It does need
@@ -793,22 +812,19 @@ void run_retention(EchoDatabase& db, int64_t now_epoch, RetentionGuardState& gua
             // would stall every collector, `echo status` and config write on this
             // connection for as long as it takes (#2361 Gate 8 / Sol).
             //
-            // Rerouted at the caller, exactly as the time-based branch is, so
-            // `retention_sql`'s pinned SQL text stays byte-identical. In steady
-            // state the excess is one tick's inflow, far below the cap, so this
-            // is a no-op; it only bites after a long disable or an upgrade
+            // In steady state the excess is one tick's inflow, far below the cap,
+            // so this is a no-op; it only bites after a long disable or an upgrade
             // backlog, which then drains over a few ticks instead of stalling
-            // the plugin once.
+            // the plugin once. (After v10 only netqual_boot and usage_live are row-count
+            // tables.)
             if (g.retention_type != RetentionType::kTimeBased) {
-                if (retention_sql(table_name, now_epoch).empty())
-                    continue; // not a retention-bearing table
                 plans.push_back(Plan{
                     table_name,
                     std::format("DELETE FROM {} WHERE id IN ("
                                 "SELECT id FROM {} WHERE id <= "
                                 "(SELECT id FROM {} ORDER BY id DESC LIMIT 1 OFFSET {}) "
                                 "ORDER BY id ASC LIMIT {})",
-                                table_name, table_name, table_name, g.retention_default,
+                                phys, phys, phys, g.retention_default,
                                 kMaxEchoDeletesPerTablePerPass)});
                 continue;
             }
@@ -818,16 +834,16 @@ void run_retention(EchoDatabase& db, int64_t now_epoch, RetentionGuardState& gua
             const std::string ts_col{ts_column_for_suffix(g.suffix)};
             const int64_t horizon = now_epoch + kEchoRetentionFutureSlackSec;
 
-            if (decide_time_based_table(table_name, ts_col, cutoff, horizon)) {
+            if (decide_time_based_table(table_name, phys, ts_col, cutoff, horizon)) {
                 // Capped, oldest-first. Every warehouse table has `id INTEGER
-                // PRIMARY KEY` plus an `idx_{table}_{ts_col}` index
-                // (generate_warehouse_ddl), so the subquery is an index scan,
-                // not a sort.
+                // PRIMARY KEY` plus an index that leads with the bucket column (the
+                // roll-up tables' unique index is (bucket, keys...)), so the
+                // subquery is an index scan, not a sort.
                 plans.push_back(Plan{table_name,
                                      std::format("DELETE FROM {} WHERE id IN ("
                                                  "SELECT id FROM {} WHERE {} < {} "
                                                  "ORDER BY {} ASC, id ASC LIMIT {})",
-                                                 table_name, table_name, ts_col, cutoff, ts_col,
+                                                 phys, phys, ts_col, cutoff, ts_col,
                                                  kMaxEchoDeletesPerTablePerPass)});
             }
 
@@ -847,7 +863,7 @@ void run_retention(EchoDatabase& db, int64_t now_epoch, RetentionGuardState& gua
                 ++time_based_tables;
                 const std::string user_table = "usage_daily_user";
                 constexpr std::string_view user_ts_col = "day_ts";
-                if (decide_time_based_table(user_table, user_ts_col, cutoff, horizon)) {
+                if (decide_time_based_table(user_table, user_table, user_ts_col, cutoff, horizon)) {
                     plans.push_back(Plan{
                         user_table,
                         std::format("DELETE FROM usage_daily_user WHERE (day_ts, exe_key, user) "
@@ -866,7 +882,7 @@ void run_retention(EchoDatabase& db, int64_t now_epoch, RetentionGuardState& gua
         // NOTE this is emptiness of the PLAN list, which is not the same as
         // "every time-based table declined": row-count tiers are queued
         // whenever they are retention-bearing, without regard to whether they
-        // have anything to delete. So a real device with an enabled _live tier
+        // have anything to delete. So a real device with a row-count table
         // still issues a BEGIN/COMMIT even while every time-based table is
         // declining. Cheap (0-row deletes), but the earlier comment here
         // claimed a guarantee that does not hold in practice (Gate 4 happy-path).
@@ -915,6 +931,243 @@ void run_retention(EchoDatabase& db, int64_t now_epoch, RetentionGuardState& gua
                          plans.size());
     }
     warn_if_degraded(declined_tables, unreadable_tables, time_based_tables, persist_failed);
+}
+
+// ── Byte budget ───────────────────────────────────────────────────────────────
+
+namespace {
+
+// One table the budget pass may evict from, with the predicate that keeps eligibility
+// inside the preservation contract (see run_budget in echo_aggregator.hpp).
+struct BudgetCandidate {
+    std::string table;       // the physical `<src>_hourly_r` table
+    std::string ts_col;
+    int64_t cutoff{0};       // rows with ts_col < cutoff are eligible
+    bool exhausted{false};   // a batch deleted nothing, the table is empty, or it failed
+};
+
+int64_t parse_i64_or(const std::string& text, int64_t fallback) {
+    int64_t v = 0;
+    const auto* first = text.data();
+    const auto* last = text.data() + text.size();
+    if (auto [p, ec] = std::from_chars(first, last, v); ec == std::errc{} && p == last)
+        return v;
+    return fallback;
+}
+
+// Structural eligibility, from the roll-up declarations alone: every fold source has an hourly
+// tier (the one tier that is evicted). The usage tables are the usage fold's own state and are
+// not roll-up tiers; daily and monthly tiers are never listed here at all.
+std::vector<const FoldSourceDef*> hourly_budget_sources() {
+    std::vector<const FoldSourceDef*> out;
+    for (const auto& def : fold_sources()) {
+        if (def.own_tables)
+            continue;
+        if (std::find(def.tiers.begin(), def.tiers.end(), "hourly") != def.tiers.end())
+            out.push_back(&def);
+    }
+    return out;
+}
+
+// Hourly tier: summarised rows past the 48 h floor (5 d for procperf).
+std::vector<BudgetCandidate> hourly_budget_candidates(EchoDatabase& db, int64_t now_epoch) {
+    std::vector<BudgetCandidate> out;
+    for (const auto* def : hourly_budget_sources()) {
+        // A paused source (or an unreadable flag) is exempt: its rows are preserved for forensics.
+        // An errored one is too only if it was paused when its flag went bad (#1572).
+        if (source_retention_exempt(db, def->name))
+            continue;
+        BudgetCandidate c;
+        c.table = physical_table_name(def->name, "hourly");
+        c.ts_col = std::string{ts_column_for_suffix("hourly")};
+        c.cutoff = now_epoch - (def->name == "procperf" ? kBudgetProcPerfHourlyFloorSec
+                                                         : kBudgetHourlyFloorSec);
+        out.push_back(std::move(c));
+    }
+    return out;
+}
+
+}  // namespace
+
+std::vector<std::string> budget_hourly_eligible_sources() {
+    std::vector<std::string> out;
+    for (const auto* def : hourly_budget_sources())
+        out.emplace_back(def->name);
+    return out;
+}
+
+std::string budget_rank_probe_sql(std::string_view table) {
+    // COALESCE so an empty table ranks 0 instead of NULL.
+    return std::format("SELECT COALESCE((SELECT MAX(id) FROM {0}) - (SELECT MIN(id) FROM {0}) + 1, 0)",
+                       table);
+}
+
+BudgetPassResult run_budget(EchoDatabase& db, int64_t now_epoch, int64_t target_bytes,
+                            const std::function<bool()>& time_left) {
+    BudgetPassResult res;
+    const auto fail = [&](const std::string& why) {
+        res.failed = true;
+        spdlog::warn("Echo budget: {}", why);
+    };
+
+    // A failed measurement is all zeros, which reads as "within budget": say it failed instead.
+    auto sb = db.storage_bytes();
+    if (!sb.ok) {
+        fail("eviction pass skipped: the database size could not be read");
+        return res;
+    }
+    res.data_bytes_after = sb.data_bytes();
+    if (res.data_bytes_after <= target_bytes)
+        return res;
+
+    // Every floor below derives from `now_epoch`; a reading this far ahead cannot be trusted to
+    // delete anything (run_retention refuses the same value for the same reason).
+    if (now_epoch > kEchoMaxPlausibleNow) {
+        fail(std::format("eviction pass skipped: the clock reading ({}) is not plausible; nothing "
+                         "evicted",
+                         now_epoch));
+        return res;
+    }
+
+    std::vector<BudgetCandidate> hourly = hourly_budget_candidates(db, now_epoch);
+
+    // A table whose probe or delete fails is skipped for the rest of this pass; the others
+    // carry on. The next maintenance pass retries it.
+    const auto drop = [&](BudgetCandidate& c, const std::string& why) {
+        c.exhausted = true;
+        fail(std::format("eviction on {} skipped for this pass: {}", c.table, why));
+    };
+
+    while (res.data_bytes_after > target_bytes) {
+        // Largest table by id span. Two separate extrema probes per table; no scan.
+        BudgetCandidate* best = nullptr;
+        int64_t best_span = 0;
+        for (auto& c : hourly) {
+            if (c.exhausted)
+                continue;
+            auto probe = db.execute_query(budget_rank_probe_sql(c.table), /*max_rows=*/1);
+            if (!probe.has_value() || probe->rows.empty() || probe->rows[0].empty()) {
+                drop(c, std::format("size probe failed: {}",
+                                    probe.has_value() ? "no result" : probe.error()));
+                continue;
+            }
+            const int64_t span = parse_i64_or(probe->rows[0][0], 0);
+            if (span <= 0) {
+                c.exhausted = true; // empty table
+                continue;
+            }
+            if (span > best_span) {
+                best_span = span;
+                best = &c;
+            }
+        }
+        if (!best) {
+            // Nothing left to take -- unless a table was skipped on an error, in which case it
+            // may still hold eligible rows and "exhausted" would be untrue.
+            res.exhausted = !res.failed;
+            break;
+        }
+
+        // Checked here, with a table chosen, so a pass with nothing left to evict reports
+        // exhausted rather than a deadline. The overrun is bounded by this one batch.
+        if (!time_left()) {
+            res.deadline_hit = true;
+            break;
+        }
+
+        // Oldest eligible rows first; bucket then id for a deterministic order on equal stamps.
+        const std::string sql = std::format(
+            "DELETE FROM {0} WHERE id IN (SELECT id FROM {0} WHERE {1} < {2} "
+            "ORDER BY {1} ASC, id ASC LIMIT {3}) RETURNING id",
+            best->table, best->ts_col, best->cutoff, kBudgetBatchRows);
+        const auto deleted = db.delete_counted(sql, kBudgetEvictedHourlyKey);
+        if (!deleted.has_value()) {
+            drop(*best, std::format("delete failed: {}", deleted.error()));
+            continue;
+        }
+        if (*deleted == 0)
+            best->exhausted = true; // nothing eligible left in this table
+        else
+            res.evicted_hourly += *deleted;
+
+        sb = db.storage_bytes();
+        if (!sb.ok) {
+            fail("eviction pass stopped: the database size could not be read");
+            return res;
+        }
+        res.data_bytes_after = sb.data_bytes();
+        // A reader pinning the WAL (an echo.sql query) stops the log being recycled: another
+        // batch would only grow it. Stop here -- not exhausted, no catch-up armed -- and let the
+        // post-pass checkpoint and the next maintenance pass pick it up once the reader ends.
+        if (sb.wal_bytes > kEchoWalAllowanceBytes && res.data_bytes_after > target_bytes) {
+            spdlog::debug("Echo budget: eviction paused, the WAL ({} bytes) is above its allowance "
+                          "(a reader pins it)",
+                          sb.wal_bytes);
+            break;
+        }
+    }
+    return res;
+}
+
+VacuumAction vacuum_decision(const VacuumInputs& in) noexcept {
+    constexpr int64_t kMinFreelistBytes = 32 * 1024 * 1024;
+    constexpr int64_t kRetryAfterSec = 86400;
+    if (in.auto_vacuum == 2)
+        return VacuumAction::kSkip;
+    // Wait for eviction to shrink the data, but not forever: once it has nothing left to take the
+    // data will not drop further, and the conversion is what returns the freelist to the OS.
+    if (in.data_bytes > in.target_bytes && !in.eviction_exhausted)
+        return VacuumAction::kSkip;
+    if (in.freelist_bytes < std::max(kMinFreelistBytes, in.file_bytes / 4))
+        return VacuumAction::kSkip;
+    // A marker ahead of `now` is stale (written during a forward clock excursion): treating its
+    // negative age as "recent" would hold the conversion off until the clock catches up.
+    if (in.deferred_at > 0 && in.deferred_at <= in.now && in.now - in.deferred_at < kRetryAfterSec)
+        return VacuumAction::kSkip;
+    // VACUUM in WAL mode builds a copy and then writes the whole file back through the WAL.
+    if (in.free_disk_bytes < 2 * in.data_bytes)
+        return VacuumAction::kDefer;
+    return VacuumAction::kRun;
+}
+
+std::optional<int64_t> parse_budget_bytes(std::string_view text) {
+    int64_t v = 0;
+    const auto [p, ec] = std::from_chars(text.data(), text.data() + text.size(), v);
+    if (ec != std::errc{} || p != text.data() + text.size() || v < kEchoDbBudgetBytesMin)
+        return std::nullopt;
+    return v;
+}
+
+std::optional<int64_t>
+budget_from_config(const std::expected<std::optional<std::string>, std::string>& stored) {
+    if (!stored.has_value())
+        return std::nullopt; // the read failed: unknown, not "the default"
+    if (!stored->has_value())
+        return kEchoDbBudgetBytesDefault; // genuinely absent: the default
+    // PRESENT but unusable (garbled, trailing text, below the minimum): a row damaged or edited
+    // outside the plugin. It says nothing about what the operator chose, so it is unknown too --
+    // never silently the default, which could delete down to a smaller target than a budget the
+    // operator raised (#6900).
+    return parse_budget_bytes(**stored);
+}
+
+bool budget_setting_invalid(const std::expected<std::optional<std::string>, std::string>& stored) {
+    return stored.has_value() && stored->has_value() && !parse_budget_bytes(**stored);
+}
+
+DictGcPlan dict_gc_plan(int64_t now, int64_t last_done_ts, int64_t last_attempt_ts,
+                        int64_t starved_streak) noexcept {
+    const auto waited = [now](int64_t marker, int64_t interval) {
+        return marker <= 0 || marker > now || now - marker >= interval;
+    };
+    DictGcPlan plan;
+    if (starved_streak > 0) {
+        plan.due = waited(last_attempt_ts, kDictGcStarvedRetrySec);
+        plan.deadline = std::chrono::seconds(starved_streak == 1 ? 4 : 8);
+    } else {
+        plan.due = waited(last_done_ts, kDictGcIntervalSec);
+    }
+    return plan;
 }
 
 } // namespace yuzu::echo

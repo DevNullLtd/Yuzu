@@ -674,8 +674,7 @@ TEST_CASE("REST viz: host endpoint rejects a control-character agent_id before i
 TEST_CASE("REST viz: a failed offline-roster read renders live-only with offline_roster_degraded",
           "[viz][routes]") {
     OfflineRosterFn failing = [](std::chrono::seconds) {
-        return std::expected<std::vector<OfflineEndpoint>, PresenceReadError>(
-            std::unexpected(PresenceReadError::DbError));
+        return OfflineRosterRead(std::unexpected(PresenceReadError::DbError));
     };
     VizHarness h({mk_agent("a1", "host-1"), mk_agent("a2", "host-2")}, true, false, failing);
 
@@ -698,8 +697,7 @@ TEST_CASE("REST viz: a healthy offline-roster read merges the stale cube with no
         ep.agent_id = "agent-off";
         ep.hostname = "host-off";
         ep.os = "linux";
-        return std::expected<std::vector<OfflineEndpoint>, PresenceReadError>(
-            std::vector<OfflineEndpoint>{ep});
+        return OfflineRosterRead(OfflineRoster{{ep}, /*truncated=*/false});
     };
     VizHarness h({mk_agent("a1", "host-1")}, true, false, healthy);
 
@@ -713,7 +711,60 @@ TEST_CASE("REST viz: a healthy offline-roster read merges the stale cube with no
             found_stale = true;
     CHECK(found_stale);
     CHECK_FALSE(j.contains("offline_roster_degraded"));
+    CHECK_FALSE(j.contains("offline_roster_truncated"));
     REQUIRE(h.audit_log.size() == 1);
     CHECK(h.audit_log[0].detail.find("offline_roster_degraded") == std::string::npos);
+    CHECK(h.audit_log[0].detail.find("offline_roster_truncated") == std::string::npos);
     CHECK(h.metrics.counter("yuzu_viz_offline_hosts_total").value() == 1);
+}
+
+// #5712: a roster past the store's row cap is a typed PARTIAL — merged, served 200, flagged
+// `offline_roster_truncated` (envelope + audit), never degraded. The closure is injected: the
+// 100k-row fleet that really produces the flag is the store's own [pg] test.
+// Kills: dropping the flag; reading it as a failure (live-only + degraded); an unaudited partial.
+TEST_CASE("REST viz: a truncated offline roster is merged and flagged, not degraded",
+          "[viz][routes][roster_truncated]") {
+    OfflineRosterFn truncated = [](std::chrono::seconds) {
+        OfflineEndpoint ep;
+        ep.agent_id = "agent-off";
+        ep.hostname = "host-off";
+        ep.os = "linux";
+        return OfflineRosterRead(OfflineRoster{{ep}, /*truncated=*/true});
+    };
+    VizHarness h({mk_agent("a1", "host-1")}, true, false, truncated);
+
+    auto res = h.sink.Get("/api/v1/viz/fleet/topology");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto j = json::parse(res->body);
+    CHECK(j["machines"].size() == 2); // the live host + the merged offline row
+    REQUIRE(j.contains("offline_roster_truncated"));
+    CHECK(j["offline_roster_truncated"].get<bool>() == true);
+    CHECK_FALSE(j.contains("offline_roster_degraded"));
+    REQUIRE(h.audit_log.size() == 1);
+    CHECK(h.audit_log[0].result == "success");
+    CHECK(h.audit_log[0].detail.find("offline_roster_truncated=1") != std::string::npos);
+}
+
+// #5712: the 413 oversize path must carry the partial marker too — a refusal after a truncated
+// merge is otherwise indistinguishable, in the audit trail, from a plainly oversize fleet.
+TEST_CASE("REST viz: the oversize 413 audit row records a truncated roster",
+          "[viz][routes][roster_truncated]") {
+    OfflineRosterFn truncated = [](std::chrono::seconds) {
+        OfflineEndpoint a;
+        a.agent_id = "off-1";
+        a.os = "linux";
+        OfflineEndpoint b;
+        b.agent_id = "off-2";
+        b.os = "linux";
+        return OfflineRosterRead(OfflineRoster{{a, b}, /*truncated=*/true});
+    };
+    VizHarness h({mk_agent("a1", "host-1")}, true, false, truncated);
+
+    auto res = h.sink.Get("/api/v1/viz/fleet/topology?machines_max=2");
+    REQUIRE(res);
+    CHECK(res->status == 413);
+    REQUIRE(h.audit_log.size() == 1);
+    CHECK(h.audit_log[0].result == "denied");
+    CHECK(h.audit_log[0].detail.find("offline_roster_truncated=1") != std::string::npos);
 }

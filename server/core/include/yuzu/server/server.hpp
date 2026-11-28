@@ -184,6 +184,15 @@ struct Config {
     // --postgres-pool-size / YUZU_POSTGRES_POOL_SIZE.
     int postgres_pool_size{16};
 
+    // Concurrency cap on the bulk device-CI read (GET /api/v1/hardware-ci and MCP
+    // list_hardware_ci_records), shared by both: how many may hold a pooled Postgres connection at
+    // once on this replica (#7949, #7951). -1 (the default) = not given: the effective cap is
+    // derived from the pool size and logged at boot. An explicit value outside 1..8, or above half
+    // the effective pool, refuses boot. Wired via --hardware-ci-read-concurrency /
+    // YUZU_HARDWARE_CI_READ_CONCURRENCY; the arithmetic is bulk_read_slots.hpp's
+    // resolve_bulk_read_cap (kBulkReadCapUnset is -1).
+    int hardware_ci_read_concurrency{-1};
+
     // HA WS-8 (ADR-2002 §12): minimum seconds stop() keeps the listener open
     // after /readyz starts answering 503 `draining`, so a load balancer stops
     // routing here before the socket closes. 0 = no minimum (the single-node
@@ -207,6 +216,12 @@ struct Config {
     // ServerImpl's ctor reads this once to pre-seed
     // `yuzu_auth_fresh_start_reset_total`.
     bool auth_fresh_start_seeded{false};
+
+    // WP01: proof of identity when an already-enrolled agent id re-registers
+    // (--agent-reregistration-proof, agent_reregistration_gate.hpp): "off" | "audit" | "enforce".
+    // `audit` (the default) decides and counts like `enforce` but admits as before; `enforce`
+    // refuses an unproven re-registration with a gRPC status. Validated by CLI11 at parse time.
+    std::string agent_reregistration_proof{"audit"};
 
     // Gateway upstream (Erlang gateway → C++ server control plane)
     std::string gateway_upstream_address; // Empty = disabled; e.g. "0.0.0.0:50053"
@@ -311,6 +326,9 @@ struct Config {
 
     // Response persistence
     LiveInt response_retention_days{90};
+    // Most stored response rows per (command, agent) pair; frames past it are dropped at the store
+    // (#561). Boot-only (not a runtime-config key), so a plain int; 0 is refused at the flag.
+    int response_max_rows_per_agent{256};
 
     // Audit trail
     LiveInt audit_retention_days{365};
@@ -331,7 +349,11 @@ struct Config {
     std::filesystem::path analytics_jsonl_path; // empty = disabled
 
     // Metrics
-    bool metrics_require_auth{true}; // Require auth for remote /metrics access
+    bool metrics_require_auth{true}; // Require auth for /metrics access
+    // WP06 F57: opt-in. true = a direct loopback peer may read /metrics unauthenticated (no
+    // forwarding headers). Default OFF: a same-host proxy/sidecar makes remote callers look
+    // like 127.0.0.1.
+    bool metrics_trust_loopback{false};
 
     // Security response headers (SOC2-C1)
     // Extra source-list entries appended to script-src, style-src, connect-src,
@@ -425,10 +447,14 @@ struct Config {
     // counter resets on a successful login or an admin unlock. Threshold 0
     // disables the feature. The lock is temporary/auto-expiring so it cannot
     // be weaponised to permanently DoS a legitimate principal; OIDC and the
-    // MFA code-verification path (which has its own rate-limit) are out of
+    // MFA code-verification path (own per-account budget, see below) are out of
     // scope. See docs/auth-architecture.md.
     int auth_lockout_threshold{5};     // consecutive failures before lock; 0 disables
     int auth_lockout_window_secs{900}; // lock duration, default 15 min
+    // WP03 perf-F1: concurrent PBKDF2 slots one source address may hold on the unauthenticated
+    // login lane (/login, recovery code behind a pending token). Keyed on the TCP peer address:
+    // behind a proxy/LB/NAT every user shares it, so raise it there. See server-admin.md.
+    int auth_pbkdf2_per_source_cap{4};
 
     // MFA / TOTP — `/auth-and-authz` skill gap matrix P0 #1, SOC 2 CC6.6.
     // See docs/auth-mfa-design.md. PR1 ships enforcement="optional" (self-
@@ -522,6 +548,24 @@ struct Config {
     /// is what you want. Setting it overrides the derivation, and the stream target is then
     /// clamped to whatever the pool you chose can actually carry.
     std::size_t http_worker_threads{0};
+
+    /// Concurrent streamed installed-software exports (--inventory-export-concurrency, 1-16),
+    /// server-wide. Each open export holds one HTTP worker for the life of the stream and is one
+    /// lease from the held-open stream budget (--max-sse-streams); this is the cap on those
+    /// leases. A request over the cap is answered 503 with a retry hint.
+    int inventory_export_concurrency{2};
+    /// Size limits on ONE streamed installed-software export (--inventory-export-max-rows,
+    /// --inventory-export-max-bytes), JSONL and CSV alike: a stream that would pass either is cut
+    /// without its terminating chunk. The defaults equal `software_export::kDefaultMaxRows` and
+    /// `kDefaultMaxBytes`; the ranges are in software_export_stream.hpp (the route clamps them).
+    std::int64_t inventory_export_max_rows{5'000'000};
+    std::int64_t inventory_export_max_bytes{std::int64_t{1} << 30};
+    /// Seconds between two on-demand software-inventory sync runs of the SAME run key (one
+    /// management group, one operator's scope expression, or the whole fleet): `POST
+    /// /api/v1/hardware/sync` and the MCP tool `sync_hardware_software`. 0 turns the gap off.
+    /// Per server process. The default equals `software_sync::kDefaultCooldownSecs` and the range
+    /// is 0..`kMaxCooldownSecs` (--inventory-sync-cooldown; server.cpp clamps it).
+    int inventory_sync_cooldown_s{600};
 
     // Fleet visualization (PR 3 of feat/viz-engine ladder)
     bool viz_disable{false}; // Kill switch: reject all /viz/fleet requests (DEP-1)

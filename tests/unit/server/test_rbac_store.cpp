@@ -25,6 +25,7 @@
 #include "rbac_store.hpp"
 
 #include "test_auth_db_pg_helper.hpp" // RBAC_STORE_WITH_AUTH — the last-admin guard's auth.users JOIN
+#include "test_mgmt_group_pg_helper.hpp" // plant_group_role_row (test-only raw group-role insert)
 #include "../test_helpers.hpp"
 #include "../test_log_capture.hpp"
 
@@ -52,14 +53,14 @@ using yuzu::server::pg::PgPool;
 namespace yuzu::server {
 
 // #2703 Gate 7 item 3 — friend seam (rbac_store.hpp) for exercising
-// user_rbac_group_names/role_effects_for directly; same shape as
+// user_rbac_group_names_checked/role_effects_for directly; same shape as
 // PreflightRoutesTestAccess (test_preflight_routes.cpp) /
 // DashboardResultsColumnsTestAccess. See the friend declaration's comment for
 // why authorize_list_read() alone can't reach role_effects_for's own sites.
 struct RbacStoreTestAccess {
     RbacStore& store;
-    auto user_rbac_group_names(const std::string& username) {
-        return store.user_rbac_group_names(username);
+    auto user_rbac_group_names_checked(const std::string& username) {
+        return store.user_rbac_group_names_checked(username);
     }
     auto role_effects_for(const std::string& securable_type, const std::string& operation) {
         return store.role_effects_for(securable_type, operation);
@@ -122,6 +123,7 @@ void seed_group_raw(PgPool& pool, const std::string& name, const std::string& de
     PgPool rbac_pool_fx_{{.conninfo = rbac_db_fx_.dsn(), .size = 4}};                               \
     REQUIRE(rbac_pool_fx_.valid());                                                                 \
     RbacStore store_var{rbac_pool_fx_};                                                             \
+    store_var.use_no_session_store_for_test(); /* no session_store schema in this fixture */        \
     REQUIRE(store_var.is_open())
 
 // Fixture for the A2 last-Administrator guard (governance BLOCKING #1,
@@ -142,6 +144,7 @@ void seed_group_raw(PgPool& pool, const std::string& name, const std::string& de
 #define RBAC_STORE_WITH_AUTH(store_var, auth_var)                                                 \
     yuzu::test::AuthDbPg auth_var;                                                                \
     RbacStore store_var{auth_var.pool()};                                                         \
+    store_var.use_no_session_store_for_test(); /* no session_store schema in this fixture */      \
     REQUIRE(store_var.is_open())
 
 /// Seed an ACTIVE auth.users row for `username` (a genuinely authenticatable
@@ -326,8 +329,9 @@ TEST_CASE("RbacStore: seed data — securable types", "[rbac_store][pg]") {
     // +Directory +Enrollment +OidcConfig (#4031 prerequisite fix — Directory was
     // referenced by discovery_routes.cpp but never seeded; Enrollment/OidcConfig
     // are the two new #4031 route securables) = 36,
-    // +Forensics (37th) +Decommission (38th, Wave 7 PR7.2) = 38.
-    REQUIRE(types.size() == 38);
+    // +Forensics (37th) +Decommission (38th, Wave 7 PR7.2) = 38,
+    // +RevocationSource (ADR-0070 R1, slice 2b-1a) = 39.
+    REQUIRE(types.size() == 39);
 
     auto has = [&](const std::string& t) {
         return std::find(types.begin(), types.end(), t) != types.end();
@@ -362,9 +366,27 @@ TEST_CASE("RbacStore: seed data — securable types", "[rbac_store][pg]") {
     CHECK(has("AnalyticsConfig")); // #4028: analytics fragment
     CHECK(has("Forensics")); // Wave 7 forensics class (execution_artifacts, app_usage)
     CHECK(has("Decommission")); // Wave 7 PR7.2: whole-device erasure cascade
+    CHECK(has("RevocationSource")); // ADR-0070 R1: registered CRL sources (admin-only)
     CHECK(has("Directory"));   // #4031 prerequisite fix — AD/Entra directory-sync
     CHECK(has("Enrollment"));  // #4031: auto-approve rules + pending-agent visibility
     CHECK(has("OidcConfig"));  // #4031: OIDC SSO config read (deliberately not "Directory")
+}
+
+// ADR-0070 R1: `RevocationSource` is seeded to Administrator and to NO other role (the surface is
+// also behind the durable-administrator predicate, but a seed that reached another role would
+// widen the egress-target registry to it under RBAC on).
+TEST_CASE("RbacStore: RevocationSource is seeded to Administrator only", "[rbac_store][pg]") {
+    RBAC_STORE(store);
+    CHECK(role_grants(store, "Administrator", "RevocationSource", "Read"));
+    CHECK(role_grants(store, "Administrator", "RevocationSource", "Write"));
+    for (const auto& role : store.list_roles()) {
+        if (role.name == "Administrator")
+            continue;
+        for (const char* op : {"Read", "Write", "Execute", "Delete", "Approve", "Push", "Attest"}) {
+            INFO("role=" << role.name << " op=" << op);
+            CHECK(role_denies(store, role.name, "RevocationSource", op));
+        }
+    }
 }
 
 TEST_CASE("RbacStore: seed data — operations", "[rbac_store][pg]") {
@@ -399,12 +421,13 @@ TEST_CASE("RbacStore: seeded catalogues match the MCP C8 validator mirrors",
 TEST_CASE("RbacStore: seed data — Administrator has all permissions", "[rbac_store][pg]") {
     RBAC_STORE(store);
     auto perms = store.get_role_permissions("Administrator");
-    // 38 types * 5 CRUD ops = 190 permissions, plus a single targeted Push
-    // grant on GuaranteedState (= 191), plus a single AccessReview:Attest grant
-    // (Periodic Access Reviews, CC6.2, = 192), plus a single ApiToken:Rotate
-    // grant (P2 #11, SOC 2 CC6.3) = 193 permissions total. Push, Attest, and
+    // 39 types * 5 CRUD ops = 195 permissions, plus a single targeted Push
+    // grant on GuaranteedState (= 196), plus a single AccessReview:Attest grant
+    // (Periodic Access Reviews, CC6.2, = 197), plus a single ApiToken:Rotate
+    // grant (P2 #11, SOC 2 CC6.3) = 198 permissions total. Push, Attest, and
     // Rotate are deliberately NOT cross-seeded on other securables — see the
-    // rationale in rbac_store.cpp seed_defaults(). (38th: Decommission, Wave 7
+    // rationale in rbac_store.cpp seed_defaults(). (39th: RevocationSource,
+    // ADR-0070 R1, slice 2b-1a; 38th: Decommission, Wave 7
     // PR7.2; 37th: Forensics, Wave 7 forensics class; 36th-34th: Directory/
     // Enrollment/OidcConfig, #4031; 33rd-30th: TlsConfig/PluginSigning/
     // ServerConfig/AnalyticsConfig, #4028 Settings read-twins; 29th:
@@ -414,7 +437,7 @@ TEST_CASE("RbacStore: seed data — Administrator has all permissions", "[rbac_s
     // PluginConfig, PR1.9a peer finding PLAN-001; 23rd: EnginePrincipal,
     // #2376; 22nd: AccessReview, SOC 2 CC6.2; 21st: SoftwareLicensing,
     // ADR-0024.)
-    CHECK(perms.size() == 193);
+    CHECK(perms.size() == 198);
     for (auto& p : perms)
         CHECK(p.effect == "allow");
 
@@ -1578,7 +1601,8 @@ TEST_CASE("RbacStore: unassign_role's last-Administrator guard WAITS for a "
     std::string b_error;
     // If a REQUIRE below throws while the worker is blocked, ScopedJoin rolls back
     // lease_a before joining, which releases the row lock the worker waits on, so the
-    // failure surfaces immediately instead of after the pool's lock_timeout.
+    // failure surfaces immediately instead of after the unassign's lock_timeout (2000 ms for a
+    // user Administrator unassign).
     ScopedJoin unassign_thread{std::thread([&] {
         auto res = store.unassign_role("user", "ghostadmin", "Administrator");
         b_ok = res.has_value();
@@ -1706,11 +1730,14 @@ TEST_CASE("RbacStore: unassign_role's guard WAITS for an in-flight reactivation 
 }
 
 // The lock-wait bound: when the reactivation stays in flight longer than the
-// pool's lock_timeout, the recheck errors, the transaction rolls back (the DELETE
+// lock_timeout, the recheck errors, the transaction rolls back (the DELETE
 // is undone), and the failure is NOT a last-Administrator refusal (callers map it
 // to 503 / an MCP internal error with a retry hint, never to the 409 refusal).
-// A second store on a pool with a 300 ms lock_timeout keeps the test fast; the
-// call is synchronous (the statement times out on its own), so no thread is needed.
+// A user Administrator unassign installs the store's own lifecycle lock_timeout (2000 ms,
+// kDefaultLifecycleLockTimeout) as its first statement, which overrides the 300 ms the second
+// pool below carries, so this test waits about 2 s, not 300 ms; the 300 ms pool does not bound
+// this wait. The call is synchronous (the statement times out on its own), so no thread is
+// needed.
 TEST_CASE("RbacStore: unassign_role's recheck lock wait times out as a store "
           "fault and rolls the DELETE back (FOR UPDATE; PR #4985 round 3)",
           "[rbac_store][pg]") {
@@ -1726,7 +1753,9 @@ TEST_CASE("RbacStore: unassign_role's recheck lock wait times out as a store "
     {
         // Fail fast if `-c lock_timeout` did not reach the session (a DSN carrying
         // `options`, or PGOPTIONS set): the synchronous call below would otherwise
-        // wait on a lock held by this same thread.
+        // wait on a lock held by this same thread. (The unassign below overrides this value with
+        // its own 2000 ms, so this probe checks the pool setting only; it no longer proves the
+        // bound of the call.)
         auto probe = short_pool.acquire();
         REQUIRE(probe);
         pg::PgResult lt = pg::exec_params(probe.get(), "SELECT current_setting('lock_timeout')",
@@ -1920,11 +1949,11 @@ TEST_CASE("RbacStore: unassign_role's last-Administrator guard serializes two "
     // (before the explicit .join() call further down) can never leave this thread
     // live-and-unguarded (governance NICE finding); it also rolls back lease_a first.
     // Runtime bound, stated explicitly (governance SHOULD #11 / NICE):
-    // `unassign_thread` blocks on connection A's row lock for at most
-    // PgPool's default `lock_timeout_ms` (10000ms, pg_pool.hpp:94), never
-    // indefinitely. If a REQUIRE above connection A's COMMIT fails, ScopedJoin
-    // rolls back lease_a first, so the worker unblocks at once instead of waiting
-    // out that timeout.
+    // `unassign_thread` blocks on connection A's row lock for at most the
+    // lifecycle `lock_timeout` a user Administrator unassign installs (2000 ms,
+    // `kDefaultLifecycleLockTimeout`), never indefinitely. If a REQUIRE above connection
+    // A's COMMIT fails, ScopedJoin rolls back lease_a first, so the worker unblocks at once
+    // instead of waiting out that timeout.
     ScopedJoin unassign_thread{std::thread([&] {
         b_started = true;
         auto res = store.unassign_role("user", "raceadmin2", "Administrator");
@@ -2907,13 +2936,15 @@ TEST_CASE("RbacStore: check_scoped_permission group-scoped allow", "[rbac_store]
     REQUIRE(group_id.has_value());
     mgmt.add_member(*group_id, "agent-crm-1");
 
-    // Assign ITServiceOwner to alice on this group
+    // Assign Operator (seeds Tag:Write and Execution:Execute) to alice on this group. The write
+    // is REQUIREd: an unchecked refusal would leave no row and the CHECKs below would fail for
+    // the wrong reason.
     GroupRoleAssignment a;
     a.group_id = *group_id;
     a.principal_type = "user";
     a.principal_id = "alice";
-    a.role_name = "ITServiceOwner";
-    mgmt.assign_role(a);
+    a.role_name = "Operator";
+    REQUIRE(mgmt.assign_role(a).has_value());
 
     // alice has NO global role, but should have scoped access
     CHECK(rbac.check_scoped_permission("alice", "Tag", "Write", "agent-crm-1", &mgmt));
@@ -2926,23 +2957,171 @@ TEST_CASE("RbacStore: check_scoped_permission denied without scope", "[rbac_stor
     yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     ManagementGroupStore mgmt{pool};
 
-    // alice has ITServiceOwner on CRM group, but agent-other is not in it
+    // alice has Operator on CRM group, but agent-other is not in it
     ManagementGroup g;
     g.name = "Service: CRM";
     g.membership_type = "static";
     auto group_id = mgmt.create_group(g);
     REQUIRE(group_id.has_value());
-    mgmt.add_member(*group_id, "agent-crm-1");
+    REQUIRE(mgmt.add_member(*group_id, "agent-crm-1").has_value());
 
     GroupRoleAssignment a;
     a.group_id = *group_id;
     a.principal_type = "user";
     a.principal_id = "alice";
-    a.role_name = "ITServiceOwner";
-    mgmt.assign_role(a);
+    a.role_name = "Operator";
+    // REQUIREd: the denial below is only meaningful when the grant genuinely exists, so that it
+    // is the scope (not a missing row) that denies.
+    REQUIRE(mgmt.assign_role(a).has_value());
 
     // agent-other is NOT in the CRM group
     CHECK_FALSE(rbac.check_scoped_permission("alice", "Tag", "Write", "agent-other", &mgmt));
+}
+
+// #3739: `check_scoped_permission_checked` tells a degrade-driven deny from a definitive one;
+// the Boolean wrapper must answer exactly `value_or(false)` in every case.
+namespace {
+// Runs ONE caller-supplied DDL statement (e.g. a DROP TABLE) against a management-group
+// table on the per-test clone, so RBAC itself stays healthy.
+void break_mgmt_table(const std::string& dsn, const std::string& sql) {
+    yuzu::server::pg::PgConn c{PQconnectdb(dsn.c_str())};
+    REQUIRE(PQstatus(c.get()) == CONNECTION_OK);
+    yuzu::server::pg::PgResult dr{PQexec(c.get(), sql.c_str())};
+    REQUIRE(dr.ok());
+}
+} // namespace
+
+TEST_CASE("RbacStore: check_scoped_permission_checked separates a genuine deny from a mgmt-store "
+          "degrade (#3739)",
+          "[rbac_store][pg]") {
+    RBAC_STORE(rbac);
+    YUZU_REQUIRE_PG_DB_TPL(db, scoped_mgmt_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ManagementGroupStore mgmt{pool};
+
+    ManagementGroup g;
+    g.name = "Service: CRM";
+    g.membership_type = "static";
+    auto group_id = mgmt.create_group(g);
+    REQUIRE(group_id.has_value());
+    REQUIRE(mgmt.add_member(*group_id, "agent-crm-1").has_value());
+    GroupRoleAssignment a;
+    a.group_id = *group_id;
+    a.principal_type = "user";
+    a.principal_id = "alice";
+    a.role_name = "Operator";
+    REQUIRE(mgmt.assign_role(a).has_value());
+
+    const auto checked = [&](const std::string& user, const std::string& agent,
+                             const ManagementGroupStore* store) {
+        return rbac.check_scoped_permission_checked(user, "Tag", "Write", agent, store);
+    };
+
+    // Healthy: allow, and genuine denials are a plain `false` (a value, not an error).
+    auto allowed = checked("alice", "agent-crm-1", &mgmt);
+    REQUIRE(allowed.has_value());
+    CHECK(*allowed);
+    auto no_scope = checked("alice", "agent-other", &mgmt);
+    REQUIRE(no_scope.has_value());
+    CHECK_FALSE(*no_scope);
+    auto no_grant = checked("bob", "agent-crm-1", &mgmt);
+    REQUIRE(no_grant.has_value());
+    CHECK_FALSE(*no_grant);
+    // No mgmt store wired / empty agent id, with every read healthy, is a definitive deny.
+    auto unwired = checked("alice", "agent-crm-1", nullptr);
+    REQUIRE(unwired.has_value());
+    CHECK_FALSE(*unwired);
+    auto no_agent = checked("alice", "", &mgmt);
+    REQUIRE(no_agent.has_value());
+    CHECK_FALSE(*no_agent);
+
+    // RBAC-side fault only: a store whose pool cannot connect. The error is NOT the
+    // management-group token (the label must say `rbac_store`), with or without a mgmt store.
+    {
+        // 127.0.0.1:1 refuses immediately and stays off the network (repo precedent).
+        PgPool bad{
+            {.conninfo = "host=127.0.0.1 port=1 dbname=x user=x connect_timeout=1", .size = 1}};
+        RbacStore broken{bad};
+        REQUIRE_FALSE(broken.is_open());
+        const ManagementGroupStore* none = nullptr;
+        const ManagementGroupStore* some = &mgmt;
+        for (const ManagementGroupStore* store : {none, some}) {
+            auto r = broken.check_scoped_permission_checked("alice", "Tag", "Write",
+                                                            "agent-crm-1", store);
+            REQUIRE_FALSE(r.has_value());
+            CHECK(r.error() != kRbacErrMgmtGroupReadDegraded);
+            CHECK_FALSE(broken.check_scoped_permission("alice", "Tag", "Write", "agent-crm-1",
+                                                       store));
+        }
+    }
+
+    // A global ALLOW still wins over a mgmt store that is about to break (no scoped read).
+    REQUIRE(rbac.assign_role({"user", "admin_user", "Administrator"}).has_value());
+
+    // Break ONLY the management-group store, one read source at a time. The FIRST failing read
+    // is the assignments read (`management_group_roles`), the common outage path: it must carry
+    // the management-group token, not the RBAC one.
+    break_mgmt_table(db.dsn(), "DROP TABLE management_group_store.management_group_roles CASCADE");
+    auto roles_down = checked("alice", "agent-crm-1", &mgmt);
+    REQUIRE_FALSE(roles_down.has_value());
+    CHECK(roles_down.error() == kRbacErrMgmtGroupReadDegraded);
+    // The Boolean wrapper is unchanged: fail-closed false.
+    CHECK_FALSE(rbac.check_scoped_permission("alice", "Tag", "Write", "agent-crm-1", &mgmt));
+
+    // The global ALLOW holder is unaffected by the broken mgmt store.
+    auto global = checked("admin_user", "agent-crm-1", &mgmt);
+    REQUIRE(global.has_value());
+    CHECK(*global);
+}
+
+TEST_CASE("RbacStore: check_scoped_permission_checked reports a member or ancestor lookup "
+          "failure as a mgmt-store degrade (#3739)",
+          "[rbac_store][pg]") {
+    RBAC_STORE(rbac);
+    YUZU_REQUIRE_PG_DB_TPL(db, scoped_mgmt_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ManagementGroupStore mgmt{pool};
+
+    ManagementGroup parent;
+    parent.name = "Parent";
+    parent.membership_type = "static";
+    auto pid = mgmt.create_group(parent);
+    REQUIRE(pid.has_value());
+    ManagementGroup child;
+    child.name = "Child";
+    child.membership_type = "static";
+    child.parent_id = *pid;
+    auto cid = mgmt.create_group(child);
+    REQUIRE(cid.has_value());
+    REQUIRE(mgmt.add_member(*cid, "agent-c1").has_value());
+    GroupRoleAssignment a;
+    a.group_id = *pid;
+    a.principal_type = "user";
+    a.principal_id = "alice";
+    a.role_name = "Operator";
+    REQUIRE(mgmt.assign_role(a).has_value());
+
+    // Healthy: the child's agent is reachable from the grant on its PARENT (ancestor-aware).
+    auto ok = rbac.check_scoped_permission_checked("alice", "Tag", "Write", "agent-c1", &mgmt);
+    REQUIRE(ok.has_value());
+    CHECK(*ok);
+
+    SECTION("member source down: the assignments read still works, get_agent_groups fails") {
+        break_mgmt_table(db.dsn(),
+                         "DROP TABLE management_group_store.management_group_members CASCADE");
+    }
+    SECTION("group table down: the member read works, the ancestor lookup is what fails") {
+        // CASCADE drops only the foreign keys that reference the table; the members and roles
+        // tables stay readable, so the first failing read is get_ancestor_ids' recursive CTE
+        // (the child has a group, so the CTE runs).
+        break_mgmt_table(db.dsn(),
+                         "DROP TABLE management_group_store.management_groups CASCADE");
+    }
+
+    auto down = rbac.check_scoped_permission_checked("alice", "Tag", "Write", "agent-c1", &mgmt);
+    REQUIRE_FALSE(down.has_value());
+    CHECK(down.error() == kRbacErrMgmtGroupReadDegraded);
+    CHECK_FALSE(rbac.check_scoped_permission("alice", "Tag", "Write", "agent-c1", &mgmt));
 }
 
 // fable (Gate 4, #2703, HIGH): the scoped/confinement path has the SAME
@@ -2975,19 +3154,24 @@ TEST_CASE("RbacStore: revoking one role's default does not create a scoped deny_
     mgmt.add_member(*group_id, "agent-crm-1");
 
     // alice holds BOTH roles scoped to the SAME group: ITServiceOwner
-    // (revoked default) and Operator (independent, unrevoked grant).
+    // (revoked default) and Operator (independent, unrevoked grant). The store refuses a
+    // group-scoped ITServiceOwner, so that row is planted by direct SQL (test-only seam): it
+    // stands in for a row an older build left behind, which the resolver still reads.
     GroupRoleAssignment a_ito;
     a_ito.group_id = *group_id;
     a_ito.principal_type = "user";
     a_ito.principal_id = "alice";
     a_ito.role_name = "ITServiceOwner";
-    mgmt.assign_role(a_ito);
+    yuzu::test::plant_group_role_row(db.dsn(), a_ito);
     GroupRoleAssignment a_op;
     a_op.group_id = *group_id;
     a_op.principal_type = "user";
     a_op.principal_id = "alice";
     a_op.role_name = "Operator";
-    mgmt.assign_role(a_op);
+    REQUIRE(mgmt.assign_role(a_op).has_value());
+    // Both rows must exist: Operator alone would also admit the check below, so without this the
+    // test could pass with the ITServiceOwner row missing, which is the case it exists for.
+    REQUIRE(mgmt.get_group_roles(*group_id).size() == 2);
 
     // If the revoked role's absence were (wrongly) treated as a deny_group,
     // this would come back false. It must not — the revoked role is
@@ -3340,7 +3524,7 @@ TEST_CASE("RbacStore: fail-fast breaker denies without a pool touch once "
 }
 
 // #2703 Gate 7 item 3 (BLOCKING, consistency-auditor Gate 4 + compliance-officer
-// Gate 6): user_rbac_group_names and role_effects_for share check_permission's
+// Gate 6): user_rbac_group_names_checked and role_effects_for share check_permission's
 // 3 degrade exits (breaker-denied, pool-acquire-timeout, query-error) but,
 // before this fix, never called note_read_degrade() on any of them — a
 // degrade on the ADR-0017 admit-then-filter chokepoint (authorize_list_read,
@@ -3349,13 +3533,13 @@ TEST_CASE("RbacStore: fail-fast breaker denies without a pool touch once "
 // (first two calls, one per sibling) and the breaker-denied fast path (calls
 // 3 and 4, once the first two have tripped the breaker) ON EACH sibling's OWN
 // code site — quality-engineer (Gate 8) found an earlier version of this
-// test exercised user_rbac_group_names' breaker-denied branch but not
+// test exercised user_rbac_group_names_checked' breaker-denied branch but not
 // role_effects_for's own (structurally identical, but a distinct site);
 // call 4 closes that. Query-error is intentionally NOT covered here (a
 // pre-existing, file-wide gap — check_permission's own query-error path has
 // never had a counter-asserting test either); asserts the counter directly,
 // not merely that the calls return an error.
-TEST_CASE("RbacStore: user_rbac_group_names and role_effects_for record "
+TEST_CASE("RbacStore: user_rbac_group_names_checked and role_effects_for record "
           "read-degrade on pool-acquire-timeout and breaker-denied "
           "(#2703 Gate 7 item 3)",
           "[rbac_store][pg]") {
@@ -3377,10 +3561,10 @@ TEST_CASE("RbacStore: user_rbac_group_names and role_effects_for record "
     auto held = pool_b.acquire();
     REQUIRE(held);
 
-    // Call 1 (user_rbac_group_names): breaker still closed (streak 0) ->
+    // Call 1 (user_rbac_group_names_checked): breaker still closed (streak 0) ->
     // genuine pool-acquire attempt -> times out -> streak 0->1, denying,
     // reason=pool_acquire_timeout.
-    auto r1 = acc.user_rbac_group_names("bob");
+    auto r1 = acc.user_rbac_group_names_checked("bob");
     REQUIRE_FALSE(r1.has_value());
     // The error text is the shared constant: authz::ceiling_degrade_reason matches on it, so a
     // hand-typed variant would be labelled query_error instead of pool_acquire_timeout.
@@ -3400,13 +3584,13 @@ TEST_CASE("RbacStore: user_rbac_group_names and role_effects_for record "
               .value() == 2.0);
     CHECK(metrics.gauge("yuzu_server_rbac_breaker_open").value() == 1.0);
 
-    // Call 3 (user_rbac_group_names again): breaker now OPEN and within its
+    // Call 3 (user_rbac_group_names_checked again): breaker now OPEN and within its
     // cooldown -> denies WITHOUT a pool touch, via each sibling's own
     // breaker-denied branch (the other half of this fix — that branch was
     // ALSO silent pre-fix). Reason is still pool_acquire_timeout (breaker-
     // denied is recorded under the same label as check_permission's own
     // breaker-denied branch, not a distinct reason — see the HELP text).
-    auto r3 = acc.user_rbac_group_names("bob");
+    auto r3 = acc.user_rbac_group_names_checked("bob");
     REQUIRE_FALSE(r3.has_value());
     CHECK(std::string_view{r3.error()} == kRbacErrCircuitBreakerOpen);
     CHECK(metrics.counter("yuzu_server_rbac_read_degrade_total",
@@ -3414,7 +3598,7 @@ TEST_CASE("RbacStore: user_rbac_group_names and role_effects_for record "
               .value() == 3.0);
 
     // Call 4 (role_effects_for, breaker-denied): quality-engineer (Gate 8) —
-    // call 3 above only exercised user_rbac_group_names' OWN breaker-denied
+    // call 3 above only exercised user_rbac_group_names_checked' OWN breaker-denied
     // branch; role_effects_for's own breaker-denied early return
     // (structurally identical, but a distinct code site) was never directly
     // hit. Still within the cooldown from call 2/3, so this denies WITHOUT a
@@ -3430,7 +3614,7 @@ TEST_CASE("RbacStore: user_rbac_group_names and role_effects_for record "
 // The error text of the degraded-read producers is a shared constant because
 // authz::ceiling_degrade_reason keys the `yuzu_server_rbac_read_degrade_total{reason}` label on it:
 // a hand-typed variant at any one producer would be counted as query_error. Three producers are
-// pinned above (user_rbac_group_names, role_effects_for) and in test_authz_gates.cpp
+// pinned above (user_rbac_group_names_checked, role_effects_for) and in test_authz_gates.cpp
 // (role_permission_effect_authz_checked, through role_permission_allowed_checked); the two cases
 // below pin the rest through the real accessors: every "store not open" producer here, and the
 // pool-acquire-timeout producers of the unbreakered reads.
@@ -3464,7 +3648,7 @@ TEST_CASE("RbacStore: every checked read on a store that is not open reports the
     const auto r6 = broken.role_permission_allowed_checked("ITServiceOwner", "Response", "Read");
     REQUIRE_FALSE(r6.has_value());
     CHECK(std::string_view{r6.error()} == kRbacErrStoreNotOpen);
-    const auto r7 = acc.user_rbac_group_names("bob");
+    const auto r7 = acc.user_rbac_group_names_checked("bob");
     REQUIRE_FALSE(r7.has_value());
     CHECK(std::string_view{r7.error()} == kRbacErrStoreNotOpen);
     const auto r8 = acc.role_effects_for("Infrastructure", "Read");
@@ -5343,5 +5527,41 @@ TEST_CASE("RbacStore: a starved pool, an open breaker and a store that is not op
         REQUIRE_FALSE(r.has_value());
         CHECK(std::string_view{r.error()} == kRbacErrStoreNotOpen);
         CHECK_FALSE(broken.check_permission("bob", "Forensics", "Read"));
+    }
+}
+
+// user_rbac_group_names_checked is public (the attestation separation-of-duties gate reads it): an
+// authoritative membership read, never the fail-open `get_group_members` shape. A member's groups
+// come back, a non-member gets an empty SUCCESS, and a read that cannot be answered is an error.
+TEST_CASE("RbacStore::user_rbac_group_names_checked: groups for a member, empty for a non-member, "
+          "an error when the read cannot be answered",
+          "[rbac_store][pg]") {
+    RBAC_STORE(store);
+    REQUIRE(store.create_group({"eng", "Engineering", "local", "", 0}).has_value());
+    REQUIRE(store.create_group({"ops", "Operations", "local", "", 0}).has_value());
+    REQUIRE(store.add_group_member("eng", "bob").has_value());
+    REQUIRE(store.add_group_member("ops", "bob").has_value());
+    REQUIRE(store.add_group_member("ops", "carol").has_value());
+
+    auto bob = store.user_rbac_group_names_checked("bob");
+    REQUIRE(bob.has_value());
+    std::ranges::sort(*bob);
+    CHECK(*bob == std::vector<std::string>{"eng", "ops"});
+
+    auto carol = store.user_rbac_group_names_checked("carol");
+    REQUIRE(carol.has_value());
+    CHECK(*carol == std::vector<std::string>{"ops"});
+
+    auto nobody = store.user_rbac_group_names_checked("nobody");
+    REQUIRE(nobody.has_value()); // a genuine non-member is a success, not an error
+    CHECK(nobody->empty());
+
+    SECTION("a dropped membership table is an error, never an empty set") {
+        exec_on_test_db(rbac_db_fx_.dsn(), "DROP TABLE rbac_store.group_members CASCADE");
+        const auto r = store.user_rbac_group_names_checked("bob");
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error().starts_with("query failed:"));
+        // The fail-open sibling cannot tell the two apart; this is why the gate must not use it.
+        CHECK(store.get_group_members("eng").empty());
     }
 }

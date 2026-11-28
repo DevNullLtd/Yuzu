@@ -7,6 +7,7 @@
 #include "rbac_store.hpp" // RbacStore::validate_assignment — shared engine-principal assignment guard
 #include "utf8_sanitize.hpp"
 
+#include <yuzu/log_token.hpp> // log_id_token, log_key_token
 #include <yuzu/metrics.hpp>
 
 #include <libpq-fe.h>
@@ -26,6 +27,7 @@
 #include <system_error>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 
 namespace yuzu::server {
 
@@ -43,6 +45,15 @@ constexpr std::chrono::milliseconds kWriteTimeout{4000};
 // share this cap so admit and visible-set agree on an over-deep/corrupt tree.
 // Validated trees never approach it (`create_group` caps hierarchy at 5).
 constexpr int kMaxHierarchyDepth = 10;
+
+// Roles `assign_role` refuses at management-group scope. Add the next one here. This is NOT the
+// delegation allowlist: any other role name still stores, so a caller that must restrict which
+// roles it hands out (the REST and MCP routes allow only Operator and Viewer) applies its own
+// check first. EXACT byte match only: no case folding, no trimming. Every consumer of a stored
+// role name matches it exactly, and `sanitize_pg_text` only SUBSTITUTES bad bytes (it never
+// deletes one), so a stored value equals the name only if the input did; a variant
+// ("itserviceowner", a trailing space, an embedded NUL) is an ordinary custom role, not this one.
+constexpr std::array<std::string_view, 1> kRefusedGroupScopedRoles = {"ITServiceOwner"};
 
 // Read-degrade reason labels (ADR-0037 convention).
 constexpr const char* kReasonStoreClosed = "store_not_open";
@@ -186,6 +197,18 @@ constexpr const char* kGroupCols =
     "id, name, description, parent_id, membership_type, scope_expression, "
     "created_by, created_at, updated_at";
 
+
+/// True when the failed statement broke the UNIQUE constraint on the group name (SQLSTATE 23505
+/// naming `management_groups_name_key`, the name Postgres gives `name TEXT NOT NULL UNIQUE`).
+/// That is the caller's conflict, not a store fault. A hit on any other constraint (the generated
+/// id, say) is not matched: retrying mints a new id, so it stays a store fault.
+bool is_group_name_conflict(const PGresult* r) {
+    const char* state = PQresultErrorField(r, PG_DIAG_SQLSTATE);
+    const char* constraint = PQresultErrorField(r, PG_DIAG_CONSTRAINT_NAME);
+    return state != nullptr && constraint != nullptr && std::string_view(state) == "23505" &&
+           std::string_view(constraint) == "management_groups_name_key";
+}
+
 } // namespace
 
 // ── Construction / teardown ──────────────────────────────────────────────────
@@ -226,8 +249,8 @@ void ManagementGroupStore::set_rbac_enabled_probe(std::function<bool()> probe) {
 
 // ── Group CRUD ───────────────────────────────────────────────────────────────
 
-std::expected<std::string, std::string>
-ManagementGroupStore::create_group(const ManagementGroup& group) {
+std::expected<void, std::string>
+ManagementGroupStore::validate_new_group(const ManagementGroup& group) const {
     if (!open_)
         return std::unexpected("database not open");
     if (group.name.empty())
@@ -237,15 +260,29 @@ ManagementGroupStore::create_group(const ManagementGroup& group) {
     if (!group.parent_id.empty()) {
         if (!group.id.empty() && group.parent_id == group.id)
             return std::unexpected("group cannot be its own parent");
-        auto parent = get_group(group.parent_id);
-        if (!parent)
+        // A parent read that FAILED is not "the parent is absent": only an authoritative miss is
+        // "parent group not found"; a degraded read takes the same answer as a degraded ancestor
+        // read below (one store-fault message, so it is classified as a store fault).
+        auto parent = get_group_checked(group.parent_id);
+        if (parent && !parent->has_value())
             return std::unexpected("parent group not found");
-        auto ancestors = get_ancestor_ids(group.parent_id);
+        std::optional<std::vector<std::string>> ancestors;
+        if (parent)
+            ancestors = get_ancestor_ids(group.parent_id);
         if (!ancestors) // confinement/hierarchy read degraded — refuse rather than mis-validate
             return std::unexpected("failed to resolve ancestor chain (store degraded)");
         if (ancestors->size() >= 5)
             return std::unexpected("maximum hierarchy depth (5) exceeded");
     }
+    return {};
+}
+
+std::expected<std::string, std::string>
+ManagementGroupStore::create_group(const ManagementGroup& group) {
+    // The single copy of the pre-insert checks. A caller that already ran
+    // `validate_new_group` is re-validated here: create_group is the authority.
+    if (auto valid = validate_new_group(group); !valid)
+        return std::unexpected(std::move(valid.error()));
 
     auto id = group.id.empty() ? generate_id() : group.id;
     auto now = now_secs();
@@ -273,9 +310,12 @@ ManagementGroupStore::create_group(const ManagementGroup& group) {
         "created_by, created_at, updated_at) "
         "VALUES ($1, $2, $3, $4, $5, $6, $7, $8::bigint, $9::bigint) RETURNING id",
         params);
-    if (r.status() != PGRES_TUPLES_OK || PQntuples(r.get()) != 1)
+    if (r.status() != PGRES_TUPLES_OK || PQntuples(r.get()) != 1) {
+        if (is_group_name_conflict(r.get()))
+            return std::unexpected("a group with that name already exists");
         return std::unexpected(std::string("failed to create group: ") +
                                PQerrorMessage(lease.get()));
+    }
     return text_col(r.get(), 0, 0);
 }
 
@@ -435,8 +475,11 @@ std::expected<void, std::string> ManagementGroupStore::update_group(const Manage
         "parent_id = $3, membership_type = $4, scope_expression = $5, updated_at = $6::bigint "
         "WHERE id = $7",
         params);
-    if (r.status() != PGRES_COMMAND_OK)
+    if (r.status() != PGRES_COMMAND_OK) {
+        if (is_group_name_conflict(r.get()))
+            return std::unexpected("a group with that name already exists");
         return std::unexpected(std::string("update failed: ") + PQerrorMessage(lease.get()));
+    }
     if (std::string_view(PQcmdTuples(r.get())) == "0")
         return std::unexpected("group not found");
     return {};
@@ -496,6 +539,70 @@ std::expected<void, std::string> ManagementGroupStore::remove_member(const std::
     if (r.status() != PGRES_COMMAND_OK)
         return std::unexpected(std::string("remove_member failed: ") + PQerrorMessage(lease.get()));
     return {};
+}
+
+bool ManagementGroupStore::delete_agent(std::string_view agent_id,
+                                        std::vector<std::string>* removed_group_ids,
+                                        std::size_t* removed_count) {
+    if (removed_group_ids)
+        removed_group_ids->clear();
+    if (removed_count)
+        *removed_count = 0;
+    if (!open_ || agent_id.empty())
+        return false;
+    // An operator request: the write budget, not the heartbeat-path one.
+    auto lease = pool_.try_acquire_for(kWriteTimeout);
+    if (!lease) {
+        spdlog::warn("ManagementGroupStore::delete_agent: no connection in time for agent {} ({})",
+                     ::yuzu::log_id_token(agent_id), pool_.last_error());
+        return false;
+    }
+    // A string_view may carry an embedded NUL; pg::exec_params refuses it (SQLSTATE 22021), so it
+    // returns false below rather than truncating onto another agent's id.
+    pg::PgResult r = pg::exec_params(
+        lease.get(),
+        "DELETE FROM management_group_store.management_group_members WHERE agent_id = $1 "
+        "RETURNING group_id",
+        std::vector<std::string>{std::string(agent_id)});
+    if (r.status() != PGRES_TUPLES_OK) {
+        spdlog::warn("ManagementGroupStore::delete_agent: delete failed for agent {}: {}",
+                     ::yuzu::log_id_token(agent_id),
+                     ::yuzu::log_key_token(PQerrorMessage(lease.get())));
+        return false;
+    }
+    // The DELETE has COMMITTED (a bare autocommit statement). Nothing below may turn that into a
+    // failure: the caller would record the store `Failed` ("the delete did not commit") for rows that
+    // are gone, and lose the groups-left evidence. So the count is published first (no allocation)
+    // and the id copy is best effort.
+    const int rows = PQntuples(r.get());
+    if (removed_count)
+        *removed_count = static_cast<std::size_t>(rows);
+    if (removed_group_ids) {
+        try {
+            // Built aside and moved in at the end: the caller's vector is either empty or complete.
+            std::vector<std::string> ids;
+            ids.reserve(static_cast<std::size_t>(rows));
+            for (int i = 0; i < rows; ++i)
+                ids.push_back(text_col(r.get(), i, 0));
+            *removed_group_ids = std::move(ids);
+        } catch (...) {
+            removed_group_ids->clear();
+            // Logging builds a token string (it can allocate), so it is guarded too: no post-commit
+            // statement in this function may let an exception escape.
+            try {
+                spdlog::warn("ManagementGroupStore::delete_agent: agent {} removed from {} "
+                             "group(s) but the group ids could not be copied (out of memory)",
+                             ::yuzu::log_id_token(agent_id), rows);
+            } catch (...) {
+            }
+        }
+    }
+    try {
+        spdlog::info("ManagementGroupStore::delete_agent: agent {} removed from {} group(s)",
+                     ::yuzu::log_id_token(agent_id), rows);
+    } catch (...) {
+    }
+    return true;
 }
 
 std::vector<ManagementGroupMember>
@@ -706,6 +813,13 @@ ManagementGroupStore::assign_role(const GroupRoleAssignment& assignment) {
     if (assignment.principal_type == "engine")
         return std::unexpected(
             "engine principals cannot hold scoped role assignments in this release");
+    // A role that must never be held at group scope. BEFORE validate_assignment (whose messages
+    // echo caller text) and the pool acquire. ONE fixed message: never echo the caller's value
+    // (REST and MCP put a non-fault refusal verbatim into the response and the audit detail) and
+    // never start it with a fault prefix (mgmt_group_error.hpp), so it is a 400-class refusal.
+    for (const auto refused : kRefusedGroupScopedRoles)
+        if (assignment.role_name == refused)
+            return std::unexpected("this role cannot be assigned at management-group scope");
     // Shared engine-principal assignment guard — see RbacStore::validate_assignment.
     if (auto v = RbacStore::validate_assignment(assignment.principal_type, assignment.principal_id,
                                                 assignment.role_name);

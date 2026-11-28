@@ -143,6 +143,23 @@ TEST_CASE("nvd_version_in_range: start excluding", "[nvd][range]") {
     REQUIRE(nvd_version_in_range("2.1", r));
 }
 
+TEST_CASE("nvd_version_in_range: inclusive and exclusive bounds set together all hold",
+          "[nvd][range]") {
+    // Pins the routing through the shared interval core: every one of the four bounds applies.
+    VersionRange both_starts{"", "2.0", "2.5", "", ""}; // >= 2.0 and > 2.5
+    REQUIRE_FALSE(nvd_version_in_range("2.2", both_starts));
+    REQUIRE_FALSE(nvd_version_in_range("2.5", both_starts));
+    REQUIRE(nvd_version_in_range("2.6", both_starts));
+    VersionRange both_ends{"", "", "", "4.0", "3.5"}; // <= 4.0 and < 3.5
+    REQUIRE(nvd_version_in_range("3.4", both_ends));
+    REQUIRE_FALSE(nvd_version_in_range("3.5", both_ends));
+    REQUIRE_FALSE(nvd_version_in_range("4.0", both_ends));
+    VersionRange all_four{"", "1.0", "1.5", "3.0", "2.5"}; // >=1.0, >1.5, <=3.0, <2.5
+    REQUIRE_FALSE(nvd_version_in_range("1.5", all_four));
+    REQUIRE(nvd_version_in_range("2.0", all_four));
+    REQUIRE_FALSE(nvd_version_in_range("2.5", all_four));
+}
+
 TEST_CASE("nvd_version_in_range: exact pin", "[nvd][range]") {
     VersionRange r{"1.2.3", "", "", "", ""};
     REQUIRE(nvd_version_in_range("1.2.3", r));

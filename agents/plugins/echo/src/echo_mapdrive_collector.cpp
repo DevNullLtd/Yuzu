@@ -28,6 +28,8 @@
 #include "bounded_wait.hpp" // yuzu::shared::bounded_call_ex — ../../shared include dir
 #include "echo_capture_status.hpp" // classify_subprocess_capture, IncompleteCaptureError, would_exceed_cap
 #include "echo_collectors.hpp"
+// g_mount_workers_in_flight, MountWorkerGuard, kHiveMountBoundMs, pin_plugin_module
+#include "echo_hive_mount_gate.hpp"
 
 #include <yuzu/agent/subprocess_runner.hpp> // run_bounded_subprocess (rung 2 argv sites)
 
@@ -56,8 +58,9 @@
 #endif
 #include <windows.h>
 #include <winnetwk.h> // WNetOpenEnumW / WNetEnumResourceW / WNetGetUserW (mpr)
-#include <lm.h>       // NetSessionEnum / NetApiBufferFree (netapi32)
-#include "echo_win_raii_guards.hpp" // yuzu::echo::win_raii::WNetEnumGuard / NetApiBufGuard
+#include <lm.h>       // NERR_Success
+#include <yuzu/agent/win_session_enum.hpp> // read_smb_sessions: bounded NetSessionEnum (agent-core)
+#include "echo_win_raii_guards.hpp"        // yuzu::echo::win_raii::WNetEnumGuard
 #include <win_str.hpp> // shared yuzu::win wide<->UTF-8 helpers (#1681)
 // Shared per-user profile/hive ladder (#2771) — replaces this file's private
 // ProfileList walk, system-SID filter and mount/unload guards.
@@ -675,7 +678,6 @@ void warn_capped(std::atomic<bool>& flag, const char* what, std::size_t cap) {
 // Shared implementation in echo_win_raii_guards.hpp (injectable closer,
 // unit-tested).
 using yuzu::echo::win_raii::WNetEnumGuard;
-using yuzu::echo::win_raii::NetApiBufGuard;
 
 // Absolute path to a System32 tool, as a bare (unquoted) argv element —
 // run_bounded_subprocess execs argv[0] directly (no shell in between), so the
@@ -769,101 +771,55 @@ void enum_wnet_outbound(std::vector<MapDriveEntry>& out) {
 }
 
 // --- inbound live: remote sessions into our shares (NetSessionEnum) ---
-template <typename INFO>
-void collect_sessions(INFO* buf, DWORD n, std::vector<MapDriveEntry>& out,
-                      LPWSTR INFO::*cname, LPWSTR INFO::*uname) {
-    for (DWORD i = 0; i < n; ++i) {
-        MapDriveEntry e;
-        e.direction = "inbound";
-        if (buf[i].*cname)
-            e.remote_host = yuzu::win::from_wide(buf[i].*cname);
-        if (buf[i].*uname)
-            e.username = yuzu::win::from_wide(buf[i].*uname);
-        e.provider = "SMB";
-        if (e.remote_host.empty() && e.username.empty())
-            continue;
-        // Check-before-push (round 3, B3-001/B3-004), same reasoning as
-        // enum_wnet_outbound above: throws rather than silently returning a
-        // partial `out` the caller would otherwise diff/persist as complete.
-        if (yuzu::echo::would_exceed_cap(out.size(), kMapDriveEntryCap))
+// The call is agent-core's, bounded over the whole drain (win_session_enum.hpp). Every
+// outcome that is not the complete session list throws, except the access denial below.
+void enum_netsession_inbound(std::vector<MapDriveEntry>& out) {
+    // The combined cap: only the room outbound left (it throws rather than exceed the cap).
+    const std::size_t room = kMapDriveEntryCap - out.size();
+    const auto read_level = [room](int level) {
+        auto read = yuzu::agent::win::read_smb_sessions(level, room,
+                                                        yuzu::agent::win::kSmbSessionsDeadline);
+        if (read.status != yuzu::agent::BoundedStatus::Completed)
+            throw yuzu::echo::IncompleteCaptureError(
+                std::format("ECHO: NetSessionEnum {}", yuzu::agent::bounded_cause(read.status)));
+        if (read.truncated)
             throw yuzu::echo::IncompleteCaptureError("ECHO: mapdrive live entry cap reached");
-        out.push_back(std::move(e));
-    }
-}
-
-// Drain one NetSessionEnum level, paging on ERROR_MORE_DATA via the resume
-// handle (MAX_PREFERRED_LENGTH usually returns everything in one call, but the
-// API may still page — a single call silently drops sessions past page one on a
-// busy file server). collect_sessions() now throws internally the moment the
-// combined cap would be exceeded (round 3), so this loop no longer needs its
-// own post-collect cap check; each page's buffer is freed by NetApiBufGuard
-// even on that throw. Returns the final NET_API_STATUS so the caller can
-// branch on access-denied.
-template <typename INFO>
-NET_API_STATUS enum_sessions_level(DWORD level, LPWSTR INFO::*cname, LPWSTR INFO::*uname,
-                                   std::vector<MapDriveEntry>& out) {
-    DWORD resume = 0; // NetSessionEnum resume_handle is LPDWORD (DWORD), not DWORD_PTR
-    NET_API_STATUS s;
-    // Hard progress backstop: a (pathological) provider returning
-    // ERROR_MORE_DATA without advancing `resume` and yielding only skipped
-    // rows could otherwise spin forever (collect_sessions's cap throw only
-    // trips once `out` actually grows, which a no-progress page never does).
-    // Real result sets need far fewer than this many pages; exceeding it
-    // means no forward progress.
-    constexpr unsigned kMaxPages = 4096;
-    unsigned pages = 0;
-    do {
-        INFO* buf = nullptr;
-        DWORD read = 0, total = 0;
-        s = NetSessionEnum(nullptr, nullptr, nullptr, level, reinterpret_cast<LPBYTE*>(&buf),
-                           MAX_PREFERRED_LENGTH, &read, &total, &resume);
-        NetApiBufGuard g{buf};
-        if (s == NERR_Success || s == ERROR_MORE_DATA)
-            collect_sessions<INFO>(buf, read, out, cname, uname); // throws on cap (round 3)
-        if (s == ERROR_MORE_DATA && (read == 0 || ++pages >= kMaxPages)) {
-            // round 3 (B3-001): a stalled pager silently returned a partial
-            // inbound list before -- that partial `out` would then be
-            // combined with outbound and diffed/persisted as though it were
-            // the complete snapshot. Throw instead, same contract as every
-            // other incomplete-capture path in this file.
-            spdlog::warn("Echo mapdrive: NetSessionEnum paging made no progress — stopping "
-                         "(read={}, pages={})",
-                         read, pages);
+        if (read.no_progress) {
+            spdlog::warn("Echo mapdrive: NetSessionEnum paging made no progress — stopping");
             throw yuzu::echo::IncompleteCaptureError(
                 "ECHO: NetSessionEnum paging made no progress");
         }
-    } while (s == ERROR_MORE_DATA);
-    return s;
-}
+        return read;
+    };
 
-void enum_netsession_inbound(std::vector<MapDriveEntry>& out) {
     // Level 502 (rich) → fall back to level 10 → give up on access-denied.
-    NET_API_STATUS s = enum_sessions_level<SESSION_INFO_502>(
-        502, &SESSION_INFO_502::sesi502_cname, &SESSION_INFO_502::sesi502_username, out);
-    // Access is checked up front, so a 502 denial leaves `out` empty — the level-10
-    // fallback cannot double-collect.
-    if (s == ERROR_ACCESS_DENIED)
-        s = enum_sessions_level<SESSION_INFO_10>(
-            10, &SESSION_INFO_10::sesi10_cname, &SESSION_INFO_10::sesi10_username, out);
+    auto read = read_level(502);
+    if (read.nerr == ERROR_ACCESS_DENIED)
+        read = read_level(10);
 
     // Access denied at both levels (not local-admin / Server-Operator) —
     // documented, constrained-empty outcome: degrade to empty, warned once.
     static std::atomic<bool> s_denied_warned{false};
-    if (s == ERROR_ACCESS_DENIED) {
+    if (read.nerr == ERROR_ACCESS_DENIED) {
         if (!s_denied_warned.exchange(true))
             spdlog::warn("Echo mapdrive: NetSessionEnum access denied — inbound sessions require "
                          "local-admin / Server-Operator; skipping (repeats suppressed)");
         return;
     }
-    // BR4-003 (round 4): every OTHER unexpected NetSessionEnum status was
-    // previously silently accepted -- `out` (whatever collect_sessions
-    // gathered before the failure, possibly empty) was returned as though
-    // it were the complete inbound session list. Any final status besides
-    // NERR_Success (clean) or ERROR_ACCESS_DENIED (handled above) is a real
-    // provider/transport failure and must not be persisted as complete.
-    if (yuzu::echo::is_unexpected_enumeration_status(s, {NERR_Success}))
+    // BR4-003 (round 4): any final status besides NERR_Success (clean) or
+    // ERROR_ACCESS_DENIED (handled above) is a real provider/transport failure and
+    // must not be persisted as complete.
+    if (yuzu::echo::is_unexpected_enumeration_status(read.nerr, {NERR_Success}))
         throw yuzu::echo::IncompleteCaptureError(
-            std::format("ECHO: NetSessionEnum failed (rc={})", s));
+            std::format("ECHO: NetSessionEnum failed (rc={})", read.nerr));
+    for (auto& s : read.sessions) {
+        MapDriveEntry e;
+        e.direction = "inbound";
+        e.remote_host = std::move(s.client);
+        e.username = std::move(s.user);
+        e.provider = "SMB";
+        out.push_back(std::move(e));
+    }
 }
 
 // --- registry helpers for outbound history ---
@@ -1103,24 +1059,14 @@ OutboundRead read_user_outbound_history(HKEY user_root, const std::string& profi
     return result;
 }
 
-// Mount workers currently running (spawned by bounded_call_ex, not yet returned from their
-// closure). A plugin static, safe because the module is pinned before any worker exists. A
-// worker the caller abandoned on a timeout stays counted until it really returns, which is how a
-// LATER walk learns that mounting would only queue behind it (decide_walk_gate).
-std::atomic<int> g_mount_workers_in_flight{0};
-
-struct MountWorkerGuard {
-    MountWorkerGuard() noexcept { g_mount_workers_in_flight.fetch_add(1); }
-    ~MountWorkerGuard() { g_mount_workers_in_flight.fetch_sub(1); }
-    MountWorkerGuard(const MountWorkerGuard&) = delete;
-    MountWorkerGuard& operator=(const MountWorkerGuard&) = delete;
-};
+} // namespace
 
 // Pins this plugin's module so FreeLibrary can never unmap it (the pin is for the life of the
-// process), once, and answers whether it holds. Called on the dispatching thread BEFORE the first
-// bounded mount spawns a worker: a worker that completes is detached too, and destroys its
-// plugin-resident closure after publishing the result, so a pin taken only on a timeout would
-// leave that tail exposed to an unload.
+// process), once, and answers whether it holds. Declared in echo_hive_mount_gate.hpp (the
+// registry source's offline reads share the gate, one in-flight counter per plugin DLL).
+// Called on the dispatching thread BEFORE the first bounded mount spawns a worker: a worker
+// that completes is detached too, and destroys its plugin-resident closure after publishing
+// the result, so a pin taken only on a timeout would leave that tail exposed to an unload.
 bool pin_plugin_module() noexcept {
     static const bool pinned = [] {
         HMODULE module = nullptr;
@@ -1130,14 +1076,17 @@ bool pin_plugin_module() noexcept {
                                    GET_MODULE_HANDLE_EX_FLAG_PIN,
                                reinterpret_cast<LPCWSTR>(&pin_plugin_module), &module))
             return true;
-        spdlog::error("Echo mapdrive: could not pin the plugin module (GetLastError {}); no hive "
-                      "is read (live or offline) until the agent restarts, because a detached "
-                      "mount thread must not outlive an unload",
+        spdlog::error("Echo hive mount: could not pin the plugin module (GetLastError {}); no "
+                      "hive is read (mapped-drive history for loaded and logged-off profiles, "
+                      "registry offline reads) until the agent restarts, because a detached mount "
+                      "thread must not outlive an unload",
                       GetLastError());
         return false;
     }();
     return pinned;
 }
+
+namespace {
 
 // Walk every profile in ProfileList; read the outbound artifacts from the live
 // HKU\<SID> hive, or load NTUSER.DAT for offline users (RAII-unloaded).
@@ -1160,9 +1109,10 @@ bool pin_plugin_module() noexcept {
 // one-shot risk at init(); the retry now re-attempts specifically the profiles already known to be
 // problematic, on a recurring cadence, from the SAME single-threaded dispatch that also runs Echo's
 // other four interval triggers including retention -- an uncancellable hang here would wedge all
-// of them indefinitely, with no self-recovery (governance Gate 6, sre). bounded_call_ex (this
-// plugin's first consumer of the shared primitive) bounds the WAIT, not the call: the mount runs
-// on a detached thread, and the dispatching thread gives up and moves on after kHiveMountBoundMs.
+// of them indefinitely, with no self-recovery (governance Gate 6, sre). bounded_call_ex (the shared
+// primitive; the registry source's offline reads use it the same way) bounds the WAIT, not the
+// call: the mount runs on a detached thread, and the dispatching thread gives up and moves on
+// after kHiveMountBoundMs.
 //
 // The residual, stated plainly, because dism_bounded_call.hpp takes the OPPOSITE stance (its work
 // lives in agent-core, which is never unloaded): the abandoned thread keeps executing THIS
@@ -1182,10 +1132,6 @@ bool pin_plugin_module() noexcept {
 // first timeout (decide_mount_call), and a LATER walk does not mount while that worker is still
 // running (decide_walk_gate, g_mount_workers_in_flight): either would only queue behind the stuck
 // mount, time out, and burn attempts it never made.
-constexpr std::chrono::milliseconds kHiveMountBoundMs{30000}; // generous for a legitimately slow
-                                                              // network-share read; see dism's 17s
-                                                              // for a comparable Windows API bound
-
 void enum_registry_outbound_history(MapDriveHistory& h, const std::vector<std::string>* only_sids) {
     const auto disc = yuzu::win::enumerate_profile_list();
     h.complete = profile_list_complete(disc.root_rc, disc.last_rc, disc.probe_rc);
@@ -1202,8 +1148,18 @@ void enum_registry_outbound_history(MapDriveHistory& h, const std::vector<std::s
                      "profiles beyond that is not collected this cycle",
                      yuzu::win::kMaxProfiles);
     }
-    const auto profiles =
-        yuzu::profiles::build_profile_list(disc.records, yuzu::win::enumerate_hku_subkeys());
+    // A failed or unstable HKEY_USERS listing is not "no hive is loaded": a profile list built from
+    // it would send every logged-on user down the offline-mount path. Skip the per-user leg this
+    // cycle (h.complete is false) and never build the list from a guess.
+    const auto hku = yuzu::win::enumerate_hku_subkeys_checked();
+    if (!hku.error.empty()) {
+        h.complete = false;
+        spdlog::warn("Echo mapdrive: hku_list_incomplete ({}) — outbound history is not collected "
+                     "this cycle",
+                     hku.error);
+        return;
+    }
+    const auto profiles = yuzu::profiles::build_profile_list(disc.records, hku.names);
 
     // sid -> the SID-key-open rc, when that open itself failed (never the ProfileImagePath read).
     std::unordered_map<std::string, long> key_open_rc;

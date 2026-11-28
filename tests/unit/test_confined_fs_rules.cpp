@@ -267,3 +267,58 @@ TEST_CASE("decide_entry is UNCHANGED by the presence of a timestamp",
     CHECK(a.reason == b.reason);
     CHECK(b.reason == c.reason);
 }
+
+// ---- the Windows cloud directory rule (pure: runs on every OS) ----
+
+TEST_CASE("is_cloud_reparse_tag is the cloud FAMILY by mask, never one value", "[confined_fs][cloud]") {
+    for (const std::uint32_t tag : {0x9000001Au, 0x9000201Au, 0x9000401Au, 0x9000601Au, 0x9000701Au, 0x9000F01Au})
+        CHECK(is_cloud_reparse_tag(tag));
+    // every state nibble of the family
+    for (std::uint32_t nibble = 0; nibble < 16; ++nibble)
+        CHECK(is_cloud_reparse_tag(0x9000001Au | (nibble << 12)));
+    // link tags, other families, the neighbours of the mask and no tag at all are not
+    for (const std::uint32_t tag : {0xA000000Cu, 0xA0000003u, 0xA000001Du, 0x80000017u, 0x80000013u, 0x8000001Bu,
+                                    0x9000001Bu, 0x8000001Au, 0x9001001Au, 0u})
+        CHECK_FALSE(is_cloud_reparse_tag(tag));
+}
+
+TEST_CASE("reparse_dir_open_allowed admits only a populated cloud directory under the opt-in policy",
+          "[confined_fs][cloud]") {
+    constexpr auto allow = ReparseDirs::allow_populated_cloud;
+    constexpr auto refuse = ReparseDirs::refuse;
+    // the measured values: a populated folder 0x410 in sync (0x9000601A) and not in sync (0x9000201A), and
+    // a sync-root folder 0x430 (0x9000701A)
+    CHECK(reparse_dir_open_allowed(allow, 0x410, 0x9000601Au));
+    CHECK(reparse_dir_open_allowed(allow, 0x410, 0x9000201Au));
+    CHECK(reparse_dir_open_allowed(allow, 0x430, 0x9000701Au));
+    // under the default policy nothing is admitted
+    CHECK_FALSE(reparse_dir_open_allowed(refuse, 0x410, 0x9000601Au));
+    CHECK_FALSE(reparse_dir_open_allowed(refuse, 0x430, 0x9000701Au));
+    // the measured not-populated folder (0x401410: offline and recall on data access) is not admitted
+    CHECK_FALSE(reparse_dir_open_allowed(allow, 0x401410, 0x9000001Au));
+    CHECK_FALSE(reparse_dir_open_allowed(allow, 0x401410, 0x9000401Au));
+    // each recall or offline bit alone refuses
+    for (const std::uint32_t bit : {0x40000u, 0x400000u, 0x1000u})
+        CHECK_FALSE(reparse_dir_open_allowed(allow, 0x410 | bit, 0x9000601Au));
+    // a cloud FILE (no directory bit) is refused
+    CHECK_FALSE(reparse_dir_open_allowed(allow, 0x420, 0x9000601Au));
+    // every link tag and unknown tag refuses whatever its attributes
+    for (const std::uint32_t tag : {0xA000000Cu, 0xA0000003u, 0xA000001Du, 0x80000017u, 0x80000013u, 0x8000001Bu, 0u})
+        for (const std::uint32_t attrs : {0x410u, 0x430u, 0x10u, 0x400u})
+            CHECK_FALSE(reparse_dir_open_allowed(allow, attrs, tag));
+}
+
+TEST_CASE("the cloud rule is a constant expression and the recall mask is exact", "[confined_fs][cloud]") {
+    static_assert(noexcept(is_cloud_reparse_tag(0)));
+    static_assert(noexcept(reparse_dir_open_allowed(ReparseDirs::refuse, 0, 0)));
+    static_assert(is_cloud_reparse_tag(0x9000601Au));
+    static_assert(reparse_dir_open_allowed(ReparseDirs::allow_populated_cloud, 0x410, 0x9000601Au));
+    static_assert(kAttrRecallOrOffline == 0x00441000u);
+    static_assert(kAttrDirectory == 0x10u && kAttrReparsePoint == 0x400u);
+    // the opt-in columns of EntryMeta and EnumBudget default to nothing, so every existing consumer is unchanged
+    const EntryMeta legacy{EntryType::RegularFile, 1, true};
+    CHECK(legacy.file_id == 0);
+    CHECK(legacy.attributes == 0);
+    CHECK(legacy.reparse_tag == 0);
+    CHECK_FALSE(EnumBudget{}.want_file_ids);
+}

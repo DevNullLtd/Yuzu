@@ -16,6 +16,9 @@ struct Config {
     std::string agent_id;             // Stable UUID; generated on first run if empty
     std::filesystem::path plugin_dir; // Directory to scan for plugin .so/.dll
     std::filesystem::path data_dir;   // Directory for persistent state (agent.db)
+    // Resolved agent log file (empty = none). Published to plugins as `agent.log_file` so the
+    // filesystem plugin can refuse it (WP06 F55) and agent_logging reads the real path.
+    std::filesystem::path log_file;
     std::chrono::seconds heartbeat_interval{30};
     bool tls_enabled{true};
     std::filesystem::path tls_ca_cert;     // PEM CA certificate for server verification
@@ -73,6 +76,13 @@ struct Config {
     std::chrono::seconds update_check_interval{6 * 3600}; // --update-check-interval
 
 
+    // Container-runtime posture (virtualization.runtime_posture, Linux only): the ONE
+    // operator-provided read-only unix-socket endpoint the plugin may connect to.
+    // --container-runtime-endpoint / YUZU_AGENT_CONTAINER_RUNTIME_ENDPOINT. EMPTY (default) = the
+    // plugin never opens a socket. Not validated here (CLI11 silently drops a rejected env value):
+    // the plugin's parse_endpoint decides and reports a typed endpoint_refused row.
+    std::string container_runtime_endpoint;
+
     // Guardian DEX (Digital Experience) — fleet-wide crash recorder (slice 1)
     bool dex_disable{false}; // --dex-disable / YUZU_AGENT_DEX_DISABLE: deploy-time opt-out;
                              // when set, the crash recorder never arms and no crash
@@ -98,6 +108,23 @@ struct Config {
                                // start. Emitting nothing at all is what made a fleet-wide
                                // boot failure invisible. The enforcing legacy Guardian path
                                // is unaffected.
+    // Registry spark periodic path verification (#5719 item 5, #7836, REG-15-I2):
+    // --spark-registry-path-verify-interval SECONDS /
+    // YUZU_AGENT_SPARK_REGISTRY_PATH_VERIFY_INTERVAL, boot-time. 0 (the default) = OFF:
+    // the Registry mechanism runs no verification, because each check re-opens the key by
+    // path, duplicates the held handle and reads canonical names, and on a key with an
+    // auditing SACL that writes Security-log events (measured once on one key: 1 per check
+    // with Registry auditing alone, 6 with Handle Manipulation also on) and can evict older
+    // ones. With the check ON, each establishment, re-arm and retry of a non-root Target
+    // watch whose first name read succeeds also opens the key a second time to confirm its
+    // name (derived: one more event, four with Handle Manipulation on). With it OFF there
+    // is no second open: only one name read per establishment, on the handle already held.
+    // Leave it at 0 where SACLs audit object access. Rollback: unset or 0 and restart the
+    // agent, nothing persists. A value of 1..4 is raised to 5 s; the CLI refuses a negative
+    // or a value above 86400. Windows only: accepted and ignored on Linux and macOS, where
+    // there is no Registry mechanism.
+    // Operator text: docs/user-manual/guaranteed-state.md.
+    int spark_registry_path_verify_interval_s{0};
 
     // Software Licensing & Entitlements (SLE, ADR-0024) — the per-user `user_ref`
     // knob for the `software_licensing` daily-sync source (Decision 11). One of

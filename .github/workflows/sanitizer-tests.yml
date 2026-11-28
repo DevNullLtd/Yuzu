@@ -51,8 +51,14 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  VCPKG_COMMIT: "4b77da7fed37817f124936239197833469f1b9a8"
-  CCACHE_MAXSIZE: "500M"
+  VCPKG_COMMIT: "9eec002df1cd109f8f104cd966a763daf9751489"
+  # Must equal every other self-hosted job's CCACHE_MAXSIZE: these legs
+  # write to the Big Tam runner's own ccache, which ci.yml, nightly.yml,
+  # release.yml and codeql.yml also use, and ccache trims that directory
+  # to the cap of whichever job is writing. At 500M each dispatch could cut the
+  # runner's cache to a few GB, as the daily CodeQL trace did (see
+  # codeql.yml; tests/test_ci_ccache_cap.py).
+  CCACHE_MAXSIZE: "30G"
   CCACHE_COMPRESS: "true"
   # Big Tam allocates one 8C/16T L3 domain to each runner.
   YUZU_BUILD_JOBS: "16"

@@ -1,13 +1,14 @@
 #include "dashboard_routes.hpp"
 #include "query_int_parse.hpp" // parse_query_int / strict_stoi / strict_stoll (#4644)
 
+#include "dispatch_denial_text.hpp" // describe_dispatch_denial: the class behind the denied arm status (#7114)
 #include "dispatch_destructive_gate.hpp" // PR6.0b: the shared Destructive targeting gate (#3685)
 #include "on_behalf_guard.hpp"              // sanitize_for_log
 #include "scope_attribute_guard.hpp" // E-1: unknown-attribute refusal for expression sends
 #include "mcp_input_bounds.hpp"    // kExecInstrScopeMaxLen
 #include "dispatch_target_shape.hpp" // kBroadcastScope (#2500), kReasonDestructiveUntargeted
 #include "forensics_read_audit.hpp" // #4990: response.forensics.read
-#include "rest_audit.hpp" // detail::try_persist_audit (E-1: audit-before-dispatch)
+#include "rest_audit.hpp" // detail::try_persist_audit / emit_behavioral_audit (#3619)
 #include "rest_a4_envelope_http.hpp" // detail::a4_error, make_correlation_id (#4027 REST twin)
 #include "echo_tree_routes.hpp" // EchoRetentionPausedScan/EchoPausedSourceRow/echo_retention_paused_json (#4027)
 
@@ -126,6 +127,133 @@ static std::string render_forensics_unknown_results() {
            "unavailable</span></div>";
 }
 
+/// `HX-Trigger` value for a refused group creation. The Create Group form is hx-swap="none", so a
+/// 4xx body and HX-Retarget are never displayed; the page's toast channel is the only signal the
+/// operator gets. @p message is always a static string, never request data. Built with the JSON
+/// library so a quote in the text can never break the header.
+static std::string refusal_toast_header(const char* message) {
+    const nlohmann::ordered_json trigger = {
+        {"showToast", {{"message", message}, {"level", "error"}}}};
+    return trigger.dump(-1, ' ', true, nlohmann::ordered_json::error_handler_t::replace);
+}
+
+/// The Echo re-enable/purge refusal when the `attempted` audit row cannot be stored (#3619): the
+/// body text and the toast (htmx does not swap a 5xx body on the Echo page, so the toast is what
+/// the operator sees).
+static constexpr const char* kEchoAuditRefusal =
+    "The audit record could not be stored, so nothing was sent. Retry once the audit store "
+    "recovers.";
+
+/// The Echo re-enable/purge body for "not yours" and "not connected" alike (one constant, so the
+/// two cannot drift into an existence oracle): a per-device scoped denial returns it verbatim.
+static constexpr const char* kEchoAgentNotReachableHtml =
+    "<span class=\"echo-row-error\">Agent not reachable.</span>";
+
+/// The toast for an Echo re-enable/purge refused because authorization could not be evaluated
+/// (a static string): htmx does not swap a 5xx body on the Echo page (see kEchoAuditRefusal), so
+/// the toast is what the operator sees.
+static constexpr const char* kEchoAuthorizationUnavailable =
+    "Authorization could not be checked, so nothing was sent. Retry shortly.";
+
+/// #2540: one probe of the per-device scoped-permission chokepoint for an Echo re-enable/purge.
+/// FAIL CLOSED: an unwired gate is `Unavailable`. The gate reports its own refusal class (a
+/// definitive denial, a session that ended, an authorization it could not evaluate, or a degraded
+/// authorization read), so the caller never reads a status or a store to tell them apart and
+/// admits only on `Admitted`. The gate is handed a throwaway Response (it writes its own refusal
+/// and its own `auth.scoped_permission_required` audit row into whatever it is given).
+static ScopedGateOutcome probe_echo_scoped_perm(const DashboardRoutes::ScopedPermFn& gate,
+                                                const httplib::Request& req, const char* type,
+                                                const char* op, const std::string& device_id) {
+    if (!gate)
+        return ScopedGateOutcome::Unavailable;
+    httplib::Response probe;
+    return gate(req, probe, type, op, device_id);
+}
+
+/// Writes the refusal for a non-admitted #2540 probe: 503 with an error toast when authorization
+/// could not be evaluated (an outage is not a missing grant, and it must not read as the 404), else
+/// the 404-collapse body, identical to the offline case so a denial cannot enumerate devices.
+static void write_echo_scoped_refusal(httplib::Response& res, ScopedGateOutcome outcome) {
+    if (echo_source::could_not_evaluate(outcome)) {
+        res.status = 503;
+        res.set_header("HX-Trigger", refusal_toast_header(kEchoAuthorizationUnavailable));
+        res.set_content("<span class=\"echo-row-error\">Authorization unavailable.</span>",
+                        "text/html; charset=utf-8");
+        return;
+    }
+    res.status = 404;
+    res.set_content(kEchoAgentNotReachableHtml, "text/html; charset=utf-8");
+}
+
+/// #7114: answer an Echo re-enable/purge whose dispatch was REFUSED by the chokepoint (the
+/// outcome's `denied`) instead of reaching nobody. Returns the reason token for the audit detail
+/// and the metric `result`.
+///
+/// 403 for the permission-class reasons (Forbidden, ApprovalRequired, AnonymousOperator,
+/// KillSwitched: `describe_dispatch_denial`'s kPermissionDenied class). 500 for Unclassified /
+/// Ambiguous, DELIBERATELY unlike `describe_dispatch_denial`'s kInvalidParams (REST 400): the
+/// (plugin, action) pair here is a SERVER literal ("echo","configure" / "echo","purge_source"),
+/// so a catalogue miss is a server catalogue fault, not a caller mistake.
+static std::string respond_echo_dispatch_denied(httplib::Response& res,
+                                                const detail::DispatchDenial& denial,
+                                                std::string_view action) {
+    const std::string token(detail::to_string(denial.reason));
+    const auto cls =
+        describe_dispatch_denial(denial.reason, "echo", std::string(action), denial,
+                                 DenialSurface::kRest)
+            .cls;
+    res.status = cls == DispatchDenialClass::kPermissionDenied ? 403 : 500;
+    const std::string message = "Not permitted: " + token;
+    // The Echo page swaps no 4xx/5xx body: the toast is what the operator sees.
+    res.set_header("HX-Trigger", refusal_toast_header(message.c_str()));
+    res.set_content("<span class=\"echo-row-error\" data-reason=\"" + token + "\">" + message +
+                        "</span>",
+                    "text/html; charset=utf-8");
+    return token;
+}
+
+/// The result-context span for a command the dispatch chokepoint refused for the caller (#7114),
+/// shared by the execute console and the Echo SQL console. `token` is a closed constexpr set
+/// (`detail::to_string(DispatchDenialReason)`), safe in markup. 200 with an error span, like every
+/// other refusal of these consoles (htmx swaps no 4xx body).
+static std::string not_permitted_result_span(const std::string& token) {
+    return "<span id=\"result-context\" hx-swap-oob=\"true\""
+           " class=\"result-context is-error\" data-reason=\"" + token + "\">" +
+           html_escape("Not permitted: " + token +
+                       ". The dispatch chokepoint refused this command for you; nothing was "
+                       "sent.") +
+           "</span>";
+}
+
+/// The toast when create_group itself fails (a store error, or a same-name group created
+/// concurrently after the duplicate check). Constant text: no store or caller data.
+static constexpr const char* kGroupCreateFailed =
+    "The group could not be created. Nothing was created. Retry shortly.";
+
+/// The refusal sentence for a group set cut by the read cap (toast and body say the same thing).
+static constexpr const char* kGroupPartialRefusal =
+    "The result set was cut by the read cap, so the agent list is partial. "
+    "Nothing was created. Narrow the filters or the Search term and try again.";
+
+/// The toast for a Search term the caller may not use (Response:Read refused or unavailable).
+static constexpr const char* kSearchAdmissionRefusal =
+    "The Search term could not be used: reading responses is not permitted or the permission "
+    "check is unavailable.";
+
+/// Intersects @p ids with the caller's visible @p scope (nullopt = sees all); returns how many
+/// ids were dropped. The intersection the group POST and the preview's Search-term path share:
+/// both read unscoped (the Search predicate runs in the server), so they scope after the read.
+/// The filters-only preview scopes in SQL (`facet_agent_count`) instead.
+static std::size_t keep_visible(std::vector<std::string>& ids,
+                                const std::optional<std::vector<std::string>>& scope) {
+    if (!scope)
+        return 0;
+    const std::unordered_set<std::string> scope_set(scope->begin(), scope->end());
+    const auto before = ids.size();
+    std::erase_if(ids, [&scope_set](const std::string& id) { return !scope_set.contains(id); });
+    return before - ids.size();
+}
+
 static bool any_filter_value_too_long(const std::vector<FacetFilter>& filters) {
     return std::any_of(filters.begin(), filters.end(),
                        [](const FacetFilter& f) { return facet_filter_value_over_bound(f.value); });
@@ -192,14 +320,59 @@ bool DashboardRoutes::refuse_cross_site_write(const httplib::Request& req,
                                      req.get_header_value("Origin"),
                                      req.get_header_value("Referer"), csrf_trusted_origins_))
         return false;
-    audit_fn_(req, "csrf.denied", "denied", "Endpoint", "dashboard",
-              "cross-site or header-less browser write refused");
+    audit_or_flag(req, res, "csrf.denied", "denied", "Endpoint", "dashboard",
+                  "cross-site or header-less browser write refused");
     res.status = 403;
     res.set_content("<span id=\"result-context\" hx-swap-oob=\"true\""
                     " class=\"result-context is-error\" data-reason=\"csrf_cross_origin\">"
                     "Cross-site request refused. Nothing was sent.</span>",
                     "text/html; charset=utf-8");
     return true;
+}
+
+bool DashboardRoutes::audit_attempted(const httplib::Request& req, httplib::Response& res,
+                                      const std::string& action, const std::string& target_type,
+                                      const std::string& target_id, const std::string& detail_text,
+                                      const std::string& refusal_html, const char* toast) const {
+    // `persist_audit_fn_ &&` first: an unwired sink is a refusal here, never audit-off (the
+    // kernel alone would read an empty sink as "audit disabled, proceed").
+    if (persist_audit_fn_ && detail::try_persist_audit(persist_audit_fn_, req, action, "attempted",
+                                                       target_type, target_id, detail_text))
+        return true;
+    res.status = 503;
+    if (!res.has_header("Sec-Audit-Failed")) // a set-and-proceed row may already have set it
+        res.set_header("Sec-Audit-Failed", "true");
+    if (toast)
+        res.set_header("HX-Trigger", refusal_toast_header(toast));
+    res.set_content(refusal_html, "text/html; charset=utf-8");
+    return false;
+}
+
+void DashboardRoutes::audit_or_flag(const httplib::Request& req, httplib::Response& res,
+                                    const std::string& action, const std::string& result,
+                                    const std::string& target_type, const std::string& target_id,
+                                    const std::string& detail_text) const {
+    (void)detail::emit_behavioral_audit(audit_fn_, req, res, action, result, target_type,
+                                        target_id, detail_text);
+}
+
+bool DashboardRoutes::admit_search_read(const httplib::Request& req,
+                                        httplib::Response& res) const {
+    if (!fleet_read_fn_) {
+        spdlog::error("group Search path: fleet_read_fn_ unwired -- misconfigured call site; "
+                      "failing closed");
+        res.status = 503;
+        res.set_header("HX-Trigger", refusal_toast_header(kSearchAdmissionRefusal));
+        res.set_content("<span class=\"feedback-error\">Service unavailable.</span>",
+                        "text/html; charset=utf-8");
+        return false;
+    }
+    // On a refusal the gate has already written the A4 error body and status; the form never
+    // swaps a 4xx/5xx body, so the toast is the operator's only signal.
+    if (fleet_read_fn_(req, res, "Response", "Read").admitted)
+        return true;
+    res.set_header("HX-Trigger", refusal_toast_header(kSearchAdmissionRefusal));
+    return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -276,20 +449,16 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
         metrics_->describe(
             "yuzu_echo_scan_dispatched_total",
             "Operator-triggered echo.status scans dispatched by result (success / "
-            "rate_limited / no_visible_agents / no_connected_agents / denied).",
+            "rate_limited / no_visible_agents / no_connected_agents / denied, or the "
+            "chokepoint's refusal reason when the dispatch itself was refused: unclassified / "
+            "ambiguous / anonymous_operator / forbidden / approval_required / kill_switched).",
             "counter");
-        metrics_->describe(
-            "yuzu_echo_source_reenable_total",
-            "Operator-triggered Echo source re-enable attempts by result "
-            "(success / scope_violation / agent_not_connected / denied / invalid_input).",
-            "counter");
-        metrics_->describe(
-            "yuzu_echo_source_purge_total",
-            "Operator-triggered Echo retention-paused source purge (destructive) attempts by "
-            "result (success / scope_violation / agent_not_connected / denied / invalid_input). "
-            "Counts DISPATCH outcomes; the agent's rows_deleted / source_not_paused outcome is in "
-            "the command response record.",
-            "counter");
+        // yuzu_echo_source_reenable_total / yuzu_echo_source_purge_total: described and every
+        // {result, surface} series created at 0 by the shared Echo action rules. This one call
+        // also describes and seeds the REST purge's surface="rest" series: RestApiV1 writes
+        // them but never describes or seeds them, so this call must keep running on the
+        // registry REST uses (server.cpp passes the one registry to both).
+        echo_source::describe_and_seed(*metrics_);
     }
 
     // -- GET /fragments/results -----------------------------------------------
@@ -352,6 +521,13 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                 auto filters = parse_filters(req, plugin);
                 bool filters_explicit = !filters.empty();
                 auto text_query = req.get_param_value("q");
+                // #5638: the operator's per-request opt-out of the View's authored equals
+                // defaults (the filter bar's "View without saved filters" checkbox). It never
+                // drops a filter the operator set.
+                const bool view_filters_off = req.get_param_value("view_filters") == "off";
+                // #6075: the SSE-driven summary refresh. Same live filters as the table, but it
+                // must not close an open Create Group form (#5669 below).
+                const bool background_refresh = req.get_param_value("refresh") == "1";
 
                 // Issue #587: when the dispatcher knew the definition_id
                 // (e.g. an instruction text resolved to a definition with
@@ -412,7 +588,7 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                         // Other ops (contains/starts_with/...) are
                         // honoured by REST consumers but not auto-applied
                         // by the dashboard for now.
-                        if (!filters_explicit) {
+                        if (!filters_explicit && !view_filters_off) {
                             auto render_cols = resolve_render_columns(plugin, definition_id);
                             for (const auto& tf : resolved.filters) {
                                 if (tf.op != "equals") continue;
@@ -434,15 +610,32 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                     tier_filter_for(req, forensics_visibility_fn_, forensics_plugins_);
                 if (!tier_resolved) {
                     // Unknown: a visible notice, never the empty or "no results" state (#4990).
-                    res.set_content(render_forensics_unknown_results(), "text/html; charset=utf-8");
+                    // An operator-driven refusal also closes the Create Group form (#5669): it
+                    // was built for filters this refusal has just replaced.
+                    auto refusal = render_forensics_unknown_results();
+                    if (!background_refresh)
+                        refusal += "<div id=\"group-form-slot\" hx-swap-oob=\"true\"></div>";
+                    res.set_content(refusal, "text/html; charset=utf-8");
                     return;
                 }
                 const ResponseTierFilter& tier = *tier_resolved;
                 ForensicsServed served;
+                // The background refresh reads for its counts and renders the summary, pager and
+                // header only: it carries NO stored rows (rows_omitted), so it has none to audit and
+                // leaves no response.forensics.read row. `refresh=1` is a plain query parameter any
+                // caller can send, which is why the rows are omitted server-side rather than just
+                // discarded by the page (swap none): nothing is read out unaudited.
                 auto html = render_results(command_id, tier, plugin, sort_col, sort_dir,
                                            page, per_page, filters, text_query,
                                            definition_id, template_id,
-                                           visible_columns, gate.scope, &served);
+                                           visible_columns, gate.scope,
+                                           background_refresh ? nullptr : &served,
+                                           background_refresh);
+                // #5669: every operator-driven results response empties the Create Group slot --
+                // the form it holds was built for the previous filters. The background refresh
+                // carries the same live filters the table shows, so it leaves the form alone.
+                if (!background_refresh)
+                    html += "<div id=\"group-form-slot\" hx-swap-oob=\"true\"></div>";
                 // #4990: a page that shows Forensics-tier rows leaves its own separately countable
                 // row. Set-and-proceed like the neighboring dashboard fragments: a persist failure
                 // shows as `Sec-Audit-Failed` and never blanks the operator's view.
@@ -593,10 +786,17 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                 // Flat ManagementGroup:Write admission stays until ADR-0017
                 // PR-B; management-group-scoped Response:Read is applied only
                 // as a filter below and does not compose into this gate
-                // (auth_routes.hpp).
+                // (auth_routes.hpp). A Search term (#5700) additionally needs
+                // the results table's own Response:Read admission, because it
+                // matches stored output content (admit_search_read); the
+                // filters-only path keeps this gate alone.
                 if (!perm_fn_(req, res, "ManagementGroup", "Write")) return;
                 auto session = auth_fn_(req, res);
                 if (!session) return;
+
+                // #5700: the results page's Search term is part of the group definition.
+                const auto text_query = req.get_param_value("q");
+                if (!text_query.empty() && !admit_search_read(req, res)) return;
 
                 auto command_id = req.get_param_value("command_id");
                 auto plugin = req.get_param_value("plugin");
@@ -612,21 +812,31 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                 // degrade must not render as "0 agents", not that the
                 // no-store/no-filter cases need a NEW distinction from it.
                 std::optional<int64_t> agent_count;
-                if (response_store_ && !filters.empty()) {
+                bool partial = false;
+                if (response_store_ && (!filters.empty() || !text_query.empty())) {
                     // #4990: after the ManagementGroup:Write gate; the tier filter alone closes
-                    // the Forensics half (no Response:Read gate is added to this route).
-                    // Unknown leaves `agent_count` empty: the form then says the count is
+                    // the Forensics half (the Response:Read admission is added only for a Search
+                    // term, above). Unknown leaves `agent_count` empty: the form then says the count is
                     // unavailable, never a number computed over a partial row set.
                     if (const auto tier =
-                            tier_filter_for(req, forensics_visibility_fn_, forensics_plugins_))
-                        agent_count = response_store_->facet_agent_count(command_id, *tier, filters,
-                                                                          agent_scope);
+                            tier_filter_for(req, forensics_visibility_fn_, forensics_plugins_)) {
+                        if (text_query.empty()) {
+                            agent_count = response_store_->facet_agent_count(
+                                command_id, *tier, filters, agent_scope);
+                        } else if (auto match = agents_matching_text(command_id, *tier, plugin,
+                                                                      filters, text_query)) {
+                            // Same scope intersection the POST applies before it counts.
+                            keep_visible(match->ids, agent_scope);
+                            agent_count = static_cast<int64_t>(match->ids.size());
+                            partial = match->truncated;
+                        }
+                    }
                 }
-                else if (filters.empty())
+                else if (filters.empty() && text_query.empty())
                     agent_count = 0; // genuine: no filter → no scoped count
 
                 auto html = render_create_group_form(command_id, plugin, filters,
-                                                      agent_count);
+                                                      agent_count, text_query, partial);
                 // Same cross-operator shared-cache concern as filter-bar above.
                 res.set_header("Cache-Control", "no-store, private");
                 res.set_header("Vary", "Cookie");
@@ -639,7 +849,12 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                  // Flat ManagementGroup:Write admission stays until ADR-0017
                  // PR-B; management-group-scoped Response:Read is applied only
                  // as a filter below and does not compose into this gate
-                 // (auth_routes.hpp).
+                 // (auth_routes.hpp). A Search term (#5700) additionally needs
+                 // the results table's own Response:Read admission, because it
+                 // matches stored output content (admit_search_read); the
+                 // filters-only path keeps this gate alone. The Search term's
+                 // admission and the Forensics tier are decided AGAIN after the
+                 // `attempted` audit row (#7112), as are the session and this gate.
                  if (!perm_fn_(req, res, "ManagementGroup", "Write")) return;
                  auto session = auth_fn_(req, res);
                  if (!session) return;
@@ -657,8 +872,8 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                          origin_is_same_site(req.get_header_value("Host"), origin, referer,
                                              csrf_trusted_origins_);
                      if (!same_site) {
-                         audit_fn_(req, "group.create_from_results", "denied",
-                                   "ManagementGroup", "", "csrf_cross_origin");
+                         audit_or_flag(req, res, "group.create_from_results", "denied",
+                                       "ManagementGroup", "", "csrf_cross_origin");
                          res.status = 403;
                          res.set_header("HX-Retarget", "#group-form-slot");
                          res.set_content(
@@ -671,6 +886,12 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                  auto group_name = extract_form_value(req.body, "group_name");
                  auto command_id = extract_form_value(req.body, "command_id");
                  auto plugin = extract_form_value(req.body, "plugin");
+                 // #5700: the Search term is part of the group definition. Read from the parsed
+                 // parameters only: `extract_form_value` is an unanchored substring scan (#2527), so
+                 // a field whose name merely ends in `q` would be read as the Search term.
+                 const auto text_query = req.get_param_value("q");
+                 // After the same-site gate, before any store read or the visible-scope resolve.
+                 if (!text_query.empty() && !admit_search_read(req, res)) return;
 
                  if (group_name.empty()) {
                      res.status = 400;
@@ -692,6 +913,64 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                      return;
                  }
 
+                 // The three refusals of the derivation below. Local responders, because the
+                 // re-decision after the `attempted` row (#7112) answers the same cases with the
+                 // same text: a refusal must read identically before and after the row. The form
+                 // is hx-swap="none", so a 4xx/5xx body and HX-Retarget are never shown; the
+                 // page's toast channel (an HX-Trigger showToast event, rendered with textContent)
+                 // is the operator's only signal. Every message is a constant: no caller or
+                 // plugin data.
+                 const auto respond_tier_unknown = [&res] {
+                     // Answered 200 (htmx drops a 4xx/5xx body); the body carries the same text for
+                     // every caller, htmx simply does not display it. The planned REST and MCP
+                     // twins (#2146) must NOT copy this 200: they answer the shared retryable A4
+                     // 503 (`respond_forensics_tier_unknown`, with `retry_after_ms`), as the
+                     // read-side twin does.
+                     res.set_header("HX-Trigger", refusal_toast_header(
+                         "The permission check for this action could not be completed. "
+                         "Nothing was created. Retry shortly."));
+                     res.set_content(
+                         "<span class=\"feedback-error\">"
+                         "The permission check for this action could not be completed. "
+                         "Nothing was created. Retry shortly.</span>",
+                         "text/html; charset=utf-8");
+                 };
+                 const auto respond_store_unreadable = [&res] {
+                     res.status = 503;
+                     res.set_header("HX-Trigger", refusal_toast_header(
+                         "Agent count unavailable. The response store could not be read. "
+                         "Nothing was created. Retry shortly."));
+                     res.set_content(
+                         "<span class=\"feedback-error\">"
+                         "Agent count unavailable — the response store could not be read. "
+                         "Retry shortly.</span>",
+                         "text/html; charset=utf-8");
+                 };
+                 const auto respond_read_cut = [&res] {
+                     // The read behind the set was cut by the read cap, so the set is partial: a
+                     // group is never materialised from it.
+                     res.status = 422;
+                     res.set_header("HX-Retarget", "#group-form-slot");
+                     res.set_header("HX-Trigger", refusal_toast_header(kGroupPartialRefusal));
+                     res.set_content(std::string("<span class=\"feedback-error\">") +
+                                         kGroupPartialRefusal + "</span>",
+                                     "text/html; charset=utf-8");
+                 };
+
+                 // The agents behind this group definition under @p t, the Forensics tier decision
+                 // the read runs under. A Search term narrows the set by the same per-line
+                 // predicate the results table renders (agents_matching_text); filters alone keep
+                 // the facet-index lookup. nullopt = the store is degraded; `truncated` = the read
+                 // was cut by the read cap, so the set is partial.
+                 const auto derive = [&](const ResponseTierFilter& t) -> std::optional<TextMatch> {
+                     if (text_query.empty()) {
+                         if (auto ids = response_store_->facet_agent_ids(command_id, t, filters))
+                             return TextMatch{std::move(*ids), false};
+                         return std::nullopt;
+                     }
+                     return agents_matching_text(command_id, t, plugin, filters, text_query);
+                 };
+
                  // Get matching agent IDs from faceted index. #2691 (Doomgoose
                  // finding #7): a degraded read must not read as "no agents
                  // match" — that's a wrong-result-presented-as-correct claim on
@@ -704,42 +983,19 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                  if (!tier) {
                      // Unknown: this action materializes membership, so it refuses outright rather
                      // than proceeding on a filter computed from a partial answer (#4990).
-                     // The form is hx-swap="none", so neither a body nor HX-Retarget is ever
-                     // shown; the operator sees the refusal through the page's toast channel
-                     // (an HX-Trigger showToast event, rendered with textContent). The message is
-                     // a constant: no caller or plugin data. Answered 200 (htmx drops a 4xx/5xx
-                     // body); the body carries the same text for every caller, htmx simply
-                     // does not display it. The planned REST and MCP twins (#2146) must NOT copy
-                     // this 200: they answer the shared retryable A4 503
-                     // (`respond_forensics_tier_unknown`, with `retry_after_ms`), as the
-                     // read-side twin does.
-                     res.set_header(
-                         "HX-Trigger",
-                         R"({"showToast":{"message":"The permission check for this action could )"
-                         R"(not be completed. Nothing was created. Retry shortly.","level":"error"}})");
-                     res.set_content(
-                         "<span class=\"feedback-error\">"
-                         "The permission check for this action could not be completed. "
-                         "Nothing was created. Retry shortly.</span>",
-                         "text/html; charset=utf-8");
+                     respond_tier_unknown();
                      return;
                  }
-                 auto agent_ids_opt = response_store_->facet_agent_ids(command_id, *tier, filters);
-                 if (!agent_ids_opt.has_value()) {
-                     res.status = 503;
-                     // Same toast channel as the refusal above (the form never swaps a body).
-                     res.set_header(
-                         "HX-Trigger",
-                         R"({"showToast":{"message":"Agent count unavailable. The response store )"
-                         R"(could not be read. Nothing was created. Retry shortly.","level":"error"}})");
-                     res.set_content(
-                         "<span class=\"feedback-error\">"
-                         "Agent count unavailable — the response store could not be read. "
-                         "Retry shortly.</span>",
-                         "text/html; charset=utf-8");
+                 auto derived = derive(*tier);
+                 if (!derived.has_value()) {
+                     respond_store_unreadable();
                      return;
                  }
-                 auto& agent_ids = *agent_ids_opt;
+                 if (derived->truncated) {
+                     respond_read_cut();
+                     return;
+                 }
+                 auto& agent_ids = derived->ids;
 
                  // D2: intersect against the caller's Response:Read-visible
                  // scope before the empty check — the raw (unscoped) list
@@ -748,28 +1004,21 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                  // bespoke error. JIT-elevated: full-fleet view (see
                  // render_filter_bar's identical comment).
                  auto agent_scope = resolve_visible_scope(*session);
-                 if (agent_scope) {
-                     std::unordered_set<std::string> scope_set(agent_scope->begin(),
-                                                                agent_scope->end());
-                     std::size_t before = agent_ids.size();
-                     std::erase_if(agent_ids, [&scope_set](const std::string& id) {
-                         return !scope_set.contains(id);
-                     });
-                     std::size_t dropped = before - agent_ids.size();
-                     if (dropped > 0) {
-                         // target_type "Execution" matches the existing response.read
-                         // denied-row convention (server.cpp's aggregate surface), not
-                         // "Response" — so SIEM rules filtering on the established
-                         // taxonomy see this row too.
-                         audit_fn_(req, "response.read", "denied", "Execution", command_id,
+                 if (const auto dropped = keep_visible(agent_ids, agent_scope); dropped > 0) {
+                     // target_type "Execution" matches the existing response.read
+                     // denied-row convention (server.cpp's aggregate surface), not
+                     // "Response" — so SIEM rules filtering on the established
+                     // taxonomy see this row too.
+                     audit_or_flag(req, res, "response.read", "denied", "Execution", command_id,
                                    "scope_dropped=" + std::to_string(dropped) +
                                        " surface=group_from_results");
-                     }
                  }
 
                  if (agent_ids.empty()) {
                      res.status = 422;
                      res.set_header("HX-Retarget", "#group-form-slot");
+                     res.set_header("HX-Trigger", refusal_toast_header(
+                         "No agents match the current filters. Nothing was created."));
                      // #5623: when a filter value is over the ingest bound the empty set may be
                      // an undercount; say so (static text, never the value). Status unchanged.
                      std::string why = "No agents match the current filters.";
@@ -788,10 +1037,119 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                  if (existing) {
                      res.status = 400;
                      res.set_header("HX-Retarget", "#group-form-slot");
+                     res.set_header("HX-Trigger", refusal_toast_header(
+                         "A group with that name already exists. Nothing was created."));
                      res.set_content(
                          "<span class=\"feedback-error\">"
                          "A group with that name already exists.</span>",
                          "text/html; charset=utf-8");
+                     return;
+                 }
+
+                 // ADR-0033 section 9, "no audit row, no mutation" (#3619): materialising a
+                 // group is a mutation, so its `attempted` row is stored before create_group and
+                 // every refusal above returned first (none burns a row). The form is
+                 // hx-swap="none", so the toast is the operator's only view of a refusal.
+                 static constexpr const char* kGroupAuditRefusal =
+                     "The audit record could not be stored. Nothing was created. Retry once the "
+                     "audit store recovers.";
+                 // #7076: one correlation id is the LAST token of the `attempted` detail and of
+                 // every row this request writes after it, so an outcome pairs with its attempt
+                 // even when two requests name the same group; rows before this point carry none.
+                 // The group name is operator text and always precedes the token.
+                 const std::string cid_token = " cid=" + detail::make_correlation_id();
+                 if (!audit_attempted(req, res, "group.create_from_results", "ManagementGroup", "",
+                                      group_name + " (" + std::to_string(agent_ids.size()) +
+                                          " agents from " + command_id + ")" +
+                                          (text_query.empty() ? "" : " text_query=1") + cid_token,
+                                      std::string("<span class=\"feedback-error\" "
+                                                  "data-reason=\"audit_unavailable\">") +
+                                          kGroupAuditRefusal + "</span>",
+                                      kGroupAuditRefusal))
+                     return;
+
+                 // UP-5 (#3619): the attempted row can wait on the audit pool, so everything the
+                 // set was derived under is decided again, in this order: the session (a revoked
+                 // elevation or an invalidated session must not survive in the copy taken before
+                 // the wait), ManagementGroup:Write, the Search term's Response:Read, the
+                 // Forensics tier (#7112), and last visibility, resolved from the fresh session,
+                 // narrowing the set to what the caller may see NOW. Every refusal is the
+                 // `attempted` row's `failure` outcome and carries its correlation id.
+                 const auto fresh_session = auth_fn_(req, res); // writes its own 401 when gone
+                 if (!fresh_session) {
+                     audit_or_flag(req, res, "group.create_from_results", "failure",
+                                   "ManagementGroup", "", "session_revoked" + cid_token);
+                     return;
+                 }
+                 // The flat ManagementGroup:Write admission above ran before the wait too, so it
+                 // is decided again for the re-authenticated session: a grant revoked during the
+                 // wait creates nothing (#3619 review). The gate writes its own 403.
+                 if (!perm_fn_(req, res, "ManagementGroup", "Write")) {
+                     audit_or_flag(req, res, "group.create_from_results", "failure",
+                                   "ManagementGroup", "",
+                                   "permission_revoked name=" + group_name + cid_token);
+                     return;
+                 }
+                 // #7112: the two admissions the membership was derived under are decided again,
+                 // in this order, because a grant withdrawn during the wait must not leave rows in
+                 // the group that the caller may no longer read. First the Search term's own
+                 // Response:Read admission (its gate writes its own refusal and toast).
+                 if (!text_query.empty() && !admit_search_read(req, res)) {
+                     audit_or_flag(req, res, "group.create_from_results", "failure",
+                                   "ManagementGroup", "",
+                                   "response_read_revoked name=" + group_name + cid_token);
+                     return;
+                 }
+                 // Then the Forensics tier. Unknown refuses (as before the row); a known tier
+                 // never refuses by itself.
+                 const auto fresh_tier =
+                     tier_filter_for(req, forensics_visibility_fn_, forensics_plugins_);
+                 if (!fresh_tier) {
+                     audit_or_flag(req, res, "group.create_from_results", "failure",
+                                   "ManagementGroup", "", "forensics_tier_unknown" + cid_token);
+                     respond_tier_unknown();
+                     return;
+                 }
+                 // The set is derived again ONLY when the tier narrowed (a Forensics:Read grant
+                 // withdrawn, or a surface that lost its plugin set), and then under the narrower
+                 // tier, so the group never keeps an agent that only a withdrawn grant matched. An
+                 // unchanged or wider tier performs no second read: the first read already
+                 // contains everything the caller may read now.
+                 if ((fresh_tier->restricts() && !tier->restricts()) ||
+                     (fresh_tier->refuses_every_row() && !tier->refuses_every_row())) {
+                     auto fresh = derive(*fresh_tier);
+                     if (!fresh.has_value()) {
+                         audit_or_flag(req, res, "group.create_from_results", "failure",
+                                       "ManagementGroup", "", "reread_unreadable" + cid_token);
+                         respond_store_unreadable();
+                         return;
+                     }
+                     if (fresh->truncated) {
+                         audit_or_flag(req, res, "group.create_from_results", "failure",
+                                       "ManagementGroup", "", "reread_truncated" + cid_token);
+                         respond_read_cut();
+                         return;
+                     }
+                     keep_visible(agent_ids,
+                                  std::optional<std::vector<std::string>>{std::move(fresh->ids)});
+                 }
+                 agent_scope = resolve_visible_scope(*fresh_session);
+                 if (const auto dropped = keep_visible(agent_ids, agent_scope); dropped > 0) {
+                     audit_or_flag(req, res, "response.read", "denied", "Execution", command_id,
+                                   "scope_dropped=" + std::to_string(dropped) +
+                                       " surface=group_from_results phase=post_attempted" +
+                                       cid_token);
+                 }
+                 if (agent_ids.empty()) {
+                     audit_or_flag(req, res, "group.create_from_results", "failure",
+                                   "ManagementGroup", "", "scope_revoked" + cid_token);
+                     res.status = 422;
+                     res.set_header("HX-Retarget", "#group-form-slot");
+                     res.set_header("HX-Trigger", refusal_toast_header(
+                         "No agents match the current filters. Nothing was created."));
+                     res.set_content("<span class=\"feedback-error\">"
+                                     "No agents match the current filters.</span>",
+                                     "text/html; charset=utf-8");
                      return;
                  }
 
@@ -801,10 +1159,19 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                  mg.description = "Created from filtered results (command " +
                                   command_id + ")";
                  mg.membership_type = "static";
-                 mg.created_by = session->username;
+                 mg.created_by = fresh_session->username;
                  auto group_result = mgmt_group_store_->create_group(mg);
                  if (!group_result) {
+                     // The attempted row above is stored, so it gets an outcome (#3619). It
+                     // names the group: there is no group id to pair it by (Gate 8 UP-13).
+                     audit_or_flag(req, res, "group.create_from_results", "failure",
+                                   "ManagementGroup", "",
+                                   "create_failed name=" + group_name + cid_token);
                      res.status = 500;
+                     // The form is hx-swap="none": without the toast the operator sees nothing
+                     // (a same-name race lost to a concurrent create lands here).
+                     res.set_header("HX-Retarget", "#group-form-slot");
+                     res.set_header("HX-Trigger", refusal_toast_header(kGroupCreateFailed));
                      res.set_content(
                          "<span class=\"feedback-error\">"
                          "Failed to create group: " +
@@ -830,10 +1197,10 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                  }
 
                  if (failed > 0) {
-                     audit_fn_(req, "group.create_from_results", "failure",
-                              "ManagementGroup", group_id,
-                              "partial_materialisation added=" + std::to_string(added) +
-                                  " failed=" + std::to_string(failed));
+                     audit_or_flag(req, res, "group.create_from_results", "failure",
+                                   "ManagementGroup", group_id,
+                                   "partial_materialisation added=" + std::to_string(added) +
+                                       " failed=" + std::to_string(failed) + cid_token);
                      res.status = 500;
                      res.set_header("HX-Retarget", "#group-form-slot");
                      res.set_content(
@@ -846,10 +1213,11 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                      return;
                  }
 
-                 audit_fn_(req, "group.create_from_results", "success",
-                          "ManagementGroup", group_id,
-                          group_name + " (" + std::to_string(agent_ids.size()) +
-                              " agents from " + command_id + ")");
+                 audit_or_flag(req, res, "group.create_from_results", "success",
+                               "ManagementGroup", group_id,
+                               group_name + " (" + std::to_string(agent_ids.size()) +
+                                   " agents from " + command_id + ")" +
+                                   (text_query.empty() ? "" : " text_query=1") + cid_token);
 
                  // Response: no body, side-effects via HX-Trigger headers
                  // The header is built with the JSON library, never by concatenation: the
@@ -927,8 +1295,8 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                      // A refusal is a 400 (htmx surfaces it through htmx:responseError) that
                      // names its reason and writes one denied audit row. Nothing dispatches.
                      auto refuse_expression = [&](const char* reason, const std::string& text) {
-                         audit_fn_(req, "command.dispatch", "denied", "command", "",
-                                   std::string("reason=") + reason);
+                         audit_or_flag(req, res, "command.dispatch", "denied", "command", "",
+                                       std::string("reason=") + reason);
                          res.status = 400;
                          res.set_content(
                              "<span id=\"result-context\" hx-swap-oob=\"true\""
@@ -1015,9 +1383,14 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                              + html_escape(context) + "</span>";
                      html += "<strong id=\"row-count\" hx-swap-oob=\"true\">"
                              + std::to_string(row_count) + "</strong>";
-                     // Clear filter bar and pagination for help display
-                     html += "<div id=\"filter-bar\" hx-swap-oob=\"innerHTML\"></div>";
-                     html += "<nav id=\"result-pagination\" hx-swap-oob=\"innerHTML\"></nav>";
+                     // Clear filter bar and pagination for help display. outerHTML ("true"), not
+                     // innerHTML, for the filter bar, the pager and the chart-deck host below:
+                     // replacing the element removes the previous command's hx-get / hx-trigger
+                     // (its pending 2 s load would otherwise land that command's chrome over the
+                     // help table) and, for the pager, clears the view stamp the SSE summary
+                     // refresh reads (an innerHTML clear would leave the old data-page on it).
+                     html += "<div id=\"filter-bar\" hx-swap-oob=\"true\"></div>";
+                     html += "<nav id=\"result-pagination\" hx-swap-oob=\"true\"></nav>";
                      html += "<div id=\"result-summary\" hx-swap-oob=\"innerHTML\"></div>";
                      html += "<div id=\"group-form-slot\" hx-swap-oob=\"innerHTML\"></div>";
                      // Clear any chart deck from a prior query — help is
@@ -1027,7 +1400,11 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                      // this OOB swap is defence-in-depth so a future
                      // refactor of that listener can't silently leave
                      // stale charts on the page.
-                     html += "<div id=\"chart-deck-host\" hx-swap-oob=\"innerHTML\"></div>";
+                     html += "<div id=\"chart-deck-host\" hx-swap-oob=\"true\"></div>";
+                     // The help table replaces the results: abort a results request still in
+                     // flight for the previous command (see kResultsAbortTrigger).
+                     res.set_header("HX-Trigger",
+                                    "{" + std::string{kResultsAbortTrigger} + "}");
                      res.set_content(html, "text/html; charset=utf-8");
                      return;
                  }
@@ -1173,10 +1550,10 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                                        "refusing dispatch of {}:{} (Destructive targeting "
                                        "cannot be decided)",
                                        plugin, action);
-                         audit_fn_(req, "command.dispatch", "denied", "command", "",
-                                   "reason=classifier_unavailable " +
-                                       onbehalf::sanitize_for_log(plugin, 128) + ":" +
-                                       onbehalf::sanitize_for_log(action, 128));
+                         audit_or_flag(req, res, "command.dispatch", "denied", "command", "",
+                                       "reason=classifier_unavailable " +
+                                           onbehalf::sanitize_for_log(plugin, 128) + ":" +
+                                           onbehalf::sanitize_for_log(action, 128));
                          res.set_content(
                              "<span id=\"result-context\" hx-swap-oob=\"true\""
                              " class=\"result-context is-error\">"
@@ -1246,10 +1623,10 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                          // Audited under this surface's own command.dispatch
                          // verb, with the same `reason=` detail prefix
                          // /api/command's twin refusal writes.
-                         audit_fn_(req, "command.dispatch", "denied", "command", "",
-                                   "reason=" + std::string(gate.refusal_reason) + " " +
-                                       onbehalf::sanitize_for_log(plugin, 128) + ":" +
-                                       onbehalf::sanitize_for_log(action, 128));
+                         audit_or_flag(req, res, "command.dispatch", "denied", "command", "",
+                                       "reason=" + std::string(gate.refusal_reason) + " " +
+                                           onbehalf::sanitize_for_log(plugin, 128) + ":" +
+                                           onbehalf::sanitize_for_log(action, 128));
                          // In-surface denial shape: every other refusal in this
                          // handler is a 200 carrying an OOB result-context
                          // span, because the caller is htmx swapping fragments
@@ -1323,10 +1700,10 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                                  "requested agents [{}] are in the caller's visible set",
                                  onbehalf::sanitize_for_log(plugin, 128),
                                  onbehalf::sanitize_for_log(action, 128), requested);
-                             audit_fn_(req, "command.dispatch", "denied", "command", "",
-                                       "reason=scope_violation " +
-                                           onbehalf::sanitize_for_log(plugin, 128) + ":" +
-                                           onbehalf::sanitize_for_log(action, 128));
+                             audit_or_flag(req, res, "command.dispatch", "denied", "command", "",
+                                           "reason=scope_violation " +
+                                               onbehalf::sanitize_for_log(plugin, 128) + ":" +
+                                               onbehalf::sanitize_for_log(action, 128));
                              res.set_content(
                                  "<span id=\"result-context\" hx-swap-oob=\"true\""
                                  " class=\"result-context is-error\">" +
@@ -1343,43 +1720,86 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                      }
                  }
 
-                 // ADR-0033 section 9, "no audit row, no mutation": an expression-targeted
-                 // send is a new fan-out surface, so its `attempted` row is stored BEFORE the
-                 // dispatch and a row that is not stored (or a sink that is not wired) refuses
-                 // the send with a 503 and dispatches nothing. Every refusal above returned
-                 // before this point, so a rejected request burns no `attempted` row. The
-                 // outcome row ("success"/"failure") follows the dispatch.
-                 if (expression_supplied) {
-                     const bool stored =
-                         persist_audit_fn_ &&
-                         yuzu::server::detail::try_persist_audit(
-                             persist_audit_fn_, req, "command.dispatch", "attempted", "command",
-                             "",
-                             plugin + ":" + action + " scope_expression=" +
-                                 onbehalf::sanitize_for_log(target_expression, 256));
-                     if (!stored) {
-                         res.status = 503;
-                         res.set_header("Sec-Audit-Failed", "true");
-                         res.set_content(
+                 // ADR-0033 section 9, "no audit row, no mutation": EVERY console send stores
+                 // its `attempted` row BEFORE the dispatch (#3619; the expression-targeted send
+                 // was the first), and a row that is not stored (or a sink that is not wired)
+                 // refuses the send with a 503 and dispatches nothing. Every refusal above
+                 // returned before this point, so a rejected request burns no `attempted` row.
+                 // The outcome row ("success"/"failure") follows the dispatch. One correlation id
+                 // (#7076) is the LAST token of the `attempted` detail and of every later
+                 // `command.dispatch` row of this request, so an outcome pairs with its attempt;
+                 // rows written before this point carry none.
+                 const std::string cid = detail::make_correlation_id();
+                 const std::string cid_token = " correlation_id=" + cid;
+                 {
+                     std::string attempted = plugin + ":" + action;
+                     if (expression_supplied)
+                         attempted += " scope_expression=" +
+                                      onbehalf::sanitize_for_log(target_expression, 256);
+                     else if (!agent_ids.empty())
+                         attempted += " agents=" + std::to_string(agent_ids.size());
+                     else if (!scope_expr.empty())
+                         attempted += " scope=" + onbehalf::sanitize_for_log(scope_expr, 256);
+                     else // no `scope` field at all: the fleet by omission
+                         attempted += " scope=" + std::string(yuzu::server::kBroadcastScope);
+                     attempted += cid_token;
+                     if (!audit_attempted(
+                             req, res, "command.dispatch", "command", "", attempted,
                              "<span id=\"result-context\" hx-swap-oob=\"true\""
                              " class=\"result-context is-error\""
                              " data-reason=\"audit_unavailable\">The audit record could not "
                              "be stored, so nothing was sent. Retry once the audit store "
-                             "recovers.</span>",
-                             "text/html; charset=utf-8");
+                             "recovers.</span>"))
                          return;
-                     }
+                 }
+                 // The Execution:Execute admission above ran before the wait too. With RBAC off
+                 // the dispatch seam admits every human principal, so a JIT elevation that
+                 // lapsed during the wait is caught only here (#3619 review). The gate writes
+                 // its own refusal.
+                 if (!perm_fn_(req, res, "Execution", "Execute")) {
+                     audit_or_flag(req, res, "command.dispatch", "failure", "command", "",
+                                   "reason=permission_revoked " +
+                                       onbehalf::sanitize_for_log(plugin, 128) + ":" +
+                                       onbehalf::sanitize_for_log(action, 128) + cid_token);
+                     return;
+                 }
+                 // UP-5 (#3619): the attempted row can wait on the audit pool, so the caller's
+                 // authority is resolved again here and the dispatch confines to what the
+                 // caller may reach NOW; a revocation during the wait narrows the send. The
+                 // gates above used the earlier resolution and only ever refuse.
+                 if (caller_fn_) {
+                     caller = caller_fn_(req);
+                 } else {
+                     caller = yuzu::server::DispatchCaller{};
+                     caller.exec_visible = yuzu::server::authz::deny_all(); // unwired: fail CLOSED
                  }
 
                  auto dispatch_outcome =
                      dispatch_fn_(plugin, action, agent_ids, scope_expr, inline_params, caller);
                  auto& command_id = dispatch_outcome.command_id;
                  auto& sent = dispatch_outcome.sent;
+                 // #7114: a chokepoint refusal is a permission-class fact, never "no agents
+                 // connected". This console runs no pre-send dry run, so a non-admin
+                 // Execution:Execute holder running an AdminOrApproval pair lands here every
+                 // time, not only on a race. The token is a closed constexpr set, safe in markup.
+                 if (dispatch_outcome.denied) {
+                     const std::string token(detail::to_string(dispatch_outcome.denied->reason));
+                     audit_or_flag(req, res, "command.dispatch", "failure", "command", command_id,
+                                   "reason=dispatch_denied dispatch_reason=" + token + " " +
+                                       onbehalf::sanitize_for_log(plugin, 128) + ":" +
+                                       onbehalf::sanitize_for_log(action, 128) + cid_token);
+                     res.set_content(not_permitted_result_span(token), "text/html; charset=utf-8");
+                     return;
+                 }
                  if (sent == 0) {
-                     if (expression_supplied)
-                         audit_fn_(req, "command.dispatch", "failure", "command", command_id,
-                                   "reason=no_agents_reached scope_expression=" +
-                                       onbehalf::sanitize_for_log(target_expression, 256));
+                     // Every send now has an `attempted` row (#3619), so every zero-reach send
+                     // records its outcome, not only an expression-targeted one.
+                     audit_or_flag(req, res, "command.dispatch", "failure", "command", command_id,
+                                   (expression_supplied
+                                        ? "reason=no_agents_reached scope_expression=" +
+                                              onbehalf::sanitize_for_log(target_expression, 256)
+                                        : std::string("reason=no_agents_reached")) +
+                                       cid_token);
                      // #3424/#3511: don't blame connectivity for a fail-closed
                      // containment gate, a quarantine denial, or a withheld
                      // plugin-absent dispatch — same discrimination /api/command
@@ -1497,27 +1917,30 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                  // the whole element (outerHTML) so the new hx-get /
                  // hx-trigger attributes attach; `innerHTML` would lose
                  // them.
-                 if (!def_id.empty()) {
-                     html += "<div id=\"chart-deck-host\" hx-swap-oob=\"true\""
-                             " hx-get=\"/fragments/results?command_id=" +
-                             url_query_value(command_id) + "&amp;plugin=" + url_query_value(plugin) +
-                             "&amp;definition_id=" + url_query_value(def_id) +
-                             "\" hx-trigger=\"load delay:2s\" hx-swap=\"none\"></div>";
-                 } else {
-                     // Clear any deck left over from a prior command.
-                     html += "<div id=\"chart-deck-host\" hx-swap-oob=\"true\"></div>";
-                 }
+                 // Emitted for every dispatch, with or without a definition: besides the chart deck
+                 // this one load fills the summary and pager once the responses are in, so a
+                 // plain action (no definition) is as honest as one with charts.
+                 html += "<div id=\"chart-deck-host\" hx-swap-oob=\"true\""
+                         " hx-get=\"/fragments/results?command_id=" +
+                         url_query_value(command_id) + "&amp;plugin=" + url_query_value(plugin);
+                 if (!def_id.empty())
+                     html += "&amp;definition_id=" + url_query_value(def_id);
+                 html += "\" hx-trigger=\"load delay:2s\" hx-swap=\"none\"></div>";
 
                  // OOB: clear pagination and summary
                  html += "<nav id=\"result-pagination\" hx-swap-oob=\"true\"></nav>";
                  html += "<div id=\"result-summary\" hx-swap-oob=\"true\"></div>";
                  html += "<div id=\"group-form-slot\" hx-swap-oob=\"true\"></div>";
 
-                 // Toast via HX-Trigger
+                 // Toast via HX-Trigger, then abort any results request still in flight for the
+                 // previous command. The abort key is LAST: htmx keeps a key's target for the keys
+                 // after it, so an earlier target:#filter-bar would retarget the toast too (the
+                 // in-flight xhr lives on the OLD #filter-bar, the sync element).
                  res.set_header("HX-Trigger",
                      "{\"showToast\":{\"message\":\"Command sent to " +
                      std::to_string(sent) +
-                     " agent(s)\",\"level\":\"success\"}}");
+                     " agent(s)\",\"level\":\"success\"}," +
+                     std::string{kResultsAbortTrigger} + "}");
                  // The one marker that a send was dispatched. Every refusal above also answers
                  // 200 (the console swaps fragments and a 4xx body would be dropped), so the
                  // page cannot tell a send from a refusal by status: its History list adds a row
@@ -1534,7 +1957,9 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                      detail += " definition_id=" + def_id;
                  if (expression_supplied)
                      detail += " scope_expression=" + onbehalf::sanitize_for_log(target_expression, 256);
-                 audit_fn_(req, "command.dispatch", "success", "command", command_id, detail);
+                 detail += cid_token;
+                 audit_or_flag(req, res, "command.dispatch", "success", "command", command_id,
+                               detail);
 
                  res.set_content(html, "text/html; charset=utf-8");
              });
@@ -1547,6 +1972,8 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
 
                  auto sql = req.get_param_value("sql");
                  if (sql.empty()) {
+                     audit_or_flag(req, res, "echo.sql", "denied", "command", "",
+                                   "reason=sql_missing");
                      res.set_content("<span id=\"result-context\" hx-swap-oob=\"true\""
                                      " class=\"result-context is-error\">"
                                      "Missing SQL query.</span>",
@@ -1556,6 +1983,8 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
 
                  // M5: Server-side SQL validation with keyword blocklist (defense in depth)
                  if (sql.size() > 4096) {
+                     audit_or_flag(req, res, "echo.sql", "denied", "command", "",
+                                   std::format("reason=sql_too_large sql_bytes={}", sql.size()));
                      res.set_content("<span id=\"result-context\" hx-swap-oob=\"true\""
                                      " class=\"result-context is-error\">"
                                      "SQL query exceeds 4KB limit.</span>",
@@ -1567,6 +1996,8 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                      for (auto& c : upper) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
                      size_t start = upper.find_first_not_of(" \t\r\n");
                      if (start == std::string::npos || !upper.substr(start).starts_with("SELECT")) {
+                         audit_or_flag(req, res, "echo.sql", "denied", "command", "",
+                                       "reason=not_select");
                          res.set_content("<span id=\"result-context\" hx-swap-oob=\"true\""
                                          " class=\"result-context is-error\">"
                                          "Only SELECT queries are allowed.</span>",
@@ -1580,6 +2011,8 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                      };
                      for (auto kw = blocked; *kw; ++kw) {
                          if (upper.find(*kw) != std::string::npos) {
+                             audit_or_flag(req, res, "echo.sql", "denied", "command", "",
+                                           std::string("reason=forbidden_keyword keyword=") + *kw);
                              res.set_content("<span id=\"result-context\" hx-swap-oob=\"true\""
                                              " class=\"result-context is-error\">"
                                              "Query contains forbidden keyword.</span>",
@@ -1613,6 +2046,8 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                  } else if (scope == yuzu::server::kBroadcastScope) {
                      scope_expr = std::string(yuzu::server::kBroadcastScope);
                  } else if (req.has_param("scope") || form_value_supplied(req.body, "scope")) {
+                     audit_or_flag(req, res, "echo.sql", "denied", "command", "",
+                                   "reason=no_target");
                      res.set_content(
                          "<span id=\"result-context\" hx-swap-oob=\"true\""
                          " class=\"result-context is-error\">"
@@ -1634,6 +2069,17 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                      dispatch_fn_("echo", "sql", agent_ids, scope_expr, params, caller);
                  auto& command_id = dispatch_outcome.command_id;
                  auto& sent = dispatch_outcome.sent;
+
+                 // #7114: a chokepoint refusal is a permission-class fact, never "No agents
+                 // connected". echo.sql classifies Infrastructure:Read while this route gates on
+                 // Execution:Execute, so a holder of only the second is refused on EVERY call.
+                 if (dispatch_outcome.denied) {
+                     const std::string token(detail::to_string(dispatch_outcome.denied->reason));
+                     audit_or_flag(req, res, "echo.sql", "failure", "command", command_id,
+                                   "reason=dispatch_denied dispatch_reason=" + token);
+                     res.set_content(not_permitted_result_span(token), "text/html; charset=utf-8");
+                     return;
+                 }
 
                  if (sent == 0) {
                      res.set_content("<span id=\"result-context\" hx-swap-oob=\"true\""
@@ -1666,8 +2112,8 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                      std::to_string(sent) +
                      " agent(s)\",\"level\":\"success\"}}");
 
-                 audit_fn_(req, "echo.sql", "success", "command", command_id,
-                          "Echo SQL -> " + std::to_string(sent) + " agent(s)");
+                 audit_or_flag(req, res, "echo.sql", "success", "command", command_id,
+                               "Echo SQL -> " + std::to_string(sent) + " agent(s)");
 
                  res.set_content(html, "text/html; charset=utf-8");
              });
@@ -1708,7 +2154,22 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
 
     sink.Get("/fragments/echo/retention-paused",
             [this](const httplib::Request& req, httplib::Response& res) {
-                if (!perm_fn_(req, res, "Infrastructure", "Read")) {
+                // #2540: gated by the fleet read chokepoint (admit-then-filter), the same seam
+                // as the REST twin below, not by the global perm_fn_ plus internal filtering:
+                // a management-group-scoped Infrastructure:Read holder is admitted and sees
+                // only the rows in gate.scope. Unwired fails closed (503).
+                auto session = auth_fn_(req, res);
+                if (!session) return;
+                if (!session->token_scope_service.empty()) {
+                    // Parity with the REST twin: the global gate this replaced denied EVERY
+                    // service-scoped token outright (kServiceScopeGlobalSafe default-deny); the
+                    // fleet gate would admit a confined one, so the denial is kept explicitly.
+                    res.status = 403;
+                    res.set_content("<span class=\"echo-row-error\">Permission denied.</span>",
+                                    "text/html; charset=utf-8");
+                    audit_or_flag(req, res, "echo.retention_paused.view", "denied",
+                                  "Infrastructure", "",
+                                  "service-scoped token denied fleet-wide retention scan read");
                     if (metrics_) {
                         metrics_->counter("yuzu_echo_dashboard_view_total",
                                           {{"frame", "retention"},
@@ -1716,8 +2177,28 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                     }
                     return;
                 }
-                auto session = auth_fn_(req, res);
-                if (!session) return;
+                if (!fleet_read_fn_) {
+                    spdlog::error("echo.retention_paused fragment: fleet_read_fn_ unwired -- "
+                                  "misconfigured call site; failing closed");
+                    res.status = 503;
+                    res.set_content("<span class=\"echo-row-error\">Service unavailable.</span>",
+                                    "text/html; charset=utf-8");
+                    if (metrics_) {
+                        metrics_->counter("yuzu_echo_dashboard_view_total",
+                                          {{"frame", "retention"},
+                                           {"result", "denied"}}).increment();
+                    }
+                    return;
+                }
+                auto gate = fleet_read_fn_(req, res, "Infrastructure", "Read");
+                if (!gate.admitted) {
+                    if (metrics_) {
+                        metrics_->counter("yuzu_echo_dashboard_view_total",
+                                          {{"frame", "retention"},
+                                           {"result", "denied"}}).increment();
+                    }
+                    return; // gate already wrote the refusal
+                }
                 // Per-operator scoped data — must not be cached by any
                 // shared upstream proxy. UP-11 from Gate 4 unhappy-path:
                 // a corporate proxy honoring default text/html caching
@@ -1728,14 +2209,19 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                 res.set_header("Vary", "Cookie");
                 // Probe effective permissions WITHOUT mutating the real response
                 // (perm_fn_ writes a 403 into whatever Response it's handed on
-                // denial — feed it a throwaway, same pattern as the def-perm probe
-                // at ~line 637). Gates which row actions render: Re-enable needs
+                // denial — feed it a throwaway, as probe_echo_scoped_perm does for the
+                // scoped gate). Gates which row actions render: Re-enable needs
                 // Execution:Execute, Purge needs the higher Infrastructure:Delete.
+                // These stay GLOBAL probes (#2540 decision): a management-group-scoped
+                // operator sees their in-scope rows without buttons and acts through the REST
+                // twin. A per-row scoped probe would write an audit denial per refused probe
+                // (require_scoped_permission), up to two rows per visible agent per page load.
                 httplib::Response perm_probe;
                 bool can_execute = perm_fn_(req, perm_probe, "Execution", "Execute");
                 bool can_delete = perm_fn_(req, perm_probe, "Infrastructure", "Delete");
                 res.set_content(
-                    render_echo_retention_paused(session->username, can_execute, can_delete),
+                    render_echo_retention_paused(session->username, can_execute, can_delete,
+                                                 gate.scope, /*scope_is_authoritative=*/true),
                     "text/html; charset=utf-8");
                 if (metrics_) {
                     metrics_->counter("yuzu_echo_dashboard_view_total",
@@ -1786,8 +2272,9 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                             res, 403,
                             "service-scoped tokens may not read the fleet-wide retention scan"),
                         "application/json");
-                    audit_fn_(req, "echo.retention_paused.view", "denied", "Infrastructure", "",
-                             "service-scoped token denied fleet-wide retention scan read");
+                    audit_or_flag(req, res, "echo.retention_paused.view", "denied",
+                                  "Infrastructure", "",
+                                  "service-scoped token denied fleet-wide retention scan read");
                     if (metrics_) {
                         metrics_->counter("yuzu_echo_dashboard_view_total",
                                           {{"frame", "retention_rest"},
@@ -1839,8 +2326,8 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                      // Compliance F1: emit a denied audit row so SIEM rules
                      // alerting on RBAC-rejection probing have a data source.
                      // Without this, the audit catalog overclaims coverage.
-                     audit_fn_(req, "echo.status.scan", "denied", "command",
-                              "", "rbac_denied");
+                     audit_or_flag(req, res, "echo.status.scan", "denied", "command",
+                                   "", "rbac_denied");
                      if (metrics_) {
                          metrics_->counter("yuzu_echo_scan_dispatched_total",
                                            {{"result", "denied"}}).increment();
@@ -1879,10 +2366,10 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                                  kScanCooldownSec - since,
                                  (kScanCooldownSec - since) == 1 ? "" : "s"),
                                  "text/html; charset=utf-8");
-                             audit_fn_(req, "echo.status.scan", "denied",
-                                      "command", "",
-                                      std::format("rate_limited cooldown={}s",
-                                                   kScanCooldownSec - since));
+                             audit_or_flag(req, res, "echo.status.scan", "denied",
+                                           "command", "",
+                                           std::format("rate_limited cooldown={}s",
+                                                        kScanCooldownSec - since));
                              if (metrics_) {
                                  metrics_->counter(
                                      "yuzu_echo_scan_dispatched_total",
@@ -1933,6 +2420,31 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                  auto& command_id = dispatch_outcome.command_id;
                  auto& sent = dispatch_outcome.sent;
 
+                 // #7114: a chokepoint refusal is a permission-class fact, never "none of the agents
+                 // in your scope are connected". echo.status classifies Infrastructure:Read while
+                 // this route gates on Execution:Execute, so a holder of only the second is refused
+                 // on EVERY scan. Reported BEFORE the scan state is stored and the success row is
+                 // written: nothing was dispatched, so there is nothing for the page to poll.
+                 if (dispatch_outcome.denied) {
+                     const std::string token(detail::to_string(dispatch_outcome.denied->reason));
+                     audit_or_flag(req, res, "echo.status.scan", "failure", "command", command_id,
+                                   "reason=dispatch_denied dispatch_reason=" + token);
+                     res.set_header("HX-Trigger",
+                                    refusal_toast_header(("Not permitted: " + token).c_str()));
+                     res.set_header("Cache-Control", "no-store, private");
+                     res.set_header("Vary", "Cookie");
+                     res.set_content("<div class=\"empty-state\" data-reason=\"" + token +
+                                         "\">Not permitted: " + token +
+                                         ". The dispatch chokepoint refused this scan for you; "
+                                         "nothing was dispatched.</div>",
+                                     "text/html; charset=utf-8");
+                     if (metrics_) {
+                         metrics_->counter("yuzu_echo_scan_dispatched_total", {{"result", token}})
+                             .increment();
+                     }
+                     return;
+                 }
+
                  {
                      std::lock_guard<std::mutex> lk(echo_scan_mu_);
                      // Bounded LRU: drop the oldest entry by dispatched_at if
@@ -1956,10 +2468,10 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                      st.dispatched_at = now_epoch();
                  }
 
-                 audit_fn_(req, "echo.status.scan", "success", "command",
-                          command_id,
-                          std::format("dispatched to {} agent(s) in scope",
-                                       sent));
+                 audit_or_flag(req, res, "echo.status.scan", "success", "command",
+                               command_id,
+                               std::format("dispatched to {} agent(s) in scope",
+                                            sent));
 
                  std::string body;
                  if (sent == 0) {
@@ -2015,24 +2527,40 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
     // tier as run-instruction and echo-sql siblings; Gate 2 governance flagged
     // the original Infrastructure:Update as a tier mismatch).
     //
-    // RBAC scope: device_id MUST be in the operator's visible agents set;
-    // out-of-scope device_ids are rejected with the same 404 body as
-    // not-connected so non-operators cannot use this endpoint as an
-    // existence-enumeration oracle.
+    // RBAC scope (#2540): the per-device scoped-permission chokepoint
+    // (`scoped_perm_fn_`, Execution:Execute on device_id) is the sole gate and is
+    // asked again after the `attempted` audit row. It answers with its own refusal
+    // class and the route admits only on `Admitted`: a denial is rejected with the
+    // same 404 body as not-connected so non-operators cannot use this endpoint as
+    // an existence-enumeration oracle, while an authorization that could not be
+    // evaluated (an unwired gate, a gate that answered 503, a degraded RBAC or
+    // management-group read) answers 503 with an error toast and is audited and
+    // counted as such. A service-scoped token is refused 403 before any of it.
+    //
+    // Repeat bound: one dispatch per (device, source) per 30 s, held from the gate's
+    // admission to the end of the request (`echo_action_cooldown_`); a repeat answers
+    // 429 and writes no `attempted` row. The `attempted` row carries a correlation id
+    // as its last token and so does every row written after it (`cid=`).
     sink.Post("/fragments/echo/retention-paused/reenable",
              [this](const httplib::Request& req, httplib::Response& res) {
-                 if (!perm_fn_(req, res, "Execution", "Execute")) {
-                     // Compliance F1: denied audit on RBAC rejection.
-                     audit_fn_(req, "echo.source.reenable", "denied",
-                              "command", "", "rbac_denied");
-                     if (metrics_) {
-                         metrics_->counter("yuzu_echo_source_reenable_total",
-                                           {{"result", "denied"}}).increment();
-                     }
-                     return;
-                 }
+                 constexpr std::string_view kFamily = echo_source::kReenableTotal;
+                 constexpr std::string_view kSurface = echo_source::kSurfaceDashboard;
                  auto session = auth_fn_(req, res);
                  if (!session) return;
+                 if (!session->token_scope_service.empty()) {
+                     // #2540: the global gate this route asked before refused EVERY
+                     // service-scoped token (kServiceScopeGlobalSafe default-deny); the scoped
+                     // gate's service branch would admit a confined one, and Re-enable has no
+                     // REST route, so the refusal is kept explicitly (as on the GET frame). It
+                     // does not depend on device_id, so it is not an existence oracle.
+                     res.status = 403;
+                     res.set_content("<span class=\"echo-row-error\">Permission denied.</span>",
+                                     "text/html; charset=utf-8");
+                     audit_or_flag(req, res, "echo.source.reenable", "denied", "command", "",
+                                   "service_scoped_token_denied");
+                     echo_source::count(metrics_, kFamily, kSurface, "denied");
+                     return;
+                 }
                  // CSRF same-site gate (parity with the purge fragment; defense-in-depth
                  // on top of SameSite=Lax). Reject cross-origin/header-less cookie POSTs.
                  {
@@ -2043,13 +2571,9 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                          origin_is_same_site(req.get_header_value("Host"), origin, referer,
                                              csrf_trusted_origins_);
                      if (!same_site) {
-                         audit_fn_(req, "echo.source.reenable", "denied", "command", "",
-                                   "csrf_cross_origin");
-                         if (metrics_) {
-                             metrics_->counter("yuzu_echo_source_reenable_total",
-                                               {{"result", "denied"}})
-                                 .increment();
-                         }
+                         audit_or_flag(req, res, "echo.source.reenable", "denied", "command", "",
+                                       "csrf_cross_origin");
+                         echo_source::count(metrics_, kFamily, kSurface, "denied");
                          res.status = 403;
                          res.set_content(
                              "<span class=\"echo-row-error\">Cross-origin request refused.</span>",
@@ -2062,6 +2586,7 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                      res.set_content("<span class=\"echo-row-error\">Dispatch "
                                      "unavailable.</span>",
                                      "text/html; charset=utf-8");
+                     echo_source::count(metrics_, kFamily, kSurface, "infra_unavailable");
                      return;
                  }
 
@@ -2078,10 +2603,17 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                                      "device_id and source are required."
                                      "</span>",
                                      "text/html; charset=utf-8");
-                     if (metrics_) {
-                         metrics_->counter("yuzu_echo_source_reenable_total",
-                                           {{"result", "invalid_input"}}).increment();
-                     }
+                     echo_source::count(metrics_, kFamily, kSurface, "invalid_input");
+                     return;
+                 }
+                 // #7811: the posted id reaches the scoped gate's denial row and the
+                 // `attempted` row detail, and the audit store keeps CR, LF and TAB, so an
+                 // over-long or control-byte id is refused before the gate; no audit row.
+                 if (!auth::agent_id_is_audit_safe(device_id)) {
+                     res.status = 400;
+                     res.set_content("<span class=\"echo-row-error\">Invalid device id.</span>",
+                                     "text/html; charset=utf-8");
+                     echo_source::count(metrics_, kFamily, kSurface, "invalid_input");
                      return;
                  }
                  // Validate source against the canonical four. Anything else
@@ -2094,41 +2626,93 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                                      "Unknown source — must be one of "
                                      "process, tcp, service, user.</span>",
                                      "text/html; charset=utf-8");
-                     if (metrics_) {
-                         metrics_->counter("yuzu_echo_source_reenable_total",
-                                           {{"result", "invalid_input"}}).increment();
-                     }
+                     echo_source::count(metrics_, kFamily, kSurface, "invalid_input");
                      return;
                  }
 
-                 // Per-device RBAC visibility check. Out-of-scope device_ids
-                 // collapse to the same 404 path as not-connected devices so
-                 // the response cannot be used to enumerate device existence.
-                 // Audit detail records the real reason on the server side.
-                 bool visible = false;
-                 if (mgmt_group_store_) {
-                     // ADR-0042: nullopt (store degraded) → not visible (fail-closed).
-                     if (auto visible_ids = mgmt_group_store_->get_visible_agents(
-                             session->username)) {
-                         for (const auto& vid : *visible_ids) {
-                             if (vid == device_id) { visible = true; break; }
-                         }
-                     }
+                 // #2540: the per-device scoped-permission chokepoint
+                 // (Execution:Execute on the posted device) is the SOLE
+                 // authorization gate, as on the REST purge twin; it fails closed and
+                 // reports its own refusal class. A gate that could not evaluate
+                 // authority (unwired, answered 503, or a degraded authorization read)
+                 // answers 503, never the 404; any other refusal collapses to the same
+                 // 404 body as not-connected so the response cannot enumerate device
+                 // existence. The audit detail records the real reason.
+                 const auto gate = probe_echo_scoped_perm(scoped_perm_fn_, req, "Execution",
+                                                          "Execute", device_id);
+                 if (gate != ScopedGateOutcome::Admitted) {
+                     audit_or_flag(req, res, "echo.source.reenable",
+                                   std::string(echo_source::admission_audit_result(gate)),
+                                   "command", "",
+                                   std::format("{} source={}",
+                                               echo_source::refusal_detail(gate, false), source));
+                     write_echo_scoped_refusal(res, gate);
+                     echo_source::count(metrics_, kFamily, kSurface,
+                                        echo_source::refusal_result(gate, false));
+                     return;
                  }
 
-                 if (!visible) {
-                     audit_fn_(req, "echo.source.reenable", "failure",
-                              "command", "",
-                              std::format("scope_violation source={}",
-                                           source));
-                     res.status = 404;
-                     res.set_content("<span class=\"echo-row-error\">"
-                                     "Agent not reachable.</span>",
+                 // One dispatch per (device, source) per 30 s. The key is held from here to the
+                 // end of the request, so a repeat that arrives while this one is still in flight
+                 // is refused too; the Slot below ends the hold on every exit.
+                 const std::string cooldown_key =
+                     std::string("reenable\x1f") + device_id + "\x1f" + source;
+                 if (const auto wait = echo_action_cooldown_.try_acquire(cooldown_key, now_epoch())) {
+                     res.status = 429;
+                     res.set_header("Retry-After", std::to_string(*wait));
+                     res.set_header(
+                         "HX-Trigger",
+                         refusal_toast_header(
+                             std::format("This source was just re-enabled. Wait {} second{} "
+                                         "before trying again.",
+                                         *wait, *wait == 1 ? "" : "s")
+                                 .c_str()));
+                     res.set_content("<span class=\"echo-row-error\">Please wait before "
+                                     "repeating this action.</span>",
                                      "text/html; charset=utf-8");
-                     if (metrics_) {
-                         metrics_->counter("yuzu_echo_source_reenable_total",
-                                           {{"result", "scope_violation"}}).increment();
-                     }
+                     audit_or_flag(req, res, "echo.source.reenable", "denied", "command", "",
+                                   std::format("rate_limited cooldown={}s device={} source={}",
+                                               *wait, audit_token(device_id), source));
+                     echo_source::count(metrics_, kFamily, kSurface, "rate_limited");
+                     return;
+                 }
+                 echo_source::EchoActionCooldown::Slot slot{echo_action_cooldown_, cooldown_key};
+
+                 // One correlation id ties this attempted row to every row written after it
+                 // (a later refusal, the dispatch outcome, the success): the last token of each.
+                 const std::string cid = detail::make_correlation_id();
+
+                 // ADR-0033 section 9, "no audit row, no mutation" (#3619): re-enabling
+                 // capture changes the device's state, so the `attempted` row is stored before
+                 // the dispatch; every refusal above returned first (none burns a row).
+                 if (!audit_attempted(req, res, "echo.source.reenable", "command", "",
+                                      std::format("device={} source={} cid={}",
+                                                  audit_token(device_id), source, cid),
+                                      std::string("<span class=\"echo-row-error\""
+                                                  " data-reason=\"audit_unavailable\">") +
+                                          kEchoAuditRefusal + "</span>",
+                                      kEchoAuditRefusal)) {
+                     // A counted exit like every other one here, under its own value: this
+                     // is an audit outage, not an RBAC refusal (`denied`).
+                     echo_source::count(metrics_, kFamily, kSurface, "audit_unavailable");
+                     return;
+                 }
+                 // Execution:Execute on this device was admitted before the wait; decide it
+                 // again so a grant withdrawn during the wait dispatches nothing (#3619 review).
+                 // The gate writes its own refusal row; counted as the refusal it is.
+                 if (const auto recheck = probe_echo_scoped_perm(scoped_perm_fn_, req, "Execution",
+                                                                 "Execute", device_id);
+                     recheck != ScopedGateOutcome::Admitted) {
+                     // The `attempted` row exists, so this is its `failure` outcome whatever the
+                     // class; the detail says whether the grant moved, the session ended, or the
+                     // gate could not decide.
+                     audit_or_flag(req, res, "echo.source.reenable", "failure", "command", "",
+                                   std::format("{} device={} source={} cid={}",
+                                               echo_source::refusal_detail(recheck, true),
+                                               audit_token(device_id), source, cid));
+                     write_echo_scoped_refusal(res, recheck);
+                     echo_source::count(metrics_, kFamily, kSurface,
+                                        echo_source::refusal_result(recheck, true));
                      return;
                  }
 
@@ -2143,36 +2727,45 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                      caller_fn_ ? caller_fn_(req)
                                : yuzu::server::DispatchCaller{
                                      .exec_visible = yuzu::server::authz::deny_all()};
+                 // From here a dispatch is under way: the key is committed on every exit unless
+                 // the dispatch reached nobody (nothing_sent below).
+                 slot.dispatching(now_epoch());
                  auto dispatch_outcome = dispatch_fn_(
                      "echo", "configure", {device_id}, /*scope_expr=*/"",
                      params, caller);
                  auto& command_id = dispatch_outcome.command_id;
                  auto& sent = dispatch_outcome.sent;
 
-                 if (sent == 0) {
-                     audit_fn_(req, "echo.source.reenable", "failure",
-                              "command", "",
-                              std::format("agent_not_connected source={}",
-                                           source));
-                     res.status = 404;
-                     res.set_content("<span class=\"echo-row-error\">"
-                                     "Agent not reachable.</span>",
-                                     "text/html; charset=utf-8");
-                     if (metrics_) {
-                         metrics_->counter("yuzu_echo_source_reenable_total",
-                                           {{"result", "agent_not_connected"}}).increment();
-                     }
+                 // #7114: a chokepoint refusal (e.g. approval_required) is reported as such, not as
+                 // an unreachable agent.
+                 if (dispatch_outcome.denied) {
+                     slot.nothing_sent();
+                     const std::string token =
+                         respond_echo_dispatch_denied(res, *dispatch_outcome.denied, "configure");
+                     audit_or_flag(req, res, "echo.source.reenable", "failure", "command", "",
+                                   std::format("dispatch_denied reason={} device={} source={} cid={}",
+                                               token, audit_token(device_id), source, cid));
+                     echo_source::count(metrics_, kFamily, kSurface, token);
                      return;
                  }
 
-                 audit_fn_(req, "echo.source.reenable", "success",
-                          "command", command_id,
-                          std::format("device={} source={}",
-                                       device_id, source));
-                 if (metrics_) {
-                     metrics_->counter("yuzu_echo_source_reenable_total",
-                                       {{"result", "success"}}).increment();
+                 if (sent == 0) {
+                     slot.nothing_sent();
+                     audit_or_flag(req, res, "echo.source.reenable", "failure",
+                                   "command", "",
+                                   std::format("agent_not_connected source={} cid={}", source,
+                                               cid));
+                     res.status = 404;
+                     res.set_content(kEchoAgentNotReachableHtml, "text/html; charset=utf-8");
+                     echo_source::count(metrics_, kFamily, kSurface, "agent_not_connected");
+                     return;
                  }
+
+                 audit_or_flag(req, res, "echo.source.reenable", "success",
+                               "command", command_id,
+                               std::format("device={} source={} cid={}", audit_token(device_id),
+                                           source, cid));
+                 echo_source::count(metrics_, kFamily, kSurface, "success");
 
                  res.set_header("HX-Trigger", std::format(
                      "{{\"showToast\":{{\"message\":\"Re-enabling {} on "
@@ -2194,18 +2787,27 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
     // The agent refuses if the source is still enabled — that is the authoritative
     // TOCTOU guard. Dispatch is fire-and-forget, so rows_deleted is computed
     // agent-side (returned in the response record) and is NOT in this audit row.
+    // The refusal classes, the 30 s repeat bound and the trailing `cid=` token are
+    // those of /reenable.
     sink.Post("/fragments/echo/retention-paused/purge",
              [this](const httplib::Request& req, httplib::Response& res) {
-                 if (!perm_fn_(req, res, "Infrastructure", "Delete")) {
-                     audit_fn_(req, "echo.source.purge", "denied", "command", "", "rbac_denied");
-                     if (metrics_) {
-                         metrics_->counter("yuzu_echo_source_purge_total", {{"result", "denied"}})
-                             .increment();
-                     }
-                     return;
-                 }
+                 constexpr std::string_view kFamily = echo_source::kPurgeTotal;
+                 constexpr std::string_view kSurface = echo_source::kSurfaceDashboard;
                  auto session = auth_fn_(req, res);
                  if (!session) return;
+                 if (!session->token_scope_service.empty()) {
+                     // #2540: same explicit refusal as re-enable. The global gate this route
+                     // asked before refused EVERY service-scoped token; a confined one purges
+                     // through POST /api/v1/echo/retention-paused/purge, never this
+                     // cookie-session fragment. Independent of device_id (no existence oracle).
+                     res.status = 403;
+                     res.set_content("<span class=\"echo-row-error\">Permission denied.</span>",
+                                     "text/html; charset=utf-8");
+                     audit_or_flag(req, res, "echo.source.purge", "denied", "command", "",
+                                   "service_scoped_token_denied");
+                     echo_source::count(metrics_, kFamily, kSurface, "denied");
+                     return;
+                 }
                  // CSRF same-site gate for this destructive cookie-authenticated POST
                  // (mirrors ca_routes.cpp ca.revoke / ca.import-chain). Reject a
                  // cross-origin OR header-less request before the irreversible dispatch —
@@ -2221,12 +2823,9 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                          origin_is_same_site(req.get_header_value("Host"), origin, referer,
                                              csrf_trusted_origins_);
                      if (!same_site) {
-                         audit_fn_(req, "echo.source.purge", "denied", "command", "",
-                                   "csrf_cross_origin");
-                         if (metrics_) {
-                             metrics_->counter("yuzu_echo_source_purge_total", {{"result", "denied"}})
-                                 .increment();
-                         }
+                         audit_or_flag(req, res, "echo.source.purge", "denied", "command", "",
+                                       "csrf_cross_origin");
+                         echo_source::count(metrics_, kFamily, kSurface, "denied");
                          res.status = 403;
                          res.set_content(
                              "<span class=\"echo-row-error\">Cross-origin request refused.</span>",
@@ -2238,6 +2837,7 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                      res.status = 503;
                      res.set_content("<span class=\"echo-row-error\">Dispatch unavailable.</span>",
                                      "text/html; charset=utf-8");
+                     echo_source::count(metrics_, kFamily, kSurface, "infra_unavailable");
                      return;
                  }
 
@@ -2251,10 +2851,15 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                      res.set_content("<span class=\"echo-row-error\">"
                                      "device_id and source are required.</span>",
                                      "text/html; charset=utf-8");
-                     if (metrics_) {
-                         metrics_->counter("yuzu_echo_source_purge_total", {{"result", "invalid_input"}})
-                             .increment();
-                     }
+                     echo_source::count(metrics_, kFamily, kSurface, "invalid_input");
+                     return;
+                 }
+                 // #7811: the same id floor as reenable, before the scoped gate.
+                 if (!auth::agent_id_is_audit_safe(device_id)) {
+                     res.status = 400;
+                     res.set_content("<span class=\"echo-row-error\">Invalid device id.</span>",
+                                     "text/html; charset=utf-8");
+                     echo_source::count(metrics_, kFamily, kSurface, "invalid_input");
                      return;
                  }
                  // Same source scope as the frame (the four core diff sources); a
@@ -2266,38 +2871,88 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                                      "Unknown source — must be one of "
                                      "process, tcp, service, user.</span>",
                                      "text/html; charset=utf-8");
-                     if (metrics_) {
-                         metrics_->counter("yuzu_echo_source_purge_total", {{"result", "invalid_input"}})
-                             .increment();
-                     }
+                     echo_source::count(metrics_, kFamily, kSurface, "invalid_input");
                      return;
                  }
 
-                 // Per-device RBAC visibility (same 404-collapse as reenable so the
-                 // response cannot enumerate device existence; real reason audited).
-                 bool visible = false;
-                 if (mgmt_group_store_) {
-                     // ADR-0042: nullopt (store degraded) → not visible (fail-closed).
-                     if (auto visible_ids = mgmt_group_store_->get_visible_agents(session->username)) {
-                         for (const auto& vid : *visible_ids) {
-                             if (vid == device_id) {
-                                 visible = true;
-                                 break;
-                             }
-                         }
-                     }
+                 // #2540: Infrastructure:Delete on the posted device through the per-device
+                 // scoped-permission chokepoint, the SOLE gate as on the REST purge twin (same
+                 // refusal classes as reenable: 503 for an authorization that could not be
+                 // evaluated, the 404 collapse for a denial; the real reason is audited).
+                 const auto gate = probe_echo_scoped_perm(scoped_perm_fn_, req, "Infrastructure",
+                                                          "Delete", device_id);
+                 if (gate != ScopedGateOutcome::Admitted) {
+                     audit_or_flag(req, res, "echo.source.purge",
+                                   std::string(echo_source::admission_audit_result(gate)),
+                                   "command", "",
+                                   std::format("{} source={}",
+                                               echo_source::refusal_detail(gate, false), source));
+                     write_echo_scoped_refusal(res, gate);
+                     echo_source::count(metrics_, kFamily, kSurface,
+                                        echo_source::refusal_result(gate, false));
+                     return;
                  }
-                 if (!visible) {
-                     audit_fn_(req, "echo.source.purge", "failure", "command", "",
-                              std::format("scope_violation source={}", source));
-                     res.status = 404;
-                     res.set_content("<span class=\"echo-row-error\">Agent not reachable.</span>",
+
+                 // One dispatch per (device, source) per 30 s, held to the end of the request
+                 // (see /reenable); a repeat writes no `attempted` row.
+                 const std::string cooldown_key =
+                     std::string("purge\x1f") + device_id + "\x1f" + source;
+                 if (const auto wait = echo_action_cooldown_.try_acquire(cooldown_key, now_epoch())) {
+                     res.status = 429;
+                     res.set_header("Retry-After", std::to_string(*wait));
+                     res.set_header(
+                         "HX-Trigger",
+                         refusal_toast_header(
+                             std::format("This source was just purged. Wait {} second{} before "
+                                         "trying again.",
+                                         *wait, *wait == 1 ? "" : "s")
+                                 .c_str()));
+                     res.set_content("<span class=\"echo-row-error\">Please wait before "
+                                     "repeating this action.</span>",
                                      "text/html; charset=utf-8");
-                     if (metrics_) {
-                         metrics_->counter("yuzu_echo_source_purge_total",
-                                           {{"result", "scope_violation"}})
-                             .increment();
-                     }
+                     audit_or_flag(req, res, "echo.source.purge", "denied", "command", "",
+                                   std::format("rate_limited cooldown={}s device={} source={}",
+                                               *wait, audit_token(device_id), source));
+                     echo_source::count(metrics_, kFamily, kSurface, "rate_limited");
+                     return;
+                 }
+                 echo_source::EchoActionCooldown::Slot slot{echo_action_cooldown_, cooldown_key};
+
+                 // One correlation id ties this attempted row to every row written after it.
+                 const std::string cid = detail::make_correlation_id();
+
+                 // ADR-0033 section 9, "no audit row, no mutation" (#3619): purge is
+                 // Destructive (it drops the device's Echo data), so the `attempted` row is
+                 // stored before the dispatch; every refusal above returned first (none burns
+                 // a row).
+                 if (!audit_attempted(req, res, "echo.source.purge", "command", "",
+                                      std::format("device={} source={} cid={}",
+                                                  audit_token(device_id), source, cid),
+                                      std::string("<span class=\"echo-row-error\""
+                                                  " data-reason=\"audit_unavailable\">") +
+                                          kEchoAuditRefusal + "</span>",
+                                      kEchoAuditRefusal)) {
+                     // A counted exit like every other one here, under its own value: this
+                     // is an audit outage, not an RBAC refusal (`denied`).
+                     echo_source::count(metrics_, kFamily, kSurface, "audit_unavailable");
+                     return;
+                 }
+                 // Infrastructure:Delete on this device was admitted before the wait. With RBAC
+                 // off the dispatch seam admits every human principal and echo.purge_source
+                 // carries no ExecuteGate, so a JIT elevation that lapsed during the wait is
+                 // caught only here (#3619 review). The gate writes its own refusal row.
+                 if (const auto recheck = probe_echo_scoped_perm(scoped_perm_fn_, req,
+                                                                 "Infrastructure", "Delete",
+                                                                 device_id);
+                     recheck != ScopedGateOutcome::Admitted) {
+                     // Same outcome row as re-enable: `failure`, with the real cause.
+                     audit_or_flag(req, res, "echo.source.purge", "failure", "command", "",
+                                   std::format("{} device={} source={} cid={}",
+                                               echo_source::refusal_detail(recheck, true),
+                                               audit_token(device_id), source, cid));
+                     write_echo_scoped_refusal(res, recheck);
+                     echo_source::count(metrics_, kFamily, kSurface,
+                                        echo_source::refusal_result(recheck, true));
                      return;
                  }
 
@@ -2313,32 +2968,41 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                      caller_fn_ ? caller_fn_(req)
                                : yuzu::server::DispatchCaller{
                                      .exec_visible = yuzu::server::authz::deny_all()};
+                 // From here a dispatch is under way (see /reenable).
+                 slot.dispatching(now_epoch());
                  auto dispatch_outcome =
                      dispatch_fn_("echo", "purge_source", {device_id}, /*scope_expr=*/"", params,
                                   caller);
                  auto& command_id = dispatch_outcome.command_id;
                  auto& sent = dispatch_outcome.sent;
 
-                 if (sent == 0) {
-                     audit_fn_(req, "echo.source.purge", "failure", "command", "",
-                              std::format("agent_not_connected source={}", source));
-                     res.status = 404;
-                     res.set_content("<span class=\"echo-row-error\">Agent not reachable.</span>",
-                                     "text/html; charset=utf-8");
-                     if (metrics_) {
-                         metrics_->counter("yuzu_echo_source_purge_total",
-                                           {{"result", "agent_not_connected"}})
-                             .increment();
-                     }
+                 // #7114: see the re-enable arm; the purge pair is a server literal too.
+                 if (dispatch_outcome.denied) {
+                     slot.nothing_sent();
+                     const std::string token = respond_echo_dispatch_denied(
+                         res, *dispatch_outcome.denied, "purge_source");
+                     audit_or_flag(req, res, "echo.source.purge", "failure", "command", "",
+                                   std::format("dispatch_denied reason={} device={} source={} cid={}",
+                                               token, audit_token(device_id), source, cid));
+                     echo_source::count(metrics_, kFamily, kSurface, token);
                      return;
                  }
 
-                 audit_fn_(req, "echo.source.purge", "success", "command", command_id,
-                          std::format("device={} source={}", device_id, source));
-                 if (metrics_) {
-                     metrics_->counter("yuzu_echo_source_purge_total", {{"result", "success"}})
-                         .increment();
+                 if (sent == 0) {
+                     slot.nothing_sent();
+                     audit_or_flag(req, res, "echo.source.purge", "failure", "command", "",
+                                   std::format("agent_not_connected source={} cid={}", source,
+                                               cid));
+                     res.status = 404;
+                     res.set_content(kEchoAgentNotReachableHtml, "text/html; charset=utf-8");
+                     echo_source::count(metrics_, kFamily, kSurface, "agent_not_connected");
+                     return;
                  }
+
+                 audit_or_flag(req, res, "echo.source.purge", "success", "command", command_id,
+                               std::format("device={} source={} cid={}", audit_token(device_id),
+                                           source, cid));
+                 echo_source::count(metrics_, kFamily, kSurface, "success");
 
                  res.set_header("HX-Trigger",
                                 std::format("{{\"showToast\":{{\"message\":\"Purging {} data on "
@@ -2431,6 +3095,123 @@ std::vector<std::string> DashboardRoutes::resolve_render_columns(
 }
 
 // ---------------------------------------------------------------------------
+// Results read/match primitives (shared by render_results and the Create Group paths)
+// ---------------------------------------------------------------------------
+
+/// A stored row is one frame (ResponseStore::store is a plain INSERT per RUNNING frame), so one
+/// agent can own several rows: an "N agents" claim counts DISTINCT agent ids, never rows.
+static int64_t distinct_agent_count(const std::vector<StoredResponse>& responses) {
+    std::unordered_set<std::string> seen;
+    for (const auto& r : responses)
+        seen.insert(r.agent_id);
+    return static_cast<int64_t>(seen.size());
+}
+
+/// The per-line predicate of the results table: every column filter (compared in the stored
+/// form the facet lookups bind) AND the free-text Search term (any field, or the agent name).
+static bool result_line_matches(const std::vector<std::string>& fields,
+                                const std::string& agent_name,
+                                const std::vector<FacetFilter>& filters,
+                                const std::vector<std::string>& filter_stored_values,
+                                const std::string& text_query) {
+    for (std::size_t fi = 0; fi < filters.size(); ++fi) {
+        const auto& f = filters[fi];
+        if (f.col_idx >= 0 && f.col_idx < static_cast<int>(fields.size())) {
+            if (fields[f.col_idx] != filter_stored_values[fi])
+                return false;
+        }
+    }
+    if (!text_query.empty()) {
+        for (const auto& fld : fields) {
+            if (fld.find(text_query) != std::string::npos)
+                return true;
+        }
+        return agent_name.find(text_query) != std::string::npos;
+    }
+    return true;
+}
+
+DashboardRoutes::MatchingResponses
+DashboardRoutes::load_matching_responses(const std::string& command_id,
+                                         const ResponseTierFilter& tier,
+                                         const std::vector<FacetFilter>& filters) const {
+    MatchingResponses out;
+    if (!response_store_) {
+        out.store_degraded = true;
+        return out;
+    }
+    if (filters.empty()) {
+        // No filters -- load all responses for this instruction. Byte-aware: the 50 MiB payload
+        // cap is applied in SQL (ResponseStore::query_bounded), so the fetch never materialises
+        // up to 10,000 full rows (each output is cut to 2 MiB at ingest) while holding a lease on
+        // the shared Postgres pool. The scope is still applied by the caller, after the fetch: a
+        // cut is therefore reported even when every dropped row was out of this caller's scope
+        // (conservative, never silent).
+        ResponseQuery q;
+        q.limit = results_row_cap().load(); // the same row bound the filtered branch reads
+        auto bounded_opt = response_store_->query_bounded(command_id, tier, q, std::nullopt,
+                                                          export_body_byte_cap().load());
+        out.store_degraded = !bounded_opt.has_value();
+        if (bounded_opt) {
+            out.result_truncated = bounded_opt->row_cap_hit || bounded_opt->byte_cap_hit;
+            out.responses = std::move(bounded_opt->rows);
+        }
+        return out;
+    }
+    // Faceted index: matching response ids, then load them. Ask for one row more than the cap so
+    // a cut is detectable exactly like the unfiltered branch (a silent cut would let a partial
+    // set be presented -- and made into a group -- as complete). query_by_ids returns every
+    // requested id that still exists and the tier admits, or nullopt (one IN-list SELECT, no byte
+    // cut), so there is no second cut here to detect. Moved, not copied (`value_or` on an lvalue
+    // would copy up to the row cap's worth of bodies).
+    const int cap = results_row_cap().load();
+    auto resp_ids_opt = response_store_->facet_response_ids(command_id, tier, filters, cap + 1, 0);
+    out.store_degraded = !resp_ids_opt.has_value();
+    auto resp_ids = std::move(resp_ids_opt).value_or(std::vector<int64_t>{});
+    if (static_cast<int>(resp_ids.size()) > cap) {
+        out.result_truncated = true;
+        resp_ids.pop_back();
+    }
+    auto responses_opt = response_store_->query_by_ids(resp_ids, tier);
+    out.store_degraded = out.store_degraded || !responses_opt.has_value();
+    out.responses = std::move(responses_opt).value_or(std::vector<StoredResponse>{});
+    return out;
+}
+
+std::optional<DashboardRoutes::TextMatch>
+DashboardRoutes::agents_matching_text(const std::string& command_id, const ResponseTierFilter& tier,
+                                      const std::string& plugin,
+                                      const std::vector<FacetFilter>& filters,
+                                      const std::string& text_query) const {
+    auto loaded = load_matching_responses(command_id, tier, filters);
+    if (loaded.store_degraded)
+        return std::nullopt;
+
+    std::vector<std::string> stored_values;
+    stored_values.reserve(filters.size());
+    for (const auto& f : filters)
+        stored_values.push_back(facet_filter_stored_form(f.value));
+
+    TextMatch match;
+    match.truncated = loaded.result_truncated;
+    std::unordered_set<std::string> seen;
+    for (const auto& resp : loaded.responses) {
+        if (seen.contains(resp.agent_id))
+            continue;
+        const auto agent_name = registry_ ? registry_->display_name(resp.agent_id) : resp.agent_id;
+        for (const auto& line : split_output_lines(resp.output)) {
+            if (result_line_matches(split_fields(plugin, line), agent_name, filters, stored_values,
+                                    text_query)) {
+                seen.insert(resp.agent_id);
+                match.ids.push_back(resp.agent_id);
+                break;
+            }
+        }
+    }
+    return match;
+}
+
+// ---------------------------------------------------------------------------
 // render_results
 // ---------------------------------------------------------------------------
 
@@ -2444,7 +3225,8 @@ std::string DashboardRoutes::render_results(
     const std::string& template_id,
     const std::vector<std::string>& visible_columns,
     const authz::VisibleSet& scope,
-    ForensicsServed* served) {
+    ForensicsServed* served,
+    bool rows_omitted) {
 
     if (!response_store_) {
         return "<tbody id=\"results-tbody\"><tr><td class=\"empty-state\">"
@@ -2481,52 +3263,23 @@ std::string DashboardRoutes::render_results(
         return false;
     };
 
-    // Phase 1: determine which responses match the filters
-    std::vector<StoredResponse> responses;
+    // Phase 1: determine which responses match the filters (shared read, see
+    // load_matching_responses). #2691: `store_degraded` keeps a failed read distinguishable from a
+    // genuine zero-match answer through to the tbody empty-state and #result-summary below.
+    auto loaded = load_matching_responses(command_id, tier, filters);
+    std::vector<StoredResponse> responses = std::move(loaded.responses);
+    bool store_degraded = loaded.store_degraded;
+    // #4644 (row 6a): the read was cut by the row or byte cap, so the render says "partial".
+    const bool result_truncated = loaded.result_truncated;
     int64_t total_agent_count = 0;
-
-    // #2691 (Doomgoose finding #7): the render still degrades to empty (ADR-0039
-    // deny-or-benign — a read failure is not a target/enforce decision here), but
-    // `store_degraded` keeps that fact distinguishable through to the two render
-    // sites below (tbody empty-state, #result-summary) so an operator sees "store
-    // degraded, not zero matches" rather than a silently wrong "no results".
-    bool store_degraded = false;
-    // #4644 (row 6a): set when the unfiltered read below was cut by the row or the
-    // byte cap, so the render says "partial" instead of presenting a cut result as complete.
-    bool result_truncated = false;
     if (filters.empty()) {
-        // No filters — load all responses for this instruction. Byte-aware: the 50 MiB
-        // payload cap is applied in SQL (ResponseStore::query_bounded), so the fetch never
-        // materialises up to 10,000 full rows (each output is cut to 2 MiB at ingest) while
-        // holding a lease on the shared Postgres pool. The scope is still applied below,
-        // after the fetch, exactly as before: a cut is therefore reported even when every
-        // dropped row happened to be out of this caller's scope (conservative, never silent).
-        ResponseQuery q;
-        q.limit = 10000; // upper bound
-        auto bounded_opt = response_store_->query_bounded(command_id, tier, q, std::nullopt,
-                                                          export_body_byte_cap().load());
-        store_degraded = !bounded_opt.has_value();
-        if (bounded_opt) {
-            result_truncated = bounded_opt->row_cap_hit || bounded_opt->byte_cap_hit;
-            responses = std::move(bounded_opt->rows);
-        }
-        total_agent_count = static_cast<int64_t>(responses.size());
+        total_agent_count = distinct_agent_count(responses);
     } else {
-        // Use faceted index to get matching response IDs, then load them
-        auto resp_ids_opt = response_store_->facet_response_ids(command_id, tier, filters, 10000, 0);
-        store_degraded = !resp_ids_opt.has_value();
-        auto resp_ids = resp_ids_opt.value_or(std::vector<int64_t>{});
-        auto responses_opt = response_store_->query_by_ids(resp_ids, tier);
-        store_degraded = store_degraded || !responses_opt.has_value();
-        responses = responses_opt.value_or(std::vector<StoredResponse>{});
-        // facet_agent_count is degrade-distinguishable too — a degraded count
-        // also hides the "Create Group" button below, the safer default for a
-        // write-adjacent action on an uncertain count.
-        //
-        // Deliberately left unscoped here (and facet_response_ids above,
-        // same reasoning) — superseded by the #1712 in-handler recompute
-        // plan (per the PR-4 re-enumeration); no behaviour change at this
-        // site.
+        // The agents behind the column filters, from the facet index. Only the table's summary
+        // needs it (the Search-term group path counts agents itself, in agents_matching_text). A
+        // degraded count also hides the "Create Group" button, the safer default for a
+        // write-adjacent action on an uncertain count. Left unscoped, like facet_response_ids
+        // (superseded by the #1712 in-handler recompute below).
         auto count_opt = response_store_->facet_agent_count(command_id, tier, filters);
         store_degraded = store_degraded || !count_opt.has_value();
         total_agent_count = count_opt.value_or(0);
@@ -2548,7 +3301,7 @@ std::string DashboardRoutes::render_results(
                 visible.push_back(std::move(r));
         }
         responses.swap(visible);
-        total_agent_count = static_cast<int64_t>(responses.size());
+        total_agent_count = distinct_agent_count(responses);
     }
 
     // Phase 2: parse output lines, apply per-line filters and text search
@@ -2575,25 +3328,8 @@ std::string DashboardRoutes::render_results(
         for (const auto& line : lines) {
             auto fields = split_fields(plugin, line);
 
-            // Apply per-field filters
-            bool match = true;
-            for (std::size_t fi = 0; fi < filters.size(); ++fi) {
-                const auto& f = filters[fi];
-                if (f.col_idx >= 0 && f.col_idx < static_cast<int>(fields.size())) {
-                    if (fields[f.col_idx] != filter_stored_values[fi]) { match = false; break; }
-                }
-            }
-            if (!match) continue;
-
-            // Apply free-text search
-            if (!text_query.empty()) {
-                bool found = false;
-                for (const auto& fld : fields) {
-                    if (fld.find(text_query) != std::string::npos) { found = true; break; }
-                }
-                if (!found && agent_name.find(text_query) == std::string::npos)
-                    continue;
-            }
+            if (!result_line_matches(fields, agent_name, filters, filter_stored_values, text_query))
+                continue;
 
             ResultLine rl;
             rl.agent_name = agent_name;
@@ -2603,6 +3339,15 @@ std::string DashboardRoutes::render_results(
         }
     }
 
+    // #5700: with a Search term the count is the agents behind the lines that survived it, so the
+    // summary and the Create Group button describe the same set the table shows.
+    if (!text_query.empty()) {
+        std::unordered_set<std::string> seen;
+        for (const auto& rl : all_lines)
+            seen.insert(responses[rl.response_idx].agent_id);
+        total_agent_count = static_cast<int64_t>(seen.size());
+    }
+
     // Phase 3: sort
     int sort_idx = -1; // -1 = sort by agent name
     if (sort_col != "agent") {
@@ -2610,18 +3355,21 @@ std::string DashboardRoutes::render_results(
     }
     bool ascending = (sort_dir == "asc");
 
-    std::sort(all_lines.begin(), all_lines.end(),
-              [sort_idx, ascending](const ResultLine& a, const ResultLine& b) {
-                  std::string va, vb;
-                  if (sort_idx < 0) {
-                      va = a.agent_name;
-                      vb = b.agent_name;
-                  } else {
-                      va = (sort_idx < static_cast<int>(a.fields.size())) ? a.fields[sort_idx] : "";
-                      vb = (sort_idx < static_cast<int>(b.fields.size())) ? b.fields[sort_idx] : "";
-                  }
-                  return ascending ? (va < vb) : (va > vb);
-              });
+    // The background refresh renders no rows (rows_omitted): its order never shows, so skip the sort.
+    if (!rows_omitted) {
+        std::sort(all_lines.begin(), all_lines.end(),
+                  [sort_idx, ascending](const ResultLine& a, const ResultLine& b) {
+                      std::string va, vb;
+                      if (sort_idx < 0) {
+                          va = a.agent_name;
+                          vb = b.agent_name;
+                      } else {
+                          va = (sort_idx < static_cast<int>(a.fields.size())) ? a.fields[sort_idx] : "";
+                          vb = (sort_idx < static_cast<int>(b.fields.size())) ? b.fields[sort_idx] : "";
+                      }
+                      return ascending ? (va < vb) : (va > vb);
+                  });
+    }
 
     // Phase 4: paginate
     int64_t total_lines = static_cast<int64_t>(all_lines.size());
@@ -2641,7 +3389,9 @@ std::string DashboardRoutes::render_results(
 
     // Phase 5: render HTML
 
-    // Build base URL for sort/page links (preserving all current params)
+    // Sort/page links name only the identity of the view. The live filters, Search term and
+    // template come from the filter bar via hx-include="#filter-bar" on each control, so a
+    // changed filter is never reverted by a URL baked at the previous render.
     auto base_url = [&](const std::string& new_sort, const std::string& new_dir,
                         int new_page) {
         std::string url = "/fragments/results?command_id=" + url_query_value(command_id) +
@@ -2652,23 +3402,12 @@ std::string DashboardRoutes::render_results(
                           "&amp;per_page=" + std::to_string(per_page);
         if (!definition_id.empty())
             url += "&amp;definition_id=" + url_query_value(definition_id);
-        if (!template_id.empty())
-            url += "&amp;template_id=" + url_query_value(template_id);
-        for (const auto& f : filters) {
-            // Reconstruct f_<col> params
-            if (f.col_idx >= 0 && f.col_idx + 1 < static_cast<int>(col_names.size())) {
-                std::string pname = "f_";
-                for (char c : col_names[f.col_idx + 1]) {
-                    if (c == ' ' || c == '-') pname += '_';
-                    else pname += static_cast<char>(std::tolower(c));
-                }
-                url += "&amp;" + url_query_value(pname) + "=" + url_query_value(f.value);
-            }
-        }
-        if (!text_query.empty())
-            url += "&amp;q=" + url_query_value(text_query);
         return url;
     };
+    // Shared by every sortable header and pager button (see kResultsSyncScope).
+    const std::string sort_page_attrs =
+        " hx-target=\"#results-tbody\" hx-include=\"#filter-bar\" hx-sync=\"" +
+        std::string{kResultsSyncScope} + "\"";
 
     std::string html;
     html.reserve(all_lines.size() * 300 + 4096);
@@ -2689,7 +3428,7 @@ std::string DashboardRoutes::render_results(
     } else if (all_lines.empty()) {
         html += "<tr><td colspan=\"" + std::to_string(visible_col_count) +
                 "\" class=\"empty-state\">No results match your filters.</td></tr>";
-    } else {
+    } else if (!rows_omitted) {
         for (int64_t i = start; i < end; ++i) {
             const auto& rl = all_lines[i];
             // Data row
@@ -2745,8 +3484,7 @@ std::string DashboardRoutes::render_results(
     if (is_visible(0)) {
         auto new_dir = (sort_col == "agent" && sort_dir == "asc") ? "desc" : "asc";
         html += "<th class=\"col-agent sortable\" hx-get=\"" +
-                base_url("agent", new_dir, 1) +
-                "\" hx-target=\"#results-tbody\" hx-sync=\"this:abort\""
+                base_url("agent", new_dir, 1) + "\"" + sort_page_attrs +
                 " hx-indicator=\"#results-loading\">"
                 "Agent";
         if (sort_col == "agent")
@@ -2763,8 +3501,7 @@ std::string DashboardRoutes::render_results(
         }
         auto new_dir = (sort_col == col_key && sort_dir == "asc") ? "desc" : "asc";
         html += "<th class=\"sortable\" hx-get=\"" +
-                base_url(col_key, new_dir, 1) +
-                "\" hx-target=\"#results-tbody\" hx-sync=\"this:abort\""
+                base_url(col_key, new_dir, 1) + "\"" + sort_page_attrs +
                 " hx-indicator=\"#results-loading\">" +
                 html_escape(col_names[i]);
         if (sort_col == col_key)
@@ -2774,21 +3511,24 @@ std::string DashboardRoutes::render_results(
     html += "</tr></thead>";
 
     // OOB: pagination
-    html += "<nav id=\"result-pagination\" hx-swap-oob=\"true\">";
+    // The data-* stamp is read by the page JS: the SSE-driven summary refresh rebuilds this view's
+    // query from it. Always emitted, also for an empty result.
+    html += "<nav id=\"result-pagination\" hx-swap-oob=\"true\" data-sort=\"" +
+            html_escape(sort_col) + "\" data-dir=\"" + html_escape(sort_dir) +
+            "\" data-page=\"" + std::to_string(page) + "\" data-per-page=\"" +
+            std::to_string(per_page) + "\">";
     if (total_lines > 0) {
         html += "<span>Showing " + std::to_string(start + 1) + "-" +
                 std::to_string(end) + " of " + std::to_string(total_lines) + "</span>";
         if (page > 1) {
             html += " <button class=\"btn-page\" hx-get=\"" +
-                    base_url(sort_col, sort_dir, page - 1) +
-                    "\" hx-target=\"#results-tbody\" hx-sync=\"this:abort\">"
-                    "Prev</button>";
+                    base_url(sort_col, sort_dir, page - 1) + "\"" + sort_page_attrs +
+                    ">Prev</button>";
         }
         if (page < static_cast<int>(total_pages)) {
             html += " <button class=\"btn-page\" hx-get=\"" +
-                    base_url(sort_col, sort_dir, page + 1) +
-                    "\" hx-target=\"#results-tbody\" hx-sync=\"this:abort\">"
-                    "Next</button>";
+                    base_url(sort_col, sort_dir, page + 1) + "\"" + sort_page_attrs +
+                    ">Next</button>";
         }
     }
     html += "</nav>";
@@ -2808,18 +3548,13 @@ std::string DashboardRoutes::render_results(
                     "rows and counts are partial</span>";
         }
 
-        // Confined-caller withhold (Gate 6 enterprise-readiness finding, this
-        // round): /fragments/create-group-form and /api/dashboard/group-from-
-        // results gate on ManagementGroup:Write only — a DIFFERENT securable,
-        // unrelated to this caller's Response:Read confinement — and apply no
-        // per-agent scope filter of their own (tracked, deliberately deferred:
-        // ADR-0017 "Doc honesty"/#3489). Before this migration a confined-only
-        // (AdmitScoped) caller could not reach /fragments/results at all, so
-        // could never see this button. Now that require_fleet_read admits
-        // them, withhold the button itself when scope is engaged rather than
-        // surface an entry point into a flow that would silently re-widen to
-        // the unscoped facet count/ids on submit.
-        if (!filters.empty() && total_agent_count > 0 && !scope) {
+        // Confined-caller withhold (Gate 6 enterprise-readiness finding): /fragments/create-group-
+        // form and /api/dashboard/group-from-results gate on ManagementGroup:Write only -- a
+        // DIFFERENT securable, unrelated to this caller's Response:Read confinement. Both do
+        // intersect their agent set with the caller's visible scope (ADR-0017 "Doc honesty"/#3489),
+        // but when scope is engaged the button is withheld rather than offering an entry point
+        // whose count is then scoped down by a route gated on another securable.
+        if ((!filters.empty() || !text_query.empty()) && total_agent_count > 0 && !scope) {
             // Build filter params for the create-group-form URL
             std::string filter_params;
             for (const auto& f : filters) {
@@ -2835,7 +3570,10 @@ std::string DashboardRoutes::render_results(
             html += " <button class=\"btn-create-group\" hx-get=\"/fragments/create-group-form"
                     "?command_id=" + url_query_value(command_id) +
                     "&amp;plugin=" + url_query_value(plugin) + filter_params +
-                    "\" hx-target=\"#group-form-slot\" hx-swap=\"innerHTML\">"
+                    (text_query.empty() ? std::string{}
+                                        : "&amp;q=" + url_query_value(text_query)) +
+                    "\" hx-target=\"#group-form-slot\" hx-swap=\"innerHTML\" hx-sync=\"" +
+                    std::string{kResultsSyncScope} + "\">"
                     "Create Group from " + std::to_string(total_agent_count) +
                     " Agent" + (total_agent_count != 1 ? "s" : "") + "</button>";
         }
@@ -2852,8 +3590,8 @@ std::string DashboardRoutes::render_results(
         html += " <span class=\"result-degrade-banner\" data-filter-too-long=\"true\">"
                 "A filter value is longer than " + std::to_string(kMaxFacetValueBytes) +
                 " bytes. Newly stored responses do not index values that long, so this "
-                "filter may match nothing. Clear the filter (or switch the View to Default) "
-                "and use the Search box.</span>";
+                "filter may match nothing. Clear the filter and use the Search box; if the filter "
+                "comes from the View, tick 'View without saved filters'.</span>";
     }
     html += "</div>";
 
@@ -2912,7 +3650,10 @@ std::string DashboardRoutes::render_filter_bar(const std::string& command_id,
     auto agent_scope = elevated ? std::nullopt : resolve_visible_scope(username);
 
     std::string html;
-    html += "<form id=\"filter-bar\" class=\"filter-bar\" hx-sync=\"this:abort\">"
+    // The SSE-driven summary refresh is issued from this form. `drop` discards a refresh issued
+    // while any results request is in flight: it is never queued, so an aborted request cannot
+    // release a stale queued refresh, and the in-flight user request renders the summary itself.
+    html += "<form id=\"filter-bar\" class=\"filter-bar\" hx-sync=\"this:drop\">"
             "<input type=\"hidden\" name=\"command_id\" value=\"" +
             html_escape(command_id) + "\">"
             "<input type=\"hidden\" name=\"plugin\" value=\"" +
@@ -2953,7 +3694,7 @@ std::string DashboardRoutes::render_filter_bar(const std::string& command_id,
             html += "<select name=\"template_id\""
                     " hx-get=\"/fragments/results\" hx-target=\"#results-tbody\""
                     " hx-include=\"#filter-bar\" hx-indicator=\"#results-loading\""
-                    " hx-sync=\"closest form:abort\">";
+                    " hx-sync=\"" + std::string{kResultsSyncScope} + "\">";
             if (!operator_has_default) {
                 html += "<option value=\"" +
                         html_escape(ResponseTemplatesEngine::kDefaultId) + "\"";
@@ -2968,6 +3709,24 @@ std::string DashboardRoutes::render_filter_bar(const std::string& command_id,
                 html += "</option>";
             }
             html += "</select>";
+            // #5638: a View's authored equals filters are defaults, applied only while the
+            // operator sets none. This per-request switch (never persisted) shows the data
+            // without them; it never drops a filter the operator set.
+            const bool has_equals_default = std::any_of(
+                templates.begin(), templates.end(), [](const ResponseTemplate& t) {
+                    return std::any_of(t.filters.begin(), t.filters.end(),
+                                       [](const ResponseTemplateFilter& f) {
+                                           return f.op == "equals";
+                                       });
+                });
+            if (has_equals_default) {
+                html += "<label class=\"view-filters-toggle\">"
+                        "<input type=\"checkbox\" name=\"view_filters\" value=\"off\""
+                        " hx-get=\"/fragments/results\" hx-target=\"#results-tbody\""
+                        " hx-include=\"#filter-bar\" hx-indicator=\"#results-loading\""
+                        " hx-sync=\"" + std::string{kResultsSyncScope} + "\">"
+                        " View without saved filters</label>";
+            }
         }
     }
 
@@ -3005,7 +3764,7 @@ std::string DashboardRoutes::render_filter_bar(const std::string& command_id,
             html += "<select name=\"" + param_name + "\""
                     " hx-get=\"/fragments/results\" hx-target=\"#results-tbody\""
                     " hx-include=\"#filter-bar\" hx-indicator=\"#results-loading\""
-                    " hx-sync=\"closest form:abort\">"
+                    " hx-sync=\"" + std::string{kResultsSyncScope} + "\">"
                     "<option value=\"\">All</option>";
             for (const auto& fv : facet_vals) {
                 html += "<option value=\"" + html_escape(fv.value) + "\">" +
@@ -3020,7 +3779,7 @@ std::string DashboardRoutes::render_filter_bar(const std::string& command_id,
                     " hx-get=\"/fragments/results\" hx-target=\"#results-tbody\""
                     " hx-include=\"#filter-bar\" hx-indicator=\"#results-loading\""
                     " hx-trigger=\"input changed delay:300ms\""
-                    " hx-sync=\"closest form:abort\">";
+                    " hx-sync=\"" + std::string{kResultsSyncScope} + "\">";
         }
     }
 
@@ -3030,7 +3789,7 @@ std::string DashboardRoutes::render_filter_bar(const std::string& command_id,
             " hx-get=\"/fragments/results\" hx-target=\"#results-tbody\""
             " hx-include=\"#filter-bar\" hx-indicator=\"#results-loading\""
             " hx-trigger=\"input changed delay:300ms\""
-            " hx-sync=\"closest form:abort\">";
+            " hx-sync=\"" + std::string{kResultsSyncScope} + "\">";
 
     html += "</form>";
     return html;
@@ -3042,7 +3801,8 @@ std::string DashboardRoutes::render_filter_bar(const std::string& command_id,
 
 std::string DashboardRoutes::render_create_group_form(
     const std::string& command_id, const std::string& plugin,
-    const std::vector<FacetFilter>& filters, std::optional<int64_t> agent_count) {
+    const std::vector<FacetFilter>& filters, std::optional<int64_t> agent_count,
+    const std::string& text_query, bool partial) {
 
     auto& col_names = columns_for_plugin(plugin);
 
@@ -3068,8 +3828,18 @@ std::string DashboardRoutes::render_create_group_form(
         }
     }
 
+    // #5700: the Search term is part of the group definition and travels with the filters.
+    if (!text_query.empty()) {
+        html += "<input type=\"hidden\" name=\"q\" value=\"" + html_escape(text_query) + "\">";
+    }
+
     std::string count_hint;
-    if (agent_count.has_value() && any_filter_value_too_long(filters)) {
+    if (partial) {
+        // The read behind the count was cut by the read cap: the count is not the group, and the
+        // POST refuses a cut read, so the submit is disabled rather than offered and refused.
+        count_hint = "The result set was cut by the read cap, so the agent count is partial. "
+                     "Narrow the filters or the Search term before creating a group.";
+    } else if (agent_count.has_value() && any_filter_value_too_long(filters)) {
         // #5623: a value over the ingest bound is not indexed in newly stored responses, so the
         // count can be 0 or an undercount. Say so instead of presenting it as the answer; static
         // text, never the value.
@@ -3088,7 +3858,8 @@ std::string DashboardRoutes::render_create_group_form(
     }
     html += "<input name=\"group_name\" type=\"text\" placeholder=\"Group name\""
             " required maxlength=\"128\" autofocus>"
-            " <button type=\"submit\">Create Static Group</button>"
+            " <button type=\"submit\"" + std::string{partial ? " disabled" : ""} +
+            ">Create Static Group</button>"
             " <span class=\"form-hint\">" + count_hint + "</span></form>";
 
     return html;
@@ -3191,7 +3962,7 @@ std::string DashboardRoutes::render_scope_list(const std::string& selected,
 // queries the response store for that command_id, **filters responses to
 // the operator's visible agents**, parses each agent's
 // `config|<source>_enabled|false` lines plus the matching paused_at /
-// live_rows / oldest_ts companions, and returns an HTML table fragment.
+// rows / oldest_ts companions, and returns an HTML table fragment.
 //
 // Per-username state + visibility filter together close the Gate 2
 // governance HIGH finding (cross-operator data leak via shared scan slot).
@@ -3272,7 +4043,7 @@ DashboardRoutes::gather_echo_retention_paused(const std::string& username,
     // Each response is from one agent. Parse each line for
     //   config|<source>_enabled|<value>
     //   config|<source>_paused_at|<ts>
-    //   config|<source>_live_rows|<count>
+    //   config|<source>_rows|<count>        (the hourly count)
     //   config|<source>_oldest_ts|<ts>
     // and emit one row for every (agent, source) pair where `<source>_enabled` ==
     // "false". Sources with `enabled=true` are dropped — callers want the *paused*
@@ -3368,9 +4139,9 @@ DashboardRoutes::gather_echo_retention_paused(const std::string& username,
                 p != kv.end()) {
                 try { row.paused_at = std::stoll(p->second); } catch (...) {}
             }
-            if (auto lr = kv.find(std::string{source} + "_live_rows");
-                lr != kv.end()) {
-                try { row.live_rows = std::stoll(lr->second); } catch (...) {}
+            // Row count: `<src>_rows` is the hourly count.
+            if (auto lr = kv.find(std::string{source} + "_rows"); lr != kv.end()) {
+                try { row.hourly_rows = std::stoll(lr->second); } catch (...) {}
             }
             if (auto ot = kv.find(std::string{source} + "_oldest_ts");
                 ot != kv.end()) {
@@ -3386,8 +4157,10 @@ DashboardRoutes::gather_echo_retention_paused(const std::string& username,
 }
 
 std::string DashboardRoutes::render_echo_retention_paused(
-    const std::string& username, bool can_execute, bool can_delete) const {
-    EchoRetentionPausedScan scan = gather_echo_retention_paused(username);
+    const std::string& username, bool can_execute, bool can_delete,
+    const authz::VisibleSet& gate_scope, bool scope_is_authoritative) const {
+    EchoRetentionPausedScan scan =
+        gather_echo_retention_paused(username, gate_scope, scope_is_authoritative);
     const std::string& scan_id = scan.scan_id;
     const int scan_count = scan.scan_count;
     const int64_t scan_at = scan.scan_at;
@@ -3400,8 +4173,14 @@ std::string DashboardRoutes::render_echo_retention_paused(
     // `EchoPausedSourceRow` fields) needs no further edits.
     std::vector<EchoPausedSourceRow>& rows = scan.rows;
 
+    // One sentence on every return path: paused rows are held in place, not pruned.
+    static constexpr const char* kPausedHint =
+        "<p class=\"hint\">A paused source is never pruned, so its hourly rows keep their "
+        "place until it is re-enabled or purged.</p>";
+
     if (scan_id.empty()) {
-        return "<div class=\"empty-state\">No scan data yet — click "
+        return std::string(kPausedHint) +
+               "<div class=\"empty-state\">No scan data yet — click "
                "<strong>Scan fleet</strong> above to query the agents "
                "in your scope for Echo retention state.</div>";
     }
@@ -3461,6 +4240,7 @@ std::string DashboardRoutes::render_echo_retention_paused(
                             agents_filtered_out_of_scope == 1 ? "" : "s");
     }
     html += "</div>";
+    html += kPausedHint;
     if (scan.result_truncated_by_cap) {
         // A cut read drops whole responses, which reads as agents that never answered, i.e. as
         // "collecting normally". Say the picture is partial (#4644, row 6a).
@@ -3535,8 +4315,8 @@ std::string DashboardRoutes::render_echo_retention_paused(
             "<th>Source</th>"
             "<th>Paused since</th>"
             "<th>Paused for</th>"
-            "<th class=\"r\">Live rows</th>"
-            "<th>Oldest data</th>"
+            "<th class=\"r\">Hourly rows</th>"
+            "<th>Oldest hourly bucket</th>"
             "<th></th>"
             "</tr></thead><tbody>";
 
@@ -3573,10 +4353,10 @@ std::string DashboardRoutes::render_echo_retention_paused(
             html += "<td>" + format_age(r.paused_at, now) + "</td>";
         }
         html += "<td class=\"r\">";
-        if (r.live_rows < 0) {
+        if (r.hourly_rows < 0) {
             html += "<span class=\"echo-tree-mute\">—</span>";
         } else {
-            html += std::format("{}", r.live_rows);
+            html += std::format("{}", r.hourly_rows);
         }
         html += "</td>";
         html += "<td>" + format_age(r.oldest_ts, now) + "</td>";

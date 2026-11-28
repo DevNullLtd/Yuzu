@@ -1,4 +1,5 @@
 #include <yuzu/agent/plugin_loader.hpp>
+#include <yuzu/agent/updater.hpp> // current_executable_path: required fixtures belong to this build
 
 // Internal helper exposed for unit testing — see header for contract.
 #include "../../agents/core/src/plugin_config_sync.hpp"
@@ -19,6 +20,7 @@
 #include <openssl/x509.h>
 #include <openssl/x509v3.h>
 
+#include <cstddef>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -28,6 +30,10 @@
 #include <string_view>
 #include <system_error>
 #include <vector>
+
+#ifndef _WIN32
+#include <sys/stat.h> // mkfifo (the FIFO allowlist test)
+#endif
 
 namespace fs = std::filesystem;
 
@@ -41,28 +47,24 @@ constexpr const char* kPluginExt = ".dylib";
 constexpr const char* kPluginExt = ".so";
 #endif
 
-// Locate a fixture plugin shared library (`<base_name><ext>`) built by
-// tests/meson.build — e.g. "reserved_name_fixture_plugin" (#453) or
-// "invalid_name_fixture_plugin" (#822). Returns empty path if not found —
-// tests that require the fixture should SKIP rather than FAIL to keep
-// cross-compile / restricted-CI scenarios quiet.
-fs::path find_fixture_plugin(std::string_view base_name) {
-    const std::string lib_name = std::string{base_name} + kPluginExt;
-
-    std::vector<fs::path> candidates;
-    if (auto* build_root = std::getenv("MESON_BUILD_ROOT")) {
-        candidates.emplace_back(fs::path{build_root} / "tests" / lib_name);
+// Fixture libraries are Meson link_depends of yuzu_agent_tests on every host. An
+// explicit build root is authoritative; otherwise use the executable's own
+// directory. Never recover a missing fixture from an unrelated working tree.
+fs::path require_fixture_plugin(std::string_view base_name) {
+    fs::path directory;
+    if (const auto* build_root = std::getenv("MESON_BUILD_ROOT")) {
+        REQUIRE(std::string_view{build_root}.size() > 0);
+        directory = fs::path{build_root} / "tests";
+    } else {
+        const auto executable = yuzu::agent::current_executable_path();
+        REQUIRE_FALSE(executable.empty());
+        directory = executable.parent_path();
     }
-    // Meson launches tests with CWD=build root; tests/ sits alongside the exe.
-    candidates.emplace_back(fs::path{"tests"} / lib_name);
-    candidates.emplace_back(fs::path{"."} / lib_name);
-
-    for (const auto& p : candidates) {
-        std::error_code ec;
-        if (fs::exists(p, ec) && !ec)
-            return fs::absolute(p, ec);
-    }
-    return {};
+    const auto fixture = directory / (std::string{base_name} + kPluginExt);
+    INFO("Required compiled fixture: " << fixture.string()
+                                       << "; build yuzu_agent_tests and its fixture dependencies");
+    REQUIRE(fs::is_regular_file(fixture));
+    return fs::absolute(fixture);
 }
 
 // ── Code-signing test fixtures ───────────────────────────────────────────────
@@ -338,102 +340,142 @@ TEST_CASE("PluginLoader::scan with require_signature on rejects unsigned plugin 
 }
 
 TEST_CASE("PluginLoader rejects a plugin declaring a reserved name",
-          "[plugin_loader][reserved_name]") {
-    auto fixture = find_fixture_plugin("reserved_name_fixture_plugin");
-    if (fixture.empty()) {
-        WARN("reserved_name_fixture_plugin not found — skipping behavioral scan test");
-        SUCCEED();
-        return;
-    }
-
-    // Copy the fixture into an isolated directory so we scan only it —
-    // avoids false positives from stray built plugins that may live in a
-    // shared tree when run from the build root. Unique per-invocation name
-    // is generated from mt19937_64 rather than ::getpid() so the code
-    // compiles on MSVC (`_getpid` in <process.h>) and Apple Clang
-    // (`<unistd.h>` not transitively available) without per-platform
-    // guards. Adopts yuzu::test::unique_temp_path (#482) over the
-    // earlier raw mt19937_64 path which lacked the monotonic counter
-    // that protects against Defender-induced collision flakes.
-    auto tmp = yuzu::test::unique_temp_path("yuzu_test_reserved_plugin_");
-    fs::create_directories(tmp);
-    auto staged = tmp / fixture.filename();
+          "[plugin_loader][reserved_name][contract-plugin-reserved-name]") {
+    // Contract: docs/cpp-conventions.md, "Reserved plugin names". The scan
+    // rejects the reserved dispatch identity while retaining an ordinary
+    // plugin from the SAME directory; an empty scan or reject-all cannot pass.
+    const auto fixture = require_fixture_plugin("reserved_name_fixture_plugin");
+    const auto control = require_fixture_plugin("abi3_fixture_plugin");
+    yuzu::test::TempDir tmp{"yuzu_test_reserved_plugin_"};
+    fs::create_directories(tmp.path);
+    const auto staged = tmp.path / fixture.filename();
+    const auto staged_control = tmp.path / control.filename();
     std::error_code ec;
     fs::copy_file(fixture, staged, fs::copy_options::overwrite_existing, ec);
     REQUIRE_FALSE(ec);
+    fs::copy_file(control, staged_control, fs::copy_options::overwrite_existing, ec);
+    REQUIRE_FALSE(ec);
 
-    auto result = yuzu::agent::PluginLoader::scan(tmp);
+    // Prove that both inputs are real loadable plugins with the intended ABI
+    // identities. A corrupt shared library or a misbuilt fixture must not be
+    // mistaken for successful reserved-name enforcement. These direct handles
+    // close before scan(); scan owns and releases its own accepted handle.
+    {
+        auto reserved = yuzu::agent::PluginHandle::load(staged);
+        REQUIRE(reserved.has_value());
+        REQUIRE(reserved->descriptor() != nullptr);
+        REQUIRE(reserved->descriptor()->name != nullptr);
+        REQUIRE(std::string_view{reserved->descriptor()->name} == "__guard__");
+        auto ordinary = yuzu::agent::PluginHandle::load(staged_control);
+        REQUIRE(ordinary.has_value());
+        REQUIRE(ordinary->descriptor() != nullptr);
+        REQUIRE(ordinary->descriptor()->name != nullptr);
+        REQUIRE(std::string_view{ordinary->descriptor()->name} == "abi3_fixture");
+        REQUIRE(ordinary->descriptor()->abi_version == 3);
+    }
 
-    // Must not appear in loaded — nothing under __guard__ may be handed
-    // to the dispatcher.
-    REQUIRE(result.loaded.empty());
-
-    // Must appear in errors with the stable reason prefix so the agent
-    // metric can categorise it.
+    auto result = yuzu::agent::PluginLoader::scan(tmp.path);
+    // No reserved dispatch candidate escapes, and the ordinary plugin remains
+    // functional through the real ABI entry point (the frozen fixture needs no context).
+    REQUIRE(result.loaded.size() == 1);
+    const auto* accepted = result.loaded.front().descriptor();
+    REQUIRE(accepted != nullptr);
+    REQUIRE(accepted->name != nullptr);
+    REQUIRE(std::string_view{accepted->name} == "abi3_fixture");
+    REQUIRE(accepted->execute != nullptr);
+    CHECK(accepted->execute(nullptr, "ping", nullptr, 0) == 0);
+    CHECK(accepted->execute(nullptr, "unknown-action", nullptr, 0) != 0);
     REQUIRE(result.errors.size() == 1);
     const auto& err = result.errors.front();
-    REQUIRE(err.path == staged.string());
-    REQUIRE(err.reason.starts_with(yuzu::agent::kReservedNameReason));
-    REQUIRE(err.reason.find("__guard__") != std::string::npos);
-
-    fs::remove_all(tmp);
+    CHECK(err.path == staged.string());
+    CHECK(err.reason == "reserved plugin name: '__guard__'");
 }
 
 TEST_CASE("PluginLoader rejects a second file declaring an already-loaded name",
-          "[plugin_loader][duplicate_name]") {
-    auto fixture = find_fixture_plugin("abi3_fixture_plugin");
-    if (fixture.empty()) {
-        WARN("abi3_fixture_plugin not found — skipping behavioral scan test");
-        SUCCEED();
-        return;
-    }
-
-    // Two copies of one valid-named plugin (declares "abi3_fixture") under two
-    // filenames in an isolated directory. `tmp` is declared BEFORE `result`, so the
-    // dlopen handles are released before the directory (and the files) are removed.
+          "[plugin_loader][duplicate_name][contract-plugin-duplicate-name]") {
+    // Contract: plugin_loader.hpp, kDuplicateNameReason. Deduplication is by
+    // declared identity, not a limit of one plugin per directory. Require a
+    // distinct, executable control so rejecting everything after the first
+    // candidate cannot masquerade as correct duplicate-name enforcement.
+    const auto fixture = require_fixture_plugin("abi3_fixture_plugin");
+    const auto control = require_fixture_plugin("abi4_declared_fixture_plugin");
     yuzu::test::TempDir tmp{"yuzu_test_dup_plugin_"};
     fs::create_directories(tmp.path);
     const auto a = tmp.path / (std::string{"aaa_"} + fixture.filename().string());
     const auto z = tmp.path / (std::string{"zzz_"} + fixture.filename().string());
+    const auto staged_control = tmp.path / control.filename();
     std::error_code ec;
     fs::copy_file(fixture, a, fs::copy_options::overwrite_existing, ec);
     REQUIRE_FALSE(ec);
     fs::copy_file(fixture, z, fs::copy_options::overwrite_existing, ec);
     REQUIRE_FALSE(ec);
+    fs::copy_file(control, staged_control, fs::copy_options::overwrite_existing, ec);
+    REQUIRE_FALSE(ec);
+
+    // Independently prove both duplicate inputs and the distinct control are
+    // loadable with their intended identities. These handles close before the
+    // scan; scan's accepted handles close before TempDir removes the libraries.
+    for (const auto& path : {a, z}) {
+        auto plugin = yuzu::agent::PluginHandle::load(path);
+        REQUIRE(plugin.has_value());
+        REQUIRE(plugin->descriptor() != nullptr);
+        REQUIRE(plugin->descriptor()->name != nullptr);
+        REQUIRE(std::string_view{plugin->descriptor()->name} == "abi3_fixture");
+        REQUIRE(plugin->descriptor()->abi_version == 3);
+    }
+    {
+        auto plugin = yuzu::agent::PluginHandle::load(staged_control);
+        REQUIRE(plugin.has_value());
+        REQUIRE(plugin->descriptor() != nullptr);
+        REQUIRE(plugin->descriptor()->name != nullptr);
+        REQUIRE(std::string_view{plugin->descriptor()->name} == "abi4_declared_fixture");
+        REQUIRE(plugin->descriptor()->abi_version == 4);
+    }
 
     auto result = yuzu::agent::PluginLoader::scan(tmp.path);
+    REQUIRE(result.loaded.size() == 2);
+    std::size_t duplicate_identity_count = 0;
+    std::size_t control_identity_count = 0;
+    for (const auto& plugin : result.loaded) {
+        const auto* descriptor = plugin.descriptor();
+        REQUIRE(descriptor != nullptr);
+        REQUIRE(descriptor->name != nullptr);
+        REQUIRE(descriptor->execute != nullptr);
+        const std::string_view name{descriptor->name};
+        if (name == "abi3_fixture") {
+            ++duplicate_identity_count;
+            CHECK(descriptor->execute(nullptr, "ping", nullptr, 0) == 0);
+        } else if (name == "abi4_declared_fixture") {
+            ++control_identity_count;
+            CHECK(descriptor->execute(nullptr, "scan", nullptr, 0) == 0);
+        }
+        CHECK(descriptor->execute(nullptr, "unknown-action", nullptr, 0) != 0);
+    }
+    CHECK(duplicate_identity_count == 1);
+    CHECK(control_identity_count == 1);
 
-    // Exactly one wins the name (directory-walk order decides which — the loaded
-    // handle's path is the dlopen/fd-pin path, so it is not compared).
-    REQUIRE(result.loaded.size() == 1);
-    CHECK(std::string_view{result.loaded.front().descriptor()->name} == "abi3_fixture");
-
+    // Exactly one duplicate loses the name; directory-walk order decides
+    // which. Do not compare loaded paths: Linux uses a pinned /proc/self/fd path.
     REQUIRE(result.errors.size() == 1);
     const auto& err = result.errors.front();
     CHECK((err.path == a.string() || err.path == z.string()));
-    REQUIRE(err.reason.starts_with(yuzu::agent::kDuplicateNameReason));
-    CHECK(err.reason.find("abi3_fixture") != std::string::npos);
+    CHECK(err.reason == "duplicate plugin name: 'abi3_fixture'");
 }
 
 TEST_CASE("PluginLoader rejects a plugin declaring an invalid name",
           "[plugin_loader][name_validation]") {
-    auto fixture = find_fixture_plugin("invalid_name_fixture_plugin");
-    if (fixture.empty()) {
-        WARN("invalid_name_fixture_plugin not found — skipping behavioral scan test");
-        SUCCEED();
-        return;
-    }
+    const auto fixture = require_fixture_plugin("invalid_name_fixture_plugin");
 
     // Scan an isolated copy so the result reflects only this fixture (mirrors
     // the reserved-name behavioral test above).
-    auto tmp = yuzu::test::unique_temp_path("yuzu_test_invalid_name_plugin_");
-    fs::create_directories(tmp);
-    auto staged = tmp / fixture.filename();
+    yuzu::test::TempDir tmp{"yuzu_test_invalid_name_plugin_"};
+    fs::create_directories(tmp.path);
+    const auto staged = tmp.path / fixture.filename();
     std::error_code ec;
     fs::copy_file(fixture, staged, fs::copy_options::overwrite_existing, ec);
     REQUIRE_FALSE(ec);
 
-    auto result = yuzu::agent::PluginLoader::scan(tmp);
+    auto result = yuzu::agent::PluginLoader::scan(tmp.path);
 
     // A malformed name must not yield a loaded plugin...
     REQUIRE(result.loaded.empty());
@@ -445,18 +487,11 @@ TEST_CASE("PluginLoader rejects a plugin declaring an invalid name",
     const auto& err = result.errors.front();
     REQUIRE(err.path == staged.string());
     REQUIRE(err.reason == yuzu::agent::kInvalidNameReason);
-
-    fs::remove_all(tmp);
 }
 
 TEST_CASE("PluginLoader rejects a stale plugin declaring the retired pre-rename name",
           "[plugin_loader][retired_name]") {
-    auto fixture = find_fixture_plugin("retired_name_fixture_plugin");
-    if (fixture.empty()) {
-        WARN("retired_name_fixture_plugin not found - skipping behavioral scan test");
-        SUCCEED();
-        return;
-    }
+    const auto fixture = require_fixture_plugin("retired_name_fixture_plugin");
 
     // Scan an isolated copy so the result reflects only this fixture. `tmp` is declared before
     // `result`, so the dlopen handle is released before the directory is removed.
@@ -538,6 +573,162 @@ TEST_CASE("defer_legacy_echo_adoption sees a stale tar plugin the allowlist refu
     CHECK(fs::path{result.errors.front().path}.stem() == "tar");
     const std::vector<std::string_view> none;
     CHECK(yuzu::agent::defer_legacy_echo_adoption(result.errors, none));
+}
+
+// ─── WP13 / F52: a configured allowlist must never fail open ─────────────────
+
+namespace {
+void write_allowlist(const fs::path& p, const std::string& body) {
+    std::ofstream f(p, std::ios::binary);
+    f << body;
+}
+} // namespace
+
+TEST_CASE("load_plugin_allowlist: unconfigured is distinct from configured-but-unusable",
+          "[plugin_loader][allowlist][f52]") {
+    using yuzu::agent::AllowlistStatus;
+    yuzu::test::TempDir tmp{"yuzu_test_allowlist_"};
+    fs::create_directories(tmp.path);
+
+    CHECK(yuzu::agent::load_plugin_allowlist({}).status == AllowlistStatus::NotConfigured);
+    CHECK(yuzu::agent::load_plugin_allowlist(tmp.path / "absent.txt").status ==
+          AllowlistStatus::Missing);
+    // A directory is not a readable allowlist file.
+    CHECK(yuzu::agent::load_plugin_allowlist(tmp.path).status == AllowlistStatus::Unreadable);
+
+    write_allowlist(tmp.path / "empty.txt", "");
+    CHECK(yuzu::agent::load_plugin_allowlist(tmp.path / "empty.txt").status ==
+          AllowlistStatus::NoValidEntries);
+    write_allowlist(tmp.path / "comments.txt", "# only a comment\n\n# another\n");
+    CHECK(yuzu::agent::load_plugin_allowlist(tmp.path / "comments.txt").status ==
+          AllowlistStatus::NoValidEntries);
+    write_allowlist(tmp.path / "bad.txt", "loneword\n");
+    CHECK(yuzu::agent::load_plugin_allowlist(tmp.path / "bad.txt").status ==
+          AllowlistStatus::NoValidEntries);
+
+    write_allowlist(tmp.path / "ok.txt", "# c\n" + std::string(64, 'A') + "  /x/y/foo.so\nloneword\n");
+    auto ok = yuzu::agent::load_plugin_allowlist(tmp.path / "ok.txt");
+    REQUIRE(ok.status == AllowlistStatus::Loaded);
+    REQUIRE(ok.entries.size() == 1);
+    CHECK(ok.entries.at("foo.so") == std::string(64, 'a'));
+}
+
+TEST_CASE("load_plugin_allowlist: wrong-format content is NoValidEntries, a BOM does not eat "
+          "the first entry (UP1)",
+          "[plugin_loader][allowlist][f52]") {
+    using yuzu::agent::AllowlistStatus;
+    yuzu::test::TempDir tmp{"yuzu_test_allowlist_shape_"};
+    fs::create_directories(tmp.path);
+    const std::string h(64, 'c');
+
+    // Junk that has two tokens per line but is not a sha256 must refuse.
+    write_allowlist(tmp.path / "md5.txt", "d41d8cd98f00b204e9800998ecf8427e  foo.so\n");
+    CHECK(yuzu::agent::load_plugin_allowlist(tmp.path / "md5.txt").status ==
+          AllowlistStatus::NoValidEntries);
+    write_allowlist(tmp.path / "words.txt", "plugin foo.so\nanother bar.so\n");
+    CHECK(yuzu::agent::load_plugin_allowlist(tmp.path / "words.txt").status ==
+          AllowlistStatus::NoValidEntries);
+    write_allowlist(tmp.path / "nonhex.txt", std::string(64, 'z') + "  foo.so\n");
+    CHECK(yuzu::agent::load_plugin_allowlist(tmp.path / "nonhex.txt").status ==
+          AllowlistStatus::NoValidEntries);
+
+    // UTF-8 BOM before the first entry: the entry must survive.
+    write_allowlist(tmp.path / "bom.txt", std::string("\xEF\xBB\xBF") + h + "  first.so\n" + h + "  second.so\n");
+    auto bom = yuzu::agent::load_plugin_allowlist(tmp.path / "bom.txt");
+    REQUIRE(bom.status == AllowlistStatus::Loaded);
+    CHECK(bom.entries.count("first.so") == 1);
+    CHECK(bom.entries.count("second.so") == 1);
+
+    // CRLF and sha256sum binary-mode '*' marker.
+    write_allowlist(tmp.path / "crlf.txt", h + " *bin.so\r\n");
+    auto crlf = yuzu::agent::load_plugin_allowlist(tmp.path / "crlf.txt");
+    REQUIRE(crlf.status == AllowlistStatus::Loaded);
+    CHECK(crlf.entries.count("bin.so") == 1);
+}
+
+#ifndef _WIN32
+TEST_CASE("load_plugin_allowlist: an unreadable file is Unreadable, not empty",
+          "[plugin_loader][allowlist][f52]") {
+    yuzu::test::TempDir tmp{"yuzu_test_allowlist_perm_"};
+    fs::create_directories(tmp.path);
+    const auto f = tmp.path / "locked.txt";
+    write_allowlist(f, std::string(64, 'a') + " foo.so\n");
+    fs::permissions(f, fs::perms::none);
+    std::ifstream probe(f);
+    if (probe) {
+        SKIP("running with privileges that bypass file modes (root)");
+    }
+    CHECK(yuzu::agent::load_plugin_allowlist(f).status == yuzu::agent::AllowlistStatus::Unreadable);
+    fs::permissions(f, fs::perms::owner_all);
+}
+#endif
+
+#ifndef _WIN32
+TEST_CASE("load_plugin_allowlist: a FIFO is Unreadable and is never opened (no hang) (F5)",
+          "[plugin_loader][allowlist][f52]") {
+    yuzu::test::TempDir tmp{"yuzu_test_allowlist_fifo_"};
+    fs::create_directories(tmp.path);
+    const auto fifo = tmp.path / "allow.fifo";
+    REQUIRE(::mkfifo(fifo.c_str(), 0600) == 0);
+    // Opening a FIFO for read with no writer blocks forever; the loader must refuse it from the
+    // stat result alone.
+    CHECK(yuzu::agent::load_plugin_allowlist(fifo).status ==
+          yuzu::agent::AllowlistStatus::Unreadable);
+}
+#endif
+
+#ifdef __linux__
+TEST_CASE("load_plugin_allowlist: a read error mid-file is Unreadable, not a short allowlist (F5)",
+          "[plugin_loader][allowlist][f52]") {
+    // /proc/self/mem is a regular file that opens but fails every read at offset 0 with EIO,
+    // which sets badbit: the f.bad() branch. A truncated map must not enforce as if complete.
+    std::ifstream probe("/proc/self/mem");
+    std::string x;
+    if (!probe || std::getline(probe, x) || !probe.bad())
+        SKIP("this host does not fail reads of /proc/self/mem with a stream error");
+    CHECK(yuzu::agent::load_plugin_allowlist("/proc/self/mem").status ==
+          yuzu::agent::AllowlistStatus::Unreadable);
+}
+#endif
+
+TEST_CASE("evaluate_allowlist_startup refuses every configured-but-unusable allowlist",
+          "[plugin_loader][allowlist][f52]") {
+    using yuzu::agent::AllowlistStatus;
+    yuzu::agent::PluginAllowlistLoad load;
+
+    // Unconfigured: proceed, whatever the load said.
+    CHECK_FALSE(yuzu::agent::evaluate_allowlist_startup({}, load).has_value());
+
+    const fs::path configured{"/etc/yuzu/plugins.allow"};
+    for (auto st : {AllowlistStatus::Missing, AllowlistStatus::Unreadable,
+                    AllowlistStatus::NoValidEntries, AllowlistStatus::NotConfigured}) {
+        load.status = st;
+        auto r = yuzu::agent::evaluate_allowlist_startup(configured, load);
+        INFO("status " << static_cast<int>(st));
+        REQUIRE(r.has_value());
+        CHECK(r->find("/etc/yuzu/plugins.allow") != std::string::npos);
+    }
+    // Loaded but somehow empty must still refuse.
+    load.status = AllowlistStatus::Loaded;
+    CHECK(yuzu::agent::evaluate_allowlist_startup(configured, load).has_value());
+
+    load.entries["a.so"] = std::string(64, '0');
+    CHECK_FALSE(yuzu::agent::evaluate_allowlist_startup(configured, load).has_value());
+}
+
+TEST_CASE("PluginLoader::scan with allowlist_required and no entries loads nothing",
+          "[plugin_loader][allowlist][f52]") {
+    // Plain bytes suffice: the refusal happens before dlopen.
+    yuzu::test::TempDir tmp{"yuzu_test_allowlist_required_"};
+    fs::create_directories(tmp.path);
+    {
+        std::ofstream pf(tmp.path / (std::string{"anything"} + kPluginExt), std::ios::binary);
+        pf << "bytes";
+    }
+    auto result = yuzu::agent::PluginLoader::scan(tmp.path, {}, {}, /*allowlist_required=*/true);
+    REQUIRE(result.loaded.empty());
+    REQUIRE(result.errors.size() == 1);
+    CHECK(result.errors.front().reason == "not in plugin allowlist");
 }
 
 // ─── Plugin config-sync (covers agent.cpp post-load sync invariant) ─────────

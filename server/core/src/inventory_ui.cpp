@@ -146,6 +146,8 @@ std::string inv_style() {
   .inv-frow .lab{min-width:88px;font-size:13px;font-weight:500;color:var(--ink2)}
   .inv-chip{height:28px;padding:0 10px;border:1px solid var(--line2);border-radius:var(--rad-ctl);background:var(--bg);color:var(--mut);font:inherit;font-size:13px;font-weight:500;cursor:pointer}
   .inv-chip[data-g=src]{font-family:var(--mds-font-family-mono);font-size:12.5px;font-weight:400}
+  .inv-chip[data-f=win]{box-shadow:inset 3px 0 0 var(--c1)}.inv-chip[data-f=mac]{box-shadow:inset 3px 0 0 var(--c2)}
+  .inv-chip[data-f=lin]{box-shadow:inset 3px 0 0 var(--c3)}.inv-chip[data-f=oth]{box-shadow:inset 3px 0 0 var(--mut)}
   .inv-chip:hover{background:var(--surface2);color:var(--ink)}
   .inv-chip[aria-pressed=true]{border-color:var(--primary);background:color-mix(in srgb,var(--primary) 14%,transparent);color:var(--ink)}
   .inv-active{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
@@ -192,6 +194,7 @@ std::string inv_style() {
   .inv-exp-body .inv-degrade{margin-top:10px}
   .inv-exp-body,.inv-devs{padding:12px 16px 14px;background:var(--bg)}
   .inv-close{float:right;color:var(--mut);cursor:pointer}.inv-close:hover{color:var(--ink)}
+  button.inv-devbtn{background:none;border:0;padding:0;font:inherit}
   .inv-devbtn,.inv-hostlink{color:var(--primary);text-decoration:none;cursor:pointer}.inv-devbtn:hover,.inv-hostlink:hover{color:var(--primary-h)}
   .inv-hostlink:hover{text-decoration:underline}
   .inv-devhead{display:flex;flex-wrap:wrap;gap:6px 10px;align-items:center;color:var(--mut)}.inv-devhead b{color:var(--ink);font-weight:600}
@@ -258,16 +261,6 @@ std::string eco_pill(std::string_view eco) {
            esc(std::string(eco)) + "</span>";
 }
 
-constexpr std::array<std::pair<const char*, const char*>, 4> kKinds{{
-    {"app", "applications"},
-    {"pkg", "macOS pkgutil and Homebrew packages"},
-    {"package", "OS packages (rpm, deb, apk, pacman)"},
-    {"feat", "Windows optional features"},
-}};
-constexpr std::array<const char*, 4> kSources{"installed_apps.list_inventory",
-                                              "pkg_inventory.packages", "pkg_inventory.managers",
-                                              "windows_optional_features.list"};
-
 bool any_filter(const SoftwarePageFilters& f) {
     return !f.q.empty() || !f.kind.empty() || !f.ecosystem.empty() || !f.source.empty() ||
            !f.agent_id.empty() || f.versions_min > 0;
@@ -320,7 +313,8 @@ std::string sw_head() {
            "title=\"Ask devices to re-send their software inventory now\">Sync now</button></div>"
            "<div class=\"inv-sub\">Installed-software inventory by application, version and "
            "device, synced <b>daily</b> from every endpoint (ADR-0016 daily-sync). Looking for a "
-           "device? See <a href=\"/hardware\">Hardware</a>.</div>";
+           "device? Open it from <a href=\"/hardware\">Hardware</a> &rarr; Installed "
+           "software &rarr; Open in Software.</div>";
 }
 
 // Retry re-requests the whole page WITH the current filters (a bare retry would drop them).
@@ -441,25 +435,36 @@ std::string chips_region(const SoftwarePageFilters& f, bool oob) {
                results_get(t) + ">" + esc(label) + "</button>";
     };
     h += kind_chip("", "All", "every kind");
-    for (const auto& [k, title] : kKinds)
-        h += kind_chip(k, k, title);
+    for (const auto& k : software_catalog::kSoftwareKinds)
+        h += kind_chip(std::string(k.value), std::string(k.title), std::string(k.tooltip));
     h += "</div></div>";
-    const auto chip_row = [&](const char* lab, const char* g, const std::string& cur, auto&& values) {
+    struct Chip {
+        std::string v, label, tooltip, family;
+    };
+    const auto chip_row = [&](const char* lab, const char* g, const std::string& cur,
+                              const std::vector<Chip>& chips) {
         h += std::string("<div class=\"inv-frow\"><span class=\"lab\">") + lab + "</span>";
-        for (const std::string v : values) {
+        for (const auto& c : chips) {
             SoftwarePageFilters t = f;
-            (std::string_view(g) == "eco" ? t.ecosystem : t.source) = (cur == v ? "" : v);
-            h += "<button type=\"button\" class=\"inv-chip\" data-g=\"" + std::string(g) + "\" data-v=\"" +
-                 esc(v) + "\" aria-pressed=\"" + (cur == v ? "true" : "false") + "\" title=\"" +
-                 esc(v) + "\" " + results_get(t) + ">" + esc(v) + "</button>";
+            (std::string_view(g) == "eco" ? t.ecosystem : t.source) = (cur == c.v ? "" : c.v);
+            h += "<button type=\"button\" class=\"inv-chip\" data-g=\"" + std::string(g) +
+                 "\" data-v=\"" + esc(c.v) + "\" aria-pressed=\"" +
+                 (cur == c.v ? "true" : "false") + "\" title=\"" + esc(c.tooltip) + "\" " +
+                 (c.family.empty() ? std::string() : "data-f=\"" + esc(c.family) + "\" ") +
+                 results_get(t) + ">" + esc(c.label) + "</button>";
         }
         h += "</div>";
     };
-    std::vector<std::string> ecos;
-    for (const auto& e : software_catalog::kEcosystemFamilies)
-        ecos.emplace_back(e.ecosystem);
+    std::vector<Chip> ecos, srcs;
+    for (const auto& e : software_catalog::kEcosystemFamilies) {
+        const std::string eco(e.ecosystem);
+        const std::string cls = family_cls(e.family);
+        ecos.push_back({eco, eco, eco, cls.empty() ? "oth" : cls});
+    }
+    for (const auto& s : software_catalog::kSoftwareSources)
+        srcs.push_back({std::string(s.value), std::string(s.title), std::string(s.tooltip), ""});
     chip_row("Ecosystem", "eco", f.ecosystem, ecos);
-    chip_row("Found by", "src", f.source, std::vector<std::string>(kSources.begin(), kSources.end()));
+    chip_row("Found by", "src", f.source, srcs);
     h += "<span id=\"sw-state\" hidden><input type=\"hidden\" name=\"kind\" value=\"" + esc(f.kind) +
          "\"><input type=\"hidden\" name=\"ecosystem\" value=\"" + esc(f.ecosystem) +
          "\"><input type=\"hidden\" name=\"source\" value=\"" + esc(f.source) +
@@ -578,17 +583,18 @@ std::string title_rows(const SoftwarePageFilters& f, const SoftwarePageData& d) 
             kinds += (kinds.empty() ? "" : "/") + std::string(one);
         });
         h += "<tr class=\"click\" data-t=\"" + std::to_string(i++) + "\" aria-expanded=\"false\" "
-             "data-tog=\"v\" title=\"Click for installs per version\" hx-get=\"" + esc(vurl) +
+             "data-tog=\"v\" role=\"button\" tabindex=\"0\" onkeydown=\"swKey(event,this)\" "
+             "title=\"Click for installs per version\" hx-get=\"" + esc(vurl) +
              "\" hx-target=\"#" + box + "\" hx-swap=\"innerHTML\"><td class=\"inv-name\">" +
              esc(r.name) + "</td><td class=\"inv-pub\">" + (r.publisher.empty() ? dash() : esc(r.publisher)) +
              "</td><td>" + pills + "<span class=\"inv-grey\">" + esc(kinds) + "</span></td>"
              "<td class=\"inv-num\">" + fmt_int(r.device_count) + "</td><td class=\"inv-num\">" +
              fmt_int(r.version_count) + "</td><td class=\"inv-mono\">" +
              ((r.newest_version.empty() || d.confined) ? dash() : esc(r.newest_version)) +
-             "</td><td class=\"inv-act\"><span class=\"inv-devbtn\" data-vers>versions &rsaquo;</span>"
-             " &middot; <span class=\"inv-devbtn\" data-devs data-tog=\"d\" "
+             "</td><td class=\"inv-act\"><button type=\"button\" class=\"inv-devbtn\" data-vers>versions &rsaquo;</button>"
+             " &middot; <button type=\"button\" class=\"inv-devbtn\" data-devs data-tog=\"d\" "
              "onclick=\"event.stopPropagation()\" hx-get=\"" + esc(durl) + "\" hx-target=\"#" + box +
-             "\" hx-swap=\"innerHTML\">devices &rsaquo;</span></td></tr>"
+             "\" hx-swap=\"innerHTML\">devices &rsaquo;</button></td></tr>"
              "<tr class=\"inv-exp\"><td colspan=\"7\"><div id=\"" + box + "\"></div></td></tr>";
     }
     const std::int64_t shown = d.shown_before + static_cast<std::int64_t>(d.rows->size());
@@ -682,6 +688,380 @@ std::string results_region(const SoftwarePageFilters& f, const SoftwarePageData&
     return h;
 }
 
+// ── Find software panel (SAM-18) ─────────────────────────────────────────────────
+// The panel shell rides the Full page (first block, above the KPI strip); its answer is the
+// `/fragments/inventory/software/find` fragment swapped into #fs-results. The renderer is pure:
+// the route has already resolved hostnames, last polls and the REST `totals`. Application ->
+// version -> device, never host-first. Every interpolation goes through esc()/url_encode(); no JS
+// string is built from data. No hx-on: the chips call fsKind() from software_page_script().
+
+constexpr const char* kFindFragment = "/fragments/inventory/software/find";
+
+// One sync scope for every control that re-requests #fs-results (the form, "show only these", the
+// status pill's x, Retry): #fs-form is outside every swap, so a later search supersedes a slower
+// earlier request instead of racing it. Load more swaps only its own row and stays unsynced.
+constexpr const char* kFindSync = "hx-sync=\"#fs-form:replace\"";
+
+// Every rule is scoped to an fs-* class, #fs-form or #fs-results, so nothing here restyles the
+// catalogue tables; everything else reuses the page's inv-*, gp-* and pill classes.
+std::string find_style() {
+    return R"css(<style>
+  .fs-head{display:flex;flex-wrap:wrap;align-items:center;gap:6px 12px;padding:14px 16px;border-bottom:1px solid var(--line)}
+  .fs-head h2{margin:0;font-size:16px;font-weight:600;color:var(--ink)}
+  .fs-head .fs-hint{flex:1 1 280px}
+  .fs-hint{font-size:12.5px;color:var(--mut)}
+  .fs-in{height:var(--ctl);width:150px;padding:0 10px;border:1px solid var(--line2);border-radius:var(--rad-ctl);background:var(--bg);color:var(--ink);font:inherit}
+  .fs-in::placeholder{color:var(--faint)}
+  #fs-form .inv-frow .inv-search{flex:1 1 320px}
+  .fs-cards{display:flex;flex-wrap:wrap;gap:14px;align-items:stretch}
+  .fs-cards>.inv-kpis{flex:3 1 520px}
+  .fs-apart{flex:1 1 250px;display:flex;flex-direction:column;padding:14px 18px;border:1px dashed var(--line2);border-radius:var(--rad-panel);background:transparent}
+  .fs-apart .big{font-size:26px;font-weight:500;letter-spacing:-.02em;line-height:1.15;color:var(--warn)}
+  .fs-apart .h{margin-top:2px;font-size:13px;color:var(--mut)}
+  .fs-apart .s2{margin-top:4px;font-size:12.5px;color:var(--mut)}
+  .fs-apart .inv-link{align-self:flex-start;margin-top:6px}
+  tr.fs-vgrp>td{padding:8px 16px;background:var(--surface2);color:var(--ink);font-weight:600}
+  #fs-results table.inv-tbl tbody td{white-space:nowrap}
+  #fs-results table.inv-tbl tr.inv-more td,#fs-results table.inv-tbl td.fs-msg,#fs-results table.inv-tbl td.inv-empty{white-space:normal}
+  .fs-trunc{display:inline-block;max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;vertical-align:bottom}
+  .fs-src{margin-left:6px}
+  table.inv-tbl.fs-tight th,table.inv-tbl.fs-tight td{padding-left:12px;padding-right:12px}
+  table.inv-tbl.fs-tight .fs-trunc{max-width:230px}
+  table.inv-tbl.fs-tight .fs-trunc.tail{max-width:200px;direction:rtl;text-align:left}
+  .fs-box{background:var(--surface);border:1px solid var(--line);border-radius:var(--rad-panel)}
+  .fs-ttl{display:block;margin-bottom:4px;color:var(--ink);font-weight:600;font-size:14px}
+  .fs-next{margin-top:10px;color:var(--ink2)}
+</style>)css";
+}
+
+// The panel's filters as query pairs, in the order every emitted URL carries them. `with_kind` is
+// the fragment's chip; the REST application lookup has no `kind` (the catalogue's app/pkg split).
+std::vector<std::pair<std::string, std::string>> find_kv(const SoftwareFindFilters& f,
+                                                         bool with_kind) {
+    std::vector<std::pair<std::string, std::string>> kv{{"name", f.name}};
+    if (with_kind)
+        kv.emplace_back("kind", f.kind);
+    if (!f.version.empty())
+        kv.emplace_back("version", f.version);
+    if (!f.version_min.empty())
+        kv.emplace_back("version_min", f.version_min);
+    if (!f.version_max.empty())
+        kv.emplace_back("version_max", f.version_max);
+    if (!f.status.empty())
+        kv.emplace_back("status", f.status);
+    return kv;
+}
+
+// The fragment URL for these filters (the cursor is never part of it: Load more adds its own).
+std::string find_url(const SoftwareFindFilters& f) {
+    return std::string(kFindFragment) + "?" + query_of(find_kv(f, true));
+}
+
+// A control that re-runs the search with other filters into #fs-results.
+std::string find_get_attrs(const SoftwareFindFilters& f) {
+    return "hx-get=\"" + esc(find_url(f)) + "\" hx-target=\"#fs-results\" hx-swap=\"innerHTML\" " +
+           kFindSync;
+}
+
+// The REST lookup the current filters correspond to: the copy-able call line (`csv` = false) and
+// the Export CSV link (`csv` = true). Applications carry no `kind` (that parameter is the
+// catalogue's app/pkg split, not the chip).
+std::string find_rest_path(const SoftwareFindFilters& f, bool csv) {
+    const bool comp = find_is_components(f);
+    auto kv = find_kv(f, comp);
+    if (csv)
+        kv.emplace_back("format", "csv");
+    else
+        kv.emplace_back("limit", std::to_string(kSoftwareFindPageSize));
+    return std::string(comp ? "/api/v1/inventory/software/components?"
+                            : "/api/v1/inventory/software?") +
+           query_of(kv);
+}
+
+std::string find_input(const char* name, const char* label, const char* placeholder) {
+    return std::string("<input class=\"fs-in\" name=\"") + name + "\" aria-label=\"" + label +
+           "\" placeholder=\"" + placeholder + "\" maxlength=\"256\" autocomplete=\"off\">";
+}
+
+// The panel shell: the search form (a plain htmx GET form, no hx-on) and the results region.
+std::string find_panel(bool confined) {
+    std::string h = find_style();
+    h += "<div class=\"inv-panel\" id=\"fs-panel\"><div class=\"fs-head\"><h2>Find software</h2>"
+         "<span class=\"fs-hint\">Type a package name to see how many installs and devices carry "
+         "it, where, and how fresh the data is.</span><span class=\"inv-pill\">Scope: ";
+    h += confined ? "your management groups" : "whole fleet";
+    h += "</span></div><form id=\"fs-form\" class=\"inv-pb\" hx-get=\"";
+    h += kFindFragment;
+    h += std::string("\" hx-target=\"#fs-results\" hx-swap=\"innerHTML\" ") + kFindSync +
+         "><input type=\"hidden\" id=\"fs-kind\" name=\"kind\" value=\"app\"><div class=\"inv-filters\">";
+    h += "<div class=\"inv-frow\"><label class=\"lab\" for=\"fs-name\">Package</label>"
+         "<input id=\"fs-name\" class=\"inv-search\" type=\"search\" name=\"name\" required "
+         "maxlength=\"1024\" autocomplete=\"off\" placeholder=\"Package or application name, e.g. "
+         "log4j-core\"><span class=\"fs-hint\">exact name</span>"
+         "<button type=\"submit\" class=\"inv-btn pri sm\">Find</button></div>";
+    h += "<div class=\"inv-frow\"><span class=\"lab\">Version</span>";
+    h += find_input("version", "Exact version", "exact, e.g. 4.2.1");
+    h += "<span class=\"fs-hint\">or from</span>";
+    h += find_input("version_min", "From version", "from, e.g. 2.0");
+    h += "<span class=\"fs-hint\">to</span>";
+    h += find_input("version_max", "To version", "to, e.g. 2.14.1");
+    h += "<span class=\"fs-hint\">(range is inclusive)</span></div>";
+    h += "<div class=\"inv-frow\"><span class=\"lab\">Kind</span><div class=\"inv-chips\" "
+         "role=\"group\" aria-label=\"Kind\">";
+    for (const auto& k : kSoftwareFindKinds) {
+        h += "<button type=\"button\" class=\"inv-chip\" data-fs-kind=\"" + std::string(k.token) +
+             "\" aria-pressed=\"" + (k.token == kSoftwareFindApp ? "true" : "false") + "\">" +
+             std::string(k.label) + "</button>";
+    }
+    h += "</div><span class=\"fs-hint\">Java, Python and Node search components found inside "
+         "applications</span></div></div></form></div>";
+    h += "<div id=\"fs-results\"><div class=\"inv-empty fs-box\">Nothing searched yet. Type a "
+         "package name above. Counts use the exact name; add a version, or a from/to range, to "
+         "narrow them.</div></div>";
+    return h;
+}
+
+std::string find_degrade(const SoftwareFindFilters& f) {
+    return "<div class=\"inv-degrade\" role=\"alert\"><b>Inventory store unavailable.</b> The "
+           "installed-software store did not answer, so nothing is shown rather than an empty "
+           "list that could be mistaken for \"no software\". <button type=\"button\" "
+           "class=\"inv-btn\" data-act=\"retry\" " +
+           find_get_attrs(f) + ">Retry</button></div>";
+}
+
+// The device's name as a link to its Hardware record; an agent the roster does not name shows its
+// id. Shared by the devices table and the Find software table.
+std::string host_link(const std::string& agent_id, const std::string& hostname) {
+    const bool named = !hostname.empty();
+    return std::string("<a class=\"inv-hostlink") + (named ? "" : " inv-unnamed") +
+           "\" href=\"/hardware/ci?id=" + url_encode(agent_id) + "\" title=\"" +
+           (named ? "Open this device (Hardware &rsaquo; CI view)"
+                  : "No host name on record; opens the device page by agent id") +
+           "\">" + esc(named ? hostname : agent_id) + "</a>";
+}
+
+// The OS cell: the roster's OS string first, else (installs) the ecosystem's OS family.
+std::string find_os_cell(const SoftwareFindRow& r) {
+    const std::string os = lc(r.os);
+    std::string_view fam;
+    if (os.find("darwin") != std::string::npos || os.find("mac") != std::string::npos)
+        fam = "macos"; // before "win": "darwin" contains it
+    else if (os.find("win") != std::string::npos)
+        fam = "windows";
+    else if (os.find("linux") != std::string::npos)
+        fam = "linux";
+    else if (!r.ecosystem.empty())
+        fam = eco_family(r.ecosystem);
+    // An ecosystem with no OS family ("other": python, middleware) names no OS, so it falls
+    // through to the roster's raw string, else the dash, never an empty pill.
+    if (const std::string_view name = family_name(fam); !name.empty())
+        return std::string("<span class=\"inv-pill ") + family_cls(fam) + "\">" + std::string(name) +
+               "</span>";
+    if (!r.os.empty())
+        return "<span class=\"inv-pill\">" + esc(r.os) + "</span>";
+    return dash();
+}
+
+std::string find_status_pill(const std::string& status, bool comp) {
+    if (status == "current")
+        return "<span class=\"pill ok\">current</span>";
+    if (status == "disabled")
+        return "<span class=\"pill idle\" title=\"this source is switched off on the device\">"
+               "disabled</span>";
+    return std::string("<span class=\"pill warn\" title=\"the last report did not confirm this ") +
+           (comp ? "component" : "install") + "\">unconfirmed</span>";
+}
+
+std::string find_ago(std::int64_t now, std::int64_t then) {
+    return "<span class=\"inv-grey\">" + esc(rel_time(now, then)) + "</span>";
+}
+
+// Last synced: amber past the 48 h window. Shared by the devices table and the Find software table.
+std::string synced_cell(std::int64_t now, const std::optional<std::int64_t>& synced) {
+    if (!synced || *synced <= 0)
+        return dash();
+    if (now - *synced > kStaleSecs)
+        return "<span class=\"inv-pill stale\" title=\"last sync more than 48h ago\">" +
+               esc(rel_time(now, *synced)) + "</span>";
+    return find_ago(now, *synced);
+}
+
+std::string find_path_cell(const std::string& path, bool tail) {
+    if (path.empty())
+        return dash();
+    std::string h = "<span class=\"inv-mono fs-trunc";
+    h += tail ? " tail" : "";
+    h += "\" title=\"" + esc(path) + "\">";
+    h += tail ? "<bdo dir=\"ltr\">" + esc(path) + "</bdo>" : esc(path);
+    return h + "</span>";
+}
+
+std::string find_row_html(const SoftwareFindRow& r, bool comp, std::int64_t now) {
+    std::string h = "<tr><td>" + host_link(r.agent_id, r.hostname) + "</td><td>" + find_os_cell(r) + "</td>";
+    if (comp) {
+        h += "<td class=\"inv-mono\">" + esc(r.name) + "</td><td>";
+        h += r.version.empty() ? dash() : "<span class=\"inv-mono\">" + esc(r.version) + "</span>";
+        if (!r.version_source.empty())
+            h += "<span class=\"inv-pill fs-src\" title=\"Where the version was read from\">" +
+                 esc(r.version_source) + "</span>";
+        h += "</td><td>" + find_path_cell(r.path, true) + "</td><td>";
+        h += r.anchor_app.empty()
+                 ? "<span class=\"inv-grey\" title=\"not inside an application folder\">" +
+                       std::string(kEm) + "</span>"
+                 : find_path_cell(r.anchor_app, false);
+        h += "</td><td>" + find_status_pill(r.status, true) + "</td>";
+    } else {
+        h += "<td class=\"inv-mono\">" + (r.version.empty() ? dash() : esc(r.version)) + "</td><td>" +
+             find_path_cell(r.path, false) + "</td><td class=\"inv-mono\">" +
+             (r.install_type.empty() ? dash() : esc(r.install_type)) + "</td><td>" +
+             find_status_pill(r.status, false) + "</td><td>" +
+             (r.last_confirmed_at > 0 ? find_ago(now, r.last_confirmed_at) : dash()) + "</td>";
+    }
+    return h + "<td>" + synced_cell(now, r.last_synced) + "</td></tr>";
+}
+
+// The table body for one page: version groups (newest first, the catalogue's own comparator)
+// within the page, the rows of a group in the order the read returned them, then the Load-more
+// row. The keyset order is name -> device, so a group repeats on a later page. The comparator is a
+// preorder (1.0 and 1.0.0 tie), so newer_than() (the catalogue's total order) breaks the tie. Find
+// has no installs figure, so it passes 0 for both and the tie falls through to the raw string, the
+// greater first: equal strings stay contiguous and share one group header.
+std::string find_body(const SoftwareFindData& d) {
+    const bool comp = find_is_components(d.f);
+    const auto& rows = *d.rows;
+    std::vector<const SoftwareFindRow*> order;
+    order.reserve(rows.size());
+    for (const auto& r : rows)
+        order.push_back(&r);
+    std::ranges::stable_sort(order, [](const SoftwareFindRow* a, const SoftwareFindRow* b) {
+        return software_catalog::newer_than(a->version, 0, b->version, 0);
+    });
+    std::string body;
+    const char* noun = comp ? " components" : " installs";
+    for (std::size_t i = 0; i < order.size();) {
+        std::size_t j = i;
+        while (j < order.size() && order[j]->version == order[i]->version)
+            ++j;
+        body += "<tr class=\"fs-vgrp\"><td colspan=\"8\"><span class=\"inv-mono\">" +
+                (order[i]->version.empty() ? std::string("(unknown)") : esc(order[i]->version)) +
+                "</span> <span class=\"inv-grey\">&middot; " + fmt_int(static_cast<std::int64_t>(j - i)) +
+                noun + " on this page</span></td></tr>";
+        for (std::size_t k = i; k < j; ++k)
+            body += find_row_html(*order[k], comp, d.now_secs);
+        i = j;
+    }
+    // A wide-scope first page can be empty yet non-terminal: never claim "nothing found" then. The
+    // notice is first-page only (Load more swaps just its own row, so a continuation notice would
+    // pile up) and only where a Load button follows.
+    if (rows.empty() && d.f.cursor.empty() && !d.next_cursor.empty())
+        body += "<tr><td colspan=\"8\" class=\"inv-empty\">No devices on this page; more may be in "
+                "later pages. Use the Load button below.</td></tr>";
+    if (!d.next_cursor.empty()) {
+        auto kv = find_kv(d.f, true);
+        kv.emplace_back("cursor", d.next_cursor);
+        kv.emplace_back("shown", std::to_string(d.shown_before));
+        body += "<tr class=\"inv-more\"><td colspan=\"8\"><button type=\"button\" class=\"inv-btn "
+                "pri\" data-act=\"fmore\" hx-get=\"" +
+                esc(std::string(kFindFragment) + "?" + query_of(kv)) +
+                "\" hx-target=\"closest tr\" hx-swap=\"outerHTML\" hx-disabled-elt=\"this\">Load " +
+                std::to_string(kSoftwareFindPageSize) + " more rows</button><span class=\"inv-cursor\">" +
+                fmt_int(d.shown_before) + " loaded</span></td></tr>";
+    } else {
+        // A match count that is an exact multiple of the page size ends on an empty continuation,
+        // so every terminal page says so. An empty terminal FIRST page never reaches here
+        // (render_software_find answers find_nothing).
+        body += "<tr class=\"inv-more\"><td colspan=\"8\"><span class=\"inv-grey\">All " +
+                fmt_int(d.shown_before) + " matching rows are loaded.</span></td></tr>";
+    }
+    return body;
+}
+
+std::string find_table_head(bool comp) {
+    return comp ? "<th scope=\"col\">Device</th><th scope=\"col\">OS</th><th scope=\"col\">Component"
+                  "</th><th scope=\"col\" title=\"Version, and where it was read from\">Version (read "
+                  "from)</th><th scope=\"col\">Path</th><th scope=\"col\" title=\"The application "
+                  "folder the component sits inside\">Inside</th><th scope=\"col\">Status</th>"
+                  "<th scope=\"col\" title=\"When the device last sent its software inventory; amber "
+                  "after 48 h\">Last synced</th>"
+                : "<th scope=\"col\">Device</th><th scope=\"col\">OS</th><th scope=\"col\">Version"
+                  "</th><th scope=\"col\">Install location</th><th scope=\"col\">Install type</th>"
+                  "<th scope=\"col\" title=\"confirmed by the device's last report, unconfirmed if it "
+                  "was not\">Status</th><th scope=\"col\" title=\"When a report last confirmed this "
+                  "install\">Last confirmed</th><th scope=\"col\" title=\"When the device last sent "
+                  "its software inventory; amber after 48 h\">Last synced</th>";
+}
+
+std::string find_cards(const SoftwareFindData& d) {
+    const bool comp = find_is_components(d.f);
+    const auto& t = *d.totals;
+    std::string h = "<div class=\"fs-cards\"><div class=\"inv-kpis\">";
+    h += std::string("<div class=\"inv-kpi\" title=\"") +
+         (comp ? "Component rows: one per device and component path"
+               : "Install rows: a device with two copies counts twice") +
+         "\"><div class=\"h\">" + (comp ? "Components" : "Installs") + "</div><div class=\"big\">" +
+         fmt_int(t.rows) + "</div><div class=\"s2\">matching the exact name" +
+         (d.f.version.empty() && d.f.version_min.empty() && d.f.version_max.empty()
+              ? ""
+              : " and version") +
+         "</div></div>";
+    h += "<div class=\"inv-kpi\" title=\"Distinct devices carrying it\"><div class=\"h\">Devices"
+         "</div><div class=\"big\">" +
+         fmt_int(t.devices) + "</div><div class=\"s2\">distinct devices &middot; some carry more "
+                              "than one copy</div></div></div>";
+    if (comp && t.devices_unconfirmed > 0) {
+        SoftwareFindFilters only = d.f;
+        only.status = "unconfirmed";
+        h += "<div class=\"fs-apart\" role=\"note\"><div class=\"big\">" + fmt_int(t.devices_unconfirmed) +
+             (t.devices_unconfirmed == 1 ? " device" : " devices") +
+             "</div><div class=\"h\">Not confirmed by their last report</div><div class=\"s2\">"
+             "Included in the counts above. Yuzu keeps the last known component and marks it "
+             "unconfirmed.</div><button type=\"button\" class=\"inv-link\" " +
+             find_get_attrs(only) + ">show only these</button></div>";
+    }
+    h += "</div><div class=\"inv-fresh\">";
+    h += t.as_of ? "Counts as of " + esc(rel_time(d.now_secs, *t.as_of)) + " (hourly rollup)."
+                 : std::string("Counts are computed live when you search.");
+    h += " Table rows are read when you search.</div>";
+    return h;
+}
+
+// Why no count card: scope (confined), filters (the REST totals rule), or the rollup is building.
+std::string find_no_totals_note(const SoftwareFindData& d) {
+    if (d.confined || d.totals_omitted == software_list::kOmittedScope)
+        return "<div class=\"inv-caveat\"><b>Fleet totals are not shown to an account scoped to "
+               "management groups.</b> A count of only part of the fleet could be read as the whole "
+               "of it, so none is given. The table below lists the matching rows on the devices in "
+               "your groups.</div>";
+    if (d.totals_omitted == software_list::kOmittedBuilding)
+        return "<div class=\"inv-caveat\"><b>Counts are still being built.</b> The hourly rollup has "
+               "not produced them yet; the table below is read live.</div>";
+    return "<div class=\"inv-caveat\"><b>No count for these filters.</b> Counts are shown for an exact "
+           "name with at most one version filter (an exact version or a from/to range) and no status "
+           "filter. The table below is read live.</div>";
+}
+
+std::string find_rest_line(const SoftwareFindFilters& f) {
+    const std::string call = find_rest_path(f, false);
+    return "<div class=\"inv-rest\" title=\"every control maps to one REST parameter\"><span>GET</span>"
+           "<span class=\"v\">" +
+           esc(call) + "</span><button type=\"button\" class=\"inv-link\" data-fs-copy=\"" +
+           esc(call) + "\">copy</button></div>";
+}
+
+std::string find_nothing(const SoftwareFindData& d) {
+    const bool comp = find_is_components(d.f);
+    std::string h = "<div class=\"inv-empty fs-box\"><span class=\"fs-ttl\">Nothing found.</span>No ";
+    h += comp ? "component" : "install";
+    h += " matches the exact name &ldquo;" + esc(d.f.name) +
+         "&rdquo; on any device in your scope. The store answered, so this is a real zero, not a "
+         "failure. Check the spelling, or clear the version fields.";
+    if (!comp)
+        h += "<div class=\"fs-next\">" + esc(d.f.name) + " may be a component that lives inside "
+             "applications. <button type=\"button\" class=\"inv-link\" data-fs-kind=\"java\">"
+             "Search Java components for " + esc(d.f.name) + "</button></div>";
+    return h + "</div>";
+}
+
 } // namespace
 
 std::string software_page_url(const SoftwarePageFilters& f, SoftwarePageMode mode, bool with_inputs) {
@@ -747,12 +1127,16 @@ std::string render_software_page(const SoftwarePageFilters& f, const SoftwarePag
     }
     // Full page.
     std::string h = sw_head();
+    h += find_panel(d.confined); // Find software: the first block, above the KPI strip
     if (d.confined) {
         // Management-group-confined caller: no fleet figures at all (not even the strip).
         h += "<div id=\"sw-kpis\">" + caveat(d.caveat ? *d.caveat
                                                      : "Fleet-wide figures are not shown to a "
                                                        "management-group-scoped account; this page "
-                                                       "shows the selected device's software only.") +
+                                                       "shows the selected device's software only. "
+                                                       "Open a device from Hardware \xE2\x86\x92 "
+                                                       "Installed software \xE2\x86\x92 Open in "
+                                                       "Software.") +
              "</div>";
         if (d.caveat) // refused: the caveat is all there is, so it carries the reset too
             return h + "<div class=\"inv-caveat\">" + kResetLink + "</div></div>";
@@ -797,10 +1181,10 @@ std::string render_software_versions_expansion(
              ((r.newest && !confined) ? " <span class=\"inv-pill on\">newest in fleet</span>" : "") +
              "</td><td class=\"inv-num\">" + fmt_int(r.device_count) +
              "</td><td><div class=\"inv-bar\"><span style=\"width:" + std::to_string(pct) +
-             "%\"></span></div></td><td class=\"inv-act\"><span class=\"inv-devbtn\" data-vdevs "
+             "%\"></span></div></td><td class=\"inv-act\"><button type=\"button\" class=\"inv-devbtn\" data-vdevs "
              "data-tog=\"d\" aria-expanded=\"false\" hx-get=\"" +
              esc(version_devices_url(f, name, r.version, r.device_count)) + "\" hx-target=\"#" + box +
-             "\" hx-swap=\"innerHTML\">devices &rsaquo;</span></td></tr><tr class=\"inv-exp\">"
+             "\" hx-swap=\"innerHTML\">devices &rsaquo;</button></td></tr><tr class=\"inv-exp\">"
              "<td colspan=\"4\"><div id=\"" + box + "\"></div></td></tr>";
     }
     h += "</tbody></table>";
@@ -824,8 +1208,8 @@ std::string render_software_devices_table(const SoftwarePageFilters& f, const So
     std::string body;
     for (const auto& r : *t.rows) {
         const auto hn = t.hostnames.find(r.agent_id);
-        const bool named = hn != t.hostnames.end() && !hn->second.empty();
-        const std::string host = named ? hn->second : r.agent_id;
+        const std::string hostname = hn != t.hostnames.end() ? hn->second : std::string{};
+        const std::string host = hostname.empty() ? r.agent_id : hostname;
         const auto fam = eco_family(r.entry.ecosystem);
         // Last synced: a degraded bulk read (no map) is told apart from "never synced" (a plain dash).
         std::string synced = t.last_synced ? dash()
@@ -834,19 +1218,11 @@ std::string render_software_devices_table(const SoftwarePageFilters& f, const So
                                                  kEm + "</span>";
         if (t.last_synced) {
             const auto it = t.last_synced->find(r.agent_id);
-            if (it != t.last_synced->end() && it->second > 0) {
-                const std::string ago = esc(rel_time(t.now_secs, it->second));
-                synced = t.now_secs - it->second > kStaleSecs
-                             ? "<span class=\"inv-pill stale\" title=\"last sync more than 48h ago\">" + ago + "</span>"
-                             : "<span class=\"inv-grey\">" + ago + "</span>";
-            }
+            if (it != t.last_synced->end() && it->second > 0)
+                synced = synced_cell(t.now_secs, it->second);
         }
-        body += "<tr data-gpf=\"" + grp + "\" data-gpname=\"" + esc(lc(host)) + "\"><td><a class=\"inv-hostlink" +
-                (named ? "" : " inv-unnamed") + "\" href=\"/hardware/ci?id=" + url_encode(r.agent_id) +
-                "\" title=\"" +
-                (named ? "Open this device (Hardware &rsaquo; CI view)"
-                       : "No host name on record; opens the device page by agent id") +
-                "\">" + esc(host) + "</a></td><td>" +
+        body += "<tr data-gpf=\"" + grp + "\" data-gpname=\"" + esc(lc(host)) + "\"><td>" +
+                host_link(r.agent_id, hostname) + "</td><td>" +
                 (fam.empty() ? dash()
                              : std::string("<span class=\"inv-pill ") + family_cls(fam) + "\">" +
                                    family_name(fam) + "</span>") +
@@ -898,9 +1274,52 @@ std::string render_software_devices_table(const SoftwarePageFilters& f, const So
     return h;
 }
 
+std::string render_software_find(const SoftwareFindData& d) {
+    const bool rows_only = !d.f.cursor.empty();
+    const bool comp = find_is_components(d.f);
+    if (d.caveat || !d.rows) { // a degraded read: the retry banner, never an empty table
+        const std::string m = d.caveat ? "<div class=\"inv-caveat\">" + esc(*d.caveat) + "</div>"
+                                       : find_degrade(d.f);
+        return rows_only ? "<tr><td colspan=\"8\" class=\"fs-msg\">" + m + "</td></tr>" : m;
+    }
+    if (rows_only)
+        return find_body(d);
+
+    std::string h = find_rest_line(d.f);
+    if (!d.f.status.empty()) {
+        SoftwareFindFilters cleared = d.f;
+        cleared.status.clear();
+        h += "<div class=\"inv-active\"><span class=\"inv-apill\">status: " + esc(d.f.status) +
+             "<button type=\"button\" aria-label=\"Remove filter status: " + esc(d.f.status) + "\" " +
+             find_get_attrs(cleared) + ">&times;</button></span></div>";
+    }
+    const bool none = d.rows->empty() && d.next_cursor.empty();
+    if (!none)
+        h += d.totals ? find_cards(d) : find_no_totals_note(d);
+    if (comp)
+        h += "<div class=\"inv-caveat\"><b>Coverage.</b> These results include only devices that "
+             "have sent their component list. A device that has not cannot be ruled in or out.</div>";
+    if (none)
+        return h + find_nothing(d);
+
+    h += "<div class=\"inv-panel\"><div class=\"inv-resbar\"><div class=\"inv-count\" "
+         "aria-live=\"polite\"><b>" +
+         fmt_int(d.shown_before) + "</b> rows " + (d.confined ? "on devices in your groups" : "loaded") +
+         " &middot; " + (comp ? "component" : "application") +
+         " &rarr; version (newest first on each page) &rarr; device</div><div class=\"inv-exports\"><a "
+         "class=\"inv-btn sm\" href=\"" +
+         esc(find_rest_path(d.f, true)) + "\" download=\"" +
+         (comp ? "software-components.csv" : "software-installs.csv") +
+         "\" title=\"the matching rows (up to 10,000); the file says if it was cut off\">Export "
+         "CSV</a></div></div><div class=\"inv-tblwrap\"><table class=\"inv-tbl" +
+         (comp ? " fs-tight" : "") + "\"><thead><tr>" + find_table_head(comp) + "</tr></thead><tbody>" +
+         find_body(d) + "</tbody></table></div></div>";
+    return h;
+}
+
 std::string software_page_script() {
     return R"js(<script>
-/* Software page: URL hash <-> filters, expansion toggles, host type-ahead. Inline handlers and listeners only, no eval. */
+/* Software page: URL hash <-> filters, expansion toggles, host type-ahead, Find software. Inline handlers and listeners only, no eval. */
 var swBoot = true, swLaterPending = false;
 function swHash() {
   var r = document.getElementById('sw-results');
@@ -926,6 +1345,22 @@ function swClear(what) {
   var ids = what === 'q' ? ['sw-q'] : what === 'host' ? ['sw-host', 'sw-agent'] : ['sw-q', 'sw-host', 'sw-agent'];
   for (var i = 0; i < ids.length; i++) { var e = document.getElementById(ids[i]); if (e) e.value = ''; }
 }
+/* Find software: a kind chip (or the nothing-found link) sets the hidden kind and re-runs a non-empty search;
+   the REST call line copies itself. One delegated listener, so the fragments carry no inline handler. */
+function fsKind(t) {
+  var k = document.getElementById('fs-kind'), f = document.getElementById('fs-form'), n = document.getElementById('fs-name'),
+      c = document.querySelectorAll('.inv-chip[data-fs-kind]');
+  if (!k || !f) return;
+  k.value = t;
+  for (var i = 0; i < c.length; i++) c[i].setAttribute('aria-pressed', c[i].getAttribute('data-fs-kind') === t ? 'true' : 'false');
+  if (n && n.value.trim() && f.requestSubmit) f.requestSubmit();
+}
+document.body.addEventListener('click', function (e) {
+  var t = e.target && e.target.closest ? e.target.closest('[data-fs-kind],[data-fs-copy]') : null;
+  if (!t) return;
+  if (t.hasAttribute('data-fs-copy')) { if (navigator.clipboard) navigator.clipboard.writeText(location.origin + t.getAttribute('data-fs-copy')); return; }
+  fsKind(t.getAttribute('data-fs-kind'));
+});
 function swMark(box, open) {
   var o = document.querySelectorAll('[hx-target="#' + box.id + '"]');
   for (var i = 0; i < o.length; i++) {
@@ -934,6 +1369,12 @@ function swMark(box, open) {
     var tr = o[i].closest ? o[i].closest('tr.click') : null;
     if (tr) tr.setAttribute('aria-expanded', open ? 'true' : 'false');
   }
+}
+/* Title rows are role=button: Enter/Space fires the row's click (htmx's default trigger). A nested
+   native button (versions / devices) handles its own key. */
+function swKey(e, el) {
+  if ((e.key !== 'Enter' && e.key !== ' ') || e.target.closest('button')) return;
+  e.preventDefault(); el.click();
 }
 function swShut(box) { box.innerHTML = ''; box.removeAttribute('data-open'); swMark(box, false); }
 function swClose(x) {
@@ -1027,11 +1468,36 @@ document.body.addEventListener('htmx:beforeRequest', function (e) {
     }
     return;
   }
+  var act = el.getAttribute('data-act');
+  if (act === 'dmore' || act === 'fmore') {  /* the swapped row is replaced in place: remember its index */
+    var tr = el.closest('tr');
+    if (tr) window.__swMore = { tb: tr.parentNode, i: tr.sectionRowIndex, btn: el };
+  }
   var m = el.getAttribute('data-tog');
   if (m && t && t.getAttribute('data-open') === m && t.firstChild) { e.preventDefault(); swShut(t); }
 });
+document.body.addEventListener('htmx:afterRequest', function (e) {
+  /* Load more finished (swapped, empty, failed or aborted): the marker is consumed only by its own request */
+  var mo = window.__swMore, rc = e.detail && e.detail.requestConfig;
+  if (!mo || !rc || rc.elt !== mo.btn) return;
+  window.__swMore = null;
+  if (!e.detail.successful) {  /* failed: put focus back on the re-enabled button */
+    if (e.detail.xhr && e.detail.xhr.status === 401) { location.assign('/login'); return; }
+    setTimeout(function () { if (mo.btn.isConnected) mo.btn.focus(); }, 0);
+    return;
+  }
+  var box = mo.tb.closest('div[id^="exp-"]') || mo.tb.closest('.inv-devs'),
+      flt = box && box.querySelector('.inv-devfilter'), rows = mo.tb.rows, ff, i;
+  if (flt && flt.value && typeof gpSearch === 'function') gpSearch(flt);  /* so hidden new rows are skipped */
+  for (i = mo.i; i < rows.length && !ff; i++)  /* first visible new row; it lands at the replaced row's index */
+    if (rows[i].style.display !== 'none' && !rows[i].classList.contains('inv-more')) ff = rows[i].querySelector('a,button');
+  if (!ff && rows[mo.i] && rows[mo.i].classList.contains('inv-more')) ff = rows[mo.i].querySelector('button');  /* empty page, next cursor */
+  ff = ff || flt;
+  if (ff) ff.focus();
+});
 document.body.addEventListener('htmx:afterSwap', function (e) {
-  var el = e.detail.elt, t = e.detail.target, m = el && el.getAttribute && el.getAttribute('data-tog');
+  var rc = e.detail.requestConfig, el = (rc && rc.elt) || e.detail.elt,  /* htmx 2: detail.elt is the target here */
+      t = e.detail.target, m = el && el.getAttribute && el.getAttribute('data-tog');
   if (m && t && t.id) { t.setAttribute('data-open', m); swMark(t, true); }
 });
 document.body.addEventListener('htmx:afterSettle', function () {

@@ -43,7 +43,7 @@ namespace yuzu::echo {
 /// The single exception type every Echo collector throws to report an
 /// incomplete capture (a failed read, a kernel/parser-reported truncation,
 /// or an entry-cap reached before the whole table was consumed) --
-/// service/mapdrive's subprocess legs, and every ARP/mapdrive native leg.
+/// service/mapdrive's subprocess legs, and every ARP/mapdrive/user native leg.
 /// collect_or_retain() below catches ONLY this type (round 3, B3-003): an
 /// earlier cut caught bare `std::exception`, which would also swallow a
 /// genuine std::bad_alloc or other programming/allocation failure thrown out
@@ -152,7 +152,7 @@ inline CaptureCompleteness classify_subprocess_capture(bool tool_ran, bool timed
 /// (an incomplete/failed/truncated/capped capture, however the specific
 /// collector detected that -- subprocess status via
 /// classify_subprocess_capture above, or a platform syscall's own error
-/// contract for the native ARP/mapdrive legs), in which case `current` is
+/// contract for the native ARP/mapdrive/user legs), in which case `current` is
 /// empty and `skip_reason` carries the thrown what() for logging.
 template <typename T>
 struct CollectOrRetain {
@@ -161,7 +161,7 @@ struct CollectOrRetain {
 };
 
 /// The single collect-or-retain seam every Echo snapshot-diff source applies
-/// (service, mapdrive, arp): call `collect`, and on a thrown
+/// (service, user, mapdrive, arp): call `collect`, and on a thrown
 /// IncompleteCaptureError -- the shared, dedicated signal a collector uses
 /// to report "this capture did not complete" -- return an empty result
 /// instead of propagating, so the caller's existing "skip this tick's diff
@@ -197,7 +197,7 @@ auto collect_or_retain(CollectFn&& collect) {
 
 /// The `snapshot` action's (do_snapshot, echo_plugin.cpp) single honesty
 /// decision (round 3, B3-002): given the names of every enabled source that
-/// collect_or_retain skipped this pass (arp/service/mapdrive -- whichever
+/// collect_or_retain skipped this pass (arp/service/user/mapdrive -- whichever
 /// legs threw IncompleteCaptureError), produce the exact response line the
 /// action writes. Previously `snapshot` unconditionally reported
 /// "echo|snapshot|complete" even when a source was classified incomplete and
@@ -243,7 +243,7 @@ struct SnapshotPhaseOutcome {
 };
 
 /// `has_earlier_skips` folds in whatever collect_or_retain already pushed
-/// onto skipped_sources BEFORE this call (arp/service/mapdrive -- the legs
+/// onto skipped_sources BEFORE this call (arp/service/user/mapdrive -- the legs
 /// that throw IncompleteCaptureError and are silently retained rather than
 /// returning a nonzero phase rc). Without it, a forced snapshot that
 /// retained one of those sources still returned rc 0 here -- the phase

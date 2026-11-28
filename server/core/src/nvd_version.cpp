@@ -1,5 +1,7 @@
 #include "nvd_version.hpp"
 
+#include "vers_range.hpp"
+
 #include <algorithm>
 #include <array>
 #include <cctype>
@@ -184,15 +186,12 @@ bool nvd_version_in_range(std::string_view installed, const VersionRange& r) {
     const bool has_bound = !r.start_including.empty() || !r.start_excluding.empty() ||
                            !r.end_including.empty() || !r.end_excluding.empty();
     if (has_bound) {
-        if (!r.start_including.empty() && nvd_version_compare(installed, r.start_including) < 0)
-            return false;
-        if (!r.start_excluding.empty() && nvd_version_compare(installed, r.start_excluding) <= 0)
-            return false;
-        if (!r.end_including.empty() && nvd_version_compare(installed, r.end_including) > 0)
-            return false;
-        if (!r.end_excluding.empty() && nvd_version_compare(installed, r.end_excluding) >= 0)
-            return false;
-        return true;
+        // The shared interval core (vers_range.hpp): the inclusive pair and the exclusive pair are
+        // each one interval, and all four bounds must hold.
+        return vers::in_interval(installed, r.start_including, true, r.end_including, true,
+                                 nvd_version_compare) &&
+               vers::in_interval(installed, r.start_excluding, false, r.end_excluding, false,
+                                 nvd_version_compare);
     }
 
     // No range: the CPE version field decides.

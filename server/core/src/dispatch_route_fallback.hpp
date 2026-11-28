@@ -4,7 +4,6 @@
 #include <optional>
 #include <string>
 #include <unordered_map>
-#include <unordered_set>
 #include <vector>
 
 #include "agent_registry.hpp"
@@ -15,9 +14,14 @@
 /// A) into the confined-dispatch arm walk (`dispatch_confined_arms.hpp`) as a
 /// FALLBACK-ONLY consult.
 ///
-/// ACCEPTANCE PROPERTY: this changes ZERO monolith routing outcomes. It fires
+/// ACCEPTANCE PROPERTY: this changes no monolith routing outcome that used to succeed (the
+/// directory read it adds for a session with no delivery path can only turn a failed send
+/// into a delivered one, or a plain not-sent into `route_unreadable` when that read degrades). It fires
 /// ONLY when the existing dispatch resolution finds NO local
-/// `AgentRegistry` session for a target agent (a "local miss") — a
+/// `AgentRegistry` session for a target agent (a "local miss"), or (#5685
+/// hp-1) a local session that has no delivery path at all (empty
+/// `gateway_node` and no stream: `send_to` returns false for it, so no
+/// outcome that used to succeed can change) — a
 /// direct-connected agent NEVER gets a `GatewayRouteStore` row (only the
 /// gateway-service writer path, Tasks A/B, writes rows), so on today's
 /// single-replica monolith a local miss means the agent is genuinely absent
@@ -60,7 +64,10 @@ public:
         std::vector<std::string> missing;
         missing.reserve(candidates.size());
         for (const auto& aid : candidates)
-            if (!registry_.get_session(aid))
+            // #5685 hp-1: a local session `send_to` cannot deliver on (empty
+            // gateway_node, no stream) is treated as a miss, or it shadows the
+            // directory row a different replica published for the same agent.
+            if (registry_.needs_directory_consult(aid))
                 missing.push_back(aid);
         if (missing.empty())
             return false;
@@ -68,12 +75,8 @@ public:
         if (!res)
             return true; // degraded read — caller surfaces route_unreadable
         for (auto& rr : *res)
-            if (rr.routable && rr.route.cluster_id) {
+            if (rr.routable && rr.route.cluster_id)
                 routable_[rr.route.agent_id] = *rr.route.cluster_id;
-                // Upgrade-window shim, removed with the other legacy-name shims.
-                if (rr.route.legacy_echo_wire_name)
-                    legacy_wire_.insert(rr.route.agent_id);
-            }
         return false;
     }
 
@@ -89,18 +92,10 @@ public:
         return it == routable_.end() ? std::nullopt : std::optional<std::string>(it->second);
     }
 
-    /// Upgrade-window shim (removed with the other legacy-name shims): whether the directory row
-    /// says this agent still speaks the pre-rename plugin name `tar`. Pass to
-    /// `send_via_directory`'s `legacy_wire`.
-    [[nodiscard]] bool legacy_wire_for(const std::string& agent_id) const {
-        return legacy_wire_.contains(agent_id);
-    }
-
 private:
     yuzu::server::detail::AgentRegistry& registry_;
     GatewayRouteStore* store_;
     std::unordered_map<std::string, std::string> routable_; // agent_id -> cluster_id
-    std::unordered_set<std::string> legacy_wire_;           // agent_ids on the legacy wire name
 };
 
 } // namespace yuzu::server

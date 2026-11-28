@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <array>
+#include "approval_continuation.hpp"
 #include "approval_manager.hpp"
 #include "approval_model.hpp"
 #include "mcp_approval_error.hpp"
@@ -1428,7 +1429,7 @@ TEST_CASE("Clock tripwires: every banned needle can actually match (positive con
 // (created_at, last_executed_at, next_execution_at and the due-ness comparison) are
 // process-clock due-ness bookkeeping and are INFORMATIONAL for approvals now: no approval
 // decision compares a ticket's database-authored stamp with them. ScheduleRunner reads the
-// process clock only for the timestamp on its audit rows. If you are adding a read to either
+// process clock only for the timestamp on its audit rows and the arming-hold lapse time. If you are adding a read to either
 // file, decide consciously that it cannot feed an approval decision, then bump the count.
 TEST_CASE("Schedule path: the process-clock reads are an allow-listed, documented set "
           "(#6096)",
@@ -1436,10 +1437,12 @@ TEST_CASE("Schedule path: the process-clock reads are an allow-listed, documente
     const std::string runner = server_code_without_comments("schedule_runner.cpp");
     const std::string engine = server_code_without_comments("schedule_engine.cpp");
 
-    // Runner: exactly one clock read (now_epoch(), used only by audit()), called once.
+    // Runner: exactly one clock read (now_epoch()), called at two sites: audit()'s timestamp and the
+    // arming hold's default clock (WP06 F53: when to ask an UNAVAILABLE arming check again; it decides
+    // nothing about a ticket and a test replaces it with Deps::now_epoch_fn).
     CHECK(count_occurrences(runner, "::now(") == 1);
     CHECK(count_occurrences(runner, "system_clock::now") == 1);
-    CHECK(count_occurrences(runner, "now_epoch(") == 2); // definition + audit()'s timestamp
+    CHECK(count_occurrences(runner, "now_epoch(") == 3); // definition + audit() + the hold clock
     // Engine: exactly one clock read (now_epoch()), called at its four due-ness stamp sites
     // (next-due computation, create's created_at, evaluate_due, advance's last_executed_at).
     CHECK(count_occurrences(engine, "::now(") == 1);
@@ -2641,6 +2644,101 @@ TEST_CASE("ApprovalManager: query_checked and pending_count_checked report a gen
     CHECK(!count_checked.error().sqlstate.empty());
 }
 
+TEST_CASE("ApprovalManager: pending_count_for_checked fails closed when the store never opened "
+          "or a query fails, and counts per submitter otherwise (up8-1)",
+          "[pg][approval_manager][approval][up8-1]") {
+    SECTION("happy path: per submitter, pending only, empty name is a genuine zero") {
+        yuzu::test::ApprovalManagerPg mgr_bundle;
+        ApprovalManager& mgr = *mgr_bundle;
+        REQUIRE(mgr.submit("d1", "alice", "s1", "", ApprovalOrigin::kInstruction).has_value());
+        REQUIRE(mgr.submit("d2", "alice", "s2", "", ApprovalOrigin::kMcp).has_value());
+        REQUIRE(mgr.submit("d3", "bob", "s3", "", ApprovalOrigin::kInstruction).has_value());
+        auto a = mgr.pending_count_for_checked("alice");
+        REQUIRE(a.has_value());
+        CHECK(*a == 2); // all origins count: the cap bounds the principal's share of the queue
+        auto b = mgr.pending_count_for_checked("bob");
+        REQUIRE(b.has_value());
+        CHECK(*b == 1);
+        auto none = mgr.pending_count_for_checked("carol");
+        REQUIRE(none.has_value());
+        CHECK(*none == 0);
+        auto empty = mgr.pending_count_for_checked("");
+        REQUIRE(empty.has_value());
+        CHECK(*empty == 0);
+    }
+    SECTION("a pending row older than the TTL is not counted even before submit's sweep expires it") {
+        yuzu::test::ApprovalManagerPg mgr_bundle;
+        ApprovalManager& mgr = *mgr_bundle;
+        REQUIRE(mgr.submit("d1", "alice", "s1", "", ApprovalOrigin::kInstruction).has_value());
+        {
+            auto lease = mgr_bundle.pool().acquire();
+            REQUIRE(lease);
+            // 25 stale rows for alice (aged past the TTL) and one just inside the window: only
+            // the unexpired ones may count.
+            pg::PgResult res = pg::exec_params(
+                lease.get(),
+                "INSERT INTO approval_manager.approvals "
+                "(id, definition_id, status, submitted_by, submitted_at) "
+                "SELECT 'stale-' || gs, 'def-stale', 'pending', 'alice', "
+                "extract(epoch from now())::bigint - $1::bigint - 60 "
+                "FROM generate_series(1, 25) AS gs",
+                std::vector<std::string>{std::to_string(yuzu::server::kApprovalTicketTtlSeconds)});
+            REQUIRE(res.status() == PGRES_COMMAND_OK);
+            pg::PgResult edge = pg::exec_params(
+                lease.get(),
+                "INSERT INTO approval_manager.approvals "
+                "(id, definition_id, status, submitted_by, submitted_at) "
+                "VALUES ('edge-1', 'def-edge', 'pending', 'alice', "
+                "extract(epoch from now())::bigint - $1::bigint + 300)",
+                std::vector<std::string>{std::to_string(yuzu::server::kApprovalTicketTtlSeconds)});
+            REQUIRE(edge.status() == PGRES_COMMAND_OK);
+        }
+        auto a = mgr.pending_count_for_checked("alice");
+        REQUIRE(a.has_value());
+        CHECK(*a == 2); // d1 and the row 300 s inside the window; the 25 stale ones do not count
+        // The sweep has NOT run (no submit since): the stale rows are still status 'pending'.
+        CHECK(mgr.pending_count() == 27);
+    }
+    SECTION("a query failure is an error") {
+        yuzu::test::ApprovalManagerPg mgr_bundle;
+        ApprovalManager& mgr = *mgr_bundle;
+        REQUIRE(mgr.is_open());
+        {
+            auto lease = mgr_bundle.pool().acquire();
+            REQUIRE(lease);
+            pg::PgResult res = pg::exec_params(lease.get(), "DROP TABLE approval_manager.approvals",
+                                               std::vector<std::string>{});
+            REQUIRE(res.status() == PGRES_COMMAND_OK);
+        }
+        auto checked = mgr.pending_count_for_checked("alice");
+        REQUIRE_FALSE(checked.has_value());
+        CHECK(checked.error().message.find("read failed") != std::string::npos);
+        CHECK(!checked.error().sqlstate.empty());
+    }
+}
+
+TEST_CASE("ApprovalManager: submit_typed reports a full queue as kQueueFull and a good submit as "
+          "an id; submit() keeps its message-only shape",
+          "[pg][approval_manager][approval][queue-full]") {
+    yuzu::test::ApprovalManagerPg bundle;
+    ApprovalManager& mgr = *bundle;
+    auto ok = mgr.submit_typed("d-ok", "alice", "s", "", ApprovalOrigin::kMcp);
+    REQUIRE(ok.has_value());
+    // A surface that binds a request cannot be minted unbound, typed as an invalid request.
+    auto bound = mgr.submit_typed("d-b", "alice", "s", "", ApprovalOrigin::kGuardianDeploy);
+    REQUIRE_FALSE(bound.has_value());
+    CHECK(bound.error().kind == SubmitFailure::kInvalidRequest);
+
+    yuzu::test::seed_pending(bundle.pool(), "qf-", ApprovalManager::kMaxPendingApprovals,
+                             /*age_seconds=*/60);
+    auto full = mgr.submit_typed("d-full", "alice", "s2", "", ApprovalOrigin::kInstruction);
+    REQUIRE_FALSE(full.has_value());
+    CHECK(full.error().kind == SubmitFailure::kQueueFull);
+    auto legacy = mgr.submit("d-full2", "alice", "s3", "", ApprovalOrigin::kInstruction);
+    REQUIRE_FALSE(legacy.has_value());
+    CHECK(legacy.error().find("queue is full") != std::string::npos);
+}
+
 TEST_CASE("ApprovalManager: query_checked happy path matches query()'s fields",
           "[pg][approval_manager][approval]") {
     yuzu::test::ApprovalManagerPg mgr_bundle;
@@ -2692,4 +2790,185 @@ TEST_CASE("ApprovalManager: query_checked truncates and flags a queue one over "
     REQUIRE(list_checked.has_value());
     CHECK(list_checked->approvals.size() == 100);
     CHECK(list_checked->truncated);
+}
+
+// ── covers_continuation: the store half of "one approval covers a whole multi-slice read" ──────
+// (approval_continuation.hpp). A ticket the caller already spent keeps covering later slices of the
+// same search for a bounded window, and for nothing else. ONE read-only SELECT, so every condition is
+// pinned against a real row: the answer is true for exactly one shape of row.
+
+namespace {
+constexpr const char* kCoverDefinition = "mcp.execute_instruction";
+constexpr const char* kCoverScope = "continuation=cursor window_s=86400\n{\"action\":\"search\"}";
+
+/// An approved, SPENT, unbound MCP ticket: submitted and consumed by `principal`, reviewed by admin1.
+std::string spent_cover_ticket(ApprovalManager& mgr, const std::string& principal = "alice") {
+    auto id = mgr.submit(kCoverDefinition, principal, kCoverScope, "", ApprovalOrigin::kMcp);
+    REQUIRE(id.has_value());
+    REQUIRE(mgr.approve(*id, "admin1", "ok").has_value());
+    REQUIRE(mgr.consume_ticket(*id, principal, ApprovalOrigin::kMcp, {}).has_value());
+    return *id;
+}
+
+/// Overwrite one column of one row directly: `column` is a fixed literal at every call site.
+void set_cover_column(pg::PgPool& pool, const std::string& id, const char* column,
+                      const std::string& value) {
+    auto lease = pool.acquire();
+    REQUIRE(lease);
+    const auto sql =
+        std::string("UPDATE approval_manager.approvals SET ") + column + " = $1 WHERE id = $2";
+    pg::PgResult res = pg::exec_params(lease.get(), sql.c_str(), std::vector<std::string>{value, id});
+    REQUIRE(res.status() == PGRES_COMMAND_OK);
+}
+
+bool covers(const ApprovalManager& mgr, const std::string& id, const std::string& principal = "alice",
+            ApprovalOrigin origin = ApprovalOrigin::kMcp,
+            const std::string& definition = kCoverDefinition,
+            const std::string& scope = kCoverScope) {
+    auto r = mgr.covers_continuation(id, principal, origin, definition, scope);
+    REQUIRE(r.has_value());
+    return *r;
+}
+} // namespace
+
+TEST_CASE("ApprovalManager: covers_continuation is true only for a ticket the caller already spent, "
+          "for the same subject, on the same surface",
+          "[pg][approval_manager][approval][continuation]") {
+    yuzu::test::ApprovalManagerPg mgr_bundle;
+    ApprovalManager& mgr = *mgr_bundle;
+
+    // Unspent: approved but not yet consumed. The ordinary consume handles the FIRST use; a cover
+    // is only for a ticket the first use already spent.
+    auto unspent = mgr.submit(kCoverDefinition, "alice", kCoverScope, "", ApprovalOrigin::kMcp);
+    REQUIRE(unspent.has_value());
+    REQUIRE(mgr.approve(*unspent, "admin1", "ok").has_value());
+    CHECK_FALSE(covers(mgr, *unspent));
+    // Pending (not even approved) is not covered either.
+    auto pending = mgr.submit(kCoverDefinition, "alice", kCoverScope, "", ApprovalOrigin::kMcp);
+    REQUIRE(pending.has_value());
+    CHECK_FALSE(covers(mgr, *pending));
+
+    // Spent by the caller: the one true case.
+    const auto spent = spent_cover_ticket(mgr);
+    CHECK(covers(mgr, spent));
+    CHECK(covers(mgr, spent)); // a read: asking twice changes nothing
+    {
+        auto row = mgr.get(spent);
+        REQUIRE(row.has_value());
+        CHECK(row->consumed_at > 0); // the cover never moved the row
+        CHECK(row->consumed_by == "alice");
+    }
+
+    // Another principal, even one that knows the id and the subject.
+    CHECK_FALSE(covers(mgr, spent, "bob"));
+    CHECK_FALSE(covers(mgr, spent, ""));
+    // Another subject: a different root, pattern, action or target set changes the scope text.
+    CHECK_FALSE(covers(mgr, spent, "alice", ApprovalOrigin::kMcp, kCoverDefinition,
+                       "continuation=cursor window_s=86400\n{\"action\":\"other\"}"));
+    CHECK_FALSE(covers(mgr, spent, "alice", ApprovalOrigin::kMcp, kCoverDefinition, ""));
+    // Another tool (definition id).
+    CHECK_FALSE(covers(mgr, spent, "alice", ApprovalOrigin::kMcp, "mcp.execute_bundle"));
+    CHECK_FALSE(covers(mgr, spent, "alice", ApprovalOrigin::kMcp, ""));
+    // Another surface: an instruction-minted ticket never covers an MCP call, and a value that names
+    // no concrete surface matches nothing.
+    CHECK_FALSE(covers(mgr, spent, "alice", ApprovalOrigin::kInstruction));
+    CHECK_FALSE(covers(mgr, spent, "alice", ApprovalOrigin::kUnspecified));
+    CHECK_FALSE(covers(mgr, spent, "alice", ApprovalOrigin::kUnrecognised));
+    // An unknown or empty id.
+    CHECK_FALSE(covers(mgr, "no-such-ticket"));
+    CHECK_FALSE(covers(mgr, ""));
+}
+
+TEST_CASE("ApprovalManager: covers_continuation refuses a ticket whose reviewer is its submitter, a "
+          "bound ticket, a rejected one, and one outside the window",
+          "[pg][approval_manager][approval][continuation]") {
+    yuzu::test::ApprovalManagerPg mgr_bundle;
+    ApprovalManager& mgr = *mgr_bundle;
+    auto& pool = mgr_bundle.pool();
+
+    SECTION("reviewer equals submitter") {
+        const auto id = spent_cover_ticket(mgr);
+        REQUIRE(covers(mgr, id));
+        set_cover_column(pool, id, "reviewed_by", "alice");
+        CHECK_FALSE(covers(mgr, id));
+    }
+    SECTION("no reviewer on the row") {
+        const auto id = spent_cover_ticket(mgr);
+        set_cover_column(pool, id, "reviewed_by", "");
+        CHECK_FALSE(covers(mgr, id));
+    }
+    SECTION("consumed by someone other than the submitter") {
+        const auto id = spent_cover_ticket(mgr);
+        set_cover_column(pool, id, "consumed_by", "bob");
+        CHECK_FALSE(covers(mgr, id));
+        CHECK_FALSE(covers(mgr, id, "bob")); // and bob is not the submitter either
+    }
+    SECTION("a bound (four-eyes) ticket binds one request and never covers a second") {
+        for (const char* column : {"request_json", "request_digest", "excluded_roots"}) {
+            const auto id = spent_cover_ticket(mgr);
+            REQUIRE(covers(mgr, id));
+            set_cover_column(pool, id, column, "x");
+            INFO("bound column: " << column);
+            CHECK_FALSE(covers(mgr, id));
+        }
+    }
+    SECTION("not approved") {
+        const auto id = spent_cover_ticket(mgr);
+        set_cover_column(pool, id, "status", "rejected");
+        CHECK_FALSE(covers(mgr, id));
+        set_cover_column(pool, id, "status", "expired");
+        CHECK_FALSE(covers(mgr, id));
+    }
+    SECTION("the window runs from the first use") {
+        const auto id = spent_cover_ticket(mgr);
+        REQUIRE(covers(mgr, id));
+        // Just inside the window: still covered.
+        backdate(pool, id, "consumed_at", approval_continuation::kCoverSeconds - 3600);
+        CHECK(covers(mgr, id));
+        // Past it: not covered, and no error.
+        backdate(pool, id, "consumed_at", 2 * 3600);
+        CHECK_FALSE(covers(mgr, id));
+    }
+    SECTION("the cover ends with the approval's own lifetime") {
+        const auto id = spent_cover_ticket(mgr);
+        REQUIRE(covers(mgr, id));
+        // First used an hour ago, approved six days ago: inside both windows, still covered.
+        backdate(pool, id, "consumed_at", 3600);
+        backdate(pool, id, "reviewed_at", 6 * 24 * 3600);
+        CHECK(covers(mgr, id));
+        // Approved eight days ago: past the 7-day lifetime while the first use is still inside the
+        // 24-hour window. Not covered, and no error.
+        backdate(pool, id, "reviewed_at", 2 * 24 * 3600);
+        CHECK_FALSE(covers(mgr, id));
+    }
+    SECTION("a use dated in the future beyond the slack is not covered") {
+        const auto id = spent_cover_ticket(mgr);
+        backdate(pool, id, "consumed_at", -3600); // an hour ahead of now
+        CHECK_FALSE(covers(mgr, id));
+    }
+    SECTION("a ticket that was never spent has no first use to measure from") {
+        const auto id = spent_cover_ticket(mgr);
+        set_cover_column(pool, id, "consumed_at", "0");
+        CHECK_FALSE(covers(mgr, id));
+    }
+}
+
+TEST_CASE("ApprovalManager: covers_continuation reports a store fault as an error, never as false",
+          "[pg][approval_manager][approval][continuation]") {
+    yuzu::test::ApprovalManagerPg mgr_bundle;
+    ApprovalManager& mgr = *mgr_bundle;
+    const auto id = spent_cover_ticket(mgr);
+    REQUIRE(covers(mgr, id));
+    {
+        auto lease = mgr_bundle.pool().acquire();
+        REQUIRE(lease);
+        pg::PgResult res = pg::exec_params(lease.get(), "DROP TABLE approval_manager.approvals",
+                                           std::vector<std::string>{});
+        REQUIRE(res.status() == PGRES_COMMAND_OK);
+    }
+    auto r = mgr.covers_continuation(id, "alice", ApprovalOrigin::kMcp, kCoverDefinition,
+                                     kCoverScope);
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error().message.find("read failed") != std::string::npos);
+    CHECK_FALSE(r.error().sqlstate.empty());
 }

@@ -11,7 +11,8 @@ context-refs: ["#2568", "#2580", "docs/postgres-store-playbook.md"]
 
 # 3005 — Plugin config/secret plane + per-action kill switch
 
-> **Amendment pending: ADR-3006 (plugin management, proposed 2026-10-06).** ADR-3006 sets
+> **Amendment pending delivery: ADR-3006 (plugin management, 2026-10-06; accepted, status
+> reconciled 2026-11-14).** ADR-3006 sets
 > the direction that the kill switch described here becomes one layer of a wider enablement
 > model: enforced on the endpoint as well as at dispatch, targetable beyond operating system,
 > no longer seeded off for any plugin on new installations, and changed under a permission of
@@ -170,6 +171,18 @@ delivery is disabling or removing the rules (state-only: the agent disarms them 
 reconcile). Refusing a kill-switch write for a protective pair is deferred until ADR-3006 D3's
 enablement catalogue replaces the kill-switch write surface; until then a stored row is
 informational only.
+
+### Update (2026-11-13) — the firewall plugin's four containment actions are protective
+
+`firewall.quarantine`, `firewall.release`, `firewall.quarantine_status` and
+`firewall.quarantine_allow` join the protective set on the owner's decision of 2026-11-12, as a CLOSED
+four-action predicate (`is_firewall_control_plugin`) behind the single `is_protective_action`:
+`firewall.release` is the way out of a firewall containment, so no enablement gate may refuse it.
+The other firewall actions (`state`, `rules`) stay ordinary, so a plugin-level `firewall` kill-switch
+row is labelled `protective_exempt=partial` (not `true`, which means a complete exemption) because it still gates them. Authorization is unchanged (the
+catalogue rows keep their permission and approval gates). The containment-gate exemption
+is the same predicate (`is_firewall_control_plugin`), so a firewall containment is reachable for
+release even while the quarantine store cannot be read.
 
 ### Update (2026-10-03, #5294) — per-OS kill-switch rows
 

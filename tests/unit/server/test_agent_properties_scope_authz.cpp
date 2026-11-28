@@ -35,15 +35,19 @@
 
 #include "audit_store.hpp"
 #include "auth_routes.hpp"
+#include "dashboard_routes.hpp" // the #2532 acceptance case drives the Echo purge fragment
 #include "management_group_store.hpp"
 #include "oidc_provider.hpp"
 #include "pg/pg_pool.hpp"
+#include "pg/pg_raii.hpp" // PgConn/PgResult for the mid-flight mgmt-store degrade injection
 #include "rbac_store.hpp"
 #include "test_api_token_pg_helper.hpp"  // ApiTokenStorePg
 #include "test_mgmt_group_pg_helper.hpp" // ManagementGroupStorePg
+#include "test_route_sink.hpp"
 
 #include "../test_helpers.hpp"
 
+#include <yuzu/metrics.hpp>
 #include <yuzu/server/auth.hpp>
 #include <yuzu/server/server.hpp>
 
@@ -53,8 +57,11 @@
 
 #include <chrono>
 #include <memory>
+#include <optional>
 #include <shared_mutex>
 #include <string>
+#include <unordered_map>
+#include <vector>
 
 using namespace yuzu::server;
 namespace pg = yuzu::server::pg;
@@ -181,6 +188,10 @@ TEST_CASE("require_scoped_permission(Infrastructure,Read): group-confined operat
     httplib::Response res;
 
     CHECK(r.ar->require_scoped_permission(req, res, "Infrastructure", "Read", "a_c1"));
+    // The typed call is the same gate's one body: the verdict as a class.
+    httplib::Response typed;
+    CHECK(r.ar->require_scoped_permission_outcome(req, typed, "Infrastructure", "Read", "a_c1") ==
+          ScopedGateOutcome::Admitted);
 }
 
 TEST_CASE("require_scoped_permission(Infrastructure,Read): group-confined operator "
@@ -195,21 +206,133 @@ TEST_CASE("require_scoped_permission(Infrastructure,Read): group-confined operat
     CHECK_FALSE(r.ar->require_scoped_permission(req, res, "Infrastructure", "Read", "a_s"));
     CHECK(res.status == 403);
 
-    // A real denial audit row IS written (was unverifiable with the
-    // nullptr audit_store the first version of this rig used). NOT
-    // asserting target_type/target_id field placement here: the ordinary-
-    // RBAC denial branch (auth_routes.cpp ~:1124) passes agent_id
-    // positionally into the audit_log wrapper's target_type slot and its
-    // reason string into target_id, leaving detail empty -- the same
-    // slot-swap class cc93f499c fixed for confine_agent_target, but this
-    // call site was never fixed. Pre-existing, not touched by #3700's
-    // diff (auth_routes.cpp is unmodified here) -- tracked as issue #3219
-    // rather than asserted (right or wrong) by this test.
+    // A real denial audit row IS written (was unverifiable with the nullptr audit_store the
+    // first version of this rig used). #3739 also pins the field placement: the reason is in
+    // `detail`, the agent is `target_type="Agent"` / `target_id=<id>` (the call site used to
+    // pass the id and the reason positionally into target_type/target_id, #3219).
     auto rows = r.audit_store.query({});
     REQUIRE(rows.has_value());
     REQUIRE(rows->size() == 1);
     CHECK((*rows)[0].action == "auth.scoped_permission_required");
     CHECK((*rows)[0].result == "denied");
+    CHECK((*rows)[0].target_type == "Agent");
+    CHECK((*rows)[0].target_id == "a_s");
+    // A genuine no-grant: the plain "denied" form, NOT the degraded one.
+    CHECK((*rows)[0].detail == "RBAC denied Infrastructure:Read");
+
+    // The typed call answers the same refusal as the class Denied (not a degraded read): the
+    // same 403, and the audit row it writes carries no `read degraded` token. The Boolean gate
+    // agrees with `== Admitted`.
+    httplib::Response typed;
+    CHECK(r.ar->require_scoped_permission_outcome(req, typed, "Infrastructure", "Read", "a_s") ==
+          ScopedGateOutcome::Denied);
+    CHECK(typed.status == 403);
+    auto after = r.audit_store.query({});
+    REQUIRE(after.has_value());
+    REQUIRE(after->size() == 2);
+    for (const auto& row : *after)
+        CHECK(row.detail == "RBAC denied Infrastructure:Read");
+
+    // A request with no credentials is refused by authentication, as the class Unauthenticated.
+    httplib::Request anonymous;
+    httplib::Response unauthenticated;
+    CHECK(r.ar->require_scoped_permission_outcome(anonymous, unauthenticated, "Infrastructure",
+                                                  "Read", "a_c1") ==
+          ScopedGateOutcome::Unauthenticated);
+    CHECK(unauthenticated.status == 401);
+    httplib::Response unauthenticated_bool;
+    CHECK_FALSE(r.ar->require_scoped_permission(anonymous, unauthenticated_bool, "Infrastructure",
+                                                "Read", "a_c1"));
+}
+
+// #3739 acceptance: a denial caused by a management-group store degrade is distinguishable in
+// the audit row from a genuine no-grant denial. Same principal, same agent, same grant -- the
+// only change between the allow and the deny is the injected fault.
+TEST_CASE("require_scoped_permission: a mgmt-group store degrade is audited as degraded, "
+          "not as a genuine no-grant denial (#3739)",
+          "[pg][auth_routes][authz_gates][properties_authz][degrade]") {
+    YUZU_REQUIRE_PG_DB_TPL(rbac_db_, rbac_props_scope_tpl);
+    PropsScopeRig r{rbac_db_.dsn()};
+    r.group_assign(r.gP, "operator", "InfraReader");
+    auto req = bearer_request(r.mint());
+
+    // Healthy baseline: the in-scope agent IS admitted, so the denial below is attributable to
+    // the fault and not to an absent grant. (An allow writes no audit row.)
+    {
+        httplib::Response ok;
+        REQUIRE(r.ar->require_scoped_permission(req, ok, "Infrastructure", "Read", "a_c1"));
+    }
+
+    // Isolate the fault to the management-group store only; RBAC itself stays healthy.
+    {
+        yuzu::server::pg::PgConn c{PQconnectdb(r.mgmt_bundle.dsn().c_str())};
+        REQUIRE(PQstatus(c.get()) == CONNECTION_OK);
+        yuzu::server::pg::PgResult dr{PQexec(
+            c.get(), "DROP TABLE management_group_store.management_group_members CASCADE")};
+        REQUIRE(dr.ok());
+    }
+
+    httplib::Response res;
+    CHECK_FALSE(r.ar->require_scoped_permission(req, res, "Infrastructure", "Read", "a_c1"));
+    CHECK(res.status == 403); // still the fail-closed 403 (ADR-0041), not a 503
+
+    auto rows = r.audit_store.query({});
+    REQUIRE(rows.has_value());
+    REQUIRE(rows->size() == 1);
+    CHECK((*rows)[0].action == "auth.scoped_permission_required");
+    CHECK((*rows)[0].result == "denied");
+    CHECK((*rows)[0].target_type == "Agent");
+    CHECK((*rows)[0].target_id == "a_c1");
+    CHECK((*rows)[0].detail ==
+          "RBAC denied Infrastructure:Read (read degraded: mgmt_group_store)");
+
+    // The class carries the same store label as the row: a typed caller learns a read failed,
+    // and which store, from the gate itself. Same 403, and the Boolean gate never admits it.
+    httplib::Response typed;
+    CHECK(r.ar->require_scoped_permission_outcome(req, typed, "Infrastructure", "Read", "a_c1") ==
+          ScopedGateOutcome::MgmtGroupReadDegraded);
+    CHECK(typed.status == 403);
+    httplib::Response boolean_res;
+    CHECK_FALSE(r.ar->require_scoped_permission(req, boolean_res, "Infrastructure", "Read", "a_c1"));
+}
+
+// Same chaos scenario through the OTHER mgmt-store source: the assignments read
+// (`management_group_roles`) fails FIRST in a real management-group outage, before the member
+// and ancestor reads are reached. It must be labelled as the management-group store too.
+TEST_CASE("require_scoped_permission: a mgmt-group ASSIGNMENTS-read degrade is labelled "
+          "mgmt_group_store, not rbac_store (#3739)",
+          "[pg][auth_routes][authz_gates][properties_authz][degrade]") {
+    YUZU_REQUIRE_PG_DB_TPL(rbac_db_, rbac_props_scope_tpl);
+    PropsScopeRig r{rbac_db_.dsn()};
+    r.group_assign(r.gP, "operator", "InfraReader");
+    auto req = bearer_request(r.mint());
+    {
+        httplib::Response ok;
+        REQUIRE(r.ar->require_scoped_permission(req, ok, "Infrastructure", "Read", "a_c1"));
+    }
+    {
+        yuzu::server::pg::PgConn c{PQconnectdb(r.mgmt_bundle.dsn().c_str())};
+        REQUIRE(PQstatus(c.get()) == CONNECTION_OK);
+        yuzu::server::pg::PgResult dr{PQexec(
+            c.get(), "DROP TABLE management_group_store.management_group_roles CASCADE")};
+        REQUIRE(dr.ok());
+    }
+
+    httplib::Response res;
+    CHECK_FALSE(r.ar->require_scoped_permission(req, res, "Infrastructure", "Read", "a_c1"));
+    CHECK(res.status == 403);
+
+    auto rows = r.audit_store.query({});
+    REQUIRE(rows.has_value());
+    REQUIRE(rows->size() == 1);
+    CHECK((*rows)[0].action == "auth.scoped_permission_required");
+    CHECK((*rows)[0].detail ==
+          "RBAC denied Infrastructure:Read (read degraded: mgmt_group_store)");
+
+    httplib::Response typed;
+    CHECK(r.ar->require_scoped_permission_outcome(req, typed, "Infrastructure", "Read", "a_c1") ==
+          ScopedGateOutcome::MgmtGroupReadDegraded);
+    CHECK(typed.status == 403);
 }
 
 TEST_CASE("require_scoped_permission(Infrastructure,Write): group-confined operator "
@@ -287,3 +410,199 @@ TEST_CASE("require_scoped_permission(Infrastructure,Write): RBAC disabled — le
 // test_custom_properties_routes.cpp's real TestRouteSink dispatch coverage
 // — see this file's header comment (HISTORY) for why a behavioural test
 // replaced it outright rather than being repointed at the new file.
+
+// ═══════════════════════════════════════════════════════════════════════════
+// #2532: the gate reports WHY it refused, as a class, so a caller that must tell a denial from an
+// outage never reads a status or a second store. No status, body or audit row changes.
+// ═══════════════════════════════════════════════════════════════════════════
+
+// The RBAC store's own read failing is the other degrade class. Same principal, same grant: only
+// the injected fault differs from the admitted case above. There is deliberately NO healthy gate
+// call for this pair before the fault: a warm permission cache would answer the global read and
+// the failure would never be reached.
+TEST_CASE("require_scoped_permission: an RBAC-store read degrade is the class RbacReadDegraded and "
+          "is audited rbac_store (#2532)",
+          "[pg][auth_routes][authz_gates][properties_authz][degrade][2532]") {
+    YUZU_REQUIRE_PG_DB_TPL(rbac_db_, rbac_props_scope_tpl);
+    PropsScopeRig r{rbac_db_.dsn()};
+    r.group_assign(r.gP, "operator", "InfraReader");
+    auto req = bearer_request(r.mint());
+
+    {
+        yuzu::server::pg::PgConn c{PQconnectdb(rbac_db_.dsn().c_str())};
+        REQUIRE(PQstatus(c.get()) == CONNECTION_OK);
+        yuzu::server::pg::PgResult dr{
+            PQexec(c.get(), "DROP TABLE rbac_store.role_permissions CASCADE")};
+        REQUIRE(dr.ok());
+    }
+
+    httplib::Response res;
+    CHECK(r.ar->require_scoped_permission_outcome(req, res, "Infrastructure", "Read", "a_c1") ==
+          ScopedGateOutcome::RbacReadDegraded);
+    CHECK(res.status == 403); // still the fail-closed 403 (ADR-0041), not a 503
+
+    // The Boolean gate never admits a degraded read either.
+    httplib::Response boolean_res;
+    CHECK_FALSE(r.ar->require_scoped_permission(req, boolean_res, "Infrastructure", "Read", "a_c1"));
+
+    auto rows = r.audit_store.query({});
+    REQUIRE(rows.has_value());
+    REQUIRE(rows->size() == 2);
+    for (const auto& row : *rows) {
+        CHECK(row.action == "auth.scoped_permission_required");
+        CHECK(row.target_id == "a_c1");
+        CHECK(row.detail == "RBAC denied Infrastructure:Read (read degraded: rbac_store)");
+    }
+}
+
+// Acceptance criterion: a management-group read failure behind the Echo purge is reported as an
+// outage (503, recorded store_unavailable), where it used to collapse into the 404 that an
+// out-of-scope device gets (recorded scope_violation). The REAL gate over REAL stores, through
+// the real route; only the dispatch is a counter.
+TEST_CASE("Echo purge fragment: a real management-group read failure through the real gate answers "
+          "503 and is recorded store_unavailable; an out-of-scope device is still the 404 "
+          "scope_violation (#2532)",
+          "[pg][auth_routes][authz_gates][properties_authz][degrade][2532]") {
+    YUZU_REQUIRE_PG_DB_TPL(rbac_db_, rbac_props_scope_tpl);
+    PropsScopeRig r{rbac_db_.dsn()};
+    REQUIRE(r.rbac.create_role({"InfraPurger", "", false, 0}).has_value());
+    REQUIRE(r.rbac.set_permission({"InfraPurger", "Infrastructure", "Delete", "allow"}).has_value());
+    r.group_assign(r.gP, "operator", "InfraPurger"); // a_c1 is in P's subtree; a_s is not
+
+    // Declared AFTER the rig, in this order so the destruction order is safe: `sink` is destroyed
+    // first, while the `DashboardRoutes` whose `this` its handlers captured is still alive, and the
+    // recorders outlive both.
+    struct DashboardRow {
+        std::string action, result, detail;
+    };
+    yuzu::MetricsRegistry metrics;
+    std::vector<DashboardRow> dashboard_rows;
+    int dispatches = 0;
+    DashboardRoutes routes;
+    yuzu::server::test::TestRouteSink sink;
+
+    auto auth_fn = [](const httplib::Request&,
+                      httplib::Response&) -> std::optional<auth::Session> {
+        auth::Session s;
+        s.username = "operator";
+        s.role = auth::Role::admin;
+        s.auth_source = "local";
+        return s;
+    };
+    auto perm_fn = [](const httplib::Request&, httplib::Response&, const std::string&,
+                      const std::string&) { return true; };
+    // ONE recording sink behind both callbacks, as production wires one `audit_log` behind both.
+    auto audit_fn = [&dashboard_rows](const httplib::Request&, const std::string& action,
+                                      const std::string& result, const std::string&,
+                                      const std::string&, const std::string& detail) {
+        dashboard_rows.push_back({action, result, detail});
+        return true;
+    };
+    routes.set_persist_audit_fn(audit_fn);
+    // The call server.cpp's `scoped_gate_fn` makes.
+    routes.set_scoped_perm_fn([&r](const httplib::Request& req, httplib::Response& res,
+                                   const std::string& type, const std::string& op,
+                                   const std::string& agent) {
+        return r.ar->require_scoped_permission_outcome(req, res, type, op, agent);
+    });
+    DashboardRoutes::DispatchFn dispatch =
+        [&dispatches](const std::string&, const std::string&, const std::vector<std::string>&,
+                      const std::string&, const std::unordered_map<std::string, std::string>&,
+                      const yuzu::server::DispatchCaller&) -> yuzu::server::ConfinedDispatchOutcome {
+        ++dispatches;
+        return {.sent = 1, .command_id = "cmd-1"};
+    };
+    routes.register_routes(
+        sink, auth_fn, perm_fn, audit_fn, /*response_store=*/nullptr, &r.mgmt, /*registry=*/nullptr,
+        /*tag_store=*/nullptr, /*event_bus=*/nullptr,
+        /*agents_json_fn=*/[] { return std::string{"[]"}; }, dispatch,
+        /*caller_fn=*/
+        [](const httplib::Request&) -> yuzu::server::DispatchCaller {
+            return yuzu::server::DispatchCaller{.exec_visible = yuzu::server::authz::VisibleSet{}};
+        },
+        /*resolve_fn=*/[](const std::string&) { return std::pair<std::string, std::string>{}; },
+        &metrics, /*instruction_store=*/nullptr);
+
+    const std::string token = r.mint();
+    const auto post = [&](const std::string& body) {
+        auto res = sink.dispatch("POST", "/fragments/echo/retention-paused/purge", body,
+                                 "application/x-www-form-urlencoded",
+                                 {{"Host", "yuzu.example:8080"},
+                                  {"Origin", "https://yuzu.example:8080"},
+                                  {"Authorization", "Bearer " + token}});
+        REQUIRE(res != nullptr);
+        return res;
+    };
+    const auto rows_with = [&dashboard_rows](const std::string& result) {
+        std::vector<DashboardRow> out;
+        for (const auto& row : dashboard_rows)
+            if (row.action == "echo.source.purge" && row.result == result)
+                out.push_back(row);
+        return out;
+    };
+    const auto series = [&metrics](const char* result) {
+        return metrics
+            .counter("yuzu_echo_source_purge_total", {{"result", result}, {"surface", "dashboard"}})
+            .value();
+    };
+    constexpr const char* kNotReachable = "<span class=\"echo-row-error\">Agent not reachable.</span>";
+
+    // (1) Healthy: the operator holds Infrastructure:Delete on group P, a_c1 is under it.
+    CHECK(post("device_id=a_c1&source=tcp")->status == 200);
+    CHECK(dispatches == 1);
+    CHECK(rows_with("attempted").size() == 1);
+
+    // (2) A device outside the grant: the real gate denies; the route collapses it to the 404 and
+    // records the real reason as a scope violation.
+    {
+        auto res = post("device_id=a_s&source=process");
+        CHECK(res->status == 404);
+        CHECK(res->body == kNotReachable);
+        const auto failures = rows_with("failure");
+        REQUIRE(failures.size() == 1);
+        CHECK(failures[0].detail == "scope_violation source=process");
+        CHECK(series("scope_violation") == 1.0);
+        CHECK(dispatches == 1);
+    }
+
+    // (3) The management-group member table fails under the live store.
+    {
+        yuzu::server::pg::PgConn c{PQconnectdb(r.mgmt_bundle.dsn().c_str())};
+        REQUIRE(PQstatus(c.get()) == CONNECTION_OK);
+        yuzu::server::pg::PgResult dr{PQexec(
+            c.get(), "DROP TABLE management_group_store.management_group_members CASCADE")};
+        REQUIRE(dr.ok());
+    }
+
+    // (4) The same in-scope device now answers 503, not the 404, and is recorded as the outage it
+    // is. Nothing is dispatched and no scope violation is recorded.
+    {
+        auto res = post("device_id=a_c1&source=process");
+        CHECK(res->status == 503);
+        CHECK_FALSE(res->get_header_value("HX-Trigger").empty()); // the error toast
+        CHECK(res->body != kNotReachable);
+
+        const auto denied = rows_with("denied");
+        REQUIRE(denied.size() == 1);
+        CHECK(denied[0].detail == "store_unavailable store=mgmt_group_store source=process");
+        CHECK(rows_with("failure").size() == 1);   // still step (2)'s scope violation only
+        CHECK(rows_with("attempted").size() == 1); // still step (1)'s
+        CHECK(series("store_unavailable") == 1.0);
+        CHECK(series("scope_violation") == 1.0);
+        CHECK(dispatches == 1);
+
+        // The gate's own row carries the same store label (one row for this device: the healthy
+        // admissions write none).
+        auto audit_rows = r.audit_store.query({});
+        REQUIRE(audit_rows.has_value());
+        int for_device = 0;
+        for (const auto& row : *audit_rows) {
+            if (row.action == "auth.scoped_permission_required" && row.target_id == "a_c1") {
+                ++for_device;
+                CHECK(row.detail ==
+                      "RBAC denied Infrastructure:Delete (read degraded: mgmt_group_store)");
+            }
+        }
+        CHECK(for_device == 1);
+    }
+}

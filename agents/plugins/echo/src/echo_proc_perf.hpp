@@ -9,7 +9,7 @@
  * APPLICATIONS by CPU and by working set out, aggregated by image name
  * (12 chrome.exe processes = one "chrome.exe" row with instances=12 — the
  * BRD asks for app-specific consumption, not per-PID noise; per-PID detail
- * stays on the process_live event trail). Raw rows stay ON-DEVICE
+ * is not stored: the process tiers keep per-name counts). Raw rows stay ON-DEVICE
  * (ADR-0004); the hourly tier carries per-app avg/max for trend queries.
  *
  * Windows source — deliberately NOT PDH, NOT WMI: ONE
@@ -154,7 +154,7 @@ ProcSnapshot read_proc_counters();
 /// (comm may contain spaces and parens; never line-split first) — the
 /// kernel's 15-char comm. The stored name is SANITIZED: '\' and '\n' are
 /// escaped exactly as the kernel escapes /proc/[pid]/status Name: (which the
-/// Linux process source records), so procperf rows join process_live rows by
+/// Linux process source records), so procperf rows join process tier rows by
 /// name; every other control byte and '|' becomes '_' (comm is
 /// attacker-settable raw bytes via prctl(PR_SET_NAME) — a '|' would inject
 /// separators into the pipe-delimited sql/export/app_perf wire formats).

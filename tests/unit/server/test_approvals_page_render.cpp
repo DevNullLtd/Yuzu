@@ -12,6 +12,8 @@
 #include "approval_manager.hpp"
 #include "sha256_hex.hpp"
 #include "approvals_page_render.hpp"
+#include "mcp_instruction_authoring.hpp"
+#include "web_utils.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -203,22 +205,86 @@ TEST_CASE("approvals_page_render: the MCP and You tags appear only where they ar
     CHECK(with_mine.find("data-mine=\"1\"") != std::string::npos);
 }
 
-TEST_CASE("approvals_page_render: scope and comment appear in full once and the cell is "
-          "clipped",
+TEST_CASE("approvals_page_render: the comment appears in full once; the scope is clipped in the "
+          "attribute and shorter in the cell",
           "[ui][approvals][render]") {
     auto r = make_row("big", "rejected");
-    r.scope_expression = std::string(10000, 'S');
+    r.scope_expression = std::string(kScopeAttrBytes + 5000, 'S');
     r.review_comment = std::string(5000, 'C');
     r.reviewed_by = "reviewer";
     r.reviewed_at = kNow - 60;
 
     const auto html = render_approvals_page(make_view({r}));
-    CHECK(count_of(html, r.scope_expression) == 1);
     CHECK(count_of(html, r.review_comment) == 1);
+    // The attribute carries kScopeAttrBytes of the scope and an ellipsis, never the whole scope.
+    CHECK(count_of(html, r.scope_expression) == 0);
+    CHECK(count_of(html, " data-scope=\"" + std::string(kScopeAttrBytes, 'S') + "\xE2\x80\xA6\"") == 1);
     CHECK(html.find("<code class=\"clip scope\">" + std::string(120, 'S') + "\xE2\x80\xA6</code>") !=
           std::string::npos);
     // No title attribute duplicates the long values.
     CHECK(html.find("title=\"" + std::string(10, 'S')) == std::string::npos);
+}
+
+// UP-1: a ticket whose scope is megabytes (a legacy row, or a hostile one) must not put those
+// megabytes in every load of the page. Turns red if the attr() call goes back to the whole scope.
+TEST_CASE("approvals_page_render: a multi-MiB scope renders a bounded page; a short scope is whole",
+          "[ui][approvals][render]") {
+    auto huge = make_row("huge", "pending");
+    huge.scope_expression = std::string(4u * 1024 * 1024, 'H');
+    auto small = make_row("small", "pending");
+    small.scope_expression = R"({"document_bytes":4194304,"tool":"import_definition"})";
+
+    const auto html = render_approvals_page(make_view({huge, small}));
+    CHECK(html.size() < 32 * 1024);
+    CHECK(html.find(" data-scope=\"" + yuzu::server::html_escape(small.scope_expression) + "\"") !=
+          std::string::npos);
+    // A clip that falls inside a multi-byte sequence backs off to a boundary (valid UTF-8).
+    auto utf = make_row("utf", "pending");
+    utf.scope_expression = std::string(kScopeAttrBytes - 1, 'a') + "\xC3\xA9" + std::string(50, 'b');
+    const auto utf_html = render_approvals_page(make_view({utf}));
+    CHECK(utf_html.find(" data-scope=\"" + std::string(kScopeAttrBytes - 1, 'a') + "\xE2\x80\xA6\"") !=
+          std::string::npos);
+}
+
+// D3 (the clip used to be 4096, below the 16 KiB a bound ticket may carry, so trailing
+// arguments could be hidden from the approver). Turns red if kScopeAttrBytes goes back to 4096,
+// or if the clipped marker is dropped.
+TEST_CASE("approvals_page_render: the scope clip sits above the bound-request cap; a clipped "
+          "scope is marked with its true size; an unclipped one is not",
+          "[ui][approvals][render]") {
+    using yuzu::server::kMaxRequestJsonBytes;
+    STATIC_REQUIRE(kScopeAttrBytes > kMaxRequestJsonBytes);
+
+    // A full-size bound ticket's scope renders whole and carries no clipped marker.
+    auto bound = make_row("bound", "pending");
+    bound.scope_expression = std::string(kMaxRequestJsonBytes, 'B');
+    const auto bound_html = render_approvals_page(make_view({bound}));
+    CHECK(count_of(bound_html, " data-scope=\"" + bound.scope_expression + "\"") == 1);
+    CHECK(bound_html.find("data-scope-clipped") == std::string::npos);
+    CHECK(bound_html.find("Scope clipped") == std::string::npos);
+
+    // Exactly at the bound: still whole, still unmarked.
+    auto at = make_row("at", "pending");
+    at.scope_expression = std::string(kScopeAttrBytes, 'A');
+    const auto at_html = render_approvals_page(make_view({at}));
+    CHECK(count_of(at_html, " data-scope=\"" + at.scope_expression + "\"") == 1);
+    CHECK(at_html.find("data-scope-clipped") == std::string::npos);
+
+    // One byte over: clipped, and the row says how big the scope really is.
+    auto over = make_row("over", "pending");
+    over.scope_expression = std::string(kScopeAttrBytes + 1, 'O');
+    const auto over_html = render_approvals_page(make_view({over}));
+    CHECK(over_html.find(" data-scope-clipped=\"" + std::to_string(kScopeAttrBytes + 1) + "\"") !=
+          std::string::npos);
+    CHECK(over_html.find("<span class=\"tag\">Scope clipped</span>") != std::string::npos);
+    CHECK(count_of(over_html, over.scope_expression) == 0);
+
+    // A 4 MiB scope: bounded page, marker carries the true size.
+    auto huge = make_row("huge", "pending");
+    huge.scope_expression = std::string(4u * 1024 * 1024, 'H');
+    const auto huge_html = render_approvals_page(make_view({huge}));
+    CHECK(huge_html.size() < 64 * 1024);
+    CHECK(huge_html.find(" data-scope-clipped=\"4194304\"") != std::string::npos);
 }
 
 TEST_CASE("approvals_page_render: an empty scope is a dash and an empty data-scope",
@@ -781,4 +847,50 @@ TEST_CASE("summarize_bound_request: the Targets budget (1700 bytes of whole line
         CHECK(text.find("\\u00e9") == std::string::npos);
         CHECK(text.find("  ... and 1 more not shown (section limit)\n") != std::string::npos);
     }
+}
+
+// F4: an import / YAML-save ticket's subject (digest + plain fields) is what the approver reads.
+// The visible cell opens with the tool and the dispatch-relevant fields (approval_mode first); the
+// detail attribute carries every plain field, whole (the clip stays above the subject).
+TEST_CASE("approvals_page_render: an authoring ticket's plain fields are in the cell and the detail",
+          "[ui][approvals][render]") {
+    namespace iauth = yuzu::server::mcp::instruction_authoring;
+    const nlohmann::json doc = {{"id", "page.imp"}, {"name", "Page Import"}, {"plugin", "os_info"},
+                                {"action", "os_name"}, {"approval_mode", "always"},
+                                {"pad", std::string(2u * 1024 * 1024, 'p')}};
+    const auto subject = iauth::ticket_subject("import_definition", {{"document", doc}});
+    REQUIRE(subject.has_value());
+    REQUIRE(subject->size() < kScopeAttrBytes);
+    auto r = make_row("auth", "pending");
+    r.scope_expression = *subject;
+    const auto html = render_approvals_page(make_view({r}));
+    CHECK(html.find("&quot;definition_id&quot;:&quot;page.imp&quot;") != std::string::npos);
+    CHECK(html.find("&quot;plugin&quot;:&quot;os_info&quot;") != std::string::npos);
+    CHECK(html.find("&quot;approval_mode&quot;:&quot;always&quot;") != std::string::npos);
+    CHECK(html.find("data-scope-clipped") == std::string::npos);
+    CHECK(count_of(html, "pppp") == 0);
+    // The short cell opens with the tool and approval_mode: the field a downgrade flips is never
+    // pushed past the cell's clip by a long id or name.
+    const auto cell = html.find("<code class=\"clip scope\">");
+    REQUIRE(cell != std::string::npos);
+    CHECK(html.find("{&quot;tool&quot;:&quot;import_definition&quot;,&quot;approval_mode&quot;", cell) ==
+          cell + std::string("<code class=\"clip scope\">").size());
+
+    // A long id and name come AFTER the dispatch fields, so the clipped cell still shows them.
+    nlohmann::json long_doc = doc;
+    long_doc["id"] = std::string(120, 'i');
+    long_doc["name"] = std::string(120, 'n');
+    long_doc.erase("pad");
+    const auto long_subject = iauth::ticket_subject("import_definition", {{"document", long_doc}});
+    REQUIRE(long_subject.has_value());
+    auto lr = make_row("auth2", "pending");
+    lr.scope_expression = *long_subject;
+    const auto long_html = render_approvals_page(make_view({lr}));
+    const auto lcell = long_html.find("<code class=\"clip scope\">");
+    REQUIRE(lcell != std::string::npos);
+    const auto lend = long_html.find("</code>", lcell);
+    const auto shown = long_html.substr(lcell, lend - lcell);
+    CHECK(shown.find("&quot;approval_mode&quot;:&quot;always&quot;") != std::string::npos);
+    CHECK(shown.find("&quot;plugin&quot;:&quot;os_info&quot;") != std::string::npos);
+    CHECK(shown.find("&quot;action&quot;:&quot;os_name&quot;") != std::string::npos);
 }

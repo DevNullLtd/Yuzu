@@ -23,8 +23,9 @@ exact partitioning of the real case population — against the compiled
 binary, not against a remembered snapshot.
 
 Runs as its own meson test() entry (suite: ['server', 'server-checks'] —
-the second label is what lets the Windows non-pg Test step's
-assert-suite-cover.py select it), NOT inside the cheap flake-retry selftest
+the second label let the Windows non-pg Test step's assert-suite-cover.py
+select it until ADR-0035 made that leg agent-only; Linux selects it by name
+in its non-pg server invocation), NOT inside the cheap flake-retry selftest
 (suite: 'docs'): it needs the real yuzu_server_tests binary built, which
 the docs suite deliberately does not depend on. No Postgres connection
 needed — --list-tests only enumerates registered TEST_CASE macros, it

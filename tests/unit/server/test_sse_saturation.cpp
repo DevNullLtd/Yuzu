@@ -32,13 +32,16 @@
 #if !defined(YUZU_TSAN_ACTIVE)
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/matchers/catch_matchers.hpp>
 
 #include "../../../server/core/src/stream_budget.hpp"
+#include "../test_helpers.hpp"
 
 #include <httplib.h>
 
 #include <atomic>
 #include <chrono>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
@@ -52,19 +55,22 @@ namespace {
 /// The point is the POOL, not the routes — every held-open response pins a worker whichever
 /// surface serves it, and that is the property under test.
 struct SaturationRig {
-    static constexpr std::size_t kStreams = 4;   // the budget's global cap
-    static constexpr std::size_t kReserve = 4;   // workers held back for plain traffic
+    static constexpr std::size_t kStreams = 4; // the budget's global cap
+    static constexpr std::size_t kReserve = 4; // workers held back for plain traffic
 
     detail::StreamBudget budget{{.global_cap = kStreams}};
     httplib::Server svr;
     std::thread listener;
     int port = 0;
     std::atomic<bool> release_streams{false};
+    std::atomic<bool> listener_finished{false};
 
-    SaturationRig() {
+    explicit SaturationRig(bool start_immediately = true) {
         // The pool is derived from the stream target, exactly as server.cpp does it.
         const std::size_t pool = detail::derive_worker_pool(kStreams, kReserve);
-        svr.new_task_queue = [pool] { return new httplib::ThreadPool(pool, pool); };
+        svr.new_task_queue = [pool] {
+            return new httplib::ThreadPool(pool, pool);
+        };
 
         // The streaming route: leases, then holds the connection open until released.
         svr.Get("/stream", [this](const httplib::Request&, httplib::Response& res) {
@@ -97,10 +103,33 @@ struct SaturationRig {
         });
 
         port = svr.bind_to_any_port("127.0.0.1");
-        listener = std::thread([this] { svr.listen_after_bind(); });
-        while (!svr.is_running()) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        if (port <= 0) {
+            throw std::runtime_error("SaturationRig could not bind a loopback port");
         }
+        if (start_immediately) {
+            start();
+        }
+    }
+
+    void start() {
+        bool ready = false;
+        yuzu::test::ScopeExit cleanup_failed_start{[&] {
+            if (!ready) {
+                svr.stop();
+                if (listener.joinable()) {
+                    listener.join();
+                }
+            }
+        }};
+        listener = std::thread([this] {
+            svr.listen_after_bind();
+            listener_finished.store(true);
+        });
+        (void)yuzu::test::spin_until([&] { return svr.is_running() || listener_finished.load(); });
+        if (!svr.is_running()) {
+            throw std::runtime_error("SaturationRig listener did not become ready");
+        }
+        ready = true;
     }
 
     ~SaturationRig() {
@@ -112,26 +141,84 @@ struct SaturationRig {
     }
 };
 
+// The cleanup member is constructed before any thread starts and destroyed before
+// the vector, including when spawning a later client throws during construction.
+struct HeldStreams {
+    SaturationRig& rig;
+    std::vector<std::thread> threads;
+    struct Cleanup {
+        HeldStreams& owner;
+        ~Cleanup() { owner.release_and_join(); }
+    } cleanup{*this};
+
+    explicit HeldStreams(SaturationRig& owner) : rig(owner) {
+        for (std::size_t i = 0; i < SaturationRig::kStreams; ++i) {
+            threads.emplace_back([&rig = rig] {
+                httplib::Client cli("127.0.0.1", rig.port);
+                cli.set_connection_timeout(5, 0);
+                cli.set_read_timeout(10, 0);
+                cli.Get("/stream", [](const char*, std::size_t) { return true; });
+            });
+        }
+    }
+    HeldStreams(const HeldStreams&) = delete;
+    HeldStreams& operator=(const HeldStreams&) = delete;
+
+    void release_and_join() {
+        rig.release_streams.store(true);
+        for (auto& thread : threads) {
+            if (thread.joinable()) {
+                thread.join();
+            }
+        }
+    }
+};
+
 } // namespace
+
+TEST_CASE("SSE fixture reports failed listener startup and joins the listener",
+          "[sse][saturation][fixture]") {
+    SaturationRig rig{false};
+    rig.svr.decommission();
+    REQUIRE_THROWS_WITH(rig.start(), "SaturationRig listener did not become ready");
+    CHECK(rig.listener_finished.load());
+    CHECK_FALSE(rig.listener.joinable());
+    CHECK_FALSE(rig.svr.is_running());
+}
+
+TEST_CASE("SSE fixture releases held streams during exception unwind",
+          "[sse][saturation][fixture]") {
+    SaturationRig rig;
+    bool saturated = false;
+    try {
+        HeldStreams streams{rig};
+        REQUIRE(
+            yuzu::test::spin_until([&] { return rig.budget.active() == SaturationRig::kStreams; }));
+        saturated = true;
+        throw std::runtime_error("fixture unwind");
+    } catch (const std::runtime_error& error) {
+        CHECK(std::string{error.what()} == "fixture unwind");
+    }
+    REQUIRE(saturated);
+    REQUIRE(yuzu::test::spin_until([&] { return rig.budget.active() == 0; }));
+    httplib::Client cli("127.0.0.1", rig.port);
+    cli.set_connection_timeout(5, 0);
+    cli.set_read_timeout(5, 0);
+    const auto response = cli.Get("/plain");
+    REQUIRE(response);
+    CHECK(response->status == 200);
+    CHECK(response->body == "ok");
+}
 
 TEST_CASE("CH-6: a server saturated with held-open streams still answers plain requests",
           "[sse][ch6][saturation]") {
     SaturationRig rig;
 
     // Fill every stream slot with a REAL held-open connection. Each one pins a worker.
-    std::vector<std::thread> streamers;
-    for (std::size_t i = 0; i < SaturationRig::kStreams; ++i) {
-        streamers.emplace_back([&rig] {
-            httplib::Client cli("127.0.0.1", rig.port);
-            cli.set_read_timeout(10, 0);
-            // Bleeds heartbeats until the rig tears down; the connection — and its worker —
-            // is held for the whole test.
-            cli.Get("/stream", [](const char*, std::size_t) { return true; });
-        });
-    }
+    HeldStreams streamers{rig};
     // Spin on the observable the assertion below actually depends on, not on a fixed
-    // sleep. an `attached` counter would only prove the client THREADS started — the Get() that takes the
-    // lease happens after it — so the old `sleep_for(150ms)` was the real barrier, and
+    // sleep. an `attached` counter would only prove the client THREADS started — the Get() that
+    // takes the lease happens after it — so the old `sleep_for(150ms)` was the real barrier, and
     // 150 ms is not a safe margin on the shared 4-agent CI boxes (Defender-serialised I/O
     // on Wee Tam is the documented aggravator, #473/#482). A short attach that slipped the
     // window failed hard, not soft: the follow-on 429 assertion got a 200 chunked stream
@@ -169,10 +256,7 @@ TEST_CASE("CH-6: a server saturated with held-open streams still answers plain r
         CHECK(rig.budget.active() == SaturationRig::kStreams);
     }
 
-    rig.release_streams.store(true);
-    for (auto& t : streamers) {
-        t.join();
-    }
+    streamers.release_and_join();
 }
 
 TEST_CASE("CH-6: every held-open response returns its worker on teardown",
@@ -183,26 +267,15 @@ TEST_CASE("CH-6: every held-open response returns its worker on teardown",
     SaturationRig rig;
 
     for (int round = 0; round < 3; ++round) {
-        std::vector<std::thread> streamers;
         rig.release_streams.store(false);
-        for (std::size_t i = 0; i < SaturationRig::kStreams; ++i) {
-            streamers.emplace_back([&rig] {
-                httplib::Client cli("127.0.0.1", rig.port);
-                cli.set_read_timeout(10, 0);
-                cli.Get("/stream", [](const char*, std::size_t) { return true; });
-            });
-        }
+        HeldStreams streamers{rig};
         // Same bounded spin on the real observable as the first case above.
-        for (int spin = 0; spin < 400 && rig.budget.active() != SaturationRig::kStreams;
-             ++spin) {
+        for (int spin = 0; spin < 400 && rig.budget.active() != SaturationRig::kStreams; ++spin) {
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
         CHECK(rig.budget.active() == SaturationRig::kStreams);
 
-        rig.release_streams.store(true);
-        for (auto& t : streamers) {
-            t.join();
-        }
+        streamers.release_and_join();
         // Every worker comes back — round after round, with no drift.
         for (int spin = 0; spin < 200 && rig.budget.active() != 0; ++spin) {
             std::this_thread::sleep_for(std::chrono::milliseconds(10));

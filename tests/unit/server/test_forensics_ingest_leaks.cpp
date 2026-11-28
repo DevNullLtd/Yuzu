@@ -175,6 +175,13 @@ TEST_CASE("live output bus: a Forensics-tier plugin's frames publish nothing to 
         CHECK(h.output_events().empty());
         CHECK(h.marker_count() == 0);
     }
+    SECTION("file_search (Forensics-tier through the stored-row flag, not the Forensics securable) "
+            "publishes nothing") {
+        h.svc.process_gateway_response("agent-1", running_frame("file_search-0004", kMarker));
+        h.svc.process_gateway_response("agent-1", running_frame("FILE_SEARCH-0005", kMarker));
+        CHECK(h.output_events().empty());
+        CHECK(h.marker_count() == 0);
+    }
     SECTION("a mixed batch: only the ordinary plugin's row publishes") {
         h.svc.process_gateway_response(
             "agent-1", running_frame(std::string{test::kForensicsPlugin} + "-0001", kMarker));
@@ -1117,6 +1124,19 @@ TEST_CASE("terminal failure text: every derived sink carries only a bounded toke
         ingest(failure_frame(id, kToken));
         check_sinks(h.observe(), id, agent, kToken);
     }
+    SECTION("free text from file_search (Forensics-tier through the stored-row flag) is reduced in "
+            "all four sinks") {
+        const std::string id = "file_search-0e5";
+        ingest(failure_frame(id, kFreeText));
+        const auto v = h.observe();
+        check_sinks(v, id, agent, "forensics_error");
+        for (const auto& s : v.notifications)
+            CHECK(s.find("marker-4990") == std::string::npos);
+        for (const auto& s : v.offload_payloads)
+            CHECK(s.find("marker-4990") == std::string::npos);
+        for (const auto& s : v.webhook_payloads)
+            CHECK(s.find("marker-4990") == std::string::npos);
+    }
     SECTION("an ordinary plugin keeps its full failure text in all four sinks (control)") {
         const std::string id = std::string{test::kOrdinaryPlugin} + "-0e3";
         ingest(failure_frame(id, kFreeText));
@@ -1260,6 +1280,19 @@ TEST_CASE("timing stat: the direct Subscribe path relays only a plain millisecon
     CHECK(marker == 0); // free text after the sentinel never reaches the shared bus
 }
 
+TEST_CASE("result-set producers: only a non-Forensics plugin may seed a set",
+          "[server][forensics_tier][security]") {
+    const auto& set = test::forensics_plugin_set();
+    CHECK_FALSE(plugin_may_seed_result_set(test::kForensicsPlugin, &set));
+    CHECK_FALSE(plugin_may_seed_result_set("BROWSER_INVENTORY", &set)); // the fold is ASCII-case-blind
+    CHECK_FALSE(plugin_may_seed_result_set("file_search", &set)); // Forensics-tier by the stored-row flag
+    CHECK(plugin_may_seed_result_set(test::kOrdinaryPlugin, &set));
+    CHECK(plugin_may_seed_result_set("echo", &set));
+    // An unwired set (a test harness; the server will not boot without it) refuses nothing.
+    CHECK(plugin_may_seed_result_set(test::kForensicsPlugin, nullptr));
+    CHECK(kSourceNotSupportedMessage.starts_with("RESULT_SET_SOURCE_NOT_SUPPORTED: "));
+}
+
 TEST_CASE("result-set materializer: membership is never derived from a Forensics plugin's rows",
           "[pg][server][forensics_tier][security]") {
     YUZU_REQUIRE_PG_DB_TPL(db, leaks_responsestore_tpl);
@@ -1361,7 +1394,7 @@ TEST_CASE("response tier SQL folds the plugin name as ASCII (observable on a loc
 TEST_CASE("the plugins behind the frozen internal-consumer reads are not Forensics-tier",
           "[server][forensics_tier][security]") {
     const auto& set = test::forensics_plugin_set();
-    for (const char* plugin : {"echo", "content_dist", "quarantine"}) {
+    for (const char* plugin : {"echo", "content_dist", "firewall"}) {
         INFO(plugin);
         CHECK_FALSE(set.contains(plugin));
     }
@@ -1369,4 +1402,119 @@ TEST_CASE("the plugins behind the frozen internal-consumer reads are not Forensi
         INFO(check.plugin);
         CHECK_FALSE(set.contains(check.plugin));
     }
+}
+
+// The per-device live read (REST POST /api/v1/dex/devices/{id}/live and MCP get_device_live)
+// dispatches os_info/uptime and processes/list_hashed and reads them back under the fixed-plugin
+// tier filter, which excludes every Forensics-tier plugin. That is only sound while neither
+// plugin is Forensics-tier, so pin both against the catalogue-derived set.
+TEST_CASE("the plugins behind the live device read are not Forensics-tier",
+          "[server][forensics_tier][security][live]") {
+    const auto& set = test::forensics_plugin_set();
+    for (const char* plugin : {"os_info", "processes"}) {
+        INFO(plugin);
+        CHECK_FALSE(set.contains(plugin));
+    }
+}
+
+// An agent failure text containing an embedded NUL byte must still settle the agent's status row:
+// a NUL cannot be stored in a text column, so the ingest replaces it (U+FFFD) before any sink
+// binds the text, and the rest of the message is kept as sent.
+TEST_CASE("tracker error_detail: a message with an embedded NUL is recorded with the byte replaced",
+          "[pg][server][forensics_tier][validation]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, forensics_leaks_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    LiveBusHarness h;
+    h.svc.set_forensics_plugin_set(&test::forensics_plugin_set());
+    ExecutionEventBus exec_bus;
+    yuzu::test::TrackerScope ts{h.svc, pool, &exec_bus};
+
+    const std::string with_nul("before\0after", 12);
+    const auto run = [&](const std::string& command_id, const std::string& message) {
+        const auto exec_id = ts.make_exec();
+        record_for_prefix(h.svc, command_id, exec_id);
+        h.svc.process_gateway_response("agent-1", failure_frame(command_id, message));
+        return exec_id;
+    };
+
+    SECTION("an ordinary plugin: the status row exists, terminal, NUL replaced, text kept") {
+        const auto exec_id = run(std::string{test::kOrdinaryPlugin} + "-0nul1", with_nul);
+        const auto statuses = ts.tracker->get_agent_statuses(exec_id);
+        REQUIRE(statuses.size() == 1);
+        CHECK(statuses[0].status == "failure");
+        CHECK(statuses[0].exit_code == 3);
+        CHECK(statuses[0].error_detail == "before\xEF\xBF\xBD" "after");
+        CHECK(outbox_data(pool, exec_id).find("failure") != std::string::npos);
+    }
+    SECTION("a Forensics plugin: still reduced to the bounded token, status kept") {
+        const auto exec_id = run(std::string{test::kForensicsPlugin} + "-0nul2", with_nul);
+        const auto statuses = ts.tracker->get_agent_statuses(exec_id);
+        REQUIRE(statuses.size() == 1);
+        CHECK(statuses[0].status == "failure");
+        CHECK(statuses[0].error_detail == "forensics_error");
+    }
+    SECTION("control: a clean ordinary message is unchanged") {
+        const auto exec_id = run(std::string{test::kOrdinaryPlugin} + "-0nul3", kFreeText);
+        const auto statuses = ts.tracker->get_agent_statuses(exec_id);
+        REQUIRE(statuses.size() == 1);
+        CHECK(statuses[0].error_detail == kFreeText);
+    }
+}
+
+// file_search is launched under FileRetrieval (fleet and group targeting stay possible) but its stored
+// rows are Forensics-tier through the catalogue flag (StoredRowTier::ForensicsRead). It is a member of
+// the one derived set, so every consumer of that set treats it as the Forensics plugins are treated; the
+// cases above that loop over the set or name browser_inventory prove the mechanism, and these name
+// file_search so that dropping the flag from its catalogue row fails here.
+TEST_CASE("file_search is in the Forensics plugin set through the stored-row flag",
+          "[server][forensics_tier][security]") {
+    const auto& set = test::forensics_plugin_set();
+    CHECK(set.contains("file_search"));
+    CHECK(set.contains("FILE_SEARCH")); // the fold is ASCII-case-blind
+    const auto filter = ResponseTierFilter::exclude(set, authz::deny_all());
+    CHECK_FALSE(filter.admits("file_search"));
+    CHECK(filter.admits(test::kOrdinaryPlugin));
+    // A global Forensics:Read (nullopt) admits it, exactly like every other Forensics-tier plugin.
+    CHECK(ResponseTierFilter::exclude(set, std::nullopt).admits("file_search"));
+    // The fixed-plugin polls (the live snapshots, the DEX and Echo result polls) exclude it too.
+    CHECK_FALSE(ResponseTierFilter::for_fixed_plugin_poll(&set).admits("file_search"));
+}
+
+TEST_CASE("tracker error_detail: a stored free-text error of a file_search execution is reduced on read",
+          "[pg][server][forensics_tier][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, forensics_leaks_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecutionTracker tracker{pool};
+    REQUIRE(tracker.is_open());
+
+    const auto make_failed = [&](const std::string& command_id, const std::string& text) {
+        Execution e;
+        e.definition_id = "def-file-search";
+        e.dispatched_by = "tester";
+        e.status = "running";
+        e.agents_targeted = 1;
+        auto id = tracker.create_execution(e);
+        REQUIRE(id.has_value());
+        REQUIRE(tracker.record_command_dispatch(command_id, command_id.substr(0, command_id.find('-')), *id));
+        AgentExecStatus s; // a write that skips the ingest-time reduction: raw text, straight to the tracker
+        s.agent_id = "agent-1";
+        s.status = "failure";
+        s.completed_at = 100;
+        s.error_detail = text;
+        tracker.update_agent_status(*id, s);
+        tracker.refresh_counts(*id);
+        return *id;
+    };
+    const auto search = make_failed("file_search-0f", kFreeText);
+    const auto ordinary = make_failed(std::string{test::kOrdinaryPlugin} + "-0g", kFreeText);
+
+    tracker.set_forensics_plugin_set(&test::forensics_plugin_set());
+    CHECK(tracker.get_agent_statuses(search)[0].error_detail == "forensics_error");
+    CHECK(tracker.get_agent_statuses_for_executions({search}).at(search)[0].error_detail ==
+          "forensics_error");
+    const auto got = tracker.get_execution(search);
+    REQUIRE(got.has_value());
+    CHECK(got->last_error_detail == "forensics_error");
+    // Control: an ordinary plugin's text is unchanged, so a scrub that withheld everything fails too.
+    CHECK(tracker.get_agent_statuses(ordinary)[0].error_detail == kFreeText);
 }

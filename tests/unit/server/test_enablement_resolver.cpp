@@ -48,7 +48,7 @@ constexpr std::array<CommandCapability, 18> kFixtureRows{{
     row("r", "w"),
     row("s", "m"),
     row("s", "n"),
-    row("quarantine", "unquarantine"),
+    row("firewall", "release"),
     row("u", "v"), // 2-cycle with u.w, and a self-edged u.s
     row("u", "w"),
     row("u", "s"),
@@ -226,7 +226,7 @@ TEST_CASE("enablement resolver: order-independence over random rule orderings", 
         {"c", {"q.b"}, "__all__"},
         {"d", {"t.a"}, R"(NOT tag:lab == "yes")"},
         {"e", {"p.z", "t.b"}, R"(hostname LIKE "lin%")"},
-        {"f", {"quarantine"}, "__all__"},
+        {"f", {"firewall"}, "__all__"},
         {"g", {"q"}, R"(ostype != "windows")", Provenance::CarriedOver},
         {"h", {"p.x"}, "__all__", Provenance::System},
     };
@@ -259,7 +259,7 @@ TEST_CASE("enablement resolver: off wins and lists every matching rule", "[enabl
 TEST_CASE("enablement resolver: provenance keys the match and not the id alone",
           "[enablement][scope]") {
     SECTION("a rule naming only a non-unit still appears in matched_rules") {
-        const auto r = run({{"only-non", {"quarantine"}, "__all__"}}, "linux");
+        const auto r = run({{"only-non", {"firewall"}, "__all__"}}, "linux");
         CHECK(r.off.empty());
         CHECK(r.matched_rules == Matches{{"only-non", Op}});
     }
@@ -408,15 +408,15 @@ TEST_CASE("enablement resolver: make_rule validates the unit names", "[enablemen
     CHECK_FALSE(make_rule("r", {"nope.x"}, "__all__", Op, overlay(), kinds()).has_value());
     CHECK_FALSE(make_rule("r", {"p.nope"}, "__all__", Op, overlay(), kinds()).has_value());
     CHECK_FALSE(make_rule("r", {}, "__all__", Op, overlay(), kinds()).has_value());
-    CHECK(make_rule("r", {"quarantine.unquarantine"}, "__all__", Op, overlay(), kinds())
+    CHECK(make_rule("r", {"firewall.release"}, "__all__", Op, overlay(), kinds())
               .has_value());
-    CHECK(make_rule("r", {"quarantine"}, "__all__", Op, overlay(), kinds()).has_value());
+    CHECK(make_rule("r", {"firewall"}, "__all__", Op, overlay(), kinds()).has_value());
 }
 
 TEST_CASE("enablement resolver: a protective rule has no effect but is listed",
           "[enablement][scope]") {
-    const auto r = run({{"a", {"quarantine.unquarantine"}, "__all__"},
-                        {"b", {"quarantine"}, "__all__"}},
+    const auto r = run({{"a", {"firewall.release"}, "__all__"},
+                        {"b", {"firewall"}, "__all__"}},
                        "linux");
     CHECK(r.off.empty());
     CHECK(r.matched_rules == Matches{{"a", Op}, {"b", Op}});
@@ -645,14 +645,14 @@ TEST_CASE("enablement resolver: a rule naming a vanished unit is reported and sw
     std::vector<Rule> rules;
     rules.push_back(load_persisted("g1", {"gone.x", "p.y"}, "__all__"));
     rules.push_back(load_persisted("g2", {"p.x", "gone.z", "gone.x"}, R"(ostype == "windows")"));
-    rules.push_back(load_persisted("g3", {"quarantine"}, "__all__"));
+    rules.push_back(load_persisted("g3", {"firewall"}, "__all__"));
 
     // g2's selector does not match a linux endpoint, yet its stale name is
     // reported: the answer is the same on every endpoint.
     for (const char* os : {"linux", "windows"}) {
         INFO(os);
         const auto r = run_rules(rules, os, {{"ostype", os}});
-        CHECK(r.unresolved_units == Names{"gone.x", "gone.z"}); // quarantine is a known non-unit
+        CHECK(r.unresolved_units == Names{"gone.x", "gone.z"}); // firewall is a known non-unit
         CHECK(find_off(r, "p.y") != nullptr);
         CHECK(find_off(r, "gone.x") == nullptr);
     }

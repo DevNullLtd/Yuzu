@@ -9,15 +9,18 @@
 #include "session_store.hpp"  // HA WS-1/1a — durable operator sessions (ADR-2002 §4)
 #include "rbac_store.hpp"                // #4966: the last-Administrator guard (deactivate_account / set_local_role)
 #include "credential_change_owner.hpp" // #5342 — the one-transaction credential change
+#include "mfa_disable_owner.hpp"        // #6079 PR 2c: the one-transaction MFA factor clear
 
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <format>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <optional>
 #include <shared_mutex>
 #include <sstream>
 #include <stdexcept>
@@ -33,7 +36,8 @@
 #include <openssl/evp.h>
 #include <openssl/rand.h>
 #include <sys/stat.h> // umask()
-#include <unistd.h>   // geteuid()
+#include <unistd.h>   // geteuid(), isatty()
+#include <termios.h>  // F44: disable echo on the first-run password prompt
 #endif
 
 namespace yuzu::server::auth {
@@ -164,7 +168,22 @@ std::string role_to_string(Role r) {
 }
 
 Role string_to_role(const std::string& s) {
-    return s == "admin" ? Role::admin : Role::user;
+    if (s == "admin")
+        return Role::admin;
+    if (s == "user")
+        return Role::user;
+    // #4072: role_to_string() only ever returns "admin" or "user", so anything else
+    // is drift (a botched migration, a hand edit of auth.users.role, a corrupt cfg
+    // line), never a legitimate value. It still floors to Role::user - failing safe,
+    // never granting - but must not do so silently: a quiet demotion hides the
+    // corruption. log_key_token (not log_token): the value is DB/file-sourced and is
+    // logged inside quotes, so it must be length-capped and have control bytes and
+    // Unicode line separators folded (CWE-117).
+    spdlog::warn("string_to_role: unrecognized role value '{}' - resolving to Role::user "
+                 "(fail-safe); check the stored role source (auth.users.role, a session row "
+                 "or the legacy config file) for corruption or a migration gap",
+                 ::yuzu::log_key_token(s));
+    return Role::user;
 }
 
 std::filesystem::path default_config_path() {
@@ -374,22 +393,36 @@ static std::string prompt(const std::string& msg, const std::string& default_val
     return input;
 }
 
-static std::string prompt_password(const std::string& msg) {
+// F44: returns nullopt (caller refuses) when echo cannot be disabled on POSIX.
+static std::optional<std::string> prompt_password(const std::string& msg) {
     std::cout << msg << ": ";
     std::cout.flush();
 
-    // Disable echo
 #ifdef _WIN32
     HANDLE hStdin = GetStdHandle(STD_INPUT_HANDLE);
-    DWORD mode;
+    DWORD mode = 0;
     GetConsoleMode(hStdin, &mode);
     SetConsoleMode(hStdin, mode & ~ENABLE_ECHO_INPUT);
 #else
-    // POSIX: use termios to disable echo
-    struct termios_guard {
-        // Simple approach: just read without echo toggle for now.
-        // Full implementation would use tcgetattr/tcsetattr.
-    };
+    // POSIX: refuse unless stdin is a TTY whose echo we can clear. The RAII
+    // guard restores the saved attributes on every exit path (early return,
+    // exception from getline).
+    struct termios saved{};
+    if (!isatty(STDIN_FILENO) || tcgetattr(STDIN_FILENO, &saved) != 0) {
+        std::cerr << "\nstdin is not a terminal; refusing to read a password without echo "
+                     "control.\n";
+        return std::nullopt;
+    }
+    struct termios noecho = saved;
+    noecho.c_lflag &= ~static_cast<tcflag_t>(ECHO);
+    if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &noecho) != 0) {
+        std::cerr << "\nCould not disable terminal echo; refusing to read a password.\n";
+        return std::nullopt;
+    }
+    struct EchoRestore {
+        struct termios saved;
+        ~EchoRestore() { tcsetattr(STDIN_FILENO, TCSAFLUSH, &saved); }
+    } restore{saved};
 #endif
 
     std::string pw;
@@ -421,7 +454,10 @@ bool AuthManager::first_run_setup(const std::filesystem::path& cfg_path) {
         std::cerr << "Account name cannot be empty.\n";
         return false;
     }
-    auto admin_pw = prompt_password("Admin password");
+    auto admin_pw_opt = prompt_password("Admin password");
+    if (!admin_pw_opt)
+        return false;
+    auto admin_pw = std::move(*admin_pw_opt);
     if (const auto verdict = check_password_policy(admin_pw);
         verdict != PasswordPolicyVerdict::kOk) {
         if (verdict == PasswordPolicyVerdict::kTooShort)
@@ -432,7 +468,9 @@ bool AuthManager::first_run_setup(const std::filesystem::path& cfg_path) {
         return false;
     }
     auto admin_pw2 = prompt_password("Confirm admin password");
-    if (admin_pw != admin_pw2) {
+    if (!admin_pw2)
+        return false;
+    if (admin_pw != *admin_pw2) {
         std::cerr << "Passwords do not match.\n";
         return false;
     }
@@ -487,7 +525,7 @@ bool AuthManager::derive_session_deadlines(Session& s, std::int64_t created_ms,
 
     // Fail-closed sentinels FIRST, so an early return below leaves EVERY steady
     // field in the defined {} state — even when re-deriving a LIVE cached session
-    // (mark_mfa / elevate re-derive `it->second` in place), where a partially-set
+    // (`post_stamp_factor_recheck` re-derives `it->second` in place), where a partially-set
     // false path would otherwise leave a stale steady_elevated_until/mfa live
     // (adversarial-review K2). A false return means "do not honor / do not cache".
     s.steady_expires = {};
@@ -584,17 +622,30 @@ bool AuthManager::wipe_user_sessions_durable(const std::string& username) {
     if (!session_store_)
         return true; // legacy in-memory path — nothing durable to fail
     if (auto r = session_store_->invalidate_user(username); !r) {
-        spdlog::error("durable session wipe for user '{}' failed ({}) — role change NOT honored, "
-                      "retry (invalidate_user is idempotent)",
-                      username, r.error().message);
+        spdlog::error("durable session wipe for user '{}' failed ({}) - session wipe did not "
+                      "persist, retry (invalidate_user is idempotent)",
+                      ::yuzu::log_key_token(username), r.error().message);
         note_session_store_degrade("invalidate_user"); // parity with the other degrade sites
         return false; // fail closed — caller must not report success (authdb-BLOCKING)
     }
     return true;
 }
 
+bool AuthManager::wipe_user_sessions_then_drop_cache(const std::string& username) {
+    const bool persisted = wipe_user_sessions_durable(username);
+    // No lock is held across the durable wipe above; mu_ is taken only for the erase and the
+    // epoch bump. The drop runs after a failed wipe too, but it only closes the straddle when the
+    // wipe persisted: after a failure the row survives and a later cold read can re-cache it.
+    std::unique_lock lock(mu_);
+    drop_cached_user_sessions_locked(username);
+    return persisted;
+}
+
 bool AuthManager::persist_new_session(const std::string& raw_token,
-                                      const yuzu::server::SessionWriteParams& params) {
+                                      const yuzu::server::SessionWriteParams& params,
+                                      bool* future_dated) {
+    if (future_dated)
+        *future_dated = false;
     // The cached Session's non-time fields come straight from params; its
     // adjudication deadlines are derived from the AUTHORED times (DB clock for a
     // durable store; this host's wall clock for the legacy path) so the cache
@@ -622,13 +673,46 @@ bool AuthManager::persist_new_session(const std::string& raw_token,
             return false; // fail closed — login not honored (ADR-0007)
         }
         const auto& a = *r;
+        if (params.local_mfa.verified_ms > 0 && a.mfa_verified_ms == 0) {
+            // The carried verification instant was later than the DB clock at the write
+            // (it stepped back between the verification and now): the store kept NO proof and
+            // NO binding. Never a clamped age-zero proof, so the mint is refused: delete the
+            // row just written (this token only; it was never released) and cache nothing.
+            if (metrics_)
+                metrics_->counter("yuzu_auth_mfa_verification_future_dated_total").increment();
+            spdlog::warn("AuthManager: refusing session for '{}': the carried MFA verification "
+                         "instant is later than the database clock",
+                         ::yuzu::log_key_token(s.username));
+            if (auto del = session_store_->invalidate(p.token_hash); !del) {
+                // The token is never released, so a row that survives holds no usable
+                // credential; surface it all the same.
+                spdlog::error("AuthManager: could not delete the refused session row ({})",
+                              del.error().message);
+                note_session_store_degrade("invalidate");
+            }
+            if (future_dated)
+                *future_dated = true;
+            return false;
+        }
         derive_session_deadlines(s, a.created_at_ms, a.expires_at_ms, a.last_activity_ms,
                                  a.mfa_verified_ms, a.elevated_until_ms, a.elevation_issued_ms,
                                  a.db_now_ms);
     } else {
-        // Legacy no-store path: this host's wall clock IS the authority.
+        // Legacy no-store path: this host's wall clock IS the authority. The same rule as
+        // the store's SQL: a carried instant later than `now` is refused, never clamped.
         const std::int64_t now_ms = wall_now_ms();
-        const std::int64_t mfa_ms = params.mfa_verified_now ? now_ms : params.mfa_verified_ms_abs;
+        if (params.local_mfa.verified_ms > now_ms) {
+            if (metrics_)
+                metrics_->counter("yuzu_auth_mfa_verification_future_dated_total").increment();
+            spdlog::warn("AuthManager: refusing session for '{}': the carried MFA verification "
+                         "instant is later than the clock",
+                         ::yuzu::log_key_token(s.username));
+            if (future_dated)
+                *future_dated = true;
+            return false;
+        }
+        const std::int64_t mfa_ms = params.local_mfa.verified_ms > 0 ? params.local_mfa.verified_ms
+                                                                     : params.mfa_verified_ms_abs;
         derive_session_deadlines(s, now_ms, now_ms + params.session_lifetime_ms, now_ms, mfa_ms,
                                  /*elevated_until*/ 0, /*elevation_issued*/ 0, now_ms);
     }
@@ -664,22 +748,51 @@ void AuthManager::maybe_refresh_session_generation() const {
         note_session_store_degrade("generation_refresh");
         return;
     }
-    bool advanced = false;
+    bool changed = false;
     {
         std::lock_guard<std::mutex> g(session_gen_mtx_);
         last_successful_session_gen_refresh_ms_ = steady_now_ms(); // bounded stale-serve anchor
-        if (!session_gen_valid_ || *gen > cached_session_gen_) {
+        // ANY difference from the cached value is a change, a LOWER one included
+        // (#6079). A point-in-time restore or a failover to a lagging standby
+        // can leave the stored counter below this replica's cached value; a
+        // forward-only `>` test would keep the old value, miss every later
+        // revocation (the counter climbs from the lower base) and keep serving
+        // cached sessions, bounded only by the 8 h absolute lifetime. This
+        // replica never writes `cached_session_gen_` on a local mutation (its
+        // own bump is observed by this same poll like any other), so an
+        // unchanged read is the only no-op and there is no clear loop. The gate
+        // above only stamps a timestamp before the unlocked read, so a read
+        // slower than the interval lets a second poll start; if they finish out
+        // of order the stale one re-adopts the older value and the next poll
+        // adopts the newer one again: up to two extra clears. Over-clearing
+        // only forces durable re-reads, never drops a durable row
+        // (a session held only in this cache, whose write-through failed, is
+        // lost on a clear, which is fail-closed). The generation read MUST come
+        // from the primary: a reader answered by alternating nodes with
+        // different counters clears the cache on every flip (at most once per
+        // replica per poll interval), an availability cost, never a bypass.
+        // KNOWN RESIDUAL: a counter that is EXACTLY equal to the cached value at
+        // the poll (restored to it, or regressed and climbed back to it between
+        // two polls) is indistinguishable from "no change" and is not detected
+        // here; a counter that passed it differs and is. The recovery runbook
+        // keeps "restart every replica" as defence in depth.
+        if (!session_gen_valid_ || *gen != cached_session_gen_) {
             cached_session_gen_ = *gen;
             session_gen_valid_ = true;
-            advanced = true;
+            changed = true;
         }
     }
-    if (advanced) {
-        // A mutation landed (possibly on another replica) — drop the whole cache
-        // so the next lookup re-reads authoritative state. Cleared under mu_,
-        // which is never held together with session_gen_mtx_.
+    if (changed) {
+        // The generation moved (a mutation landed, possibly on another replica,
+        // or the counter regressed): drop the whole cache so the next lookup
+        // re-reads authoritative state. Cleared under mu_, which is never held
+        // together with session_gen_mtx_. The epoch moves in the SAME critical
+        // section as the clear: a validation that captured the old epoch under its
+        // step-1 shared lock may no longer insert its session (see the tail of
+        // validate_session_durable).
         std::unique_lock lock(mu_);
         sessions_.clear();
+        ++session_cache_epoch_;
     }
 }
 
@@ -779,56 +892,56 @@ AuthManager::recheck_role_after_credential_check(const std::string& username, Ro
     // #5274: set inside the row lock when the stored hash is no longer the one
     // the caller verified the supplied password against.
     bool credential_changed = false;
-    auto outcome = auth_db_->recheck_role_locked(username, [&](Role db_role,
-                                                               const std::string& db_hash) {
-        // Invoked while AuthDB holds this row's lock - see the header doc.
-        // Lock ORDERING invariant (cpp-expert Gate 8 catch): this is the
-        // first place in this file mu_ is acquired from INSIDE an open
-        // AuthDB transaction. Safe only because every DB write this file
-        // makes (update_role_checked/reactivate_user/remove_user_checked, the first and
-        // last through the #4966 owner's guarded transactions) completes its own
-        // DB call BEFORE ever touching mu_ (the file-wide "never hold mu_
-        // across a DB call" discipline, stated where each of those calls
-        // takes mu_) - so no code path can be holding mu_ while ALSO
-        // attempting to open a transaction that needs this same row lock,
-        // which would deadlock against this one. A future change that holds
-        // mu_ and then calls an AuthDB write method would break this.
-        //
-        // TEST-ONLY seam (see set_role_recheck_inside_lock_hook_for_test's
-        // doc): a no-op (nullptr) in production.
-        if (role_recheck_inside_lock_hook_for_test_)
-            role_recheck_inside_lock_hook_for_test_();
-        // #5274: a password change committed between the caller's DB-first
-        // read (find_user_or_hydrate) and this row lock means the password was
-        // verified against a credential that no longer exists. Deny - no
-        // re-verify against the new hash; the user retries. Checked BEFORE the
-        // cache write so a denied check leaves the cache untouched. The compare
-        // is of two server-held hashes (no secret-dependent timing to protect),
-        // but constant_time_compare costs nothing and keeps the idiom uniform.
-        if (!constant_time_compare(db_hash, verified_hash_hex)) {
-            credential_changed = true;
-            return;
-        }
-        std::unique_lock lock(mu_);
-        auto it = users_.find(username);
-        if (it != users_.end()) {
-            it->second.role = db_role;
-            it->second.role_version = next_role_version_();
-        }
-        // else: the entry vanished from the cache mid-recheck. Provably
-        // unreachable today (cpp-expert Gate 8 verified this by tracing):
-        // the only eraser of a specific username is remove_user_checked(),
-        // whose DB write (the owner's `deactivate_account`, the guarded soft
-        // delete, #4966) takes this SAME row lock, so its cache-erase (which
-        // runs strictly after that commit) cannot land before a callback
-        // that already observed the row as active. Not a silent bypass if
-        // this invariant is ever broken by a future change - `result` still
-        // gets set to the DB-confirmed role either way, which is the
-        // conservative choice (the row lock already proved the account is
-        // active; a merely-absent cache entry is this process's own
-        // bookkeeping lagging, not a signal to deny).
-        result = db_role;
-    });
+    auto outcome = auth_db_->recheck_role_locked(
+        username, [&](Role db_role, const std::string& db_hash, std::int64_t /*factor_gen*/) {
+            // Invoked while AuthDB holds this row's lock - see the header doc.
+            // Lock ORDERING invariant (cpp-expert Gate 8 catch): this is the
+            // first place in this file mu_ is acquired from INSIDE an open
+            // AuthDB transaction. Safe only because every DB write this file
+            // makes (update_role_checked/reactivate_user/remove_user_checked, the first and
+            // last through the #4966 owner's guarded transactions) completes its own
+            // DB call BEFORE ever touching mu_ (the file-wide "never hold mu_
+            // across a DB call" discipline, stated where each of those calls
+            // takes mu_) - so no code path can be holding mu_ while ALSO
+            // attempting to open a transaction that needs this same row lock,
+            // which would deadlock against this one. A future change that holds
+            // mu_ and then calls an AuthDB write method would break this.
+            //
+            // TEST-ONLY seam (see set_role_recheck_inside_lock_hook_for_test's
+            // doc): a no-op (nullptr) in production.
+            if (role_recheck_inside_lock_hook_for_test_)
+                role_recheck_inside_lock_hook_for_test_();
+            // #5274: a password change committed between the caller's DB-first
+            // read (find_user_or_hydrate) and this row lock means the password was
+            // verified against a credential that no longer exists. Deny - no
+            // re-verify against the new hash; the user retries. Checked BEFORE the
+            // cache write so a denied check leaves the cache untouched. The compare
+            // is of two server-held hashes (no secret-dependent timing to protect),
+            // but constant_time_compare costs nothing and keeps the idiom uniform.
+            if (!constant_time_compare(db_hash, verified_hash_hex)) {
+                credential_changed = true;
+                return;
+            }
+            std::unique_lock lock(mu_);
+            auto it = users_.find(username);
+            if (it != users_.end()) {
+                it->second.role = db_role;
+                it->second.role_version = next_role_version_();
+            }
+            // else: the entry vanished from the cache mid-recheck. Provably
+            // unreachable today (cpp-expert Gate 8 verified this by tracing):
+            // the only eraser of a specific username is remove_user_checked(),
+            // whose DB write (the owner's `deactivate_account`, the guarded soft
+            // delete, #4966) takes this SAME row lock, so its cache-erase (which
+            // runs strictly after that commit) cannot land before a callback
+            // that already observed the row as active. Not a silent bypass if
+            // this invariant is ever broken by a future change - `result` still
+            // gets set to the DB-confirmed role either way, which is the
+            // conservative choice (the row lock already proved the account is
+            // active; a merely-absent cache entry is this process's own
+            // bookkeeping lagging, not a signal to deny).
+            result = db_role;
+        });
     if (!outcome) {
         // #4020 Gate 3 quality-engineer follow-up: only a genuine UserNotFound
         // (soft-deleted/removed) means the cache is actually stale - evicting on
@@ -867,7 +980,8 @@ AuthManager::recheck_role_after_credential_check(const std::string& username, Ro
 
 bool AuthManager::post_mint_role_recheck(const std::string& username, Role minted_role,
                                          const std::optional<std::string>& expected_hash_hex,
-                                         std::string_view context) {
+                                         std::optional<std::int64_t> expected_factor_gen,
+                                         std::string_view context, MintDenial* why) {
     // #4107 check-then-mint gap (external adversarial review, fjarvis, PR
     // #4076): recheck_role_after_credential_check's row-locked read closes
     // the SAME-process/cross-replica divergence race for the read itself,
@@ -933,17 +1047,37 @@ bool AuthManager::post_mint_role_recheck(const std::string& username, Role minte
     // which is what makes the revoke-on-divergence half of this function
     // (not just the read half above) cross-replica-correct too.
     //
+    // #6079 factor generation. The same locked read also returns the account's
+    // `mfa_factor_gen`, which a database trigger sets to a fresh value on EVERY change of
+    // `mfa_enrolled_at` (clear, re-enrol, soft delete, whichever binary writes it) and
+    // which every such writer changes under this same row lock. A BOUND proof carries the
+    // generation its verifier read under that lock; a difference here means the factor
+    // the proof was earned with has since been replaced, so the mint is revoked and
+    // denied like a role change. The three cases above apply unchanged (a clear that
+    // takes the lock after this read is covered by the gates' own generation equality).
+    // Only the comparison runs under the lock: the revoke follows after it releases.
+    //
     // Returns true (nothing to do) in cfg-file mode - `users_` IS the
     // truth there, nothing to diverge from.
     if (!auth_db_)
         return true;
-    enum class Divergence { kNone, kRole, kCredential };
+    const auto deny = [&](MintDenial cause, const char* reason) {
+        if (why)
+            *why = cause;
+        if (metrics_) {
+            metrics_->counter("yuzu_auth_role_recheck_post_mint_denied_total", {{"reason", reason}})
+                .increment();
+        }
+    };
+    enum class Divergence { kNone, kRole, kCredential, kFactor };
     Divergence divergence = Divergence::kNone;
     Role db_role_seen = minted_role;
+    std::int64_t db_factor_gen_seen = 0;
     auto post = auth_db_->recheck_role_locked(
-        username, [&](Role db_role, const std::string& db_hash) {
+        username, [&](Role db_role, const std::string& db_hash, std::int64_t db_factor_gen) {
             // Under the row lock: compare only — no I/O, no mutex.
             db_role_seen = db_role;
+            db_factor_gen_seen = db_factor_gen;
             if (db_role != minted_role) {
                 divergence = Divergence::kRole;
                 return;
@@ -954,8 +1088,13 @@ bool AuthManager::post_mint_role_recheck(const std::string& username, Role minte
             // empty anchor never equals a stored hash, so it DENIES — fail
             // closed). Two server-held hashes, but constant_time_compare keeps
             // the idiom uniform.
-            if (expected_hash_hex && !constant_time_compare(db_hash, *expected_hash_hex))
+            if (expected_hash_hex && !constant_time_compare(db_hash, *expected_hash_hex)) {
                 divergence = Divergence::kCredential;
+                return;
+            }
+            // #6079: a bound proof's generation must still be the account's.
+            if (expected_factor_gen && db_factor_gen != *expected_factor_gen)
+                divergence = Divergence::kFactor;
         });
     if (!post) {
         const bool removed = yuzu::server::AuthDBError::UserNotFound == post.error();
@@ -963,9 +1102,7 @@ bool AuthManager::post_mint_role_recheck(const std::string& username, Role minte
                     context, username, removed ? "found the account no longer active"
                                                 : "hit a store error (failing closed)");
         auto revoke = invalidate_user_sessions(username);
-        if (metrics_) {
-            metrics_->counter("yuzu_auth_role_recheck_post_mint_denied_total").increment();
-        }
+        deny(MintDenial::kRecheckUnavailable, removed ? "removed" : "store");
         (void)revoke; // best-effort revoke; the mint is already denied to the caller either way
         return false;
     }
@@ -974,9 +1111,7 @@ bool AuthManager::post_mint_role_recheck(const std::string& username, Role minte
                     "the mint (concurrent role-change race) - revoking the session just minted",
                     context, username, role_to_string(minted_role), role_to_string(db_role_seen));
         auto revoke = invalidate_user_sessions(username);
-        if (metrics_) {
-            metrics_->counter("yuzu_auth_role_recheck_post_mint_denied_total").increment();
-        }
+        deny(MintDenial::kRoleChanged, "role");
         (void)revoke;
         return false;
     }
@@ -986,13 +1121,135 @@ bool AuthManager::post_mint_role_recheck(const std::string& username, Role minte
                      "the session just minted",
                      context, username);
         auto revoke = invalidate_user_sessions(username);
-        if (metrics_) {
-            metrics_->counter("yuzu_auth_role_recheck_post_mint_denied_total").increment();
-        }
+        deny(MintDenial::kCredentialChanged, "credential");
+        (void)revoke;
+        return false;
+    }
+    if (divergence == Divergence::kFactor) {
+        spdlog::warn("{}: post-mint re-check for '{}' found the MFA factor changed after the "
+                     "second factor was verified (generation {} -> {}) - revoking the session "
+                     "just minted",
+                     context, username, *expected_factor_gen, db_factor_gen_seen);
+        auto revoke = invalidate_user_sessions(username);
+        deny(MintDenial::kFactorChanged, "factor");
         (void)revoke;
         return false;
     }
     return true;
+}
+
+AuthManager::StampRecheck AuthManager::post_stamp_factor_recheck(const std::string& username,
+                                                                 const std::string& token_hash,
+                                                                 std::int64_t stamped_gen) {
+    // The stamp half of the post-mint pattern (#6079). The stamp (SessionStore::mark_mfa)
+    // has COMMITTED, so this session's row is visible to every later statement; the read
+    // below is `AuthDB::recheck_role_locked`, `SELECT ... FOR UPDATE` on the account's
+    // `auth.users` row, and every factor writer (enrol, clear, soft delete) takes that same
+    // row lock for its whole transaction. For a factor change W exactly one of:
+    //   (1) W committed before this FOR UPDATE ran -> the read sees the new generation ->
+    //       the stamp is cleared;
+    //   (2) W holds the row lock -> this read WAITS for W's commit, then sees the new
+    //       generation -> cleared (a plain read would have seen the old one);
+    //   (3) W has not taken the lock yet -> the read admits, and W's new generation lands
+    //       after the stamp, so the stored (old) generation no longer equals the account's:
+    //       a binding gate refuses the proof by equality. Nothing relies on the cleanup
+    //       below succeeding.
+    // Comparison only under the lock (no I/O, no mutex); the cleanup runs AFTER it releases,
+    // so no AuthDB row lock is ever held across a SessionStore write (the cross-store
+    // nesting docs/auth-architecture.md section 3 rejects). A wait is bounded by
+    // recheck_role_locked's transaction-scoped lock_timeout; a timeout is a store error and
+    // fails closed (the stamp is cleared and not reported as stamped).
+    if (!auth_db_ || !session_store_)
+        return StampRecheck::kHolds; // nothing to compare against / no durable stamp to clear
+    std::int64_t db_gen = 0;
+    auto post = auth_db_->recheck_role_locked(
+        username, [&](Role, const std::string&, std::int64_t factor_gen) { db_gen = factor_gen; });
+    const bool unverifiable = !post;
+    const bool changed = post && db_gen != stamped_gen;
+    if (!unverifiable && !changed)
+        return StampRecheck::kHolds;
+
+    if (unverifiable)
+        spdlog::warn("post_stamp_factor_recheck: could not read the factor generation for '{}' "
+                     "- clearing the proof just stamped (failing closed)",
+                     ::yuzu::log_key_token(username));
+    else
+        spdlog::warn("post_stamp_factor_recheck: the MFA factor for '{}' changed after the "
+                     "second factor was verified (generation {} -> {}) - clearing the proof "
+                     "just stamped",
+                     ::yuzu::log_key_token(username), stamped_gen, db_gen);
+    if (metrics_)
+        metrics_
+            ->counter("yuzu_auth_mfa_stamp_denied_total",
+                      {{"reason", unverifiable ? "unverifiable" : "factor_changed"}})
+            .increment();
+    // Cleanup, after the lock. A failure is logged and counted; this replica's cache is dropped
+    // regardless. After a CHANGED factor the row stays bound to the old generation (refused by
+    // equality); after an UNVERIFIABLE recheck the stamp holds the verifier's generation, which
+    // is the current one unless a change raced, so a failed clear leaves a proof a binding gate
+    // would admit.
+    auto cleared = session_store_->clear_mfa_proof(token_hash);
+    if (!cleared) {
+        spdlog::error("post_stamp_factor_recheck: clearing the stamped proof failed ({}) - the "
+                      "stored proof stays: after a changed factor it is bound to the previous "
+                      "generation (a binding gate refuses it), after an unverifiable recheck it "
+                      "is bound to the current one",
+                      cleared.error().message);
+        note_session_store_degrade("clear_mfa_proof");
+        drop_cached_mfa_proof(token_hash);
+    } else if (cleared->has_value()) {
+        const auto& a = cleared->value();
+        std::unique_lock lock(mu_);
+        // The in-place re-derive below edits a cached entry's MFA proof, so it moves the
+        // cache epoch in this same critical section (even when the entry is absent): a
+        // cold validation that read the row before the clear holds a pre-clear copy and
+        // must not cache it. See the tail of validate_session_durable (#8010).
+        ++session_cache_epoch_;
+        if (auto it = sessions_.find(token_hash); it != sessions_.end())
+            (void)derive_session_deadlines(it->second, a.created_at_ms, a.expires_at_ms,
+                                           a.last_activity_ms, a.mfa_verified_ms,
+                                           a.elevated_until_ms, a.elevation_issued_ms, a.db_now_ms);
+    } else {
+        drop_cached_mfa_proof(token_hash);
+    }
+    return unverifiable ? StampRecheck::kUnverifiable : StampRecheck::kFactorChanged;
+}
+
+void AuthManager::drop_cached_mfa_proof(const std::string& key) {
+    std::unique_lock lock(mu_);
+    // The epoch moves whenever this critical section runs, whether or not `key` is cached:
+    // a cold validation in flight holds a copy read before this proof change and must not
+    // cache it (the entry is edited in place, not erased, so the erase paths' bump does
+    // not cover it; #8010).
+    ++session_cache_epoch_;
+    if (auto it = sessions_.find(key); it != sessions_.end()) {
+        it->second.steady_mfa_verified = {};
+        it->second.mfa_verified_at = tp_from_ms(0);
+    }
+}
+
+std::optional<std::string> AuthManager::session_username_for_key(const std::string& key) const {
+    {
+        std::shared_lock lock(mu_);
+        if (auto it = sessions_.find(key); it != sessions_.end())
+            return it->second.username;
+    }
+    if (!session_store_)
+        return std::nullopt;
+    auto found = session_store_->find(key);
+    if (!found || !found->has_value())
+        return std::nullopt;
+    return found->value().row.username;
+}
+
+std::optional<AuthManager::LiveMfaState>
+AuthManager::read_live_mfa_state(const std::string& username) const {
+    if (!auth_db_)
+        return std::nullopt;
+    auto st = auth_db_->mfa_status(username);
+    if (!st)
+        return std::nullopt;
+    return LiveMfaState{st->enrolled, st->factor_gen, st->db_now_ms};
 }
 
 std::optional<std::string> AuthManager::authenticate(const std::string& username,
@@ -1008,7 +1265,7 @@ std::optional<std::string> AuthManager::authenticate(const std::string& username
     // one) — reject without the DB read or PBKDF2, which bounds the hash input.
     // Never log the length.
     if (password_exceeds_max(password)) {
-        spdlog::warn("Auth failed: over-length password for '{}'", username);
+        spdlog::warn("Auth failed: over-length password for '{}'", ::yuzu::log_key_token(username));
         return std::nullopt;
     }
 
@@ -1018,7 +1275,10 @@ std::optional<std::string> AuthManager::authenticate(const std::string& username
         if (entry.error() == UserLookupMiss::DbError)
             return std::nullopt; // AuthDB unreachable: fail closed, already logged, not a
                                  // bad-username signal (no unknown_user histogram sample)
-        spdlog::warn("Auth failed: unknown user '{}'", username);
+        spdlog::warn("Auth failed: unknown user '{}'", ::yuzu::log_key_token(username));
+        // F38: equalise cost with the known-user path (fixed dummy salt, result
+        // discarded) so latency does not enumerate usernames.
+        (void)pbkdf2_sha256(password, std::vector<uint8_t>(16, 0x5a), kPbkdf2Iterations);
         if (metrics_) {
             const auto elapsed =
                 std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count();
@@ -1034,7 +1294,7 @@ std::optional<std::string> AuthManager::authenticate(const std::string& username
     auto hash = pbkdf2_sha256(password, salt, kPbkdf2Iterations);
 
     if (!constant_time_compare(hash, entry->hash_hex)) {
-        spdlog::warn("Auth failed: bad password for '{}'", username);
+        spdlog::warn("Auth failed: bad password for '{}'", ::yuzu::log_key_token(username));
         if (metrics_) {
             const auto elapsed =
                 std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count();
@@ -1077,7 +1337,8 @@ std::optional<std::string> AuthManager::authenticate(const std::string& username
     if (!persist_new_session(token, params))
         return std::nullopt; // durable-write failure → login not honored (ADR-0007)
     // #4107 check-then-mint gap: see post_mint_role_recheck's own doc.
-    if (!post_mint_role_recheck(username, entry->role, entry->hash_hex, "Auth failed"))
+    if (!post_mint_role_recheck(username, entry->role, entry->hash_hex, std::nullopt,
+                                "Auth failed"))
         return std::nullopt;
 
     spdlog::info("User '{}' authenticated (role={})", username, params.role);
@@ -1102,7 +1363,7 @@ AuthManager::verify_password(const std::string& username, const std::string& pas
     // AuthRoutes::verify_password_with_lockout already rejects before calling).
     // An over-max password can never match, so it is a credential verdict.
     if (password_exceeds_max(password)) {
-        spdlog::warn("verify_password failed: over-length password for '{}'", username);
+        spdlog::warn("verify_password failed: over-length password for '{}'", ::yuzu::log_key_token(username));
         return std::unexpected(VerifyFailure::kBadCredential);
     }
     auto entry = find_user_or_hydrate(username); // AuthDB-first (#4020/#5274), a COPY
@@ -1112,7 +1373,10 @@ AuthManager::verify_password(const std::string& username, const std::string& pas
         // as a failed guess. Logged by the helper; no unknown_user sample.
         if (entry.error() == UserLookupMiss::DbError)
             return std::unexpected(VerifyFailure::kStoreUnavailable);
-        spdlog::warn("verify_password failed: unknown user '{}'", username);
+        spdlog::warn("verify_password failed: unknown user '{}'", ::yuzu::log_key_token(username));
+        // F38: equalise cost with the known-user path (fixed dummy salt, result
+        // discarded) so latency does not enumerate usernames.
+        (void)pbkdf2_sha256(password, std::vector<uint8_t>(16, 0x5a), kPbkdf2Iterations);
         if (metrics_) {
             const auto elapsed =
                 std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count();
@@ -1126,7 +1390,7 @@ AuthManager::verify_password(const std::string& username, const std::string& pas
     auto salt = hex_to_bytes(entry->salt_hex);
     auto hash = pbkdf2_sha256(password, salt, kPbkdf2Iterations);
     if (!constant_time_compare(hash, entry->hash_hex)) {
-        spdlog::warn("verify_password failed: bad password for '{}'", username);
+        spdlog::warn("verify_password failed: bad password for '{}'", ::yuzu::log_key_token(username));
         if (metrics_) {
             const auto elapsed =
                 std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count();
@@ -1160,19 +1424,49 @@ AuthManager::verify_password(const std::string& username, const std::string& pas
 }
 
 std::string AuthManager::create_local_session(const std::string& username, Role role,
-                                              bool mfa_verified,
                                               const std::string& expected_hash_hex) {
-    return mint_local_session(username, role, mfa_verified, expected_hash_hex);
+    return mint_local_session(username, role, nullptr, expected_hash_hex);
+}
+
+std::string AuthManager::create_local_session(const std::string& username, Role role,
+                                              const std::string& expected_hash_hex,
+                                              const yuzu::server::LocalMfaProof& proof,
+                                              MintDenial* denial) {
+    return mint_local_session(username, role, &proof, expected_hash_hex, denial);
 }
 
 std::string AuthManager::create_local_session_for_test(const std::string& username, Role role,
                                                        bool mfa_verified) {
-    return mint_local_session(username, role, mfa_verified, std::nullopt);
+    if (!mfa_verified)
+        return mint_local_session(username, role, nullptr, std::nullopt);
+    // Bind the proof to the live identity when an AuthDB knows the user (the shape a
+    // production verifier produces); an un-enrolled user, any error, or no AuthDB leaves it
+    // unbound. A read error never fails the mint: existing call sites must not change.
+    const auto live = read_live_mfa_state(username);
+    yuzu::server::LocalMfaProof proof{0,
+                                      (live && session_store_) ? live->db_now_ms : wall_now_ms()};
+    if (live && live->enrolled && live->factor_gen > 0)
+        proof.factor_gen = live->factor_gen;
+    return mint_local_session(username, role, &proof, std::nullopt);
 }
 
 std::string AuthManager::mint_local_session(const std::string& username, Role role,
-                                            bool mfa_verified,
-                                            const std::optional<std::string>& expected_hash_hex) {
+                                            const yuzu::server::LocalMfaProof* proof,
+                                            const std::optional<std::string>& expected_hash_hex,
+                                            MintDenial* denial) {
+    if (denial)
+        *denial = MintDenial::kNone;
+    // A proof is {generation >= 0, instant > 0}. A binding without an instant (or a
+    // negative value) is a caller bug: refuse rather than mint a session whose binding
+    // means nothing.
+    if (proof && (proof->verified_ms <= 0 || proof->factor_gen < 0)) {
+        spdlog::error("create_local_session: invalid MFA proof for '{}' (instant {} generation {})"
+                      " - refusing to mint",
+                      ::yuzu::log_key_token(username), proof->verified_ms, proof->factor_gen);
+        if (denial)
+            *denial = MintDenial::kPersistFailed;
+        return {};
+    }
     auto token = generate_session_token();
     yuzu::server::SessionWriteParams params;
     params.username = username;
@@ -1181,12 +1475,22 @@ std::string AuthManager::mint_local_session(const std::string& username, Role ro
     params.auth_source = "local";
     params.session_lifetime_ms =
         std::chrono::duration_cast<std::chrono::milliseconds>(kSessionDuration).count();
-    params.mfa_verified_now = mfa_verified; // local step-up → stamp now() in the store
-    if (!persist_new_session(token, params)) {
-        // Durable-write failure (store configured but unreachable) → no session.
-        // An empty token degrades to "not authenticated" at the caller's cookie
-        // set / next validate (fail-safe), never a false success (ADR-0007).
+    if (proof)
+        params.local_mfa = *proof; // carried verification instant + factor generation
+    bool future_dated = false;
+    if (!persist_new_session(token, params, &future_dated)) {
+        // Durable-write failure (store configured but unreachable) or a refused
+        // future-dated proof → no session. An empty token degrades to "not authenticated"
+        // at the caller's cookie set / next validate (fail-safe), never a false success
+        // (ADR-0007).
+        if (future_dated) {
+            if (denial)
+                *denial = MintDenial::kVerificationFutureDated;
+            return {};
+        }
         spdlog::error("create_local_session: durable persist failed for '{}'", username);
+        if (denial)
+            *denial = MintDenial::kPersistFailed;
         return {};
     }
     // #4107 check-then-mint gap: see post_mint_role_recheck's own doc. This
@@ -1201,8 +1505,14 @@ std::string AuthManager::mint_local_session(const std::string& username, Role ro
     // session, degrades to "not authenticated" at the caller's cookie set.
     // #5342 Gate 7: the same re-read also requires the stored hash to still be
     // the one the caller verified (`expected_hash_hex`), so the window covers
-    // a credential change exactly as it covers a role change.
-    if (!post_mint_role_recheck(username, role, expected_hash_hex, "create_local_session"))
+    // a credential change exactly as it covers a role change. #6079: and, for a
+    // BOUND proof, the account's factor generation to still be the one the
+    // verifier read, so the window covers a factor replacement too.
+    std::optional<std::int64_t> expected_gen;
+    if (proof && proof->factor_gen > 0)
+        expected_gen = proof->factor_gen;
+    if (!post_mint_role_recheck(username, role, expected_hash_hex, expected_gen,
+                                "create_local_session", denial))
         return {};
     // Stamp last_login_at on every successful login, not just the
     // MFA-verified TOTP path. The MFA-verified TOTP path already does
@@ -1214,42 +1524,95 @@ std::string AuthManager::mint_local_session(const std::string& username, Role ro
     if (auth_db_) {
         auth_db_->touch_last_login(username);
     }
-    spdlog::info("Local session created for '{}' (mfa_verified={})", username, mfa_verified);
+    spdlog::info("Local session created for '{}' (mfa_verified={})", username, proof != nullptr);
     return token;
 }
 
-bool AuthManager::mark_session_mfa_verified(const std::string& token) {
+AuthManager::MfaStampOutcome
+AuthManager::stamp_session_mfa_proof(const std::string& token,
+                                     const yuzu::server::LocalMfaProof& proof) {
     if (token.size() > auth::kMaxSessionTokenLength)
-        return false;
+        return MfaStampOutcome::kNoSession;
+    if (proof.verified_ms <= 0 || proof.factor_gen < 0)
+        return MfaStampOutcome::kInvalidProof;
     if (session_store_) {
         const std::string key = hash_token(token);
-        // Durable write FIRST (bumps the generation → every replica's cache drops
-        // the stale copy on its next refresh); the store authors mfa_verified =
-        // now() and RETURNs every time field, so the cache re-derives exactly.
-        auto r = session_store_->mark_mfa(key);
+        // Durable write FIRST (bumps the generation → every replica's cache drops the
+        // stale copy on its next refresh); the store writes the CARRIED instant and
+        // generation (never its own now()) and RETURNs the row's time fields; the future-dated
+        // check below reads `mfa_verified_ms`, and the cached copy is then dropped rather than
+        // re-derived (see the drop after the recheck).
+        auto r = session_store_->mark_mfa(key, proof);
         if (!r) {
             spdlog::error("mark_session_mfa_verified: durable write failed ({})",
                           r.error().message);
             note_session_store_degrade("mark_mfa");
-            return false;
+            return MfaStampOutcome::kStoreError;
         }
         if (!r->has_value())
-            return false; // no such durable session
+            return MfaStampOutcome::kNoSession; // no such durable session
         const auto& a = r->value();
+        if (a.mfa_verified_ms == 0) {
+            // The carried instant was later than the DB clock at the write: the store kept
+            // NO proof and NO binding. A refusal the caller sees, never a clamped proof.
+            if (metrics_)
+                metrics_->counter("yuzu_auth_mfa_verification_future_dated_total").increment();
+            spdlog::warn("mark_session_mfa_verified: the carried MFA verification instant is "
+                         "later than the database clock - no proof stored");
+            drop_cached_mfa_proof(key);
+            return MfaStampOutcome::kFutureDated;
+        }
+        if (proof.factor_gen > 0 && auth_db_) {
+            // S1: the factor may have been replaced between the verification and now.
+            const auto username = session_username_for_key(key);
+            StampRecheck verdict = StampRecheck::kUnverifiable;
+            if (username) {
+                verdict = post_stamp_factor_recheck(*username, key, proof.factor_gen);
+            } else {
+                // Cannot name the account to compare against: fail closed.
+                spdlog::warn("mark_session_mfa_verified: cannot resolve the session's account "
+                             "for the factor recheck - clearing the proof just stamped");
+                if (auto cleared = session_store_->clear_mfa_proof(key); !cleared)
+                    note_session_store_degrade("clear_mfa_proof");
+                drop_cached_mfa_proof(key);
+            }
+            if (verdict == StampRecheck::kFactorChanged)
+                return MfaStampOutcome::kFactorChanged;
+            if (verdict == StampRecheck::kUnverifiable)
+                return MfaStampOutcome::kStoreError;
+        }
+        // TEST-ONLY seam: no lock is held here (it may block to straddle a revocation).
+        if (post_durable_write_hook_for_test_)
+            post_durable_write_hook_for_test_("mfa_stamp");
+        // Drop the cached copy instead of re-deriving it from `a`. `a` was read inside the
+        // durable write, so by now it can predate a revocation that cleared the elevation and
+        // evicted this entry, after which a validator repopulated the cache from the cleared
+        // row; re-deriving the stale `a` into that fresh entry would resurrect the elevation
+        // with no later generation poll to undo it. The drop advances the cache epoch, so the
+        // next validate re-reads durable state under the epoch-guarded populate path.
         std::unique_lock lock(mu_);
-        if (auto it = sessions_.find(key); it != sessions_.end())
-            derive_session_deadlines(it->second, a.created_at_ms, a.expires_at_ms,
-                                     a.last_activity_ms, a.mfa_verified_ms, a.elevated_until_ms,
-                                     a.elevation_issued_ms, a.db_now_ms);
-        return true;
+        drop_cached_session_locked(key);
+        return MfaStampOutcome::kStamped;
     }
+    // Legacy no-store path: this host's clock is the authority, the same rule as the
+    // store's SQL (an instant later than `now` is refused). There is no durable binding to
+    // recheck here.
+    const std::int64_t wall = wall_now_ms();
+    if (proof.verified_ms > wall)
+        return MfaStampOutcome::kFutureDated;
     std::unique_lock lock(mu_);
     auto it = sessions_.find(token);
     if (it == sessions_.end())
-        return false;
-    it->second.mfa_verified_at = std::chrono::system_clock::now();
-    it->second.steady_mfa_verified = std::chrono::steady_clock::now();
-    return true;
+        return MfaStampOutcome::kNoSession;
+    it->second.mfa_verified_at = tp_from_ms(proof.verified_ms);
+    it->second.steady_mfa_verified =
+        std::chrono::steady_clock::now() - std::chrono::milliseconds(wall - proof.verified_ms);
+    return MfaStampOutcome::kStamped;
+}
+
+bool AuthManager::mark_session_mfa_verified(const std::string& token,
+                                            const yuzu::server::LocalMfaProof& proof) {
+    return stamp_session_mfa_proof(token, proof) == MfaStampOutcome::kStamped;
 }
 
 std::optional<std::chrono::system_clock::time_point>
@@ -1275,13 +1638,18 @@ AuthManager::elevate_session(const std::string& token, std::chrono::seconds dura
         if (!r->has_value())
             return std::nullopt;
         const auto& a = r->value();
-        // Re-derive the cached session (best-effort — it may live only on another
-        // replica, which picks up the grant on its next generation refresh).
+        // TEST-ONLY seam: no lock is held here (it may block to straddle a revocation).
+        if (post_durable_write_hook_for_test_)
+            post_durable_write_hook_for_test_("elevate");
+        // Drop the cached copy instead of re-deriving it from `a` (another replica picks the
+        // grant up on its next generation refresh). `a` was read inside the durable write, so
+        // by now it can predate a revocation that cleared the elevation and evicted this
+        // entry, after which a validator repopulated the cache from the cleared row;
+        // re-deriving the stale `a` into that fresh entry would resurrect the elevation with
+        // no later generation poll to undo it. The drop advances the cache epoch, so the next
+        // validate re-reads durable state under the epoch-guarded populate path.
         std::unique_lock lock(mu_);
-        if (auto it = sessions_.find(key); it != sessions_.end())
-            derive_session_deadlines(it->second, a.created_at_ms, a.expires_at_ms,
-                                     a.last_activity_ms, a.mfa_verified_ms, a.elevated_until_ms,
-                                     a.elevation_issued_ms, a.db_now_ms);
+        drop_cached_session_locked(key);
         return tp_from_ms(a.elevated_until_ms);
     }
     std::unique_lock lock(mu_);
@@ -1320,50 +1688,68 @@ AuthManager::elevate_session(const std::string& token, std::chrono::seconds dura
     return until;
 }
 
-std::expected<bool, std::string> AuthManager::revoke_elevation(const std::string& token) {
+std::expected<bool, std::string> AuthManager::revoke_elevation(const std::string& token,
+                                                               bool* lookup_degraded) {
+    if (lookup_degraded)
+        *lookup_degraded = false;
     if (token.size() > auth::kMaxSessionTokenLength)
         return false;
     if (session_store_) {
         const std::string key = hash_token(token);
         // Determine "was elevated" from authoritative state (cache-first), then
         // clear durably. was_elevated distinguishes a real step-down from a
-        // no-op for the route's audit.
+        // no-op for the route's audit. The CLEAR is the fail-closed action and
+        // does not depend on the read: elevate_session drops the cached entry
+        // after its durable write, so this read is usually cache-cold, and a
+        // degraded find must not stop the clear (the /elevate audit-failure
+        // rollback would otherwise leave a live, unrecorded elevation).
         std::optional<Session> s;
         {
             std::shared_lock lock(mu_);
             if (auto it = sessions_.find(key); it != sessions_.end())
                 s = it->second;
         }
+        std::optional<std::string> find_error; // set when the authoritative read degraded
         if (!s) {
             auto found = session_store_->find(key);
             if (!found) {
-                // Degraded authoritative read — cannot tell if an elevation is
-                // live. Fail closed: do NOT report a successful no-op over a
-                // possibly-live durable elevation (adversarial C2).
                 note_session_store_degrade("validate");
-                return std::unexpected(std::string("session lookup degraded: ") +
-                                       found.error().message);
-            }
-            if (!found->has_value())
+                find_error = found.error().message;
+            } else if (!found->has_value()) {
                 return false; // definitively no such session → genuine no-op
-            s = session_from_row(found->value().row, found->value().db_now_ms);
+            } else {
+                s = session_from_row(found->value().row, found->value().db_now_ms);
+            }
         }
-        const bool was_elevated = is_elevated(*s);
+        const bool was_elevated = s && is_elevated(*s);
         auto r = session_store_->clear_elevation(key);
         if (!r) {
             spdlog::error("revoke_elevation: durable clear failed ({})", r.error().message);
             note_session_store_degrade("invalidate_user");
-            // The durable elevation is STILL LIVE — surface the failure so the
-            // route fails closed instead of auditing a false revocation.
+            // The durable elevation is STILL LIVE (or, with a degraded read too, cannot be
+            // ruled out) - surface the failure so the route fails closed instead of auditing
+            // a false revocation.
+            if (find_error)
+                return std::unexpected("session lookup degraded: " + *find_error +
+                                       "; durable clear also failed: " + r.error().message);
             return std::unexpected(std::string("durable clear failed: ") + r.error().message);
         }
-        std::unique_lock lock(mu_);
-        if (auto it = sessions_.find(key); it != sessions_.end()) {
-            it->second.elevated_until = {};
-            it->second.elevation_issued_at = {};
-            it->second.steady_elevated_until = {}; // the field is_elevated reads
+        // Drop the cached entry (advancing the cache epoch) rather than zeroing it in place: a
+        // validator that read the still-elevated durable row before the clear and is parked
+        // before its cache insert re-inserts only while the epoch is unchanged
+        // (validate_session_durable), so an in-place zero would let it put an elevated copy
+        // back. The next validate re-reads the cleared durable row.
+        {
+            std::unique_lock lock(mu_);
+            drop_cached_session_locked(key);
         }
-        return was_elevated;
+        // With a degraded read was_elevated is UNKNOWN: the clear succeeded, so any elevation
+        // is definitively gone. The returned value is then only whether a session ROW existed
+        // (clear_elevation's RETURNING), NOT whether it was elevated, and `*lookup_degraded` is
+        // set so the caller can say "unknown" rather than claim an elevation was ended.
+        if (find_error && lookup_degraded)
+            *lookup_degraded = true;
+        return find_error ? *r : was_elevated;
     }
     std::unique_lock lock(mu_);
     auto it = sessions_.find(token);
@@ -1402,6 +1788,9 @@ std::optional<std::string> AuthManager::reap_expired_elevation(const std::string
                 is_elevated(it->second))
                 return std::nullopt; // TOCTOU recheck (single-replica exactly-once)
             username = it->second.username;
+            // No epoch bump: this only clears an elevation that has already lapsed (not
+            // is_elevated), so a stale cold copy that still carries it is not elevated
+            // either and grants nothing more than the cleared entry.
             it->second.elevated_until = {};
             it->second.elevation_issued_at = {};
             it->second.steady_elevated_until = {};
@@ -1498,6 +1887,34 @@ void AuthManager::lapse_elevation_for_test(const std::string& token,
         std::chrono::duration_cast<std::chrono::steady_clock::duration>(elapsed);
 }
 
+void AuthManager::expire_session_generation_poll_for_test() {
+    std::lock_guard<std::mutex> g(session_gen_mtx_);
+    last_session_gen_refresh_ms_ = steady_now_ms() - kSessionGenRefreshMs - 1;
+}
+
+void AuthManager::suppress_session_generation_poll_for_test() {
+    std::lock_guard<std::mutex> g(session_gen_mtx_);
+    last_session_gen_refresh_ms_ = steady_now_ms() + 3'600'000;
+}
+
+void AuthManager::age_session_generation_refresh_for_test(std::chrono::milliseconds age) {
+    std::lock_guard<std::mutex> g(session_gen_mtx_);
+    last_successful_session_gen_refresh_ms_ -= age.count();
+}
+
+void AuthManager::set_validate_pre_cache_hook_for_test(std::function<void()> hook) {
+    validate_pre_cache_hook_for_test_ = std::move(hook);
+}
+
+void AuthManager::set_post_durable_write_hook_for_test(
+    std::function<void(std::string_view op)> hook) {
+    post_durable_write_hook_for_test_ = std::move(hook);
+}
+
+void AuthManager::set_between_local_erase_and_wipe_hook_for_test(std::function<void()> hook) {
+    between_local_erase_and_wipe_hook_for_test_ = std::move(hook);
+}
+
 void AuthManager::set_role_recheck_race_hook_for_test(std::function<void()> hook) {
     role_recheck_race_hook_for_test_ = std::move(hook);
 }
@@ -1535,23 +1952,21 @@ std::expected<int, std::string> AuthManager::revoke_user_elevations(const std::s
     if (session_store_) {
         // Durable clear FIRST (bumps the generation → every replica drops the
         // stale elevations on refresh); the store's count is authoritative
-        // (sessions may live only on other replicas). Then clear local cache.
+        // (sessions may live only on other replicas). Then drop this replica's cached copies,
+        // advancing the cache epoch: a validator that read the still-elevated durable row
+        // before the clear (a cold miss, or a cache HIT whose copy is written back) and is
+        // parked before its insert must not re-cache an elevated copy, so an in-place zero
+        // would not do. The next validate re-reads the cleared durable row.
         auto r = session_store_->clear_user_elevations(username);
         if (!r) {
             spdlog::error("revoke_user_elevations: durable clear failed ({})", r.error().message);
             note_session_store_degrade("invalidate_user");
-            // Elevations may still be live durably — surface so the caller fails
+            // Elevations may still be live durably - surface so the caller fails
             // closed rather than reporting a successful "0 cleared" (C2).
             return std::unexpected(std::string("durable clear failed: ") + r.error().message);
         }
         std::unique_lock lock(mu_);
-        for (auto& [key, s] : sessions_) {
-            if (s.username == username) {
-                s.elevated_until = {};
-                s.elevation_issued_at = {};
-                s.steady_elevated_until = {}; // the field is_elevated reads
-            }
-        }
+        drop_cached_user_sessions_locked(username);
         return *r;
     }
     std::unique_lock lock(mu_);
@@ -1565,6 +1980,29 @@ std::expected<int, std::string> AuthManager::revoke_user_elevations(const std::s
         }
     }
     return cleared;
+}
+
+void AuthManager::drop_local_sessions_of_user(const std::string& username) noexcept {
+    try {
+        std::unique_lock lock(mu_);
+        if (session_store_) {
+            // Durable mode: the clear already committed; evict this replica's cache and advance
+            // the epoch so a racing validator cannot re-insert the pre-clear copy.
+            drop_cached_user_sessions_locked(username);
+            return;
+        }
+        for (auto& [key, s] : sessions_) {
+            if (s.username == username) {
+                s.elevated_until = {};
+                s.elevation_issued_at = {};
+                s.steady_elevated_until = {}; // the field is_elevated reads
+            }
+        }
+    } catch (const std::exception& e) {
+        spdlog::error("drop_local_sessions_of_user failed ({})", e.what());
+    } catch (...) {
+        spdlog::error("drop_local_sessions_of_user failed (unknown exception)");
+    }
 }
 
 std::optional<Session> AuthManager::validate_session(const std::string& token) const {
@@ -1708,14 +2146,57 @@ DurableMfaProof AuthManager::read_durable_mfa_proof(const std::string& token,
     const auto& f = found->value();
     if (f.row.username != expected_username)
         return {DurableMfaProof::Source::kAbsent, 0, 0};
-    return {DurableMfaProof::Source::kRow, f.row.mfa_verified_ms, f.db_now_ms};
+    // The row is returned as read. Whether its stored generation may be trusted as a binding
+    // is the caller's decision (`stored_binding_trustworthy` for the sticky latch,
+    // `stored_binding_read_confirmed` for this read's `guard_unverified`): the binding applies to
+    // a local session only, so an OIDC approver reading its IdP-seeded proof is not refused.
+    return {.source = DurableMfaProof::Source::kRow,
+            .mfa_verified_ms = f.row.mfa_verified_ms,
+            .db_now_ms = f.db_now_ms,
+            .mfa_factor_gen = f.row.mfa_factor_gen,
+            .guard_unverified = f.guard_unverified};
+}
+
+bool AuthManager::stored_binding_trustworthy() const {
+    // The stored generation is only trustworthy while the rebind guard is observed to be in
+    // force (find() re-validates it behind a memo). Once it is not, a legacy writer could have
+    // carried a binding the guard would have cleared: untrustworthy, never a bound proof. This
+    // is the one place that logs and counts that degrade.
+    if (session_store_ && session_store_->rebind_guard_ok())
+        return true;
+    // Once the guard is latched this runs on every gated request: sample the line (the first
+    // always), the degrade counter below records all of them.
+    static std::atomic<std::uint64_t> untrusted_hits{0};
+    if (untrusted_hits.fetch_add(1, std::memory_order_relaxed) % 100 == 0)
+        spdlog::warn("stored_binding_trustworthy: the session store's rebind guard is not in force "
+                     "- failing closed (1 log per 100 refusals; the counter records all)");
+    note_session_store_degrade("rebind_guard");
+    return false;
+}
+
+bool AuthManager::stored_binding_read_confirmed(const DurableMfaProof& proof) const {
+    if (!proof.guard_unverified)
+        return true;
+    // One catalog validation that could not run: not evidence the trigger is gone, so this is a
+    // transient degrade of this read (counted as a validate degrade, retried by the caller), not
+    // the sticky `rebind_guard` latch.
+    note_session_store_degrade("validate");
+    // Logged on the first refusal and every kUnverifiedReadLogEvery-th after it, so a persistent
+    // catalog fault cannot become a log storm; the cause is logged once by the session store.
+    const auto n = unverified_read_refusals_.fetch_add(1, std::memory_order_relaxed);
+    if (n % kUnverifiedReadLogEvery == 0)
+        spdlog::warn("stored_binding_read_confirmed: the session store's rebind guard could not be "
+                     "validated - refusing local binding reads as unavailable ({} so far)",
+                     n + 1);
+    return false;
 }
 
 std::optional<Session> AuthManager::validate_session_durable(const std::string& token,
                                                              bool idle_enabled) const {
     // Refresh cross-replica cache coherence BEFORE consulting the cache: a
     // create/invalidate/elevate/mfa mutation on any replica advances the durable
-    // generation, which clears this replica's now-stale cache.
+    // generation (a restore or failover can also lower it); either change clears
+    // this replica's now-stale cache.
     maybe_refresh_session_generation();
 
     const std::string key = hash_token(token);
@@ -1726,11 +2207,22 @@ std::optional<Session> AuthManager::validate_session_durable(const std::string& 
     // blocker #2): this bounds how long a revoked/demoted/elevated session can
     // ride a stale cache during a PG brownout to ~kSessionGenStaleServeBoundMs
     // rather than its 8h absolute expiry.
+    //
+    // The cache epoch is captured under this same shared lock, BEFORE any store
+    // read and whether or not the cached entry is used, so it is ordered against
+    // the clear in maybe_refresh_session_generation (which increments it under the
+    // unique lock). The staleness check runs first, outside mu_: it takes
+    // session_gen_mtx_, which is never held together with mu_.
+    const bool cache_trusted = !session_generation_view_stale();
     std::optional<Session> session_copy;
-    if (!session_generation_view_stale()) {
+    std::uint64_t cache_epoch = 0;
+    {
         std::shared_lock lock(mu_);
-        if (auto it = sessions_.find(key); it != sessions_.end())
-            session_copy = it->second;
+        cache_epoch = session_cache_epoch_;
+        if (cache_trusted) {
+            if (auto it = sessions_.find(key); it != sessions_.end())
+                session_copy = it->second;
+        }
     }
 
     // 2. Cache miss (or a distrusted stale cache) → authoritative store lookup.
@@ -1809,6 +2301,15 @@ std::optional<Session> AuthManager::validate_session_durable(const std::string& 
         return std::nullopt;
     }
 
+    // Account gate. A session built from a store row (the cold-miss read in step 2 or the
+    // idle re-read in step 4; both set `from_store`) is served and cached only while
+    // session_account_admits holds: a session whose LOCAL account is inactive or deleted is
+    // rejected on every replica, whether or not the deactivation's own session wipe
+    // persisted. It runs after the expiry and idle verdicts above so an expired or idled-out
+    // row never costs an account read, and before step 5 so nothing refused is cached.
+    if (from_store && !session_account_admits(key, *session_copy))
+        return std::nullopt;
+
     // 5. Slide the activity window (throttled), mirror it durably, and (re)cache.
     const auto touch_granularity =
         idle_enabled ? (std::min)(session_inactivity_ / 4, std::chrono::seconds(30))
@@ -1842,11 +2343,100 @@ std::optional<Session> AuthManager::validate_session_durable(const std::string& 
             }
         }
     }
+    // TEST-ONLY seam: no lock is held here (it may block, or run a deactivation or
+    // a sign-out on another manager, to straddle the cache clear).
+    if (validate_pre_cache_hook_for_test_)
+        validate_pre_cache_hook_for_test_();
     {
         std::unique_lock wlock(mu_);
-        sessions_[key] = *session_copy;
+        // Insert only if no cache invalidation ran since this validation started
+        // (ADR-0012 section 4, rule 2). The epoch moves with every clear of the cache
+        // (the generation poll), every targeted erase (drop_cached_session_locked,
+        // drop_cached_user_sessions_locked) and every in-place edit of a cached entry that
+        // removes a proof or privilege (drop_cached_mfa_proof, the re-derives after a stamp or
+        // a post-stamp clear, and the elevation clears in revoke_elevation and
+        // revoke_user_elevations), so a revoke, wipe, account removal or refusal on THIS
+        // replica, a proof stamp or clear, or an elevation revoke, also drops a validation
+        // held across it. It does not move for an elevation GRANT (elevate_session: a stale
+        // pre-grant copy under-grants and self-heals at the next generation poll), for
+        // reap_expired_elevation (clears an already-lapsed elevation only), for this
+        // function's own expiry and idle evictions, or for the legacy no-store paths. On a mismatch the session is
+        // still returned to THIS caller, whose request is concurrent with the invalidation
+        // and linearises before it, but it is not cached: a refusal here would reject an
+        // unrelated in-flight request whenever any session anywhere is created or revoked,
+        // and a retry would add a second read for nothing. The next request finds no entry
+        // and reads the authoritative row. The mint insert in persist_new_session is
+        // deliberately unguarded: the post-mint recheck compares the role, the credential
+        // hash and the active state (and, for a mint carrying a bound MFA proof, the factor
+        // generation), and revokes the account's sessions on a divergence in those; it does
+        // not otherwise evict a freshly minted entry.
+        if (session_cache_epoch_ == cache_epoch)
+            sessions_[key] = *session_copy;
     }
     return session_copy;
+}
+
+void AuthManager::drop_cached_session_locked(const std::string& key) const {
+    sessions_.erase(key);
+    ++session_cache_epoch_;
+}
+
+std::size_t AuthManager::drop_cached_user_sessions_locked(const std::string& username) const {
+    const auto before = sessions_.size();
+    std::erase_if(sessions_, [&](const auto& pair) { return pair.second.username == username; });
+    ++session_cache_epoch_;
+    return before - sessions_.size();
+}
+
+bool AuthManager::session_account_admits(const std::string& key, const Session& session) const {
+    // Closed three-way on the stored auth source. `local` sessions are keyed on an `auth.users`
+    // account; federated (oidc, saml) principals need not be one (a ':' is not a valid account
+    // name), so they pass; anything else, empty included, has no production writer and is
+    // refused rather than guessed at.
+    bool admit = false;
+    if (session.auth_source == "local") {
+        if (!auth_db_) {
+            admit = true; // test wiring only; production wires both stores
+        } else {
+            // `user_exists` is active-only, own-schema and bounded-lease, and tells an
+            // unreadable account store from an absent account: an unreadable store refuses.
+            const auto active = auth_db_->user_exists(session.username);
+            if (!active) {
+                spdlog::warn("validate_session: account state for '{}' unreadable (AuthDB error "
+                             "{}), refusing the session",
+                             ::yuzu::log_key_token(session.username),
+                             static_cast<int>(active.error()));
+                note_session_store_degrade("account_state");
+            } else if (!*active) {
+                // Debug, not warn: a replayed cookie would log once per request; the counter
+                // is the signal.
+                spdlog::debug("validate_session: refusing a session whose account '{}' is not "
+                              "active",
+                              ::yuzu::log_key_token(session.username));
+                if (metrics_)
+                    metrics_->counter("yuzu_auth_session_account_inactive_total").increment();
+            } else {
+                admit = true;
+            }
+        }
+    } else if (session.auth_source == "oidc" || session.auth_source == "saml") {
+        admit = true;
+    } else {
+        // Plain warn: no production writer stores another source, so this is not a replay
+        // flood; the counter is the alertable signal.
+        spdlog::warn("validate_session: refusing a session with unknown auth source '{}'",
+                     ::yuzu::log_key_token(session.auth_source));
+        if (metrics_)
+            metrics_->counter("yuzu_auth_session_unknown_source_total").increment();
+    }
+    if (!admit) {
+        // Erase on EVERY refusal (fail closed: the next request goes cold). A copy can be
+        // cached from before a stale-distrust window, where it was not consulted; leaving it
+        // would flip this refusal back to a grant as soon as trust returns.
+        std::unique_lock wlock(mu_);
+        drop_cached_session_locked(key);
+    }
+    return admit;
 }
 
 bool AuthManager::invalidate_session(const std::string& token) {
@@ -1870,7 +2460,7 @@ bool AuthManager::invalidate_session(const std::string& token) {
         }
     }
     std::unique_lock lock(mu_);
-    sessions_.erase(key);
+    drop_cached_session_locked(key);
     return db_persisted;
 }
 
@@ -1909,21 +2499,15 @@ AuthManager::invalidate_user_sessions(const std::string& username) {
             note_session_store_degrade("invalidate_user"); // parity with wipe/other sites
         }
         std::unique_lock lock(mu_);
-        const auto before = sessions_.size();
-        std::erase_if(sessions_,
-                      [&](const auto& pair) { return pair.second.username == username; });
+        const auto erased = drop_cached_user_sessions_locked(username);
         if (!db_persisted)
-            count = before - sessions_.size();
+            count = erased;
         return RevokeResult{count, db_persisted};
     }
 
     bool db_persisted = true;
     std::unique_lock lock(mu_);
-    const auto before = sessions_.size();
-    std::erase_if(sessions_, [&](const auto& pair) {
-        return pair.second.username == username;
-    });
-    return RevokeResult{before - sessions_.size(), db_persisted};
+    return RevokeResult{drop_cached_user_sessions_locked(username), db_persisted};
 }
 
 // ── User management ─────────────────────────────────────────────────────────
@@ -1999,8 +2583,7 @@ bool AuthManager::upsert_user(const std::string& username, const std::string& pa
     if (role_changed) {
         // Invalidate sessions so the user picks up the new role on next login
         // Prevents stale session role from granting old privileges (G4-CON-AUTH-001)
-        std::erase_if(sessions_,
-                      [&](const auto& pair) { return pair.second.username == username; });
+        drop_cached_user_sessions_locked(username);
     }
     lock.unlock(); // release before durable I/O and save_config (both take their own locks)
 
@@ -2020,7 +2603,7 @@ bool AuthManager::upsert_user(const std::string& username, const std::string& pa
     // fixed Role::user). A future
     // demote-via-upsert MUST recompute role_changed against the durable/DB row (or
     // wipe unconditionally) before relying on retry to converge.
-    if (role_changed && !wipe_user_sessions_durable(username))
+    if (role_changed && !wipe_user_sessions_then_drop_cache(username))
         return false;
 
     // Only save config file if NOT using DB (backwards compat)
@@ -2046,13 +2629,12 @@ void AuthManager::evict_target_after_indeterminate_write(const std::string& user
     {
         std::unique_lock lock(mu_);
         users_.erase(username);
-        std::erase_if(sessions_,
-                      [&](const auto& pair) { return pair.second.username == username; });
+        drop_cached_user_sessions_locked(username);
     }
-    if (!wipe_user_sessions_durable(username))
+    if (!wipe_user_sessions_then_drop_cache(username))
         spdlog::warn("AuthManager: durable session wipe for '{}' after an indeterminate "
-                     "lifecycle write also failed; a durable session may survive until the "
-                     "operation is retried",
+                     "lifecycle write also failed; the durable session row may survive until "
+                     "the operation is retried",
                      username);
 }
 
@@ -2072,7 +2654,12 @@ RemoveUserOutcome AuthManager::remove_user_checked(const std::string& username) 
         // file-wide "never hold mu_ across a DB call" discipline, which
         // recheck_role_after_credential_check's mu_-inside-row-lock acquisition relies on to
         // stay deadlock-free against the owner's `auth.users` row lock).
-        const auto res = rbac_store_->deactivate_account(username);
+        // With a SessionStore wired the deactivation transaction also advances the durable
+        // session generation, so every replica's session cache is cleared by its next poll even
+        // when the wipe below fails; without one there is no session_store schema to touch.
+        const auto res = rbac_store_->deactivate_account(
+            username, session_store_ ? SessionGenerationMode::kBumpSessionGeneration
+                                     : SessionGenerationMode::kNoSessionStore);
         using Kind = AccountDeactivationResult::Kind;
         if (res.kind == Kind::kLastAdministratorRefused)
             return RemoveUserOutcome::LastAdministratorRefused; // nothing changed: no cleanup
@@ -2098,8 +2685,7 @@ RemoveUserOutcome AuthManager::remove_user_checked(const std::string& username) 
         users_.erase(username);
         // Invalidate all active sessions belonging to this user
         // to prevent deleted users from retaining access (CHAOS-T1-001)
-        std::erase_if(sessions_,
-                      [&](const auto& pair) { return pair.second.username == username; });
+        drop_cached_user_sessions_locked(username);
         lock.unlock();
         // Fail closed on a durable-wipe error (see wipe_user_sessions_durable): a removed
         // user's sessions must not survive because the durable delete was lost; the operator
@@ -2120,8 +2706,7 @@ RemoveUserOutcome AuthManager::remove_user_checked(const std::string& username) 
     if (erased) {
         // Invalidate all active sessions belonging to this user
         // to prevent deleted users from retaining access (CHAOS-T1-001)
-        std::erase_if(sessions_,
-                      [&](const auto& pair) { return pair.second.username == username; });
+        drop_cached_user_sessions_locked(username);
     }
 
     lock.unlock();
@@ -2169,6 +2754,40 @@ bool AuthManager::reactivate_user(const std::string& username) {
     if (!auth_db_) {
         spdlog::error("AuthManager::reactivate_user: no AuthDB configured for '{}'", username);
         return false;
+    }
+
+    // Wipe-first: sessions that exist when an account is reactivated are removed, so a
+    // session left behind by an earlier deactivation (whose own wipe may not have persisted)
+    // cannot become valid again. A sign-in whose credential check started after the
+    // reactivation is a new sign-in. One residual remains: a login that carries no bound MFA
+    // proof, whose first factor was verified before the deactivation, can still mint after the
+    // reactivation (reactivation keeps the password), because the post-mint recheck compares
+    // the role, the credential hash and the active state, and all three match. A login that
+    // carries a bound proof earned before the deactivation is denied instead: the deactivation changed the account's factor
+    // generation and the recheck compares it. Local erase, then the durable wipe; if the wipe
+    // does not persist the account stays inactive and the caller retries (invalidate_user is
+    // idempotent).
+    {
+        std::unique_lock lock(mu_);
+        drop_cached_user_sessions_locked(username);
+    }
+    // TEST-ONLY seam (see set_between_local_erase_and_wipe_hook_for_test's doc); no lock held.
+    if (between_local_erase_and_wipe_hook_for_test_)
+        between_local_erase_and_wipe_hook_for_test_();
+    if (!wipe_user_sessions_durable(username)) {
+        spdlog::error("AuthManager::reactivate_user: durable session wipe for '{}' failed, "
+                      "leaving the account inactive",
+                      ::yuzu::log_key_token(username));
+        return false;
+    }
+    {
+        // Drop again now the wipe has persisted: a validation that began after the local erase
+        // above can have read the then-present row and cached the pre-change session. (Not on
+        // the failure path: for a deactivated account the account stays inactive there and the
+        // gate refuses. An already-active account whose wipe fails keeps a gap-cached session
+        // until the next generation poll: bounded, and no worse than before.)
+        std::unique_lock lock(mu_);
+        drop_cached_user_sessions_locked(username);
     }
 
     // DB write FIRST, outside mu_ — mirrors remove_user/update_role's lock
@@ -2235,8 +2854,45 @@ AuthManager::commit_password_change(const yuzu::server::CredentialChangeRequest&
         it->second.hash_hex = request.new_hash_hex;
         it->second.salt_hex = request.new_salt_hex;
     }
-    std::erase_if(sessions_,
-                  [&](const auto& pair) { return pair.second.username == request.username; });
+    drop_cached_user_sessions_locked(request.username);
+    return outcome;
+}
+
+// ── MFA factor clear (#6079 PR 2c) ──────────────────────────────────────────
+
+yuzu::server::MfaDisableOutcome
+AuthManager::commit_mfa_disable(const yuzu::server::MfaDisableRequest& request) {
+    // No owner (cfg-file-only mode, or a server wired without Postgres): there is
+    // no durable factor to clear. Fail closed, never pretend; nothing is written.
+    // (A default outcome is kStoreUnavailable.)
+    if (!mfa_disable_owner_)
+        return yuzu::server::MfaDisableOutcome{};
+    // The ONE transaction (mfa_disable_owner.hpp). No mu_ is held across it, same
+    // discipline as commit_password_change.
+    auto outcome = mfa_disable_owner_->commit(request);
+    if (outcome.result == yuzu::server::MfaDisableResult::kStoreUnavailable) {
+        // The connection can be lost exactly at COMMIT after everything landed, so the
+        // factor clear and the durable session delete may have committed even though the
+        // owner cannot say so. Drop this replica's cached sessions of the account anyway:
+        // the over-invalidation is idempotent (a session that is still valid re-reads its
+        // durable row on its next request). The other non-kOk results wrote nothing and
+        // keep the cache untouched.
+        std::unique_lock lock(mu_);
+        drop_cached_user_sessions_locked(request.username);
+        return outcome;
+    }
+    if (outcome.result != yuzu::server::MfaDisableResult::kOk)
+        return outcome;
+    // Post-commit cache work only: the durable session rows were already deleted
+    // (and the write-generation bumped) inside the transaction, so this is NOT a
+    // second durable wipe. Drop this replica's in-memory sessions of the account
+    // unless the owner skipped the session delete (an un-enrolled account under
+    // `end_sessions_if_not_enrolled = false`), where those sessions stay valid.
+    // users_ carries no MFA state, so nothing else is cached here.
+    if (outcome.was_enrolled || request.end_sessions_if_not_enrolled) {
+        std::unique_lock lock(mu_);
+        drop_cached_user_sessions_locked(request.username);
+    }
     return outcome;
 }
 
@@ -2275,7 +2931,7 @@ std::size_t AuthManager::report_stale_cfg_credentials() {
             } else if (row.error() != yuzu::server::AuthDBError::InvalidUsername) {
                 spdlog::warn("#5274 boot check: could not read auth.users row for cfg user '{}' "
                              "(store error) - stale-credential check skipped for it",
-                             name);
+                             ::yuzu::log_key_token(name));
             }
             continue; // no row: the cfg entry is not shadowing anything
         }
@@ -2293,7 +2949,8 @@ std::size_t AuthManager::report_stale_cfg_credentials() {
     return stale;
 }
 
-std::optional<Role> AuthManager::get_user_role(const std::string& username) const {
+std::expected<Role, AuthManager::GetUserRoleError>
+AuthManager::get_user_role(const std::string& username) const {
     // Gate 3 governance BLOCKING finding (cpp-safety), fix shape confirmed via
     // Sol/codex opine: this was a pure `users_` cache read with NO AuthDB
     // fallback at all - completely independent of authenticate()/
@@ -2345,8 +3002,10 @@ std::optional<Role> AuthManager::get_user_role(const std::string& username) cons
         if (!db_user) {
             // Gate 3 re-review follow-up (cpp-expert + authdb, converged): log
             // a genuine store error distinctly from a plain not-found, so a PG
-            // outage that silently floors every legacy-token session to
-            // Role::user (auth_routes.cpp's `.value_or(Role::user)`) leaves an
+            // outage - which floors every legacy-token session to Role::user
+            // (auth_routes.cpp's `.value_or(Role::user)`) and, since #4068,
+            // makes the Settings create/role-change routes and SCIM
+            // active:false answer 503 - leaves an
             // operational trail instead of zero diagnostic signal - mirrors
             // find_user_or_hydrate's own UserNotFound-vs-DbError split in this
             // same file.
@@ -2359,29 +3018,27 @@ std::optional<Role> AuthManager::get_user_role(const std::string& username) cons
             if (db_user.error() != yuzu::server::AuthDBError::UserNotFound &&
                 db_user.error() != yuzu::server::AuthDBError::InvalidUsername) {
                 spdlog::error("get_user_role: AuthDB lookup for '{}' failed (store error, not "
-                              "a genuine miss) - returning nullopt",
+                              "a genuine miss) - returning DbError",
                               ::yuzu::log_key_token(username));
                 // Gate 5 chaos-injector CH-3/UP-6 follow-up: a log line alone is
-                // invisible exactly while the store is already stressed (the
-                // scenario that matters). This is the ONLY caller-visible signal
-                // that auth_routes.cpp's `.value_or(Role::user)` is about to
-                // floor a legacy-token-authenticated request's role down - narrows
-                // the observability gap; the honest fix (this call returning
-                // std::expected so callers can distinguish "not found" from
-                // "store degraded" and respond accordingly, e.g. 503 instead of a
-                // silent floor) touches 6 call sites and is a follow-up, not this
-                // metric.
+                // invisible exactly while the store is already stressed. The
+                // counter stays (auth_routes.cpp's legacy-token synthesis still
+                // floors to Role::user on DbError and has no other signal);
+                // since #4068 the error channel ALSO lets every other caller
+                // respond to a store error explicitly instead of reading it as
+                // "not found".
                 if (metrics_)
                     metrics_->counter("yuzu_auth_get_user_role_store_error_total").increment();
+                return std::unexpected(GetUserRoleError::DbError);
             }
-            return std::nullopt;
+            return std::unexpected(GetUserRoleError::NotFound);
         }
         return db_user->role;
     }
     std::shared_lock lock(mu_);
     auto it = users_.find(username);
     if (it == users_.end())
-        return std::nullopt;
+        return std::unexpected(GetUserRoleError::NotFound);
     return it->second.role;
 }
 
@@ -2391,7 +3048,7 @@ UpdateRoleOutcome AuthManager::update_role_checked(const std::string& username, 
         if (lifecycle_guard_unwired(true, rbac_store_ != nullptr)) {
             spdlog::error("AuthManager::update_role_checked('{}'): the last-Administrator guard "
                           "is not wired (no RbacStore) - refusing to change the role without it",
-                          username);
+                          ::yuzu::log_key_token(username));
             note_lifecycle_store_failure("set_role");
             return UpdateRoleOutcome::StoreFailure; // nothing was attempted: no eviction
         }
@@ -2400,16 +3057,16 @@ UpdateRoleOutcome AuthManager::update_role_checked(const std::string& username, 
         using Kind = LocalRoleChangeResult::Kind;
         switch (res.kind) {
         case Kind::kNotFound:
-            spdlog::warn("update_role: user not found: '{}'", username);
+            spdlog::warn("update_role: user not found: '{}'", ::yuzu::log_key_token(username));
             return UpdateRoleOutcome::NotFound;
         case Kind::kLastAdministratorRefused:
             return UpdateRoleOutcome::LastAdministratorRefused; // nothing changed
         case Kind::kInactivePromotionRefused:
-            spdlog::warn("update_role: refusing to promote inactive account '{}'", username);
+            spdlog::warn("update_role: refusing to promote inactive account '{}'", ::yuzu::log_key_token(username));
             return UpdateRoleOutcome::InactivePromotionRefused;
         case Kind::kStoreFailure:
             spdlog::error("AuthManager::update_role_checked: guarded role write for '{}' failed: {}",
-                          username, res.err);
+                          ::yuzu::log_key_token(username), ::yuzu::log_key_token(res.err));
             note_lifecycle_store_failure("set_role");
             // The write MAY have committed (a lost COMMIT ack): do not keep serving the cached
             // role or a session minted at the old one. Fail toward re-authentication.
@@ -2436,15 +3093,21 @@ UpdateRoleOutcome AuthManager::update_role_checked(const std::string& username, 
 
         // Invalidate sessions so the user picks up the new role on next login
         // Prevents stale session role from granting old privileges
-        std::erase_if(sessions_,
-                      [&](const auto& pair) { return pair.second.username == username; });
+        drop_cached_user_sessions_locked(username);
         lock.unlock();
+        // TEST-ONLY seam (see set_between_local_erase_and_wipe_hook_for_test's doc); no lock held.
+        if (between_local_erase_and_wipe_hook_for_test_)
+            between_local_erase_and_wipe_hook_for_test_();
         // Fail closed on a durable-wipe error: a demoted user's higher-role session must not
-        // survive a lost durable delete (see the helper). The role IS changed by now.
-        if (!wipe_user_sessions_durable(username)) {
+        // survive a lost durable delete (see the helper). The role IS changed by now. The cache is
+        // dropped again after the wipe for a validation that straddled it. That closes the gap
+        // only when the wipe persisted: after a FAILED wipe the row survives, so a later cold
+        // read can re-cache the stale-role session (the existing "role stale after a failed
+        // wipe" case, not addressed here).
+        if (!wipe_user_sessions_then_drop_cache(username)) {
             spdlog::error("AuthManager::update_role_checked: durable session wipe for '{}' failed "
                           "(the role IS changed)",
-                          username);
+                          ::yuzu::log_key_token(username));
             return UpdateRoleOutcome::UpdatedSessionWipeFailed;
         }
         return UpdateRoleOutcome::Updated;
@@ -2460,10 +3123,13 @@ UpdateRoleOutcome AuthManager::update_role_checked(const std::string& username, 
 
     // Invalidate sessions so the user picks up the new role on next login
     // Prevents stale session role from granting old privileges
-    std::erase_if(sessions_, [&](const auto& pair) { return pair.second.username == username; });
+    drop_cached_user_sessions_locked(username);
 
     lock.unlock();
-    if (!wipe_user_sessions_durable(username)) // no-op (true) w/o store
+    // TEST-ONLY seam (see set_between_local_erase_and_wipe_hook_for_test's doc); no lock held.
+    if (between_local_erase_and_wipe_hook_for_test_)
+        between_local_erase_and_wipe_hook_for_test_();
+    if (!wipe_user_sessions_then_drop_cache(username)) // no-op (true) w/o store
         return UpdateRoleOutcome::UpdatedSessionWipeFailed;
     save_config();
 
@@ -2624,12 +3290,14 @@ std::string AuthManager::create_saml_session(const std::string& name_id,
     params.session_lifetime_ms =
         std::chrono::duration_cast<std::chrono::milliseconds>(kSessionDuration).count();
     if (!persist_new_session(token, params)) {
-        spdlog::error("create_saml_session: durable persist failed for '{}'", stable_username);
+        spdlog::error("create_saml_session: durable persist failed for '{}'", ::yuzu::log_key_token(stable_username));
         return {}; // fail-safe empty token (ADR-0007)
     }
 
-    spdlog::info("SAML session created for '{}' (display={}, email={}, role={})", stable_username,
-                 resolved_display, saml_email, role_to_string(role));
+    // NameID, display name and email are IdP-controlled: fold the LOG copies only.
+    spdlog::info("SAML session created for '{}' (display={}, email={}, role={})",
+                 ::yuzu::log_key_token(stable_username), ::yuzu::log_key_token(resolved_display),
+                 ::yuzu::log_key_token(saml_email), role_to_string(role));
     return token;
 }
 
@@ -2727,11 +3395,11 @@ std::expected<ConsumeEnrollResult, StoreError>
 AuthManager::consume_and_enroll(std::string_view raw_token, const std::string& agent_id,
                                 const std::string& hostname, const std::string& os,
                                 const std::string& arch, const std::string& agent_version,
-                                bool enforce_new_id_charset) {
+                                bool enforce_new_id_charset, bool require_single_use) {
     return enrollment_store_call<ConsumeEnrollResult>(
         "consume", [&](yuzu::server::AuthDB& db) {
             return db.consume_and_enroll(raw_token, agent_id, hostname, os, arch, agent_version,
-                                         enforce_new_id_charset);
+                                         enforce_new_id_charset, require_single_use);
         });
 }
 

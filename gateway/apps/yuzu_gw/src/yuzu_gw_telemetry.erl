@@ -97,6 +97,11 @@
     [yuzu, gw, mgmt_auth, admitted],
     [yuzu, gw, mgmt_auth, pin_unresolved],
 
+    %% The CA revocation list watcher (yuzu_gw_mgmt_crl_source, #6016 PR 4b): the
+    %% state of the loaded CRL, and a CRL that was not obtained or not loaded.
+    [yuzu, gw, mgmt_crl, state],
+    [yuzu, gw, mgmt_crl, rejected],
+
     %% Certificate files (yuzu_gw_mgmt_pins' tick, yuzu_gw_cert_files): a
     %% pinned management key changed, and a configured certificate file's
     %% readable flag or notAfter changed.
@@ -361,6 +366,29 @@ handle_event([yuzu, gw, mgmt_auth, admitted], #{count := N}, Meta, _Config) ->
 
 handle_event([yuzu, gw, mgmt_auth, pin_unresolved], #{count := N}, _Meta, _Config) ->
     prometheus_counter:inc(yuzu_gw_mgmt_auth_pin_unresolved_total, [], N);
+
+%% The CA revocation list (yuzu_gw_mgmt_crl_source). `state' is the loaded CRL as the stream check
+%% sees it (0 for each gauge while none is loaded); `rejected' counts a CRL that was not obtained
+%% or not loaded, by the closed reason set yuzu_gw_mgmt_crl_source:reject_reasons/0.
+handle_event([yuzu, gw, mgmt_crl, state], Measurements, _Meta, _Config) ->
+    prometheus_gauge:set(yuzu_gw_mgmt_crl_enforced, [], maps:get(enforced, Measurements, 0)),
+    prometheus_gauge:set(yuzu_gw_mgmt_crl_loaded, [], maps:get(loaded, Measurements, 0)),
+    prometheus_gauge:set(yuzu_gw_mgmt_crl_number, [], maps:get(number, Measurements, 0)),
+    prometheus_gauge:set(yuzu_gw_mgmt_crl_next_update_timestamp_seconds, [],
+                         maps:get(next_update, Measurements, 0)),
+    prometheus_gauge:set(yuzu_gw_mgmt_crl_revoked_entries, [],
+                         maps:get(revoked_entries, Measurements, 0)),
+    %% Only an attempt that obtained something carries `last_success'; the gauge keeps the time of
+    %% the last one otherwise.
+    case Measurements of
+        #{last_success := T} ->
+            prometheus_gauge:set(yuzu_gw_mgmt_crl_last_success_timestamp_seconds, [], T);
+        _ ->
+            ok
+    end;
+handle_event([yuzu, gw, mgmt_crl, rejected], #{count := N}, Meta, _Config) ->
+    Reason = closed(maps:get(reason, Meta, undefined), yuzu_gw_mgmt_crl_source:reject_reasons()),
+    prometheus_counter:inc(yuzu_gw_mgmt_crl_rejected_total, [Reason], N);
 
 %% A pinned management key changed (yuzu_gw_mgmt_pins): the wall-clock second
 %% it was published. Read by the pin_mismatch alert to tell the rotation window
@@ -733,7 +761,8 @@ closed(_Value, _Set) ->
 mgmt_auth_reject_reasons() ->
     [internal_error, no_pins_configured, no_pins_resolved, pin_mismatch,
      missing_server_auth_eku, bad_peer_cert, bad_pin_config,
-     no_uri_san, identity_mismatch, identity_unresolved, revoked].
+     no_uri_san, identity_mismatch, identity_unresolved, revoked,
+     revocation_unknown, revocation_stale, crl_revoked].
 
 %% The closed set of `reason' values on yuzu_gw_heartbeat_rejected_total: every
 %% `{reject, Reason}' yuzu_gw_heartbeat_admission:check/2 returns except
@@ -918,6 +947,19 @@ metric_specs() ->
             {help, "Mgmt-plane (:50063) peers admitted by the peer authorization, "
                    "by the method that admitted them (closed set: identity | pin; "
                    "no certificate contents)"}]},
+        {counter, [
+            {name, yuzu_gw_mgmt_crl_rejected_total},
+            {labels, [reason]},
+            {help, "CA revocation lists (mgmt_crl_source) that were not obtained or not "
+                   "loaded, by reason (closed set: malformed | unsupported | too_large | "
+                   "unverified | issuer_mismatch | validity_too_long | future_dated | replay | "
+                   "fetch_timeout | fetch_connect | fetch_tls | fetch_status | fetch_error | "
+                   "file_unreadable). The CRL loaded earlier, if any, stays in force. The same "
+                   "refused bytes are counted once in a row and again once an hour while "
+                   "they persist, not once per refresh, except for future_dated, replay, "
+                   "too_large as reported by the fetch, and the fetch reasons, which count "
+                   "every attempt. Alert on the state gauges, not on this rate; see "
+                   "yuzu_gw_mgmt_crl_next_update_timestamp_seconds"}]},
         {counter, [
             {name, yuzu_gw_heartbeat_rejected_total},
             {labels, [reason]},
@@ -1192,6 +1234,43 @@ metric_specs() ->
                    "pinned {cert_file, Path} certificate change to a different key; 0 "
                    "until the first such change in this process. Not set by the first "
                    "read at start or by a rewrite of the same key"}]},
+        {gauge, [
+            {name, yuzu_gw_mgmt_crl_enforced},
+            {labels, []},
+            {help, "1 when a CA revocation list source (mgmt_crl_source) is configured, so "
+                   "the management-plane check refuses a peer until a CRL has loaded, "
+                   "once the loaded CRL is stale, and when the peer's serial is listed; "
+                   "0 when none is configured (no CRL check)"}]},
+        {gauge, [
+            {name, yuzu_gw_mgmt_crl_loaded},
+            {labels, []},
+            {help, "1 when a verified CA revocation list is loaded, 0 when none is (a "
+                   "configured source that has never produced a verifiable CRL refuses every "
+                   "management stream as revocation_unknown)"}]},
+        {gauge, [
+            {name, yuzu_gw_mgmt_crl_number},
+            {labels, []},
+            {help, "cRLNumber of the loaded CA revocation list; 0 while none is loaded"}]},
+        {gauge, [
+            {name, yuzu_gw_mgmt_crl_next_update_timestamp_seconds},
+            {labels, []},
+            {duration_unit, false},
+            {help, "nextUpdate (Unix seconds) of the loaded CA revocation list; 0 while none "
+                   "is loaded. The management plane refuses the server once the clock passes "
+                   "this plus mgmt_crl_grace_s (default 86400), as revocation_stale"}]},
+        {gauge, [
+            {name, yuzu_gw_mgmt_crl_last_success_timestamp_seconds},
+            {labels, []},
+            {duration_unit, false},
+            {help, "Unix seconds of the last time the CA revocation list source was read "
+                   "successfully (a new CRL, the same CRL again, or a 304); 0 until then. "
+                   "Not advanced by a failed fetch, so a watcher that is stuck or whose "
+                   "fetches keep failing behind a still-valid CRL shows here"}]},
+        {gauge, [
+            {name, yuzu_gw_mgmt_crl_revoked_entries},
+            {labels, []},
+            {help, "Number of revoked serial numbers in the loaded CA revocation list; 0 "
+                   "while none is loaded"}]},
         {gauge, [
             {name, yuzu_gw_cert_expiry_timestamp_seconds},
             {labels, [role, name]},
@@ -1529,6 +1608,8 @@ seed_metrics() ->
      || R <- mgmt_auth_reject_reasons()],
     [prometheus_counter:inc(yuzu_gw_mgmt_auth_admitted_total, [M], 0)
      || M <- [<<"identity">>, <<"pin">>]],
+    [prometheus_counter:inc(yuzu_gw_mgmt_crl_rejected_total, [atom_to_binary(R, utf8)], 0)
+     || R <- yuzu_gw_mgmt_crl_source:reject_reasons()],
     %% Create every series at 0 now (a series that first appears already at 1
     %% is invisible to increase()).
     [prometheus_counter:inc(yuzu_gw_heartbeat_rejected_total,
@@ -1574,6 +1655,12 @@ seed_metrics() ->
     prometheus_gauge:set(yuzu_gw_upstream_slow, [], 0),
     %% 0 = no rotation observed: the pin_mismatch alert is then not suppressed.
     prometheus_gauge:set(yuzu_gw_mgmt_pin_rotated_timestamp_seconds, [], 0),
+    %% No CRL source or none loaded yet: every CRL gauge reads 0 from the first scrape.
+    [prometheus_gauge:set(G, [], 0)
+     || G <- [yuzu_gw_mgmt_crl_enforced, yuzu_gw_mgmt_crl_loaded, yuzu_gw_mgmt_crl_number,
+              yuzu_gw_mgmt_crl_next_update_timestamp_seconds,
+              yuzu_gw_mgmt_crl_last_success_timestamp_seconds,
+              yuzu_gw_mgmt_crl_revoked_entries]],
     %% Series at 0 from startup, before yuzu_gw_upstream:init/1 has reported.
     prometheus_gauge:set(yuzu_gw_upstream_notify_pending, [node()], 0),
     prometheus_gauge:set(yuzu_gw_upstream_notify_inflight, [node()], 0),

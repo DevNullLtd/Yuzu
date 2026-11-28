@@ -5,7 +5,7 @@
   "description": "Multi-platform agent and server framework",
   "homepage": "https://github.com/DevNullLtd/Yuzu",
   "license": "AGPL-3.0-or-later",
-  "builtin-baseline": "4b77da7fed37817f124936239197833469f1b9a8",
+  "builtin-baseline": "9eec002df1cd109f8f104cd966a763daf9751489",
   "dependencies": [
     {
       "name": "grpc",
@@ -42,7 +42,8 @@
         {
           "name": "drogon",
           "default-features": false
-        }
+        },
+        "libxlsxwriter"
       ]
     },
     "agent": {
@@ -58,5 +59,9 @@
       ]
     }
   },
-  "overrides": []
+  "$overrides-comment": "Security pins above the baseline (WP14): brotli 1.2.1 (CVE-2026-111497) and sqlite3 3.54.1 (the 3.54.0 CVE batch). An override is an exact pin that also holds a port BACK, so delete each entry once the baseline reaches that version; see docs/build-guide.md (vcpkg).",
+  "overrides": [
+    { "name": "brotli", "version": "1.2.1" },
+    { "name": "sqlite3", "version": "3.54.1" }
+  ]
 }

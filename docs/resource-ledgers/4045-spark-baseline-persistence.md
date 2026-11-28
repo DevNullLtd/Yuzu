@@ -30,12 +30,19 @@ members.
   Stop pass takes `persist_mu_` afterwards), the same pair `apply_rules` -> `attach_core` takes.
 - **Destruction order.** `agent.cpp` declares `kv_store_` before `guardian_`, so the engine (and the
   persister it owns, which borrows the `KvStore*`) is destroyed first; the drain worker is joined
-  before either. The runtime holds no `KvStore`: its drop counter is a `shared_ptr` the persister
-  copies, so it stays valid whichever of the two dies first.
+  before either. The runtime holds no `KvStore`: its drop counter and the staged-size mirror
+  (`staged_baseline_count_`, #5605) are `shared_ptr`s the persister copies, so both stay valid
+  whichever of the two dies first. The mirror is written only under `registry_mu_` (`store(size())`
+  where staging changes size, and a repair of any mismatch found when a snapshot or an erase runs);
+  that repair is counted (`staged_baseline_mirror_resyncs_`), logged once and never aborts.
 - **Published persister pointer.** `GuardianEngine::baseline_persister_published_` is a
   non-owning `std::atomic<GuardianBaselinePersister*>`, stored once with release by
-  `wire_spark_engine` (under `mtx_`, right after `make_shared`) and never cleared. Readers use
-  acquire: the two heartbeat getters and the top of `stop()` (for `begin_stop()`).
+  `wire_spark_engine` (under `mtx_`, right after `make_shared`) and cleared (stored null) only by
+  `rollback_spark_wiring_locked`, so a wiring that failed after the publish reads as no persister
+  (#5605); the persister object itself stays alive until the engine's destructor. Readers use
+  acquire: the three lock-free engine getters (`baseline_persist_failures` and
+  `baseline_unpersisted` feed heartbeat tags; `baseline_persist_refusals` is diagnostic only and
+  has no heartbeat tag or metric) and the top of `stop()` (for `begin_stop()`).
   A `stop()` that loads null before the wire publishes is covered by a second `begin_stop()` after
   `stop()` takes `mtx_` (first call wins).
 
@@ -54,12 +61,15 @@ members.
 | `next_attempt_rep_` (`atomic<Clock::rep>`) | Persister; read lock-free by the Worker retry floor, written under `persist_mu_` | After a failed pass | Reset by a pass with no failure | n/a |
 | `persist_failures_`, `no_store_pending_`, `persist_refusals_`, `firewalled_exceptions_` (`atomic<uint64_t>`) | Persister | `fetch_add` at the event | Never | Relaxed counters; `failure_signals()` sums them with the runtime's drop counter, lock-free |
 | `staging_drops_` (`shared_ptr<const atomic<uint64_t>>`) | Persister member, never reseated | Constructor, copied from `staged_baseline_drops_source()` | Last holder | Outlives runtime teardown |
+| `staging_count_` (`const shared_ptr<const atomic<uint64_t>>`, #5605) | Persister member, `const`, never reseated; may be null | Constructor, copied from `GuardianSparkRuntime::staged_baseline_count_source()` | Last holder (runtime or persister) | Outlives runtime teardown. Read only by `pending_captures()`, one relaxed lock-free load, no lock; a null pointer reads 0 |
 | `no_store_logs_`, `info_logs_`, `stop_skip_stalled_logs_`, `stop_skip_late_logs_`, `yields_`, `backoff_deferrals_`, `lock_waiters_`, `priority_waiters_`, `apply_active_` | Persister atomics (log latch and test observation, plus the two waiter counts the Worker pass reads) | `fetch_add` at the event | Never | Relaxed |
 | `snap` and `done` vectors, `std::span<const CapturedBaseline>` over `done` | Pass-local; the span is consumed synchronously by `erase_staged_baselines_if_unchanged` and never stored | `persist_staged` | Scope end | `done` is allocated before the first write, so nothing after a write can throw; a throw before the first write loses nothing and widens the worker backoff |
 | `should_stop` (`const std::function<bool()>&`) | Borrowed for one call, worker thread only | Call-expression temporary | End of the full-expression | n/a |
 | `clock_`, `post_snapshot_hook_`, `post_write_hook_` (`std::function`) | Persister members, TEST-ONLY; the setters take `persist_mu_`; `begin_stop()` and `stop_stage_begin()/end()` read `clock_` unlocked, which is safe only because tests set it before threads start | Test setters | Member | Restored by `HookGuard4045` / `FakeClock4045` on every exit |
 | `kKvStoreBusyTimeout`, `kBaselinePassBudget`, `kBaselineStopBudget`, `kBaselineShutdownGrace`, `kBaselineStopLatestStart`, `kBaselineStopTroubleSlack` (250 ms since #5604; 500 ms before), `kBaselineStopTroubleThreshold` (the stop busy budget minus the slack, 750 ms since #5604; 4.5 s before) | `inline constexpr` values (no resource) | Compile time | n/a | A `static_assert` in `agent.cpp` ties `kBaselineShutdownGrace` to `kShutdownDeadlineGrace`; E46, E51 and E53 pin the values; a `static_assert` keeps the threshold between 0 and the stop busy budget; `kBaselineStopLatestStart` is 18 s since #5604 (15 s before), pinned by a `static_assert` and E46 |
 | `baseline_stop_flush_done_` (`bool`) | Engine, guarded by `mtx_` (only `stop()` sets it) | First `at_stop` flush, set before the stage and the pass | Never | Set before the attempt, so the destructor's second `stop()` flushes and logs nothing |
+| `boot_rearm_walk_` (`bool`, #5605) | Engine, guarded by `mtx_` (start_local and apply_rules both hold it) | `start_local`, set after `boot_walk_clear.fn` is assigned | Cleared by the function-scoped `GuardianRollback` guard when `start_local` returns, on every path | `apply_rules` therefore never sees it set; a rule seeded outside the boot walk is never counted |
+| `boot_rebaselined_` (`atomic<uint64_t>`, #5605) | Engine | `fetch_add` (relaxed) in `reconcile_rule_locked`'s seed block with `mtx_` held and `boot_rearm_walk_` set, only for a genuinely Absent record | Never reset; dies with the engine | Read lock-free (relaxed) by `baseline_rebaselined_at_boot()` for the heartbeat; a count only, no resource |
 | `baseline_stop_incomplete_logs_`, `baseline_stop_unstaged_logs_`, `baseline_stop_flush_threw_logs_`, `baseline_stop_sweep_threw_logs_` (`atomic<uint64_t>`) | Engine, TEST-ONLY observation beside each ERROR call | `fetch_add` at the log site | Never | Each is inside its own try/catch(...) |
 | `stop_stage_hook_for_test_` (`std::function<void(const char*)>`) | Engine, guarded by `mtx_`; the setter takes `mtx_` | Test setter | Member; cleared by `HookGuard4045` | Called from `stop_stage_hook_locked` at the START of each stage, inside a try/catch(...) |
 | `stop_stage_begin_locked()` / `stop_stage_hook_locked()` / `stop_stage_end_locked()` / `stop_journal_flush_locked()` | Engine member functions, `mtx_` held, noexcept | `stop()` | n/a | No resource: read the persister's clock and report a stage that took at least `kBaselineStopTroubleThreshold` (750 ms since #5604; 4.5 s before) |
@@ -71,6 +81,8 @@ members.
 | `staged_baselines_` (`std::map<std::string, CapturedBaseline>`) | Runtime, guarded by `registry_mu_` | `stage_baseline_locked` (noexcept, returns bool), `salvage_unstaged_baseline_locked` (noexcept, returns bool, `[[nodiscard]]`), the `attach_core` pre-stage, `stage_unstaged_baselines()` at stop | `erase_staged_baselines_if_unchanged` by identity after Written or Refused | The snapshot is a COPY; a throw leaves staging intact; a failed stage leaves the generation flagged and counts one drop |
 | `RuleGeneration::baseline_unstaged` (`bool`) | Runtime, guarded by `registry_mu_`, per generation | `evaluate_key` commit, `attach_core` | Dies with the generation; cleared on a successful stage (commit, attach, withdrawal salvage, the stop sweep) | A failed stage keeps it set and counts one drop per attempt; the stop sweep returns the number still set |
 | `staged_baseline_drops_` (`shared_ptr<atomic<uint64_t>>`) | Runtime member, never reseated | Constructor | Last holder (runtime or persister) | `fetch_add` is noexcept. It also counts the `attach_core` read-back whose copy throws after a successful staging; that is not a staging attempt, and has no counter of its own |
+| `staged_baseline_count_` (`shared_ptr<atomic<uint64_t>>`, #5605) | Runtime member, never reseated; a mirror of `staged_baselines_.size()` | Constructor | Last holder (runtime or persister) | Written ONLY under `registry_mu_` (`store(size())` at the two size-changing sites); read lock-free by the persister. A mismatch found by `snapshot_staged_baselines` or `erase_staged_baselines_if_unchanged` is repaired with `store(size())` by `resync_staged_baseline_mirror_locked` (noexcept), counted and never aborts |
+| `staged_baseline_mirror_resyncs_` (`mutable atomic<uint64_t>`, #5605) | Runtime member | `fetch_add` under `registry_mu_` by `resync_staged_baseline_mirror_locked` | Never reset; dies with the runtime | Relaxed; the one log line is emitted on the 0 to 1 transition only. Not exposed on the wire; read by a test accessor |
 | `inherited_hash` (`std::string`) in `attach_core`, and its read-back after `detach_rule_locked` | Local, `registry_mu_` held | Copy of the staged hash | Moved into `rg->assertion.expected_hash` (noexcept move) or scope end | The first read is before the detach (a throw is a plain unwind, the prior arm survives); the read-back is inside try/catch(...) with a noexcept counter bump because the prior generation is already gone |
 | `stage_unstaged_baselines()` | Runtime member function; `registry_mu_` held for its span | Engine `stop()` after the worker join and the runtime's `begin_stop()` | Scope exit | Not noexcept (the lock can throw); the engine firewalls it. A per-rule `key_for_rule` throw is caught inside the loop, counted, and the loop continues |
 | `fail_next_stage_baseline_` (`atomic<int>`), `fail_next_snapshot_`, `fail_next_inherit_copy_` (`atomic<bool>`), `fail_next_unstaged_sweep_` (`atomic<bool>`), `unstaged_sweep_stopping_for_test_` (`atomic<int>`) | Runtime, TEST-ONLY seams | Test setters or the sweep | Decrement or `exchange(false)`; the last records whether `stopping_` was set when the sweep ran | One-shot; relaxed. `fail_next_unstaged_sweep_` makes the sweep throw before its lock |
@@ -102,7 +114,8 @@ Engine: `baseline_persister_for_test`, `baseline_stop_incomplete_logs_for_test`,
 `baseline_stop_sweep_threw_logs_for_test`, `set_apply_post_drain_hook_for_test`,
 `set_seed_read_hook_for_test`, `set_post_attach_hook_for_test`, `set_stop_stage_hook_for_test`,
 `unpublish_baseline_persister_for_test`. Runtime: `stage_baseline_for_test`,
-`staged_baseline_count_for_test`, `fail_next_stage_baseline_for_test`,
+`staged_baseline_count_for_test`, `staged_baseline_count_mirror_for_test`,
+`staged_baseline_mirror_resyncs_for_test`, `skew_staged_baseline_mirror_for_test`, `fail_next_stage_baseline_for_test`,
 `fail_next_snapshot_for_test`, `fail_next_unstaged_sweep_for_test`,
 `fail_next_inherit_copy_for_test`, `unstaged_sweep_stopping_for_test`. Drain worker:
 `stop_requested_for_test`. KvStore (#5604): `busy_timeout_for_test`, `busy_handler_for_test`,

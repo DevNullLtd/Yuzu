@@ -431,7 +431,8 @@ Decision numbers are stable, since other documents cite them.
     Decision 5) — a globally-granted engine acting for a group-confined operator reaches
     only that operator's groups. SLE's in-server gates use the fail-closed
     `rbac_enforcement_in_effect()` primitive, not the `is_rbac_enabled()` shape whose
-    corrupt-rbac.db fail-open is tracked by #1717. *Rejected: an ad-hoc per-row filter for
+    corrupt-rbac.db fail-open is tracked by #1717 (SQLite-era wording; RBAC is the Postgres
+    `rbac_store` schema since ADR-0041, noted 2026-11-14). *Rejected: an ad-hoc per-row filter for
     the fan-out reads — exactly the pattern ADR-0017 exists to replace.*
 
 11. **Per-user discovery is a contained ADR-0016 deviation, pseudonymous by default. [core]**
@@ -476,6 +477,37 @@ Decision numbers are stable, since other documents cite them.
     `CertificateInventoryStore` (schema `certificate_inventory_store`, the fleet certificate inventory of
     ADR-0070 D12) joined, and its `delete_agent` erases its rows in one transaction. Its read securable,
     `CertificateInventory`, arrives in PR 2a-2b.)*
+    *(Update 2026-11-09, #5675: the cascade now covers **nine** stores. `GuaranteedStateStore` (schema
+    `guaranteed_state_store`, public key `guaranteed_state`) joined: its `delete_agent` erases the device's
+    compliance-census rows (`guardian_agent_rule_status`) and retires its pending census evidence in one
+    transaction, so a decommissioned agent stops counting in `errored_rules` and `uncertain_rules`. Its
+    read securable is `GuaranteedState:Read`, which makes it the second `GuaranteedState`-governed member
+    after `AppPerfDailyStore`. The Guardian event log and DEX observations are NOT erased by this
+    decommission; they are kept until retention expires (30 days by default; rows stamped while `guardian_event_retention_days` is 0 or below never expire). Widening the erasure to them is a separate follow-up (#7531) that needs an
+    ADR-0038 Update. The "five per-agent stores" list in Decisions 9 and 11 is left as written; it is history.
+    A still-running agent re-creates its census row on its next census-bearing event (after a state change, an agent restart or a rule push; not on a schedule), so stop the agent first.)*
+    *(Update 2026-11-16, #6352: the cascade now covers **ten** stores. `ManagementGroupStore` (schema
+    `management_group_store`, public key `management_group_memberships`) joined, registered last: its
+    `delete_agent` removes the device's rows in every management group (static, dynamic and the root group) in
+    one statement and reports which groups it left. Its read securable is `ManagementGroup:Read`. Only
+    `management_group_members` is touched: the groups, their role assignments, the device's tags and its
+    enrolment row are not. Decommission therefore still does not unenrol, so the same agent id is accepted
+    again on the approved re-register fast path and its next Register attempts (best effort) to add it back to
+    the root group only; un-enrolling is a separate planned change. The removal is a point in time (an operator
+    add, or a dynamic or `Service:` group created later from the tags decommission leaves in place, can
+    re-insert the id). The "five per-agent stores" list in Decisions 9 and 11 stays as written; it is history.
+    The authoritative list is `AgentDecommissionStores` in `agent_decommission.hpp`.)*
+    *(Owner ruling, Dave Rae, 2026-11-17, from the governance review of this change, recorded here because it
+    widens what `Decommission:Delete` confers: the grant is the authority to remove the device's membership
+    rows in every group, including groups the caller could not otherwise write. A service-scoped token
+    admitted for a device in its service cannot hold the global `ManagementGroup:Write` that the member-removal
+    routes require, yet its decommission removes the device from every group. The rows are agent-keyed links to
+    the retired device and nothing is granted; removal narrows what anyone can reach. It also ends
+    group-targeted compliance policy, Guardian and collection-settings coverage of the device, a loss the owner
+    accepted. Tags stay outside the cascade. Because the removal changes confinement input, the outcome audit
+    row records the groups the device left (`management_group_memberships.groups=<n>:<ids>`, or `<n>:unrecorded` when the ids could not be copied after the delete committed). A group-scoped
+    holder, if one could exist, cannot re-issue a partial decommission once the memberships are gone; a
+    tag-confined token is not affected by that, because tags survive.)*
     There is **no row-level erasure API**, a stated gap. The cascade's
     production trigger is `DELETE /api/v1/sle/agents/{id}`, authorized by the scoped
     `SoftwareLicensing:Delete` **AND** `Inventory:Delete` **AND** `GuaranteedState:Delete`

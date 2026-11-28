@@ -1,4 +1,5 @@
 #include "policy_store.hpp"
+#include "dispatch_target_shape.hpp" // check_params_key_shape (sg10 / UP-1)
 
 #include "cel_eval.hpp"
 #include "compliance_eval.hpp"
@@ -6,6 +7,7 @@
 #include "pg/pg_exec.hpp"
 #include "pg/pg_migration_runner.hpp"
 #include "pg/pg_raii.hpp"
+#include "policy_dispatch.hpp"
 #include "scope_yaml.hpp"
 #include "store_errors.hpp"
 #include "utf8_sanitize.hpp"
@@ -425,6 +427,22 @@ std::string PolicyStore::peek_fragment_name(const std::string& yaml_source) {
     return extract_yaml_value(yaml_source, "id");
 }
 
+std::string PolicyStore::peek_policy_fragment(const std::string& yaml_source) {
+    return extract_yaml_value(yaml_source, "fragment");
+}
+
+std::vector<std::string> PolicyStore::peek_fragment_instructions(const std::string& yaml_source) {
+    std::vector<std::string> out;
+    // The same section paths `create_fragment` reads, so the two cannot disagree on which
+    // instructions a fragment names.
+    for (const char* section : {"spec.check", "spec.fix", "spec.postCheck"}) {
+        auto id = extract_yaml_value(extract_yaml_section(yaml_source, section), "instruction");
+        if (!id.empty())
+            out.push_back(std::move(id));
+    }
+    return out;
+}
+
 // ── Fragment CRUD ────────────────────────────────────────────────────────────
 
 std::expected<std::string, std::string>
@@ -484,6 +502,12 @@ PolicyStore::create_fragment(const std::string& yaml_source) {
     nlohmann::json post_params_json = nlohmann::json::object();
     for (const auto& [k, v] : post_params_map)
         post_params_json[k] = v;
+    // sg10 / UP-1: a parameter key the agent would truncate (control byte, NUL, invalid UTF-8) or a
+    // NUL value is refused at creation, never stored (the same rule every ingress applies).
+    for (const auto* m : {&check_params_json, &fix_params_json, &post_params_json}) {
+        if (const auto bad = yuzu::server::check_params_key_shape(*m))
+            return std::unexpected(std::string(bad->reason) + ": " + bad->message);
+    }
 
     if (!check_compliance.empty()) {
         check_compliance = cel::migrate_expression(check_compliance);
@@ -604,6 +628,88 @@ PolicyStore::get_fragment(const std::string& id) const {
     return std::optional<PolicyFragment>{read_fragment(res.get(), 0)};
 }
 
+std::expected<std::vector<std::string>, PolicyReadError>
+PolicyStore::fragments_referencing_instruction(
+    const std::string& instruction_id, int limit,
+    const std::unordered_set<std::string>& exclude_ids) const {
+    return fragments_referencing_instructions(std::vector<std::string>{instruction_id}, limit,
+                                              exclude_ids);
+}
+
+std::expected<std::vector<std::string>, PolicyReadError>
+PolicyStore::fragments_referencing_instructions(
+    const std::vector<std::string>& instruction_ids, int limit,
+    const std::unordered_set<std::string>& exclude_ids) const {
+    if (!open_) {
+        spdlog::warn("PolicyStore::fragments_referencing_instructions: store not open");
+        return std::unexpected(PolicyReadError::kDegraded);
+    }
+    if (instruction_ids.empty())
+        return std::vector<std::string>{};
+    auto lease = pool_.try_acquire_for(kAcquireTimeout);
+    if (!lease) {
+        spdlog::warn("PolicyStore::fragments_referencing_instructions: no connection in time ({})",
+                     pool_.last_error());
+        return std::unexpected(PolicyReadError::kDegraded);
+    }
+    const std::vector<std::string_view> wanted(instruction_ids.begin(), instruction_ids.end());
+    std::vector<std::string_view> excluded(exclude_ids.begin(), exclude_ids.end());
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "SELECT id FROM policy_store.policy_fragments WHERE (check_instruction = ANY($1::text[]) "
+        "OR fix_instruction = ANY($1::text[]) OR post_check_instruction = ANY($1::text[])) "
+        "AND NOT (id = ANY($3::text[])) ORDER BY id ASC LIMIT $2",
+        std::vector<std::string>{pg::to_text_array(wanted), std::to_string(std::max(limit, 1)),
+                                 pg::to_text_array(excluded)});
+    if (res.status() != PGRES_TUPLES_OK) {
+        spdlog::warn("PolicyStore::fragments_referencing_instructions: query failed: {}",
+                     PQerrorMessage(lease.get()));
+        return std::unexpected(PolicyReadError::kDegraded);
+    }
+    std::vector<std::string> ids;
+    ids.reserve(static_cast<size_t>(PQntuples(res.get())));
+    for (int i = 0; i < PQntuples(res.get()); ++i)
+        ids.emplace_back(PQgetvalue(res.get(), i, 0));
+    return ids;
+}
+
+std::expected<std::vector<FragmentUse>, PolicyReadError>
+PolicyStore::policies_using_fragments(const std::vector<std::string>& fragment_ids,
+                                      int per_fragment_limit) const {
+    if (!open_) {
+        spdlog::warn("PolicyStore::policies_using_fragments: store not open");
+        return std::unexpected(PolicyReadError::kDegraded);
+    }
+    if (fragment_ids.empty())
+        return std::vector<FragmentUse>{};
+    auto lease = pool_.try_acquire_for(kAcquireTimeout);
+    if (!lease) {
+        spdlog::warn("PolicyStore::policies_using_fragments: no connection in time ({})",
+                     pool_.last_error());
+        return std::unexpected(PolicyReadError::kDegraded);
+    }
+    const std::vector<std::string_view> wanted(fragment_ids.begin(), fragment_ids.end());
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "SELECT fragment_id, id, name FROM (SELECT fragment_id, id, name, "
+        "ROW_NUMBER() OVER (PARTITION BY fragment_id ORDER BY name ASC, id ASC) AS rn "
+        "FROM policy_store.policies WHERE fragment_id = ANY($1::text[])) t "
+        "WHERE rn <= $2 ORDER BY fragment_id ASC, rn ASC",
+        std::vector<std::string>{pg::to_text_array(wanted),
+                                 std::to_string(std::max(per_fragment_limit, 1))});
+    if (res.status() != PGRES_TUPLES_OK) {
+        spdlog::warn("PolicyStore::policies_using_fragments: query failed: {}",
+                     PQerrorMessage(lease.get()));
+        return std::unexpected(PolicyReadError::kDegraded);
+    }
+    std::vector<FragmentUse> uses;
+    uses.reserve(static_cast<size_t>(PQntuples(res.get())));
+    for (int i = 0; i < PQntuples(res.get()); ++i)
+        uses.push_back({PQgetvalue(res.get(), i, 0), PQgetvalue(res.get(), i, 1),
+                        PQgetvalue(res.get(), i, 2)});
+    return uses;
+}
+
 bool PolicyStore::delete_fragment(const std::string& id) {
     if (!open_)
         return false;
@@ -706,24 +812,29 @@ PolicyStore::create_policy(const std::string& yaml_source) {
     std::vector<PolicyTrigger> triggers;
     auto triggers_section = extract_yaml_section(yaml_source, "triggers");
     if (!triggers_section.empty()) {
+        // Item boundaries: every `-` line at the column of the FIRST `-` line.
+        // The first `-` is looked for on line starts only, never inside a
+        // comment: a hyphen in `# re-check every 5-min` used to set the item
+        // column, no item matched it, and the policy was stored with no
+        // triggers (#2123 governance G4-TRIG-1). extract_yaml_section returns
+        // the block LF-joined, so splitting on '\n' here is exact.
         std::vector<size_t> dash_positions;
         {
-            auto first_dash = triggers_section.find('-');
-            if (first_dash != std::string::npos) {
-                auto line_start = triggers_section.rfind('\n', first_dash);
-                size_t dash_indent =
-                    (line_start == std::string::npos) ? first_dash : first_dash - line_start - 1;
-                size_t scan = 0;
-                while (scan < triggers_section.size()) {
-                    auto nl = triggers_section.find('\n', scan);
-                    if (nl == std::string::npos)
-                        nl = triggers_section.size();
-                    auto line = triggers_section.substr(scan, nl - scan);
-                    auto fc = line.find_first_not_of(" \t");
-                    if (fc != std::string::npos && line[fc] == '-' && fc == dash_indent)
+            size_t dash_indent = std::string::npos;
+            size_t scan = 0;
+            while (scan < triggers_section.size()) {
+                auto nl = triggers_section.find('\n', scan);
+                if (nl == std::string::npos)
+                    nl = triggers_section.size();
+                auto line = triggers_section.substr(scan, nl - scan);
+                auto fc = line.find_first_not_of(" \t");
+                if (fc != std::string::npos && line[fc] == '-') {
+                    if (dash_indent == std::string::npos)
+                        dash_indent = fc;
+                    if (fc == dash_indent)
                         dash_positions.push_back(scan + fc);
-                    scan = nl + 1;
                 }
+                scan = nl + 1;
             }
         }
         for (size_t di = 0; di < dash_positions.size(); ++di) {
@@ -765,6 +876,12 @@ PolicyStore::create_policy(const std::string& yaml_source) {
     }
 
     auto groups = extract_yaml_list(yaml_source, "managementGroups");
+    // A reference that cannot be a group id (a misspelling, or a list item
+    // yaml_scan could not place) would match nobody, and a non-empty group list
+    // replaces the scope at evaluation, so refuse it rather than store a policy
+    // that silently targets zero devices (#2123 governance G4-UP-1 / G4-UP-2).
+    if (auto err = validate_management_group_ids(groups))
+        return std::unexpected(*err);
     auto now = now_epoch();
 
     // Whole write is one transaction (improvement over the SQLite original's
@@ -1089,6 +1206,154 @@ PolicyStore::update_agent_status(const std::string& policy_id, const std::string
     return true;
 }
 
+std::expected<PolicyStore::MarkBlockedResult, std::string>
+PolicyStore::mark_blocked(const std::string& policy_id, const std::vector<std::string>& agent_ids,
+                          std::string_view phase, std::string_view plugin, std::string_view action,
+                          std::string_view reason, std::optional<int64_t> expected_gen) {
+    if (!open_)
+        return std::unexpected(std::string(kPolicyDbErrorPrefix) + "database not open");
+    if (policy_id.empty())
+        return std::unexpected("policy_id is required");
+    if (phase != "check" && phase != "fix" && phase != "verify")
+        return std::unexpected("invalid phase");
+    if (reason.empty())
+        return std::unexpected("reason is required");
+    // A fenced write needs a real claim generation: 0 would match every unclaimed row.
+    if (expected_gen && *expected_gen == 0)
+        return std::unexpected("expected_gen must be a real claim generation");
+    if (agent_ids.empty())
+        return MarkBlockedResult{};
+
+    // check_result carries the pair as two fields, and only when it is well formed. An
+    // over-length or off-charset part is never stored (it would be author-chosen text that
+    // authoring itself would have refused): the row records the seventh reason and null parts.
+    nlohmann::json result = nlohmann::json::object();
+    result["phase"] = std::string(phase);
+    result["result"] = "blocked";
+    if (dispatch_pair_well_formed(plugin, action)) {
+        result["reason"] = std::string(reason);
+        result["plugin"] = std::string(plugin);
+        result["action"] = std::string(action);
+    } else {
+        result["reason"] = std::string(to_string(PolicyDispatchDenialReason::DispatchIdentifierInvalid));
+        result["plugin"] = nullptr;
+        result["action"] = nullptr;
+    }
+    const std::string check_result = sanitize_pg_text(result.dump());
+
+    // Distinct ids: a duplicate would make the INSERT's ON CONFLICT raise a cardinality
+    // violation, and would double-count a target.
+    std::vector<std::string> ids = agent_ids;
+    std::sort(ids.begin(), ids.end());
+    ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+
+    // A large run is worth a line: it is one write per 500 targets on every refusal.
+    constexpr std::size_t kLargeRun = 5000;
+    if (ids.size() > kLargeRun)
+        spdlog::info("PolicyStore: mark_blocked policy={} phase={} targets={} (chunks of 500, one "
+                     "pool lease per chunk)",
+                     policy_id, phase, ids.size());
+
+    // Unfenced (a refused CHECK): the UPSERT, because the first refusal for an agent may be
+    // its first row. Every target row is written, so last_check_at is refreshed on each
+    // refusal: a refusal that still applies never ages out of the fleet figure, while a row
+    // nothing marks again decays like any other status (B6). "Changed" is counted separately,
+    // from the row as it was before the write: absent, not yet blocked, or a different
+    // check_result. The "old" read takes no row lock: the upsert locks the rows itself, and a
+    // FOR UPDATE here would skip rows the same statement then updates. IS DISTINCT FROM so a
+    // NULL cannot hide a change. Fenced (a refused fix or
+    // verify while the claim is held): an UPDATE guarded on the claim generation, never an
+    // INSERT, so a sibling's reclaim is not overwritten; it refreshes only the rows that still
+    // match the fence, and the first count reports how many targets matched it at all.
+    const std::string unfenced_sql =
+        "WITH old AS ("
+        "  SELECT agent_id, status, check_result FROM policy_store.policy_status "
+        "  WHERE policy_id = $1 AND agent_id = ANY($2::text[])), "
+        "up AS ("
+        "  INSERT INTO policy_store.policy_status "
+        "  (policy_id, agent_id, status, last_check_at, last_fix_at, check_result, "
+        "   fix_attempt_count) "
+        "  SELECT DISTINCT $1::text, x, 'blocked', EXTRACT(EPOCH FROM NOW())::bigint, 0::bigint, "
+        "                  $3::text, 0 "
+        "  FROM unnest($2::text[]) AS x "
+        "  ON CONFLICT (policy_id, agent_id) DO UPDATE SET "
+        "    status = 'blocked', "
+        "    last_check_at = EXCLUDED.last_check_at, "
+        "    check_result = EXCLUDED.check_result "
+        "  RETURNING agent_id) "
+        "SELECT COUNT(*) FROM up LEFT JOIN old ON old.agent_id = up.agent_id "
+        "WHERE old.agent_id IS NULL "
+        "   OR old.status IS DISTINCT FROM 'blocked' "
+        "   OR old.check_result IS DISTINCT FROM $3::text";
+    const std::string fenced_sql =
+        "WITH matched AS ("
+        "  SELECT agent_id, status, check_result FROM policy_store.policy_status "
+        "  WHERE policy_id = $1 AND agent_id = ANY($2::text[]) "
+        "    AND remediation_claim_gen = $4::bigint "
+        "  FOR UPDATE), "
+        "upd AS ("
+        "  UPDATE policy_store.policy_status ps SET "
+        "    status = 'blocked', "
+        "    last_check_at = EXTRACT(EPOCH FROM NOW())::bigint, "
+        "    check_result = $3::text "
+        "  FROM matched m "
+        "  WHERE ps.policy_id = $1 AND ps.agent_id = m.agent_id "
+        "  RETURNING (m.status IS DISTINCT FROM 'blocked' "
+        "             OR m.check_result IS DISTINCT FROM $3::text) AS changed) "
+        "SELECT (SELECT COUNT(*) FROM matched), "
+        "       (SELECT COUNT(*) FROM upd WHERE changed)";
+
+    constexpr std::size_t kChunk = 500;
+    MarkBlockedResult total;
+    for (std::size_t off = 0; off < ids.size(); off += kChunk) {
+        const std::size_t n = std::min(kChunk, ids.size() - off);
+        const std::vector<std::string> chunk(ids.begin() + static_cast<std::ptrdiff_t>(off),
+                                             ids.begin() + static_cast<std::ptrdiff_t>(off + n));
+        std::vector<std::string> params{policy_id, pg::to_text_array(as_views(chunk)), check_result};
+        if (expected_gen)
+            params.push_back(std::to_string(*expected_gen));
+
+        // One pool lease per chunk, released before the next: a refused /evaluate on a large
+        // scope repeats every chunk on each call, and holding one connection across all of them
+        // would let a handful of concurrent calls take the whole pool. Each chunk is its own
+        // statement, so nothing depends on one connection spanning them.
+        auto lease = pool_.try_acquire_for(kAcquireTimeout);
+        if (!lease) {
+            // Earlier chunks stay written; a retry is idempotent.
+            if (total.changed > 0)
+                invalidate_fleet_compliance_cache();
+            return std::unexpected(std::string(kPolicyDbErrorPrefix) +
+                                   "database unavailable, try again");
+        }
+
+        pg::PgResult res =
+            pg::exec_params(lease.get(), expected_gen ? fenced_sql.c_str() : unfenced_sql.c_str(),
+                            params);
+        if (res.status() != PGRES_TUPLES_OK) {
+            spdlog::error("PolicyStore: mark_blocked failed for policy {}: {}", policy_id,
+                          PQerrorMessage(lease.get()));
+            // Earlier chunks stay written; a retry is idempotent. The refusal itself is not
+            // reversed (nothing was sent), so the caller still audits.
+            if (total.changed > 0)
+                invalidate_fleet_compliance_cache();
+            return std::unexpected(std::string(kPolicyDbErrorPrefix) +
+                                   "failed to record blocked status");
+        }
+        if (expected_gen) {
+            const auto matched = to_i64(PQgetvalue(res.get(), 0, 0));
+            total.changed += to_i64(PQgetvalue(res.get(), 0, 1));
+            total.fenced_out += static_cast<int64_t>(n) - matched;
+        } else {
+            total.changed += to_i64(PQgetvalue(res.get(), 0, 0));
+        }
+    }
+    // Only a changed row moves the cached fleet figure at once. A refresh that changed nothing
+    // matters only to a row that had already aged out, and the figure's own 60 s TTL covers it.
+    if (total.changed > 0)
+        invalidate_fleet_compliance_cache();
+    return total;
+}
+
 std::expected<std::optional<PolicyAgentStatus>, PolicyReadError>
 PolicyStore::get_agent_status(const std::string& policy_id, const std::string& agent_id) const {
     if (!open_) {
@@ -1183,6 +1448,8 @@ PolicyStore::get_compliance_summary(const std::string& policy_id) const {
             cs.fixing = count;
         else if (status == "error")
             cs.error = count;
+        else if (status == "blocked")
+            cs.blocked = count;
         cs.total += count;
     }
     return cs;
@@ -1222,6 +1489,8 @@ std::expected<FleetCompliance, PolicyReadError> PolicyStore::compute_fleet_compl
             fc.fixing = count;
         else if (status == "error")
             fc.error = count;
+        else if (status == "blocked")
+            fc.blocked = count;
         fc.total_checks += count;
     }
     if (fc.total_checks > 0)
@@ -1315,6 +1584,8 @@ PolicyStore::compliance_by_policy_checked() const {
             cs.fixing = count;
         else if (status == "error")
             cs.error = count;
+        else if (status == "blocked")
+            cs.blocked = count;
         cs.total += count;
     }
     {

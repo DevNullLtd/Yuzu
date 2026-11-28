@@ -126,8 +126,10 @@ public:
     TriggerEngine(const TriggerEngine&) = delete;
     TriggerEngine& operator=(const TriggerEngine&) = delete;
 
-    /// Register a trigger. Safe to call while running.
-    void register_trigger(TriggerConfig config);
+    /// Register a trigger. Safe to call while running. Returns false only when the
+    /// table is full and `config.id` is new (the trigger was NOT registered); an
+    /// insert and a replace of an existing id return true.
+    bool register_trigger(TriggerConfig config);
 
     /// Unregister a trigger by ID. Safe to call while running.
     void unregister_trigger(const std::string& id);

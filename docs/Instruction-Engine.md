@@ -6,6 +6,19 @@
 
 ---
 
+## Planned incident-mode dispatch
+
+In a broad threat hunt the device verdict can be small even when the evidence is enormous.
+For example, 1,000 path records averaging 93 bytes across 1.3 million devices produce about
+121 GB of text before storage overhead. The approved design streams bulk live responses through
+core to ClickHouse in both ordinary and incident runs. PostgreSQL holds run control and bounded
+warm verdicts. Incident mode admits a higher rate in waves as ClickHouse acknowledges writes.
+A stalled sink pauses dispatch. The run must show the destination, acknowledged progress and
+devices with incomplete coverage. Operators cannot infer absence from missing evidence.
+
+This is planned for the live-input ladder. Today's response store writes to PostgreSQL.
+See [criteria-run live delivery](adr/0075-criteria-runs.md#r13-live-delivery-from-slice-3-d17-d23-d25-d30).
+
 ## 1. Epistemic Status
 
 ### Verified from implementation
@@ -308,7 +321,8 @@ spec:
   assignment:
     mode: dynamic
     managementGroups:
-      - workstations
+      # the workstations group's id (ids, not names)
+      - 8d41e0c7a2b9
   fragment:
     ref: fragment.service.must_be_running
     with:
@@ -536,7 +550,7 @@ This table replaces the previous per-OS tables (Sections 9, 10, 11 of the origin
 | `network.diagnostics.run` | `network_diag` | Y | Y | Y | Verified | Ping, traceroute |
 | `network.adapter.enable` | `network_actions` | Y | Y | Y | Verified | Enable network adapter |
 | `network.adapter.disable` | `network_actions` | Y | Y | Y | Verified | Disable network adapter |
-| `network.quarantine` | `quarantine` | Y | Y | - | Planned | Isolate device (Phase 3) |
+| `network.quarantine` | `firewall` (`quarantine` action) | Y | Y | - | Planned | Isolate device (Phase 3) |
 
 ### 7.6 Software and Patching
 

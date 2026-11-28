@@ -87,9 +87,18 @@
 ///     `"denied"`; it is not reachable from a single-threaded test without
 ///     simulating the race. A genuine DB error (either read or write leg)
 ///     audits `"error"`. A plain validation 400 is NOT audited. Success
-///     audits `"success"`.
-///   - `DELETE /:id`: a DB error audits `"error"`; a not-found audits
-///     `"denied"`; success audits `"success"`.
+///     audits `"success"`, its detail naming any change to plugin, action,
+///     approval_mode or enabled as `field: old -> new` and a `yaml_source
+///     cleared` note when the edit cleared a stored YAML (#2146 batch C; empty
+///     when neither happened).
+///   - `DELETE /:id`: a DB error on the pre-read or the delete audits
+///     `"error"` (`db_error`); an unwired or failing referrer check audits
+///     `"error"` (`referrer_check_unwired` / `referrer_check_unavailable`) and
+///     a referenced definition audits `"denied"` (`referenced`), each refusal
+///     deleting nothing; a not-found audits `"denied"`; success audits
+///     `"success"`, its detail the pre-image (`name`, `plugin`, `action`,
+///     `approval_mode`, `concurrency_mode`, `enabled`) and, when packs contain
+///     the definition, `packs=<ids>`.
 ///   - `POST /api/instructions/import`: a DB error audits `"error"`; EVERY
 ///     other rejection (conflict or otherwise) audits `"denied"` — unlike
 ///     the plain JSON create route, `import` audits every non-DB-error
@@ -152,6 +161,8 @@
 ///   POST   /api/instructions/yaml                 (perm_fn InstructionDefinition:Write, then auth_fn)
 ///   POST   /api/instructions/validate-yaml        (perm_fn InstructionDefinition:Read)
 
+#include "instruction_referrers.hpp" // DefinitionReferrersFn / DefinitionPackAdvisoryFn
+
 #include <yuzu/server/auth.hpp>
 
 #include <httplib.h>
@@ -160,10 +171,12 @@
 #include <functional>
 #include <optional>
 #include <string>
+#include <string_view>
 
 namespace yuzu::server {
 class HttpRouteSink;
 class InstructionStore;
+struct InstructionDefinition;
 } // namespace yuzu::server
 
 namespace yuzu::server::instruction {
@@ -200,6 +213,15 @@ struct Deps {
     /// they degrade to a 200 HTML error instead, matching the original
     /// inline code's fragment-response convention).
     InstructionStore* store{nullptr};
+    /// The shared "what still points at this definition?" lookup (instruction_referrers.hpp), the
+    /// SAME closure the v1 DELETE and MCP `delete_definition` take. `DELETE /api/instructions/{id}`
+    /// refuses with a 409 listing the referrers when any exist, and with a 503 (fail closed, nothing
+    /// deleted) when it is unwired or cannot answer. An id that does not exist skips the check and
+    /// keeps the 404.
+    DefinitionReferrersFn referrers_fn;
+    /// Advisory only: the packs that contain the definition, noted as `packs=` in the delete's
+    /// success audit detail. Unwired or failing = no note, the delete unaffected.
+    DefinitionPackAdvisoryFn pack_advisory_fn;
     /// `--csrf-trusted-origin` allowlist (#2537), for the same-site gate on cookie-authorised
     /// writes. Empty = same-host only (fails closed behind a Host-rewriting proxy).
     std::vector<std::string> csrf_trusted_origins;
@@ -208,5 +230,11 @@ struct Deps {
 /// Register all 13 Instruction Definitions + Instruction Sets API routes
 /// against `sink`.
 void register_instruction_routes(HttpRouteSink& sink, Deps deps);
+
+/// Render the editor fragment template in ONE pass over the original template (never
+/// rescanning substituted text), HTML-escaping every stored value. `def == nullptr` renders
+/// the new-definition form. Security: stored fields containing `{{TOKEN}}` stay literal.
+std::string render_instruction_editor(std::string_view tmpl,
+                                      const InstructionDefinition* def);
 
 } // namespace yuzu::server::instruction

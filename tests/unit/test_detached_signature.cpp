@@ -14,7 +14,10 @@
 #include <algorithm>
 #include <chrono>
 #include <fstream>
+#include <optional>
 #include <string>
+#include <type_traits>
+#include <utility>
 
 #include "cms_test_fixtures.hpp"
 
@@ -38,6 +41,29 @@ std::string read_file(const fs::path& p) {
 }
 
 } // namespace
+
+TEST_CASE("detached CMS: fixture move transfers directory lifetime", "[signature][cms][fixture]") {
+    STATIC_REQUIRE_FALSE(std::is_copy_constructible_v<SigningFixtures>);
+    STATIC_REQUIRE_FALSE(std::is_copy_assignable_v<SigningFixtures>);
+    STATIC_REQUIRE(std::is_nothrow_move_constructible_v<SigningFixtures>);
+
+    fs::path directory;
+    std::optional<SigningFixtures> owner;
+    {
+        auto source = build_signing_fixtures();
+        directory = source.dir;
+        owner.emplace(std::move(source)); // force a transfer, independent of compiler elision
+    }
+    // The source has been destroyed: all material must still be usable by
+    // the real verifier, not just have plausible path strings.
+    REQUIRE(fs::is_directory(directory));
+    CHECK(owner->dir == directory);
+    CHECK(fs::is_regular_file(owner->other_trust_bundle));
+    CHECK_FALSE(verify_detached_cms(owner->artifact_file, read_file(owner->sig_file),
+                                   owner->trust_bundle).has_value());
+    owner.reset();
+    CHECK_FALSE(fs::exists(directory));
+}
 
 TEST_CASE("detached CMS: a valid signature verifies", "[signature][cms]") {
     auto f = build_signing_fixtures();

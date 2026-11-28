@@ -137,6 +137,12 @@ TEST_CASE("access golden: role assignments", "[access][golden]") {
     v.rows.clear();
     check_golden("assignments__empty", render_assignments(v));
     check_golden("assignments__unavailable", render_assignments(Unavailable{}));
+    // #6034: the authority check could not be answered: Assign drawn disabled, with the reason.
+    AssignmentsView unconfirmed;
+    unconfirmed.self = "alice";
+    unconfirmed.admin_unconfirmed = true;
+    unconfirmed.rows = {grant("user", "alice", "Administrator"), grant("user", "bob", "Viewer")};
+    check_golden("assignments__unconfirmed", render_assignments(unconfirmed));
 }
 
 TEST_CASE("access golden: your account", "[access][golden]") {
@@ -145,8 +151,19 @@ TEST_CASE("access golden: your account", "[access][golden]") {
 }
 
 TEST_CASE("access golden: enforcement", "[access][golden]") {
-    check_golden("enforcement__on-admin", render_enforcement(EnforcementView{true, false, true}));
-    check_golden("enforcement__off-readonly", render_enforcement(EnforcementView{false, false, false}));
-    check_golden("enforcement__degraded", render_enforcement(EnforcementView{true, true, true}));
+    check_golden("enforcement__on-admin",
+                 render_enforcement(
+                     EnforcementView{.enabled = true, .degraded = false, .may_toggle = true}));
+    check_golden("enforcement__off-readonly",
+                 render_enforcement(
+                     EnforcementView{.enabled = false, .degraded = false, .may_toggle = false}));
+    check_golden(
+        "enforcement__degraded",
+        render_enforcement(EnforcementView{.enabled = true, .degraded = true, .may_toggle = true}));
     check_golden("enforcement__unavailable", render_enforcement(Unavailable{}));
+    // #6034: the authority check could not be answered: the switch is disabled, with the reason.
+    check_golden(
+        "enforcement__unconfirmed",
+        render_enforcement(EnforcementView{
+            .enabled = true, .degraded = false, .may_toggle = false, .admin_unconfirmed = true}));
 }

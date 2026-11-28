@@ -58,6 +58,8 @@
  * `#if defined(__APPLE__)`) needs Apple headers.
  */
 
+#include "echo_db.hpp"         // NetworkEvent
+#include "echo_hour_dedup.hpp" // HourlySeenSet
 #include "echo_netqual.hpp"     // TcpQualitySample
 #include "echo_proc_stream.hpp" // EventRing<T>
 
@@ -236,6 +238,7 @@ struct TcpDescriptor {
     std::uint8_t reserved[3]{};
 };
 static_assert(sizeof(TcpDescriptor) == 336);
+static_assert(offsetof(TcpDescriptor, state) == 76); // read by nstat_decode_tcp_src_desc
 static_assert(offsetof(TcpDescriptor, pid) == 116);
 static_assert(offsetof(TcpDescriptor, epid) == 120);
 static_assert(offsetof(TcpDescriptor, local) == 124);
@@ -400,6 +403,7 @@ struct DecodedTcpDesc {
     int remote_port{0};
     std::uint32_t pid{0};
     std::string process_name; ///< pname; "" if empty (the macOS 13.3 tcp descriptor has no epname/uid)
+    std::string state;        ///< TCP state name from the descriptor (ESTABLISHED, TIME_WAIT, ...)
 };
 /// PURE. Decodes a SRC_DESC message whose embedded provider is
 /// kNstatProviderTcp/kNstatProviderTcpKernel into a DecodedTcpDesc. Returns
@@ -437,6 +441,7 @@ struct NstatFlowEvent {
     int remote_port{0};
     std::uint32_t pid{0};
     std::string process_name;
+    std::string state; ///< open events: the descriptor's TCP state; "" on a close event
 };
 
 /// The lifecycle-event ring — EventRing<T> reused verbatim (echo_proc_stream.hpp),
@@ -500,6 +505,30 @@ NstatFlowEvent nstat_build_open_event(std::int64_t ts_unix, const DecodedTcpDesc
 /// removed before its identity was ever resolved — there is nothing
 /// meaningful to report).
 NstatFlowEvent nstat_build_close_event(std::int64_t ts_unix, const FlowState& last_known);
+
+/// PURE. The tcp row a lifecycle event is stored as. An open event carries the descriptor's
+/// TCP state when SRC_DESC resolved it and ESTABLISHED when it did not; a close event is
+/// "CLOSED" (the flow just vanished). nstat is a lifecycle stream, not the DNS-resolving poll,
+/// so remote_host stays empty.
+NetworkEvent network_event_from_nstat_flow(const NstatFlowEvent& e, std::int64_t snapshot_id);
+
+/// PURE. The closing-socket rule of the poll leg (compute_network_events), applied to nstat
+/// lifecycle events: an OPEN event whose descriptor state is ending (TIME_WAIT, CLOSE_WAIT, ...)
+/// is kept only the first time its (process, remote address, remote port) is seen in the hour of
+/// its timestamp, `seen` being the same set the poll leg uses. Every other event (a close, an
+/// open in any non-ending state) passes through unchanged and in order. The subscription dump of
+/// pre-existing flows repeats on every agent restart, so without this a host with thousands of
+/// sockets in TIME_WAIT would store one row per socket each time (#6899).
+std::vector<NstatFlowEvent> nstat_dedupe_closing_opens(std::vector<NstatFlowEvent> events,
+                                                       HourlySeenSet& seen);
+
+/// PURE. The undo of nstat_dedupe_closing_opens for rows that will never be stored: when the
+/// plugin drops typed rows from its insert-retry backlog (the backlog cap, a layout mismatch, a
+/// confirmed disable, the tcp enable/disable edge), every closing-state `connected` row among them gives its hourly key back
+/// to `seen`, so the next sighting of that process and remote in the hour is stored rather than
+/// read as a repeat of a row that was lost. Rows of any other shape hold no key.
+void nstat_release_closing_keys(const NetworkEvent* first, const NetworkEvent* last,
+                                HourlySeenSet& seen);
 
 /// PURE. Derives one TcpQualitySample from a live flow. `lost` is
 /// nq_delta_clamped(txretransmit_cum, txretransmit_prev_snapshot) — the

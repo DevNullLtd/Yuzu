@@ -44,10 +44,6 @@ namespace yuzu::server::home {
 /// Newest-first `failed` executions read size (the executions list cap).
 inline constexpr std::size_t kFailedReadCap = 100;
 
-/// Row cap of the roster read behind `Deps::roster_fn`. A full read is a lower bound,
-/// not the fleet. server.cpp pins this to `OfflineEndpointStore::kQueryRowCap`.
-inline constexpr std::size_t kRosterReadCap = 100000;
-
 /// How long a successful TOP-caller estate read is reused. `fleet_state_counts` is
 /// uncached by design and costs seconds at fleet scale, so this route owns the cache.
 inline constexpr std::int64_t kEstateCacheTtlSecs = 60;

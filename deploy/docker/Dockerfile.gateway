@@ -12,14 +12,83 @@
 # Quick rebuild (code-only):
 #   docker build -t yuzu-gateway -f deploy/docker/Dockerfile.gateway .
 #
-# Pre-bake the deps image:
+# Pre-bake the deps image (linux/amd64 only, see "Supported platforms" below):
 #   docker build --target deps -t yuzu-gateway-deps -f deploy/docker/Dockerfile.gateway .
 #   docker build -t yuzu-gateway -f deploy/docker/Dockerfile.gateway .
 
+# ── Supported platforms (#6711) ───────────────────────────────────────────
+#
+# linux/amd64 ONLY: the platform the release builds, publishes and tests
+# (release.yml builds the gateway image for linux/amd64 alone). No other
+# platform of this image is built or tested anywhere, so the first RUN below
+# refuses it up front rather than produce an untested image.
+#
+# The builder is hexpm/erlang (WP15, owner ruling 2026-11-18): its tag names
+# the exact OTP and Alpine release (28.5.0.8 on Alpine 3.23.8), and every
+# platform of the pinned index is built on that one Alpine release (its first
+# history entry is `ADD alpine-minirootfs-3.23.8-<arch>.tar.gz`, checked for
+# amd64 and arm64 on 2026-11-20). The upstream erlang:28-alpine index this
+# replaced was mixed (amd64 on Alpine 3.23, arm64 on 3.24), which is what
+# first restricted the image to amd64 (#6711).
+#
+# Before adding a platform: build and boot it, and keep the runtime stage on
+# the builder's Alpine release (the abi-guard below enforces it for the
+# platform being built, after the whole rebar3 build). The marker line is read
+# by scripts/ci/check-gateway-base-index.py, which fails when a listed platform
+# is not shown, in the pinned index, as built on the runtime stage's Alpine
+# release (by the entry's base-name annotation or, failing that, the minirootfs
+# its image config records) or when the builder tag names another Alpine
+# release; add a platform to the marker and to the guard below together. The
+# guard treats an unset TARGETARCH (a builder that does not set it) as amd64;
+# the abi-guard below still stops a build whose Alpine or musl differs.
+# yuzu:gateway-platforms linux/amd64
+
 # ── Stage 1: deps — fetch and compile Erlang dependencies (cached) ────────
-FROM erlang:28-alpine@sha256:a2679e9248862e8cfc1c106f602dac416092450b6727f0a63739521670fa38cf AS deps
+# Erlang/OTP 28.5.0.8 on Alpine 3.23.8. The digest is the multi-arch index's,
+# resolved with `docker buildx imagetools inspect
+# hexpm/erlang:28.5.0.8-alpine-3.23.8` on 2026-11-20. The release's ERTS comes
+# from this image (`include_erts`), so this pin IS the OTP the gateway ships.
+# Trust basis: trust on first use. hexpm publishes no signature for its images,
+# so the digest proves only that every build uses the bytes resolved that day;
+# scripts/ci/check-gateway-base-index.py and the abi-guard check the Alpine
+# release and musl, not the publisher, and the release image gate scans the
+# result. Re-resolve and review the digest on every bump, and set the same OTP
+# in scripts/ci/image-vuln-gate.sh's GRYPE_REQUIRED_COMPONENTS (a test checks
+# they agree).
+FROM hexpm/erlang:28.5.0.8-alpine-3.23.8@sha256:1fc35219ea9db671006cfd87d2aa645bc80268a49d90a93c592abdb49edc8e26 AS deps
+
+# BuildKit sets TARGETARCH from --platform (and from the host when it is not
+# given). Keep the allowed set in step with the marker line above.
+ARG TARGETARCH
+RUN case "${TARGETARCH:-amd64}" in amd64) ;; *) \
+      echo "FATAL: Dockerfile.gateway supports linux/amd64 only (TARGETARCH=${TARGETARCH})." \
+           "It is the only platform the release builds, publishes and tests; another platform needs" \
+           "a build-and-boot check and the runtime stage on the builder's Alpine release (#2150)." \
+           "Build with --platform linux/amd64 (on an arm64 host that is emulation, which has crashed in" \
+           "the Erlang deps stage under OrbStack; prefer an amd64 host or CI)." \
+           "See #6711 and docs/operations/troubleshooting.md." \
+           "A single-node demo can use deploy/docker/Dockerfile.gateway.chisel (demo variant: no" \
+           "gateway-entrypoint.sh, so it cannot resolve its own cluster advertise address; do not use" \
+           "it for a scaled or clustered gateway)."; \
+      exit 1;; esac
 
 RUN apk add --no-cache git
+
+# rebar3: the hexpm image ships Erlang/OTP only. Pinned by version AND sha256:
+# BuildKit verifies --checksum before the file is used, and fails the build on
+# a mismatch. 3.27.3 (published 2026-10-12) is the newest release at least a
+# month old; its bytes' SLSA provenance was verified on 2026-11-20 with
+#   cosign verify-blob-attestation --bundle rebar3.sigstore \
+#     --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+#     --certificate-identity \
+#       https://github.com/erlang/rebar3/.github/workflows/publish.yml@refs/tags/3.27.3 \
+#     --type slsaprovenance1 rebar3
+# after downloading both `rebar3` and `rebar3.sigstore` from the 3.27.3 release
+# page; `sha256sum rebar3` gives the checksum below. Bump the URL, the checksum
+# and the version check below together, and re-verify the provenance.
+ADD --checksum=sha256:f1d87d78decfc56b87d971c75ee6355698ec0c49fadd57f2c056043b7ca291b5 --chmod=755 \
+    https://github.com/erlang/rebar3/releases/download/3.27.3/rebar3 /usr/local/bin/rebar3
+RUN rebar3 version | grep -q '^rebar 3\.27\.3 on Erlang/OTP 28 '
 
 WORKDIR /src
 
@@ -70,12 +139,12 @@ RUN { echo "BUILD_ALPINE=$(cut -d. -f1,2 /etc/alpine-release)"; \
 #     is still 8192 there. The fix is in ERTS (erlang/otp#11249, #11376), first
 #     released in OTP 29.1; no OTP 28 or 29.0.x release carries it.
 #
-# So: keep this FROM on the builder's Alpine release (erlang:28-alpine is on
-# 3.23 today). Do not move to Alpine 3.24 (musl 1.2.6) until the builder's OTP
-# is 29.1 or newer. Dependabot is told to ignore Alpine minor bumps for this
-# reason (.github/dependabot.yml). If upstream erlang:28-alpine itself moves to
-# 3.24 while still on OTP 28, the guard fails the build rather than ship an
-# image that crash-loops on AMX hosts.
+# So: keep this FROM on the builder's Alpine release (the hexpm builder above
+# is on 3.23.8). Do not move to Alpine 3.24 (musl 1.2.6) until the builder's
+# OTP is 29.1 or newer. Dependabot is told to ignore Alpine minor bumps for
+# this reason (.github/dependabot.yml). If the builder is ever re-pinned to a
+# 3.24-based image while still on OTP 28, the guard fails the build rather
+# than ship an image that crash-loops on AMX hosts.
 #
 # RUNTIME INVARIANT: busybox wget is required by docker-compose.uat.yml's
 # healthcheck (`wget --spider -q http://localhost:8081/healthz`). Alpine's
@@ -89,12 +158,28 @@ RUN { echo "BUILD_ALPINE=$(cut -d. -f1,2 /etc/alpine-release)"; \
 # pushes it, and on every PR that touches this file. NOTE: Alpine's busybox is
 # built WITHOUT the httpd applet, so it cannot serve the probe's listener — the
 # script uses the official busybox image for that.
-FROM alpine:3.23@sha256:85fe1e81d6758c208f3e1eed4338a1997e19d4be002d4dd32d3100c9a8c010a0
+FROM alpine:3.23@sha256:469c9ea410b9215eaee7976ba6c0639039b444be8e5d638f7abbada189971eb2
+
+# Current Alpine 3.23 packages (WP15/S9). The base digest is only as fresh as
+# the day it was built, so every release build takes the 3.23 branch's fixes
+# (musl, zlib, ...). It runs BEFORE the abi-guard so the guard checks the musl
+# that ships. An upgrade stays on the 3.23 branch, so it cannot cross to musl
+# 1.2.6 (and if a 3.23 update ever did, the guard fails the build). The release
+# scans this image for fixable CRITICAL vulnerabilities before pushing it
+# (release.yml, scripts/ci/image-vuln-gate.sh).
+# YUZU_PACKAGE_REFRESH: release.yml passes a value that changes on every run
+# attempt, so the package step below re-runs instead of being served from the
+# runner's persistent build cache (cache-from type=local; cache-prune.yml only
+# removes blobs no cache index references, so a referenced package layer stays
+# cached indefinitely), which would otherwise keep shipping the packages of
+# whichever build first populated it. Local builds leave it empty and cache as usual.
+ARG YUZU_PACKAGE_REFRESH=
+RUN : "package refresh: ${YUZU_PACKAGE_REFRESH}" && apk upgrade --no-cache
 
 # Builder/runtime ABI guard (#2150). See the stage header above for why.
 # Every version is first required to be a plain dotted number: `apk version -t`
 # prints nothing for anything else (an OTP release candidate "29.0-rc1", a
-# patched "28.5.0.2**"), and an empty comparison must never read as "not
+# patched "28.5.0.8**"), and an empty comparison must never read as "not
 # older"; each comparison must then be exactly one of < = >. Two OTP_VERSION
 # files in the builder put a bare line in the env file, which fails the build
 # at the `.` (command not found) before any of this runs. otp_fix_min is the
@@ -128,7 +213,9 @@ RUN --mount=type=bind,from=builder,source=/build-abi.env,target=/tmp/build-abi.e
            "(sys_sigaltstack internal error, #1743). Needs OTP >= $otp_fix_min or musl < 1.2.6; see docs/operations/troubleshooting.md."; \
       exit 1; fi
 
-RUN apk add --no-cache ncurses-libs libstdc++ libgcc openssl \
+# zlib: the hexpm-built beam.smp links the system libz.so.1 (the erlang:28-alpine
+# one did not); declared so a slimmer base cannot drop it.
+RUN apk add --no-cache ncurses-libs libstdc++ libgcc openssl zlib \
     # bind-tools (dig) + iproute2: HA WS-4 #4555 — gateway-entrypoint.sh
     # resolves this node's own advertised distribution address by DNS-A-record
     # lookup + local-interface intersection BEFORE the BEAM starts. Busybox's
@@ -146,6 +233,7 @@ RUN apk add --no-cache ncurses-libs libstdc++ libgcc openssl \
 
 COPY --from=builder /src/_build/prod/rel/yuzu_gw/ /opt/yuzu_gw/
 COPY --chmod=755 deploy/docker/gateway-entrypoint.sh /opt/yuzu_gw/gateway-entrypoint.sh
+COPY --chmod=644 deploy/docker/gateway-cookie-policy.sh /opt/yuzu_gw/gateway-cookie-policy.sh
 RUN chown -R yuzu-gw:yuzu-gw /opt/yuzu_gw
 
 USER yuzu-gw

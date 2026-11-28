@@ -1,5 +1,6 @@
 #include "workflows_page_render.hpp"
 
+#include "plural.hpp"
 #include "web_utils.hpp" // html_escape, format_iso_utc, truncate_utf8
 
 #include <nlohmann/json.hpp>
@@ -15,16 +16,19 @@ constexpr std::size_t kConditionChars = 80;
 constexpr std::size_t kScopeChars = 120;
 constexpr std::size_t kErrorChars = 160;
 
+// The disabled Run control's reason. A supervised-tier MCP token holds the grant but is
+// approval-gated here: the way to run a workflow is the MCP execute_workflow ticket flow.
+constexpr std::string_view kRunRequiresGrantAttr = " disabled title=\"Requires Workflow:Execute\"";
+constexpr std::string_view kRunApprovalGatedAttr =
+    " disabled title=\"Approval-gated for this MCP token tier: use the MCP execute_workflow "
+    "tool and its approval ticket\"";
+
 std::string pill(std::string_view cls, std::string_view label) {
     return "<span class=\"pill " + std::string(cls) + "\">" + html_escape(std::string(label)) +
            "</span>";
 }
 
 std::string esc(std::string_view s) { return html_escape(std::string(s)); }
-
-std::string plural(int n, std::string_view one, std::string_view many) {
-    return std::to_string(n) + " " + std::string(n == 1 ? one : many);
-}
 
 // "-" for a missing instant, else the ISO text with the epoch the controller localises.
 std::string time_cell(int64_t secs, std::string_view data_c = {}) {
@@ -45,7 +49,7 @@ std::string step_subtitle(const WorkflowStepView& s) {
     if (!s.condition.empty())
         t += " &middot; if " + esc(truncate_utf8(s.condition, kConditionChars));
     if (s.retry_count > 0)
-        t += " &middot; up to " + plural(s.retry_count, "retry", "retries") + ", " +
+        t += " &middot; up to " + plural_count(s.retry_count, "retry", "retries") + ", " +
              std::to_string(s.retry_delay_seconds) + " s apart";
     if (!s.foreach_source.empty())
         t += " &middot; for each " + esc(truncate_utf8(s.foreach_source, kConditionChars));
@@ -93,7 +97,8 @@ std::string render_workflows_list(const WorkflowListView& v) {
            "\" data-count=\"" + std::to_string(v.rows.size()) + "\" data-truncated=\"" +
            (v.truncated ? "1" : "0") + "\" data-can-run=\"" + (v.can_run ? "1" : "0") +
            "\" data-can-write=\"" + (v.can_write ? "1" : "0") + "\" data-can-delete=\"" +
-           (v.can_delete ? "1" : "0") + "\">";
+           (v.can_delete ? "1" : "0") + "\"" +
+           (v.run_approval_gated ? " data-run-gate=\"approval\"" : "") + ">";
     if (v.rows.empty()) {
         out += "<div class=\"empty-state\">" + esc(kWorkflowsEmptyNote) + "<br>" +
                esc(kWorkflowsEmptyHint) + "</div></div>";
@@ -112,7 +117,9 @@ std::string render_workflows_list(const WorkflowListView& v) {
         out += "</td><td>" + std::to_string(w.steps.size()) +
                "</td><td class=\"tm\" data-c=\"started\">-</td><td data-c=\"status\">-</td>"
                "<td class=\"act\"><button type=\"button\" class=\"btn btn-sm\" data-act=\"run\"" +
-               std::string(v.can_run ? "" : " disabled title=\"Requires Workflow:Execute\"") +
+               std::string(v.can_run ? std::string_view{}
+                           : v.run_approval_gated ? kRunApprovalGatedAttr
+                                                  : kRunRequiresGrantAttr) +
                ">Run now</button></td></tr>";
     }
     out += "</tbody></table></div><div class=\"ops-steps-store\" hidden>";
@@ -242,7 +249,7 @@ std::string step_detail(const RunStepView& s, bool confined) {
             }
         }
         if (any)
-            return "Reached " + plural(static_cast<int>(reached), "device", "devices");
+            return "Reached " + plural_count(static_cast<int>(reached), "device", "devices");
     }
     return "";
 }
@@ -379,7 +386,7 @@ std::string render_schedules_page(const ScheduleListView& v) {
         if (s.owner && s.requires_approval)
             extra += " &middot; Approval required";
         if (s.owner && s.parameter_count > 0)
-            extra += " &middot; " + plural(s.parameter_count, "parameter", "parameters");
+            extra += " &middot; " + plural_count(s.parameter_count, "parameter", "parameters");
 
         out += "<tr class=\"row\" data-schedule-id=\"" + esc(s.id) + "\" data-owner=\"" +
                (s.owner ? "1" : "0") + "\" data-enabled=\"" + (s.enabled ? "1" : "0") +

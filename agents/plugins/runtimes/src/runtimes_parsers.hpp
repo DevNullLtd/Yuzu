@@ -1,6 +1,6 @@
 /**
  * runtimes_parsers.hpp -- the PURE parsing / row-formatting layer for the
- * runtimes plugin (installed .NET and JVM runtimes).
+ * runtimes plugin (installed .NET, JVM and Python runtimes).
  *
  * Everything here is a free function over plain data: no OS call, no I/O, no
  * logging, no platform header (the repo's pure-core / thin-shell discipline;
@@ -8,8 +8,8 @@
  * compiles and is unit-tested on EVERY OS (tests/unit/test_runtimes_parsers.cpp,
  * unguarded); the OS-reading legs live in runtimes_{linux,macos,win}.cpp.
  *
- * ZERO SUBPROCESS. The plugin never runs `java -version` or `dotnet
- * --list-runtimes`: every fact comes from a directory name or a metadata file
+ * ZERO SUBPROCESS. The plugin never runs `java -version`, `dotnet
+ * --list-runtimes` or `python --version`: every fact comes from a directory name or a metadata file
  * the runtime's installer laid down.
  *
  * WIRE GRAMMAR. Every action emits, in this order:
@@ -30,7 +30,8 @@
  * from "no data" (which is an empty optional / no row):
  *   dotnet  core | sdk | unmodelled
  *   jvm     jdk | jre | unmodelled
- * Only the Linux legs ship today, so the vocabulary is the Linux subset; the
+ *   python  cpython | unmodelled   (runtimes_python_parsers.hpp)
+ * dotnet and jvm ship on Linux only, so their vocabulary is the Linux subset; the
  * planned macOS and Windows legs add their own flavours (.NET Framework).
  *
  * Free-text fields (version, path, vendor) are untrusted OS-supplied text and
@@ -41,6 +42,7 @@
 #pragma once
 
 #include <constraint_accumulator.hpp> // yuzu::shared::ConstraintAccumulator (agents/shared)
+#include <inventory_status_row.hpp>    // yuzu::shared::StatusLevel / format_status_row (agents/shared)
 
 #include <yuzu/string_utils.hpp>
 
@@ -53,16 +55,16 @@
 namespace yuzu::runtimes {
 
 // -- fixed vocabulary: status level ----------------------------------------
+//
+// The status row grammar is the collector's, owned by agents/shared/inventory_status_row.hpp
+// (producers and the consumer cannot drift); this plugin uses it unchanged.
 
-enum class StatusLevel { supported, constrained, unsupported };
+using yuzu::shared::StatusLevel;
+using yuzu::shared::format_status_row;
 
+/// Kept as a forwarder: tests/unit/test_runtimes_parsers.cpp pins the three tokens through this name.
 [[nodiscard]] constexpr std::string_view status_token(StatusLevel l) noexcept {
-    switch (l) {
-    case StatusLevel::supported:   return "supported";
-    case StatusLevel::constrained: return "constrained";
-    case StatusLevel::unsupported: return "unsupported";
-    }
-    return "unsupported";
+    return yuzu::shared::status_level_token(l);
 }
 
 // -- fixed vocabulary: flavours --------------------------------------------
@@ -221,9 +223,11 @@ struct ReleaseFields {
 }
 
 /// IMAGE_TYPE "JDK"/"JRE" (case-insensitive) decides. Distributions that omit
-/// the key (Debian's OpenJDK `release` file has no IMAGE_TYPE) read
-/// `unmodelled` -- deliberately NOT guessed from the module list, which
-/// Debian's headless JRE package fills with jdk.* modules, nor from the path.
+/// the key (Debian, Ubuntu and openSUSE OpenJDK `release` files have no
+/// IMAGE_TYPE) read `unmodelled` here -- deliberately NOT guessed from the module
+/// list, which Debian's headless JRE package fills with jdk.* modules, nor from
+/// the path. The Linux leg answers those from the home's bin/javac instead
+/// (flavour_from_bin in runtimes_linux_parsers.hpp), passed to jvm_row as `fallback`.
 [[nodiscard]] inline JvmFlavour jvm_flavour_from(std::string_view image_type) noexcept {
     const auto t = detail::trim(image_type);
     if (detail::ieq(t, "jdk")) return JvmFlavour::jdk;
@@ -267,8 +271,8 @@ struct DotnetEntry {
 
 /// Untrusted OS text becomes one safe field: invalid UTF-8 bytes are replaced first (the
 /// output crosses the wire as a proto3 `string`, and one invalid byte fails the parse of
-/// the whole chunk; overlong, surrogate and out-of-range sequences still pass, #4864), then the
-/// pipe-grammar escaper runs.
+/// the whole chunk; overlong, surrogate and out-of-range sequences are replaced too, #4864),
+/// then the pipe-grammar escaper runs.
 [[nodiscard]] inline std::string field_or_dash(std::string_view v) {
     return v.empty() ? std::string{"-"}
                      : yuzu::util::safe_output_field(yuzu::util::sanitize_utf8(std::string{v}));
@@ -291,18 +295,6 @@ struct DotnetEntry {
     out += field_or_dash(install_path);
     out += '|';
     out += field_or_dash(vendor);
-    return out;
-}
-
-/// status|<action>|<level>|<reason or ->
-[[nodiscard]] inline std::string format_status_row(std::string_view action, StatusLevel level,
-                                                   std::string_view reason) {
-    std::string out = "status|";
-    out.append(action);
-    out += '|';
-    out.append(status_token(level));
-    out += '|';
-    out += field_or_dash(reason);
     return out;
 }
 
@@ -344,25 +336,35 @@ struct StatusOutcome {
 
 // -- per-runtime row builders (parse + format in one pure step) ------------------
 
+/// True when the release file carries a non-blank IMAGE_TYPE (whatever its value): then
+/// jvm_flavour_from decides and no fallback is consulted.
+[[nodiscard]] inline bool has_image_type(const ReleaseFields& f) noexcept {
+    return !detail::trim(f.image_type).empty();
+}
+
 /// jvm row from a parsed `release` file. Version = JAVA_VERSION, falling back
-/// to JAVA_RUNTIME_VERSION; vendor = IMPLEMENTOR. nullopt when neither version
-/// key is present (an unparsable `release` file is not a JVM row; the leg
+/// to JAVA_RUNTIME_VERSION; vendor = IMPLEMENTOR; flavour = IMAGE_TYPE when the file has one,
+/// otherwise `fallback` (default unmodelled: the macOS and Windows legs pass none). nullopt when
+/// neither version key is present (an unparsable `release` file is not a JVM row; the leg
 /// records a constraint token for it).
-[[nodiscard]] inline std::optional<std::string> jvm_row(const ReleaseFields& f,
-                                                        std::string_view install_path) {
+[[nodiscard]] inline std::optional<std::string> jvm_row(
+    const ReleaseFields& f, std::string_view install_path,
+    JvmFlavour fallback = JvmFlavour::unmodelled) {
     const std::string_view version =
         !f.java_version.empty() ? std::string_view{f.java_version}
                                 : std::string_view{f.java_runtime_version};
     if (version.empty()) return std::nullopt;
-    return format_runtime_row("jvm", flavour_token(jvm_flavour_from(f.image_type)), version,
-                              install_path, f.implementor);
+    const auto flavour = has_image_type(f) ? jvm_flavour_from(f.image_type) : fallback;
+    return format_runtime_row("jvm", flavour_token(flavour), version, install_path, f.implementor);
 }
 
 /// jvm row for a home whose installer laid down no `release` file (some distro OpenJDK 8
-/// packages): the home is real but its version and vendor are unknown, so both read `-`. The leg
-/// records `release_missing` next to it; such a home is never left out.
-[[nodiscard]] inline std::string jvm_row_release_missing(std::string_view install_path) {
-    return format_runtime_row("jvm", flavour_token(JvmFlavour::unmodelled), "", install_path, "");
+/// packages): the home is real but its version and vendor are unknown, so both read `-`; the
+/// flavour is whatever the leg could read from bin/ (default unmodelled). The leg records
+/// `release_missing` next to it; such a home is never left out.
+[[nodiscard]] inline std::string jvm_row_release_missing(
+    std::string_view install_path, JvmFlavour flavour = JvmFlavour::unmodelled) {
+    return format_runtime_row("jvm", flavour_token(flavour), "", install_path, "");
 }
 
 /// dotnet row for one shared/<fw>/<ver> or sdk/<ver> directory pair.

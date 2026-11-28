@@ -9,8 +9,11 @@ echo_objcpp_args = []
 echo_sources = files(
   'src/echo_plugin.cpp',
   'src/echo_db.cpp',
+  'src/echo_db_v10_migration.cpp',
   'src/echo_diff.cpp',
   'src/echo_schema_registry.cpp',
+  'src/echo_fold_schema.cpp',
+  'src/echo_fold.cpp',
   'src/echo_aggregator.cpp',
   'src/echo_usage.cpp',
   'src/echo_sql_executor.cpp',
@@ -47,7 +50,6 @@ if host_machine.system() == 'windows'
   echo_deps += cxx.find_library('advapi32')
   echo_deps += cxx.find_library('iphlpapi')
   echo_deps += cxx.find_library('ws2_32')
-  echo_deps += cxx.find_library('wtsapi32')
   echo_deps += cxx.find_library('tdh')      # ETW event decoding (echo_proc_etw, echo_module_etw)
   echo_deps += cxx.find_library('dnsapi')   # DnsQuery_W / DnsRecordListFree (echo_dns_collector)
   echo_deps += cxx.find_library('wintrust') # WinVerifyTrust — image signing (echo_module_etw)
@@ -55,7 +57,6 @@ if host_machine.system() == 'windows'
   echo_deps += cxx.find_library('version')  # GetFileVersionInfoW / VerQueryValueW (echo_proc_perf)
   echo_deps += cxx.find_library('wevtapi')  # EvtQuery / EvtNext / EvtRender (echo_netconn_win)
   echo_deps += cxx.find_library('mpr')      # WNetOpenEnumW / WNetGetUserW — outbound mapped drives (echo_mapdrive_collector)
-  echo_deps += cxx.find_library('netapi32') # NetSessionEnum — inbound share sessions (echo_mapdrive_collector)
   echo_deps += cxx.find_library('powrprof') # PowerRegisterSuspendResumeNotification /
                                            # PowerSettingRegisterNotification (echo_power_collector)
 elif host_machine.system() == 'linux'

@@ -19,6 +19,7 @@
 #include "pg/pg_pool.hpp"
 #include "test_route_sink.hpp"
 #include "../test_helpers.hpp"
+#include "../test_log_capture.hpp"
 #include <yuzu/server/auth.hpp>
 #include <yuzu/server/auto_approve.hpp>
 #include <yuzu/server/server.hpp>
@@ -27,10 +28,16 @@
 
 #include <httplib.h>
 
+#include <libpq-fe.h>
+#include <nlohmann/json.hpp>
+
+#include <functional>
 #include <memory>
+#include <optional>
 #include <shared_mutex>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 using namespace yuzu::server;
 using yuzu::server::pg::PgPool;
@@ -49,6 +56,20 @@ yuzu::test::PgTestTemplate mgmt_routes_tpl{"mgmtgroupstoreroutes", [](const std:
         throw std::runtime_error("mgmtgroupstoreroutes template: store failed to migrate");
 }};
 
+// One call the routes layer made to the bool-returning audit hook (the audit-first path).
+struct AuditRow {
+    std::string action;
+    std::string result;
+    std::string target_type;
+    std::string target_id;
+    std::string detail;
+    bool stored{true}; // false: the hook refused the write (a failure-injection switch)
+    // Who the row names: the re-resolving hook models production (the CURRENT session, empty once
+    // it is gone), the session-bound writer stamps the session it is handed.
+    std::string principal;
+    bool bound{false}; // true: written through the session-bound writer
+};
+
 struct MgmtGroupsHarness {
     PgPool pool;
     ManagementGroupStore mgmt_group_store;
@@ -57,27 +78,134 @@ struct MgmtGroupsHarness {
     auth::AutoApproveEngine auto_approve{};
     std::shared_mutex oidc_mu;
     std::unique_ptr<oidc::OidcProvider> oidc_provider; // empty
+    // Declared BEFORE `routes`: the audit callbacks `routes` holds record into it, so it must
+    // outlive them (members are destroyed in reverse order of declaration).
+    std::vector<AuditRow> calls;
     SettingsRoutes routes;
     yuzu::server::test::TestRouteSink sink;
+
+    // Failure injection for the audit-first create (#7074), copied from the users harness
+    // (test_settings_routes_users.cpp): every call to the bool-returning audit hook lands in
+    // `calls`; the two switches make the `attempted` row or the outcome rows unstorable.
+    bool attempt_audit_ok{true};
+    bool outcome_audit_ok{true};
+    // The session / the grant disappear once an `attempted` row has been STORED (the audit write
+    // can wait on the pool, so authority is decided again after it). They write their own 401 /
+    // 403 into the response, as the production callbacks do.
+    bool session_gone_after_attempt{false};
+    bool perm_revoked_after_attempt{false};
+    /// After an `attempted` row is stored the request resolves to a DIFFERENT principal
+    /// ("intruder"): the production resolver falls through cookie -> Bearer -> X-Yuzu-Token, so
+    /// with the first credential gone a second credential on the same request resolves.
+    bool other_principal_after_attempt{false};
+    /// The session is gone only AFTER the route's post-attempted re-check passed (the re-check is
+    /// the first session resolution once an `attempted` row is stored): the window in which the
+    /// outcome row is written. A row the re-resolving hook stamps from then on names nobody, so a
+    /// row that names the session went through the session-bound writer.
+    bool session_gone_after_recheck{false};
+    /// The session is already gone when the `attempted` row itself is written (it lapsed in the
+    /// window after the route resolved it): the re-resolving hook names nobody on an `attempted`
+    /// row, so a row that names the session went through the session-bound writer.
+    bool session_gone_at_attempted{false};
+    std::size_t post_attempted_auth_calls{0};
+    /// The FIRST session resolution answers no session and writes the 401 itself, as the
+    /// production callback does; every later call would answer a session. A route that carries on
+    /// past that first answer would store rows and create the group.
+    bool no_session_on_first_auth_call{false};
+    std::size_t auth_calls{0};
+    /// Runs ONCE, the first time the session is resolved after an `attempted` row is stored: the
+    /// deterministic injection point for a change that lands between the route's pre-check and
+    /// its insert (e.g. deleting the parent group).
+    std::function<void()> after_attempted_hook{};
+
+    /// Rows the hook actually stored, in order.
+    std::vector<AuditRow> stored() const {
+        std::vector<AuditRow> out;
+        for (const auto& c : calls)
+            if (c.stored)
+                out.push_back(c);
+        return out;
+    }
+    /// Every management_group.create row stored, of any result.
+    std::vector<AuditRow> create_rows() const {
+        std::vector<AuditRow> out;
+        for (const auto& c : stored())
+            if (c.action == "management_group.create")
+                out.push_back(c);
+        return out;
+    }
+    bool attempted_stored() const {
+        for (const auto& c : calls)
+            if (c.stored && c.result == "attempted")
+                return true;
+        return false;
+    }
 
     explicit MgmtGroupsHarness(const std::string& dsn)
         : pool({.conninfo = dsn, .size = 4}), mgmt_group_store(pool) {
         REQUIRE(mgmt_group_store.is_open());
 
-        auto auth_fn = [](const httplib::Request&,
-                          httplib::Response&) -> std::optional<auth::Session> {
+        auto auth_fn = [this](const httplib::Request&,
+                              httplib::Response& res) -> std::optional<auth::Session> {
+            if (no_session_on_first_auth_call && auth_calls++ == 0) {
+                res.status = 401;
+                return std::nullopt;
+            }
+            if (after_attempted_hook && attempted_stored()) {
+                auto hook = std::move(after_attempted_hook);
+                after_attempted_hook = nullptr;
+                hook();
+            }
+            if (session_gone_after_attempt && attempted_stored()) {
+                res.status = 401;
+                return std::nullopt;
+            }
+            if (attempted_stored())
+                ++post_attempted_auth_calls;
             auth::Session s;
-            s.username = "admin";
+            s.username = (other_principal_after_attempt && attempted_stored()) ? "intruder" : "admin";
             s.role = auth::Role::admin;
             return s;
         };
         auto admin_fn = [](const httplib::Request&, httplib::Response&) { return true; };
-        auto perm_fn = [](const httplib::Request&, httplib::Response&, const std::string&,
-                          const std::string&) { return true; };
+        auto perm_fn = [this](const httplib::Request&, httplib::Response& res, const std::string&,
+                              const std::string&) {
+            if (perm_revoked_after_attempt && attempted_stored()) {
+                res.status = 403;
+                return false;
+            }
+            return true;
+        };
         auto audit_fn = [](const httplib::Request&, const std::string&, const std::string&,
                            const std::string&, const std::string&, const std::string&) {
             return true;
         };
+        auto audit_read_fn = [this](const httplib::Request&, const std::string& action,
+                                    const std::string& result, const std::string& target_type,
+                                    const std::string& target_id,
+                                    const std::string& detail) -> bool {
+            const bool attempted = result == "attempted";
+            const bool ok = attempted ? attempt_audit_ok : outcome_audit_ok;
+            const bool alive = !(session_gone_after_attempt && attempted_stored()) &&
+                               !(session_gone_after_recheck && post_attempted_auth_calls > 0) &&
+                               !(session_gone_at_attempted && attempted);
+            calls.push_back({action, result, target_type, target_id, detail, ok,
+                             alive ? "admin" : "", /*bound=*/false});
+            return ok;
+        };
+        // The session-bound writer, as `AuthRoutes::audit_as_session_fn()` is wired in production.
+        // It writes every row of the create, the `attempted` row included, so the same two
+        // switches govern it as govern the re-resolving hook.
+        routes.set_audit_as_session_fn(
+            [this](const httplib::Request&, const auth::Session& session, const std::string&,
+                   const std::string& action, const std::string& result,
+                   const std::string& target_type, const std::string& target_id,
+                   const std::string& detail) -> bool {
+                const bool ok = result == "attempted" ? attempt_audit_ok : outcome_audit_ok;
+                calls.push_back({action, result, target_type, target_id, detail, ok,
+                                 session.username, /*bound=*/true});
+                return ok;
+            });
         routes.register_routes(sink, auth_fn, admin_fn, perm_fn, audit_fn, cfg, auth_mgr,
                                auto_approve,
                                /*api_token_store=*/nullptr, &mgmt_group_store,
@@ -85,9 +213,44 @@ struct MgmtGroupsHarness {
                                /*update_registry=*/nullptr, /*runtime_config_store=*/nullptr,
                                /*audit_store=*/nullptr,
                                /*gateway_enabled=*/false, []() -> std::size_t { return 0; },
-                               []() -> std::string { return "[]"; }, oidc_mu, oidc_provider);
+                               []() -> std::string { return "[]"; }, oidc_mu, oidc_provider,
+                               /*metrics_registry=*/nullptr, /*step_up_fn=*/{}, audit_read_fn);
+    }
+
+    /// POST the create form. A form body needs its content type spelled out (test_route_sink.hpp).
+    auto create(const std::string& name, const std::string& parent_id = {}) {
+        return sink.Post("/api/settings/management-groups",
+                         "name=" + httplib::encode_uri_component(name) +
+                             "&parent_id=" + parent_id + "&membership_type=static",
+                         "application/x-www-form-urlencoded");
+    }
+    /// Names of every group in the store.
+    std::vector<std::string> group_names() const {
+        std::vector<std::string> out;
+        for (const auto& g : mgmt_group_store.list_groups())
+            out.push_back(g.name);
+        return out;
     }
 };
+
+/// The `showToast` payload of an `HX-Trigger` response header, parsed: the header is JSON, so the
+/// message and level are asserted as fields, not as substrings of the raw text.
+nlohmann::json toast_of(const httplib::Response& res) {
+    const auto header = res.get_header_value("HX-Trigger");
+    const auto parsed = nlohmann::json::parse(header, nullptr, /*allow_exceptions=*/false);
+    REQUIRE_FALSE(parsed.is_discarded());
+    REQUIRE(parsed.is_object());
+    REQUIRE(parsed.contains("showToast"));
+    return parsed.at("showToast");
+}
+
+// Runs `sql` on the test database over its own connection (the harness pool is not reachable).
+void exec_sql(const std::string& dsn, const char* sql) {
+    std::unique_ptr<PGconn, decltype(&PQfinish)> conn{PQconnectdb(dsn.c_str()), &PQfinish};
+    REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+    std::unique_ptr<PGresult, decltype(&PQclear)> r{PQexec(conn.get(), sql), &PQclear};
+    REQUIRE(PQresultStatus(r.get()) == PGRES_COMMAND_OK);
+}
 
 } // namespace
 
@@ -154,4 +317,631 @@ TEST_CASE("create-group form's parent <option> list escapes group names",
     // render sites.
     CHECK(res->body.find("<option value=\"" + *created +
                           "\">&lt;b&gt;evil&lt;/b&gt;</option>") != std::string::npos);
+}
+
+// ---------------------------------------------------------------------------------------------
+// #7074: Settings create is audit-first. Twins: POST /api/v1/management-groups (REST) and the MCP
+// create_management_group tool; same verb, row strings, order and fixed failure tokens.
+// ---------------------------------------------------------------------------------------------
+
+namespace {
+constexpr const char* kMarkupName = "<img src=x onerror=1>";
+} // namespace
+
+TEST_CASE("Settings group create: an unstorable attempted row refuses with 503, a toast, and "
+          "creates nothing",
+          "[pg][settings][management-groups][mgmt-audit-first]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mgmt_routes_tpl);
+    MgmtGroupsHarness h(db.dsn());
+    h.attempt_audit_ok = false;
+
+    auto res = h.create("Audit Down");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+    // htmx drops a 5xx body, so the operator's only view of the refusal is the toast.
+    const auto toast = toast_of(*res);
+    CHECK(toast.value("level", "") == "error");
+    CHECK(toast.value("message", "") == "Audit log unavailable: the group was not created");
+    CHECK(res->body.find("audit log unavailable") != std::string::npos);
+
+    CHECK(h.group_names().empty());
+    // Exactly one attempt, the failing attempted row; no outcome row of any result.
+    REQUIRE(h.calls.size() == 1);
+    CHECK(h.calls[0].action == "management_group.create");
+    CHECK(h.calls[0].result == "attempted");
+    CHECK_FALSE(h.calls[0].stored);
+    CHECK(h.stored().empty());
+}
+
+// What this proves: a refusal's text is a fixed literal, so the caller's raw name and parent id
+// are never echoed. It does NOT prove html_escape ran (no refusal text here contains markup for
+// it to escape), so a removed html_escape on the refusal span would not fail this test.
+TEST_CASE("Settings group create: refusals decided without a write burn no audit row and do not "
+          "echo the raw name or parent id",
+          "[pg][settings][management-groups][mgmt-audit-first][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mgmt_routes_tpl);
+    MgmtGroupsHarness h(db.dsn());
+
+    SECTION("empty name") {
+        auto res = h.create("");
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        CHECK(res->body.find("Name required") != std::string::npos);
+    }
+    SECTION("unknown parent (a parent id that would inject markup)") {
+        auto res = h.create("Orphan", kMarkupName);
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        CHECK(res->body.find("<span class=\"feedback-error\">parent group not found</span>") !=
+              std::string::npos);
+        CHECK(res->body.find("<img") == std::string::npos);
+    }
+    SECTION("unknown parent, markup name") {
+        auto res = h.create(kMarkupName, "does-not-exist");
+        REQUIRE(res);
+        CHECK(res->body.find("parent group not found") != std::string::npos);
+        CHECK(res->body.find("<img") == std::string::npos);
+    }
+    SECTION("hierarchy depth overflow") {
+        std::string prev_id;
+        for (int i = 0; i < 6; ++i) {
+            ManagementGroup g;
+            g.name = "Chain " + std::to_string(i);
+            g.membership_type = "static";
+            g.parent_id = prev_id;
+            auto r = h.mgmt_group_store.create_group(g);
+            REQUIRE(r.has_value());
+            prev_id = *r;
+        }
+        auto res = h.create(kMarkupName, prev_id);
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        CHECK(res->body.find("<span class=\"feedback-error\">maximum hierarchy depth (5) "
+                             "exceeded</span>") != std::string::npos);
+        CHECK(res->body.find("<img") == std::string::npos);
+        CHECK(h.group_names().size() == 6);
+    }
+    // Nothing was written: no management_group.create row of any result, and no hook call at all.
+    CHECK(h.calls.empty());
+    CHECK(h.create_rows().empty());
+}
+
+TEST_CASE("Settings group create: a store that cannot answer the validation refuses with fixed "
+          "text, a toast and no row",
+          "[settings][management-groups][mgmt-audit-first][degrade]") {
+    // No database: a construct-invalid pool makes the store report "database not open", a store
+    // fault by mgmt_group_error_is_store_fault, which validate_new_group returns first.
+    PgPool pool{{.conninfo = "yuzu_invalid_keyword=1", .size = 1}};
+    ManagementGroupStore closed_store{pool};
+    REQUIRE(!closed_store.is_open());
+
+    Config cfg{};
+    auth::AuthManager auth_mgr{};
+    auth::AutoApproveEngine auto_approve{};
+    std::shared_mutex oidc_mu;
+    std::unique_ptr<oidc::OidcProvider> oidc_provider;
+    // Declared BEFORE `routes`: the audit callback registered below captures it by reference, and
+    // `routes` (which holds that callback) must be destroyed first.
+    std::vector<AuditRow> calls;
+    SettingsRoutes routes;
+    yuzu::server::test::TestRouteSink sink;
+    auto auth_fn = [](const httplib::Request&, httplib::Response&) -> std::optional<auth::Session> {
+        auth::Session s;
+        s.username = "admin";
+        s.role = auth::Role::admin;
+        return s;
+    };
+    auto admin_fn = [](const httplib::Request&, httplib::Response&) { return true; };
+    auto perm_fn = [](const httplib::Request&, httplib::Response&, const std::string&,
+                      const std::string&) { return true; };
+    auto audit_fn = [](const httplib::Request&, const std::string&, const std::string&,
+                       const std::string&, const std::string&, const std::string&) {
+        return true;
+    };
+    auto audit_read_fn = [&calls](const httplib::Request&, const std::string& a,
+                                  const std::string& r, const std::string& tt,
+                                  const std::string& ti, const std::string& d) -> bool {
+        calls.push_back({a, r, tt, ti, d, true});
+        return true;
+    };
+    routes.register_routes(sink, auth_fn, admin_fn, perm_fn, audit_fn, cfg, auth_mgr,
+                           auto_approve,
+                           /*api_token_store=*/nullptr, &closed_store, /*tag_store=*/nullptr,
+                           /*update_registry=*/nullptr, /*runtime_config_store=*/nullptr,
+                           /*audit_store=*/nullptr,
+                           /*gateway_enabled=*/false, []() -> std::size_t { return 0; },
+                           []() -> std::string { return "[]"; }, oidc_mu, oidc_provider,
+                           /*metrics_registry=*/nullptr, /*step_up_fn=*/{}, audit_read_fn);
+
+    auto res = sink.Post("/api/settings/management-groups",
+                         "name=Closed&parent_id=&membership_type=static",
+                         "application/x-www-form-urlencoded");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(res->body.find("<span class=\"feedback-error\">Management group store unavailable, "
+                         "try again</span>") != std::string::npos);
+    CHECK(res->body.find("database not open") == std::string::npos);
+    const auto toast = toast_of(*res);
+    CHECK(toast.value("level", "") == "error");
+    CHECK(toast.value("message", "") == "Management group store unavailable, try again");
+    CHECK(calls.empty());
+}
+
+TEST_CASE("Settings group create: a duplicate name writes attempted then failure/name_conflict",
+          "[pg][settings][management-groups][mgmt-audit-first][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mgmt_routes_tpl);
+    MgmtGroupsHarness h(db.dsn());
+    ManagementGroup first;
+    first.name = kMarkupName;
+    first.membership_type = "static";
+    REQUIRE(h.mgmt_group_store.create_group(first).has_value());
+
+    auto res = h.create(kMarkupName);
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(res->body.find("<span class=\"feedback-error\">a group with that name already "
+                         "exists</span>") != std::string::npos);
+    CHECK(res->body.find("<img") == std::string::npos);
+    CHECK(h.group_names().size() == 1);
+
+    const auto rows = h.create_rows();
+    REQUIRE(rows.size() == 2);
+    CHECK(rows[0].result == "attempted");
+    CHECK(rows[0].target_type == "ManagementGroup");
+    CHECK(rows[0].target_id.empty());
+    CHECK(rows[0].detail == kMarkupName); // the raw name, the existing contract
+    CHECK(rows[1].result == "failure");
+    CHECK(rows[1].target_id.empty());
+    CHECK(rows[1].detail == std::string("name_conflict ") + kMarkupName);
+}
+
+TEST_CASE("Settings group create: success writes attempted then success with the new id",
+          "[pg][settings][management-groups][mgmt-audit-first]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mgmt_routes_tpl);
+    MgmtGroupsHarness h(db.dsn());
+
+    auto res = h.create(kMarkupName);
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(res->get_header_value("Sec-Audit-Failed").empty());
+    CHECK(res->get_header_value("HX-Trigger").empty());
+    // The refreshed section, with the name escaped.
+    CHECK(res->body.find("&lt;img src=x onerror=1&gt;") != std::string::npos);
+    CHECK(res->body.find("<img") == std::string::npos);
+
+    const auto groups = h.mgmt_group_store.list_groups();
+    REQUIRE(groups.size() == 1);
+    CHECK(groups[0].name == kMarkupName);
+    CHECK(groups[0].created_by == "admin");
+
+    const auto rows = h.create_rows();
+    REQUIRE(rows.size() == 2);
+    CHECK(rows[0].result == "attempted");
+    CHECK(rows[0].target_id.empty());
+    CHECK(rows[0].detail == kMarkupName);
+    CHECK(rows[1].result == "success");
+    CHECK(rows[1].target_type == "ManagementGroup");
+    CHECK(rows[1].target_id == groups[0].id);
+    CHECK(rows[1].detail == kMarkupName);
+}
+
+TEST_CASE("Settings group create: a lost outcome row keeps the success and shows a warning toast",
+          "[pg][settings][management-groups][mgmt-audit-first]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mgmt_routes_tpl);
+    MgmtGroupsHarness h(db.dsn());
+    h.outcome_audit_ok = false;
+
+    auto res = h.create("Outcome Lost");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+    const auto toast = toast_of(*res);
+    CHECK(toast.value("level", "") == "warning");
+    CHECK(toast.value("message", "") == "Group created, but its audit record could not be stored");
+    CHECK(res->body.find("Outcome Lost") != std::string::npos); // the refreshed section
+
+    // Nothing rolled back; the attempted row stands as "started, outcome unknown".
+    CHECK(h.group_names() == std::vector<std::string>{"Outcome Lost"});
+    REQUIRE(h.calls.size() == 2);
+    CHECK(h.calls[0].result == "attempted");
+    CHECK(h.calls[0].stored);
+    CHECK(h.calls[1].result == "success");
+    CHECK_FALSE(h.calls[1].stored);
+}
+
+TEST_CASE("Settings group create: a store fault answers fixed text, writes failure/store_error "
+          "and leaks no database text",
+          "[pg][settings][management-groups][mgmt-audit-first][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mgmt_routes_tpl);
+    MgmtGroupsHarness h(db.dsn());
+    // With no parent, validate_new_group reads nothing, so the fault surfaces in the insert.
+    exec_sql(db.dsn(), "DROP TABLE management_group_store.management_groups CASCADE");
+
+    yuzu::test::LogCapture cap;
+    auto res = h.create("Store Down");
+    cap.stop();
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    // The cause is recorded in the server log (not on the page, the toast or the audit rows).
+    CHECK(cap.text().find("management_group.create store fault: failed to create group") !=
+          std::string::npos);
+    CHECK(cap.text().find("does not exist") != std::string::npos);
+    CHECK(res->body.find("<span class=\"feedback-error\">Management group store unavailable, "
+                         "try again</span>") != std::string::npos);
+    for (const char* leak : {"relation \"", "does not exist", "management_groups", "ERROR",
+                             "failed to create group"})
+        CHECK(res->body.find(leak) == std::string::npos);
+    const auto toast = toast_of(*res);
+    CHECK(toast.value("level", "") == "error");
+    CHECK(toast.value("message", "") == "Management group store unavailable, try again");
+    for (const char* leak : {"relation \"", "does not exist", "management_groups", "ERROR"})
+        CHECK(toast.dump().find(leak) == std::string::npos);
+
+    const auto rows = h.create_rows();
+    REQUIRE(rows.size() == 2);
+    CHECK(rows[0].result == "attempted");
+    CHECK(rows[1].result == "failure");
+    CHECK(rows[1].target_id.empty());
+    CHECK(rows[1].detail == "store_error Store Down");
+}
+
+TEST_CASE("Settings group create: a session or grant gone after the attempted row creates "
+          "nothing and writes a revoked failure row",
+          "[pg][settings][management-groups][mgmt-audit-first]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mgmt_routes_tpl);
+    MgmtGroupsHarness h(db.dsn());
+
+    SECTION("session gone") {
+        h.session_gone_after_attempt = true;
+        auto res = h.create("Session Gone");
+        REQUIRE(res);
+        CHECK(res->status == 401);
+        // htmx drops a 4xx body: the refusal must carry a fixed-text toast (K2, PR #7920).
+        const auto toast = toast_of(*res);
+        CHECK(toast.at("message") == "Session no longer valid: the group was not created");
+        CHECK(toast.at("level") == "error");
+        const auto rows = h.create_rows();
+        REQUIRE(rows.size() == 2);
+        CHECK(rows[0].result == "attempted");
+        CHECK(rows[1].result == "failure");
+        CHECK(rows[1].target_id.empty());
+        CHECK(rows[1].detail == "session_revoked Session Gone");
+    }
+    SECTION("permission revoked") {
+        h.perm_revoked_after_attempt = true;
+        auto res = h.create("Grant Gone");
+        REQUIRE(res);
+        CHECK(res->status == 403);
+        const auto toast = toast_of(*res);
+        CHECK(toast.at("message") == "Permission revoked: the group was not created");
+        CHECK(toast.at("level") == "error");
+        const auto rows = h.create_rows();
+        REQUIRE(rows.size() == 2);
+        CHECK(rows[0].result == "attempted");
+        CHECK(rows[1].result == "failure");
+        CHECK(rows[1].target_id.empty());
+        CHECK(rows[1].detail == "permission_revoked Grant Gone");
+        CHECK(rows[1].bound);
+    }
+    CHECK(h.group_names().empty());
+}
+
+TEST_CASE("Settings group create: a different principal at the post-attempted recheck creates "
+          "nothing and writes a session_revoked row naming the original principal",
+          "[pg][settings][management-groups][mgmt-audit-first][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mgmt_routes_tpl);
+    MgmtGroupsHarness h(db.dsn());
+    h.other_principal_after_attempt = true;
+
+    auto res = h.create("Other Principal");
+    REQUIRE(res);
+    CHECK(res->status == 401);
+    const auto toast = toast_of(*res);
+    CHECK(toast.at("message") == "Session no longer valid: the group was not created");
+    CHECK(toast.at("level") == "error");
+    CHECK(h.group_names().empty());
+    const auto rows = h.create_rows();
+    REQUIRE(rows.size() == 2);
+    CHECK(rows[0].result == "attempted");
+    CHECK(rows[1].result == "failure");
+    CHECK(rows[1].target_id.empty());
+    CHECK(rows[1].detail == "session_revoked Other Principal");
+    CHECK(rows[1].bound);
+    CHECK(rows[1].principal == "admin");
+    CHECK(h.create_rows().back().result != "success");
+}
+
+TEST_CASE("Settings group create: no session on the first resolution answers the 401 before any "
+          "audit row and creates nothing",
+          "[pg][settings][management-groups][mgmt-audit-first]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mgmt_routes_tpl);
+    MgmtGroupsHarness h(db.dsn());
+    h.no_session_on_first_auth_call = true;
+
+    auto res = h.create("Never Authenticated");
+    REQUIRE(res);
+    CHECK(res->status == 401);
+    CHECK(h.calls.empty()); // neither an attempted row nor a failure row, stored or refused
+    CHECK(h.auth_calls == 1); // the route stopped at the first answer
+    CHECK(h.group_names().empty());
+}
+
+TEST_CASE("Settings group create: a missing group store refuses with the fixed text, a toast "
+          "and no audit row",
+          "[settings][management-groups][mgmt-audit-first]") {
+    // No Postgres needed: the route is registered with a null group store.
+    Config cfg{};
+    auth::AuthManager auth_mgr{};
+    auth::AutoApproveEngine auto_approve{};
+    std::shared_mutex oidc_mu;
+    std::unique_ptr<oidc::OidcProvider> oidc_provider;
+    yuzu::server::test::TestRouteSink sink;
+    std::vector<AuditRow> calls;
+
+    auto auth_fn = [](const httplib::Request&, httplib::Response&) -> std::optional<auth::Session> {
+        auth::Session s;
+        s.username = "admin";
+        s.role = auth::Role::admin;
+        return s;
+    };
+    auto admin_fn = [](const httplib::Request&, httplib::Response&) { return true; };
+    auto perm_fn = [](const httplib::Request&, httplib::Response&, const std::string&,
+                      const std::string&) { return true; };
+    auto audit_fn = [](const httplib::Request&, const std::string&, const std::string&,
+                       const std::string&, const std::string&, const std::string&) {
+        return true;
+    };
+    auto audit_read_fn = [&calls](const httplib::Request&, const std::string& action,
+                                  const std::string& result, const std::string& target_type,
+                                  const std::string& target_id,
+                                  const std::string& detail) -> bool {
+        calls.push_back({action, result, target_type, target_id, detail, true});
+        return true;
+    };
+    SettingsRoutes routes;
+    routes.register_routes(sink, auth_fn, admin_fn, perm_fn, audit_fn, cfg, auth_mgr, auto_approve,
+                           /*api_token_store=*/nullptr, /*mgmt_group_store=*/nullptr,
+                           /*tag_store=*/nullptr,
+                           /*update_registry=*/nullptr, /*runtime_config_store=*/nullptr,
+                           /*audit_store=*/nullptr,
+                           /*gateway_enabled=*/false, []() -> std::size_t { return 0; },
+                           []() -> std::string { return "[]"; }, oidc_mu, oidc_provider,
+                           /*metrics_registry=*/nullptr, /*step_up_fn=*/{}, audit_read_fn);
+
+    auto res = sink.Post("/api/settings/management-groups", "name=NoStore&membership_type=static",
+                         "application/x-www-form-urlencoded");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(res->body.find("<span class=\"feedback-error\">Management group store unavailable, "
+                         "try again</span>") != std::string::npos);
+    const auto toast = toast_of(*res);
+    CHECK(toast.value("level", "") == "error");
+    CHECK(toast.value("message", "") == "Management group store unavailable, try again");
+    CHECK(calls.empty());
+}
+
+TEST_CASE("Settings group create: an over-long or unclean name or parent id is refused with fixed "
+          "text, no row and no group",
+          "[pg][settings][management-groups][mgmt-audit-first][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mgmt_routes_tpl);
+    MgmtGroupsHarness h(db.dsn());
+    const std::string fixed_name_text =
+        "group name must be at most 256 bytes and must not contain control characters or invalid "
+        "UTF-8";
+
+    // No multi-MiB case: httplib answers 413 to an urlencoded body over its own cap before the
+    // handler runs (and the sink models that), so a larger form never reaches this route.
+    SECTION("257 B, 300 B and 3 KB names; 256 B is accepted") {
+        for (const std::size_t n : {std::size_t{257}, std::size_t{300}, std::size_t{3 * 1024}}) {
+            auto res = h.create(std::string(n, 'n'));
+            REQUIRE(res);
+            CHECK(res->status == 200);
+            CHECK(res->body ==
+                  "<span class=\"feedback-error\">" + fixed_name_text + "</span>");
+        }
+        CHECK(h.calls.empty());
+        CHECK(h.group_names().empty());
+
+        auto ok = h.create(std::string(256, 'n'));
+        REQUIRE(ok);
+        CHECK(h.create_rows().size() == 2); // attempted + success
+        CHECK(h.group_names().size() == 1);
+    }
+    SECTION("a 20-iteration retry loop of 3 KB names writes no row") {
+        for (int i = 0; i < 20; ++i) {
+            auto res = h.create(std::string(3 * 1024, 'r'));
+            REQUIRE(res);
+            CHECK(res->body.find(fixed_name_text) != std::string::npos);
+        }
+        CHECK(h.calls.empty());
+        CHECK(h.group_names().empty());
+    }
+    SECTION("a newline, a NUL, a DEL and invalid UTF-8 in the name") {
+        for (const auto& name :
+             {std::string("line1\nline2"), std::string("nul\0byte", 8), std::string("del\x7f"),
+              std::string("bad\xff\xfe utf8")}) {
+            auto res = h.create(name);
+            REQUIRE(res);
+            CHECK(res->status == 200);
+            CHECK(res->body.find(fixed_name_text) != std::string::npos);
+        }
+        CHECK(h.calls.empty());
+        CHECK(h.group_names().empty());
+    }
+    SECTION("an over-long or unclean parent id names no group") {
+        for (const auto& pid : {std::string(300, 'a'), std::string(3 * 1024, 'b'),
+                                std::string("ab\ncd"), std::string("bad\xff")}) {
+            auto res = h.sink.Post("/api/settings/management-groups",
+                                   "name=Child&parent_id=" + httplib::encode_uri_component(pid) +
+                                       "&membership_type=static",
+                                   "application/x-www-form-urlencoded");
+            REQUIRE(res);
+            CHECK(res->status == 200);
+            CHECK(res->body ==
+                  "<span class=\"feedback-error\">parent group not found</span>");
+        }
+        CHECK(h.calls.empty());
+        CHECK(h.group_names().empty());
+    }
+}
+
+TEST_CASE("Settings group create: a parent deleted between the check and the insert refuses with "
+          "attempted then failure/validation_refused and creates no group",
+          "[pg][settings][management-groups][mgmt-audit-first]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mgmt_routes_tpl);
+    bool deleted = false; // before `h`: the hook below captures it and `h` is destroyed first
+    MgmtGroupsHarness h(db.dsn());
+    ManagementGroup parent;
+    parent.name = "Vanishing Parent";
+    parent.membership_type = "static";
+    const auto parent_id = h.mgmt_group_store.create_group(parent);
+    REQUIRE(parent_id.has_value());
+    h.after_attempted_hook = [&]() {
+        deleted = h.mgmt_group_store.delete_group(*parent_id).has_value();
+    };
+
+    auto res = h.create("Orphaned Child", *parent_id);
+    REQUIRE(res);
+    REQUIRE(deleted);
+    CHECK(res->status == 200);
+    CHECK(res->body == "<span class=\"feedback-error\">parent group not found</span>");
+
+    const auto rows = h.create_rows();
+    REQUIRE(rows.size() == 2);
+    CHECK(rows[0].result == "attempted");
+    CHECK(rows[1].result == "failure");
+    CHECK(rows[1].target_id.empty());
+    CHECK(rows[1].detail == "validation_refused Orphaned Child");
+    CHECK(h.group_names().empty());
+}
+
+TEST_CASE("Settings group create: the session_revoked and permission_revoked failure rows name the "
+          "principal of the attempted row",
+          "[pg][settings][management-groups][mgmt-audit-first][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mgmt_routes_tpl);
+    MgmtGroupsHarness h(db.dsn());
+
+    SECTION("session revoked") {
+        h.session_gone_after_attempt = true;
+        auto res = h.create("Revoked Session");
+        REQUIRE(res);
+        const auto rows = h.create_rows();
+        REQUIRE(rows.size() == 2);
+        CHECK(rows[0].principal == "admin");
+        CHECK(rows[1].detail == "session_revoked Revoked Session");
+        CHECK(rows[1].bound); // a re-resolved row would name nobody here
+        CHECK(rows[1].principal == "admin");
+        CHECK(rows[1].principal == rows[0].principal);
+        CHECK(rows[1].target_id == rows[0].target_id);
+    }
+    SECTION("permission revoked") {
+        h.perm_revoked_after_attempt = true;
+        auto res = h.create("Revoked Perm");
+        REQUIRE(res);
+        const auto rows = h.create_rows();
+        REQUIRE(rows.size() == 2);
+        CHECK(rows[1].detail == "permission_revoked Revoked Perm");
+        CHECK(rows[1].bound);
+        CHECK(rows[1].principal == rows[0].principal);
+        CHECK(rows[1].principal == "admin");
+    }
+    CHECK(h.group_names().empty());
+}
+
+// ── Every row after the attempted row is written through the session-bound writer ──────────────
+// The re-check passes, then the session lapses (create_group can wait up to 4 s on the pool). The
+// harness's re-resolving hook models production (it names nobody once the session is gone), so
+// these cases fail on a route that writes any outcome row through `audit_read_fn_`.
+
+TEST_CASE("Settings group create: the success and failure outcome rows are session-bound and name "
+          "the attempted row's principal",
+          "[pg][settings][management-groups][mgmt-audit-first][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mgmt_routes_tpl);
+    MgmtGroupsHarness h(db.dsn());
+    h.session_gone_after_recheck = true;
+
+    SECTION("success row") {
+        auto res = h.create("Bound Success");
+        REQUIRE(res);
+        const auto rows = h.create_rows();
+        REQUIRE(rows.size() == 2);
+        CHECK(rows[0].result == "attempted");
+        CHECK(rows[0].principal == "admin");
+        CHECK(rows[1].result == "success");
+        CHECK(rows[1].bound);
+        CHECK(rows[1].principal == "admin");
+        CHECK(rows[1].principal == rows[0].principal);
+    }
+    SECTION("name_conflict failure row") {
+        ManagementGroup first;
+        first.name = "Bound Dup";
+        first.membership_type = "static";
+        REQUIRE(h.mgmt_group_store.create_group(first).has_value());
+        auto res = h.create("Bound Dup");
+        REQUIRE(res);
+        const auto rows = h.create_rows();
+        REQUIRE(rows.size() == 2);
+        CHECK(rows[1].result == "failure");
+        CHECK(rows[1].bound);
+        CHECK(rows[1].principal == rows[0].principal);
+    }
+}
+
+// The route resolves the session before the `attempted` row, and the row can wait on the audit
+// pool, so the session can lapse in between: the re-resolving hook would stamp an empty principal
+// on the `attempted` row while every later row names the user. The harness hook models that, so
+// this case fails on a route that writes the `attempted` row through `audit_read_fn_`.
+TEST_CASE("Settings group create: the attempted row is written through the session-bound writer "
+          "and names the principal when the session lapsed before it",
+          "[pg][settings][management-groups][mgmt-audit-first][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mgmt_routes_tpl);
+    MgmtGroupsHarness h(db.dsn());
+    h.session_gone_at_attempted = true;
+    h.session_gone_after_attempt = true; // the re-check then refuses
+
+    auto res = h.create("Attempt Bound");
+    REQUIRE(res);
+    const auto rows = h.create_rows();
+    REQUIRE(rows.size() == 2);
+    CHECK(rows[0].result == "attempted");
+    CHECK(rows[0].bound);
+    CHECK(rows[0].principal == "admin");
+    CHECK(rows[1].result == "failure");
+    CHECK(rows[1].bound);
+    CHECK(rows[1].principal == rows[0].principal);
+    CHECK(h.group_names().empty());
+}
+
+// A create's target_id is empty on both rows, so the group name is what pairs a failure row with
+// its attempted row: detail is "<token> <name>", the name being the bounded clean-text value the
+// attempted row carries.
+TEST_CASE("Settings group create: a failure row's detail is the token, a space and the group name "
+          "the attempted row carries",
+          "[pg][settings][management-groups][mgmt-audit-first]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mgmt_routes_tpl);
+    MgmtGroupsHarness h(db.dsn());
+    for (const char* n : {"Pair A", "Pair B"}) {
+        ManagementGroup first;
+        first.name = n;
+        first.membership_type = "static";
+        REQUIRE(h.mgmt_group_store.create_group(first).has_value());
+    }
+
+    std::vector<std::string> details;
+    for (const std::string& name : {std::string("Pair A"), std::string("Pair B")}) {
+        h.calls.clear();
+        auto res = h.create(name);
+        REQUIRE(res);
+        const auto rows = h.create_rows();
+        REQUIRE(rows.size() == 2);
+        CHECK(rows[1].detail == "name_conflict " + name);
+        CHECK(rows[1].detail == "name_conflict " + rows[0].detail);
+        for (const unsigned char c : rows[1].detail) {
+            CHECK(c > 0x1F);
+            CHECK(c != 0x7F);
+        }
+        details.push_back(rows[1].detail);
+    }
+    CHECK(details[0] != details[1]);
 }

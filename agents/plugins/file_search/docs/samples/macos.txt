@@ -1,0 +1,12 @@
+captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-11-23 · euid 501 · leg-hash d2997fe1071a
+== action=search root=/private/tmp/yuzu_test_file_search_sample pattern=yuzu-fs-control-* kinds=both
+match|/private/tmp/yuzu_test_file_search_sample/n1/n2/n3/n4/n5/n6/n7/n8/n9/n10/n11/yuzu-fs-control-d12.bin|file|0000000001000011:000000003ae32248|8|1795462358|system
+extents|0000000001000011:000000003ae32248|ok|1|0:407407009792:8:-
+match|/private/tmp/yuzu_test_file_search_sample/yuzu-fs-control-d1.bin|file|0000000001000011:000000003ae32239|8|1795462358|system
+extents|0000000001000011:000000003ae32239|ok|1|0:407406866432:8:-
+match|/private/tmp/yuzu_test_file_search_sample/yuzu-fs-control-dir|directory|0000000001000011:000000003ae3223a|-|-|system
+volume|/|apfs|complete|none|extents=collected|entries=16
+coverage|complete|slices=1|prior_gaps=0|consistency=single_pass
+search|ok|none|macos_nfc_casefold_v1|seq=0|q=f25c9ba4|links_skipped=1
+[result_status] OK / FULL / 
+

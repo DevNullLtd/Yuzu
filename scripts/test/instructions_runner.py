@@ -14,14 +14,12 @@ scripts/test/synthetic-uat-tests.sh:
 Per-instruction outcome (recorded to the test-runs DB as both timing
 and gate_notes):
 
-  pass              dispatch returned 200 and an agent answered within the timeout
-                    (dispatched and answered; no check of the result shape). A
-                    destructive/forensic row passes only when every response row
-                    is terminal SUCCESS with an empty error_detail.
-  fail              dispatch error, no response within timeout, or every
-                    answer errored (a destructive/forensic row also fails on
-                    any errored answer, any error_detail, or a row still running
-                    at the poll deadline)
+  pass              dispatch returned 200 and every reached agent has a terminal
+                    SUCCESS with empty error_detail. Historical RUNNING chunks from
+                    those agents are allowed. The destructive/forensic path retains
+                    its stricter rule: every response row must be terminal SUCCESS.
+  fail              dispatch error, incomplete completion at the poll deadline,
+                    any failed response, error_detail, or malformed response evidence
   pending_approval  HTTP 202 with status=pending_approval - the approval mode
                     is always, role-gated for a non-admin caller, or an
                     unrecognised approval mode; never auto. Not a failure, but
@@ -30,7 +28,12 @@ and gate_notes):
                     (everything but safe and mutating by default), or a
                     destructive/forensic definition the targeted run may not
                     dispatch (no override entry, required parameter missing,
-                    server.* row, not eligible on the target's OS)
+                    server.* row, not eligible on the target's OS), a definition
+                    whose host platforms exclude this host, or a row skipped by name
+                    (named_skip_reason: agent.http_client.get/head,
+                    crossplatform.echo.configure and windows.rdp.set_state always;
+                    network_actions.ping/flush_dns only with
+                    YUZU_INSTRUCTIONS_SKIP_PRIVILEGED=1); the reason is the row's note
   error             internal runner error (network, JSON parse, etc.) -
                     distinct from `fail` so flake-watching can separate
                     "instruction broken" from "test infra broken"
@@ -41,6 +44,12 @@ Definitions whose id is NOT in the override map are classified by plugin, then s
                                            dispatch chokepoint denies them)
   type=question/query                   -> safe
   type=action                           -> mutating
+
+Untargeted dispatches (safe/mutating by default) use agents_reached from the POST response
+and paginate the command's response rows. Every reached agent must have a terminal SUCCESS;
+any FAILURE/TIMEOUT/REJECTED, error_detail, malformed identity/status or incomplete read fails.
+Historical RUNNING output from an agent with a terminal result is allowed. These are execution
+verdict checks, not validation of the instruction's result columns or output content.
 
 The runner broadcasts: it sends no agent_ids and no scope. The exception is the opt-in classes
 destructive and forensic (a Destructive or Forensics capability row). The server refuses a
@@ -124,7 +133,10 @@ approval control; use a dedicated admin account on a disposable stack. If safe o
 are in the same --risks they are still sent to every agent (the run says so on stderr); target flags
 given with no destructive or forensic class selected are ignored, with a warning. A server-internal
 definition is never sent a target: it names no agent plugin, so if selected it is broadcast and the
-dispatch chokepoint denies it. A server.* row that the risk table classes destructive is skipped in
+dispatch chokepoint denies it. A definition the server boot-seeds kill-switched (an action-level
+default-off seed, today crossplatform.components.native) is classed default-off: the server refuses it
+until an operator enables its kill switch, so it runs only with --risks default-off, broadcast like a
+safe row, on a stack where that has been done. A server.* row that the risk table classes destructive is skipped in
 a targeted run for the same reason, as is testing.chargen.start (it streams until stopped; start and
 stop it by hand through the dashboard or REST with agent_ids).
 
@@ -188,7 +200,7 @@ LOOPBACK_HOSTS = ("127.0.0.1", "::1", "localhost")
 RUN_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")  # used with fullmatch
 
 ALL_RISKS = ("safe", "mutating", "destructive", "forensic", "server-internal", "network-disrupt",
-             "interactive")
+             "interactive", "default-off")
 
 
 # ── data classes ───────────────────────────────────────────────────────────
@@ -377,11 +389,12 @@ def seeded_directory(base: str | None = None):
         except OSError as exc:
             last_error = exc
             continue
-        _SEED.update(dir=path, sha256=digest)
+        _SEED.update(dir=path, sha256=digest, text_file=os.path.join(path, _SEED_FILES[0][0]))
         break
     if path is None:
         say(f"instructions_runner: seed directory unavailable ({last_error}); "
-            "find_by_hash will use the host default", file=sys.stderr)
+            "find_by_hash will use the host default and device.filesystem.list_dir/read "
+            "will be sent the host default file, which they refuse", file=sys.stderr)
     try:
         yield path
     finally:
@@ -390,10 +403,42 @@ def seeded_directory(base: str | None = None):
             shutil.rmtree(path, ignore_errors=True)
 
 
-def _synth_string(name: str, schema: dict) -> str:
+# Per-definition parameters whose meaning the name alone does not carry: a `path` that must be a
+# directory for one action and a readable text file for another. Value is the _SEED key to use; when
+# nothing is seeded the ordinary name-based default applies. Without these, `path` resolves to
+# /bin/ls (a binary file), which list_dir refuses ("not a directory") and read refuses ("binary").
+_DEFINITION_PARAM_SEEDS: dict[tuple[str, str], str] = {
+    ("device.filesystem.list_dir", "path"): "dir",
+    ("device.filesystem.read", "path"): "text_file",
+}
+
+# Parameters whose accepted shape is fixed by their documented contract, matched by exact name.
+# `from`/`to` are Unix epoch seconds (echo.query, echo.export; a non-numeric value is refused with
+# "invalid 'from' parameter (must be epoch seconds)"). There is deliberately NO rule for
+# echo.configure's `db_budget_bytes`: any valid value is a real write of the agent's Echo budget
+# (the documented default included, which would lower or raise a non-default budget and, when
+# lowering, delete history for good), so that row is skipped by name instead (_UNSAFE_TO_SYNTHESISE).
+
+
+def _contract_string(name: str) -> str | None:
+    if name == "from":
+        return "0"
+    if name == "to":
+        return str(int(time.time()))
+    return None
+
+
+def _synth_string(name: str, schema: dict, def_id: str = "") -> str:
     """Best-effort string default for a parameter, host-aware."""
     nl = name.lower()
     paths = _HOST_PATHS[HOST]
+
+    seeded = _SEED.get(_DEFINITION_PARAM_SEEDS.get((def_id, name), ""), "")
+    if seeded:
+        return seeded
+    contract = _contract_string(name)
+    if contract is not None:
+        return contract
 
     # Order matters: longer/more-specific tokens first.
     if nl == "sql" or nl.endswith("_sql") or "query" == nl:
@@ -448,6 +493,7 @@ _PATTERN_FALLBACKS = (
     "true",                                  # boolean string
     "00000000-0000-0000-0000-000000000000",  # UUID
     "00:00:00:00:00:00",                     # MAC
+    "00000000.1",                            # process start-time token
 )
 
 
@@ -467,7 +513,7 @@ def _fit_pattern(value: str, schema: dict) -> str:
     return next((c for c in (value, *_PATTERN_FALLBACKS) if rx.search(c)), value)
 
 
-def _value_for_property(name: str, schema: dict) -> Any:
+def _value_for_property(name: str, schema: dict, def_id: str = "") -> Any:
     """Synthesise a sane default for a single parameter property.
 
     Honours, in order: explicit YAML `default:`, `enum:`, then a per-host
@@ -487,7 +533,7 @@ def _value_for_property(name: str, schema: dict) -> Any:
     t = schema.get("type", "string")
 
     if t in ("string", None):
-        return _fit_pattern(_synth_string(name, schema), schema)
+        return _fit_pattern(_synth_string(name, schema, def_id), schema)
 
     if t in ("integer", "int", "int32", "int64", "number"):
         validation = schema.get("validation", {}) or {}
@@ -505,7 +551,8 @@ def _value_for_property(name: str, schema: dict) -> Any:
     return ""
 
 
-def synthesise_params(spec_params: dict, override: dict[str, Any] | None = None) -> dict:
+def synthesise_params(spec_params: dict, override: dict[str, Any] | None = None,
+                      def_id: str = "") -> dict:
     """Build a parameter dict that satisfies `required` and `properties`.
 
     `override` (if provided) wins per-key, so a hand-written --params-override entry
@@ -516,14 +563,14 @@ def synthesise_params(spec_params: dict, override: dict[str, Any] | None = None)
     required = set(spec_params.get("required", []) or [])
     for prop_name in required:
         prop_schema = properties.get(prop_name, {}) or {}
-        out[prop_name] = _value_for_property(prop_name, prop_schema)
+        out[prop_name] = _value_for_property(prop_name, prop_schema, def_id)
     # If the definition has no `required:` block but does declare properties
     # (e.g. security.ioc.check — all optional, but at least one must be
     # supplied), synthesise one property so dispatch exercises the plugin
     # rather than erroring at "no parameters provided".
     if not required and properties:
         first_name = next(iter(properties))
-        out[first_name] = _value_for_property(first_name, properties[first_name] or {})
+        out[first_name] = _value_for_property(first_name, properties[first_name] or {}, def_id)
     if override:
         out.update(override)
     return out
@@ -644,9 +691,10 @@ class YuzuClient:
                 payload = {}
             return e.code, payload
 
-    def get_responses(self, command_id: str) -> dict:
+    def get_responses(self, command_id: str, *, offset: int = 0) -> dict:
         req = urllib.request.Request(
-            f"{self.base}/api/responses/{urllib.parse.quote(command_id)}")
+            f"{self.base}/api/responses/{urllib.parse.quote(command_id)}"
+            + (f"?offset={offset}" if offset else ""))
         try:
             with self.opener.open(req, timeout=self.timeout) as resp:
                 return json.loads(resp.read() or b"{}")
@@ -911,6 +959,54 @@ def _post_verdict(code: int, payload: Any) -> str:
     return "unknown"
 
 
+# Rows the runner cannot make succeed in the environment it is run from, skipped with a recorded
+# reason (never passed, and never hidden: the reason is the Outcome note, so it reaches the console
+# line for a fail/error/--verbose run and the --output JSON; the test-runs DB records only the row's
+# id and duration, plus the aggregate skip count).
+# A plugin FAILURE on any other row still fails the gate; this is not a verdict loosening.
+#
+# These two always need a public host: the plugin refuses private, loopback and unresolvable
+# targets as an SSRF block by design, so no value the runner can invent succeeds offline.
+_NO_PUBLIC_EGRESS_SKIPS = frozenset({"agent.http_client.get", "agent.http_client.head"})
+
+# These two need host privileges a bare checkout or an isolated rig may not give the agent: on Linux
+# flush_dns runs `sudo -n resolvectl flush-caches`, which needs the NOPASSWD grant that
+# scripts/install-agent-user.sh installs (or a root agent), and ping needs cap_net_raw. They are
+# skipped ONLY when the operator says the run lacks those (the bwrap rig: no_new_privs and dropped
+# capabilities), so a provisioned host still runs them and a real failure there still fails the gate.
+_PRIVILEGED_SKIPS = frozenset({"device.network_actions.ping", "device.network_actions.flush_dns"})
+SKIP_PRIVILEGED_ENV = "YUZU_INSTRUCTIONS_SKIP_PRIVILEGED"
+
+# A mutating row whose only synthesisable value is a REAL write to every reached agent's own
+# configuration or security posture, so there is no value that is safe to invent. Each takes one
+# optional setting (or one required state) per call and the runner would send it to every reached
+# agent: echo.configure would overwrite each agent's Echo database byte budget (a no-op value is the
+# agent's CURRENT one, which the runner cannot know without a read-then-write step it does not
+# have), and windows.rdp.set_state would be sent `enable`, turning remote desktop on.
+_UNSAFE_TO_SYNTHESISE = {
+    "crossplatform.echo.configure":
+        "any synthesised value is a real write of each reached agent's Echo byte budget "
+        "(lowering it deletes history for good); needs the agent's current value",
+    "windows.rdp.set_state":
+        "the synthesised state `enable` would turn remote desktop on for every reached "
+        "Windows agent; the runner has no safe value to send",
+}
+
+
+def named_skip_reason(def_id: str, environ: dict[str, str] | None = None) -> str:
+    """Why `def_id` is skipped as unrunnable here, or "" when it runs."""
+    env = os.environ if environ is None else environ
+    if def_id in _NO_PUBLIC_EGRESS_SKIPS:
+        return ("needs a public host: the plugin SSRF-blocks private, loopback and unresolvable "
+                "targets, so no synthesised URL can succeed")
+    if def_id in _UNSAFE_TO_SYNTHESISE:
+        return _UNSAFE_TO_SYNTHESISE[def_id]
+    if def_id in _PRIVILEGED_SKIPS and env.get(SKIP_PRIVILEGED_ENV, "") == "1":
+        return (f"{SKIP_PRIVILEGED_ENV}=1: this run lacks the host privileges the "
+                "action needs (sudo NOPASSWD grant / cap_net_raw)")
+    return ""
+
+
 def targeted_skip_reason(defn: Definition, param_overrides: dict[str, dict[str, Any]],
                          target_os: str = "") -> str:
     """Why a destructive/forensic definition must not be dispatched, or "" if it may be.
@@ -950,13 +1046,15 @@ def row_in_flight(r: Any) -> bool:
     return _int_status(r) == 0
 
 
-def grade_targeted(responses: list, target: str = "") -> tuple[str, bool, bool]:
+def grade_targeted(responses: list, target: str = "", *, strict_running: bool = False) -> tuple[str, bool, bool]:
     """(why it is a fail, any row running, any row unrecognised).
 
     The wire row is {id, instruction_id, agent_id, timestamp, status, output, error_detail} with
     an integer status 0-4. A row that is not an object, has any other status, or names an agent
     other than the target is UNRECOGNISED: something is not as the runner assumes, so the caller
     stops the run. A row with no agent_id is tolerated. A legacy `rc` can only add a failure.
+    Broadcast history also validates RUNNING rows (strict_running), whose terminal
+    rows may arrive beside them rather than replace them.
     """
     problems: list[str] = []
     running = False
@@ -973,13 +1071,14 @@ def grade_targeted(responses: list, target: str = "") -> tuple[str, bool, bool]:
             continue
         if row_in_flight(r):
             running = True
-            continue
+            if not strict_running:
+                continue
         reasons: list[str] = []
         s = _int_status(r)
         if s is None or not 0 <= s <= 4:
             reasons.append(f"unrecognised status {clip(r.get('status'), 40)!r}")
             odd = True
-        elif s != 1:
+        elif s not in (0, 1):
             reasons.append(STATUS_NAMES[s])
         rc = r.get("rc", r.get("return_code", 0))
         if isinstance(rc, int) and not isinstance(rc, bool) and rc != 0:
@@ -1040,6 +1139,106 @@ def exercise(client: YuzuClient, defn: Definition,
                     manifest, accepted, control or RunControl(), targeted_poll_timeout_s)
     out.dispatched = accepted[0]
     return out
+
+
+def _broadcast_verdict(rows: list, command_id: str, expected: int) -> tuple[str, int]:
+    """Return a failure reason and the number of agents with terminal SUCCESS.
+
+    response_routes.cpp returns command-filtered rows, not one mutable row per agent.
+    A terminal frame carrying output is inserted beside historical RUNNING chunks;
+    an empty terminal frame instead updates those chunks (agent_service_impl.cpp).
+    Row order/timestamps are therefore not a completion signal. Require a terminal
+    result per distinct agent and reject every conflicting failure, never pick the
+    newest-looking success. No output text is interpreted as a verdict.
+    """
+    agents: set[str] = set()
+    completed: set[str] = set()
+    for r in rows:
+        if not isinstance(r, dict):
+            return "a response row is not an object", 0
+        agent = r.get("agent_id")
+        if not isinstance(agent, str) or not agent.strip():
+            return "unrecognised response agent_id", 0
+        if r.get("instruction_id") != command_id:
+            return "response instruction_id does not match the dispatched command", 0
+        agents.add(agent)
+        status = _int_status(r)
+        if status == 1:
+            completed.add(agent)
+    reason, _, _ = grade_targeted(rows, strict_running=True)
+    if reason:
+        return reason, 0
+    if len(agents) > expected:
+        return "response agent count exceeds dispatch agents_reached", 0
+    return "", len(completed)
+
+
+def _poll_broadcast(client: YuzuClient, defn: Definition, control: RunControl,
+                    timeout: int, payload: dict, ms: Any) -> Outcome:
+    """Safe/mutating (and other untargeted) dispatches need complete fleet evidence.
+
+    The response API defaults to 100 rows, with offset pagination and no total.
+    Read to a short page before grading; an incomplete/error page cannot pass.
+    Pages are not a snapshot, so every poll starts over. The distinct-agent count
+    from the dispatch prevents duplicate rows/pages from completing a broadcast.
+    Targeted refusal accounting/stop policy remains in _poll_targeted.
+    """
+    command_id = payload.get("command_id")
+    execution_id = payload.get("execution_id", "")
+
+    def outcome(status: str, note: str = "", count: int = 0) -> Outcome:
+        return Outcome(defn.id, defn.risk, status, ms(), http_code=200,
+                       command_id=command_id if isinstance(command_id, str) else "",
+                       execution_id=execution_id, response_count=count, note=note)
+
+    if not isinstance(command_id, str) or not command_id:
+        return outcome("fail", "dispatch ok but no command_id returned")
+    expected = payload.get("agents_reached")
+    if not isinstance(expected, int) or isinstance(expected, bool) or expected <= 0:
+        return outcome("fail", "dispatch has no positive integer agents_reached")
+    deadline = time.monotonic() + timeout
+    final = False
+    while True:
+        rows: list = []
+        poll_error = ""
+        while True:
+            if control.stop.is_set():
+                return outcome("error", "in_flight_unknown: dispatch was sent, result not collected")
+            polled = (client.get_responses(command_id, offset=len(rows)) if rows
+                      else client.get_responses(command_id))
+            if not isinstance(polled, dict) or "responses" not in polled:
+                poll_error = (str(polled["error"]) if isinstance(polled, dict) and "error" in polled
+                              else "unrecognised response body")
+                break
+            page = polled["responses"]
+            if not isinstance(page, list):
+                return outcome("fail", "responses is not a list")
+            if "error" in polled or polled.get("result_truncated_by_cap"):
+                poll_error = "incomplete response page"
+                break
+            rows.extend(page)
+            if len(page) < 100:
+                break
+            if time.monotonic() >= deadline:
+                poll_error = "response pagination did not complete before the deadline"
+                break
+        if not poll_error:
+            problems, completed = _broadcast_verdict(rows, command_id, expected)
+            if problems:
+                return outcome("fail", problems, len(rows))
+            if completed == expected:
+                return outcome("pass", count=len(rows))
+        if final or time.monotonic() >= deadline:
+            if poll_error:
+                note = f"poll failed: {clip(poll_error)}"
+            elif not rows:
+                note = f"no response within {timeout}s"
+            else:
+                note = (f"only {completed}/{expected} agents completed successfully within {timeout}s; "
+                        "remaining agents may still be running")
+            return outcome("fail", note, len(rows))
+        time.sleep(min(POLL_INTERVAL_S, max(0, deadline - time.monotonic())))
+        final = time.monotonic() >= deadline
 
 
 def _poll_targeted(client: YuzuClient, defn: Definition, control: RunControl, poll_timeout_s: int,
@@ -1154,9 +1353,13 @@ def _exercise(client: YuzuClient, defn: Definition,
             return Outcome(defn.id, defn.risk, "skip", ms(),
                            note=f"host={HOST} not in platforms={sorted(eligible)}")
 
+    why = named_skip_reason(defn.id)
+    if why:
+        return Outcome(defn.id, defn.risk, "skip", ms(), note=why)
+
     try:
         params = (dict(param_overrides[defn.id]) if targeted
-                  else synthesise_params(defn.parameters, param_overrides.get(defn.id)))
+                  else synthesise_params(defn.parameters, param_overrides.get(defn.id), defn.id))
     except Exception as e:
         return Outcome(defn.id, defn.risk, "error", ms(), note=f"param-synth: {e}")
 
@@ -1237,71 +1440,7 @@ def _exercise(client: YuzuClient, defn: Definition,
             return _dispatch_unknown(defn, control, ms(),
                                      f"after the accepted POST: {type(e).__name__}: {e}", manifest,
                                      payload)
-    command_id = payload.get("command_id", "")
-    execution_id = payload.get("execution_id", "")
-    if not command_id:
-        return Outcome(defn.id, defn.risk, "fail", ms(),
-                       http_code=code,
-                       execution_id=execution_id,
-                       note="dispatch ok but no command_id returned")
-
-    deadline = time.monotonic() + poll_timeout_s
-    last_payload: dict = {}
-    responses: list = []
-    response_count = 0
-    while time.monotonic() < deadline:
-        if control.stop.is_set():
-            return Outcome(defn.id, defn.risk, "error", ms(), http_code=code,
-                           command_id=command_id, execution_id=execution_id,
-                           note="in_flight_unknown: dispatch was sent, result not collected")
-        last_payload = client.get_responses(command_id)
-        responses = last_payload.get("responses", []) if isinstance(last_payload, dict) else []
-        response_count = len(responses)
-        if response_count > 0:  # the first answer (a targeted row waits for a verdict instead)
-            break
-        time.sleep(POLL_INTERVAL_S)
-
-    duration_ms = ms()
-
-    if response_count == 0:
-        last_err = last_payload.get("error") if isinstance(last_payload, dict) else None
-        return Outcome(defn.id, defn.risk, "fail",
-                       duration_ms, http_code=code, command_id=command_id,
-                       execution_id=execution_id,
-                       note=f"no response within {poll_timeout_s}s"
-                            + (f" (last poll: {last_err})" if last_err else ""))
-
-    # Loose shape validation: trust the agent's structured `status` and
-    # `rc` fields rather than greping the body for "error|". Several
-    # legitimate-empty cases (event_logs.errors returning rows whose
-    # column-0 label is "error", agent_logging emitting an empty marker)
-    # would otherwise be misclassified.
-    # NOTE: this safe/mutating grading still compares a string `status` and an `rc`, neither
-    # of which the server's integer-status rows carry; tracked as a follow-up, unchanged here.
-    sane_count = 0
-    error_count = 0
-    for r in responses:
-        out = r.get("output", "")
-        if not out:
-            continue
-        status = r.get("status", "")
-        # Agent reports rc explicitly when available; non-zero rc or
-        # status=="error" is the authoritative failure signal.
-        rc = r.get("rc", r.get("return_code", 0))
-        if status == "error" or (isinstance(rc, int) and rc != 0):
-            error_count += 1
-        else:
-            sane_count += 1
-
-    if sane_count == 0 and error_count > 0:
-        return Outcome(defn.id, defn.risk, "fail",
-                       duration_ms, http_code=code, command_id=command_id,
-                       execution_id=execution_id, response_count=response_count,
-                       note=f"all {error_count} responses errored")
-
-    return Outcome(defn.id, defn.risk, "pass",
-                   duration_ms, http_code=code, command_id=command_id,
-                   execution_id=execution_id, response_count=response_count)
+    return _poll_broadcast(client, defn, control, poll_timeout_s, payload, ms)
 
 
 # ── DB writeback ───────────────────────────────────────────────────────────
@@ -1616,6 +1755,18 @@ def run(args: argparse.Namespace) -> int:
     say(f"instructions_runner: {len(all_defs)} total definitions, "
           f"{len(runnable)} runnable (risks={','.join(sorted(selected_risks))}), "
           f"{len(skipped)} skipped")
+    named = sorted((d.id, named_skip_reason(d.id)) for d in runnable if named_skip_reason(d.id))
+    if named:   # always visible: a skip the operator did not select must not be silent
+        say(f"instructions_runner: {len(named)} runnable row(s) will be skipped by name:")
+        for def_id, why in named:
+            say(f"instructions_runner:   {esc(def_id)}: {esc(why)}")
+        for def_id in sorted(param_overrides):
+            if any(def_id == n for n, _ in named):
+                say(f"instructions_runner: --params-override for {esc(def_id)} is ignored: "
+                    "the row is skipped by name", file=sys.stderr)
+    if os.environ.get(SKIP_PRIVILEGED_ENV, "") == "1":
+        say(f"instructions_runner: {SKIP_PRIVILEGED_ENV}=1 is set: network_actions.ping and "
+            "flush_dns are skipped on this run", file=sys.stderr)
 
     known = {d.id for d in all_defs}
     for stray in sorted(set(param_overrides) - known):

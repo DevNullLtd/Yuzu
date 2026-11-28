@@ -6,7 +6,8 @@
  * Two halves: a PORTABLE pure layer (failure tokens, errno -> token maps, path
  * helpers) that compiles on every OS, and a WALK SHELL (`#if !defined(_WIN32)`,
  * because agents/shared/posix_dir_walk.hpp is POSIX-only) holding
- * `dotnet_rows_at` / `jvm_rows_at` and the injected-root leg body
+ * `dotnet_rows_at` / `jvm_rows_at` / `python_rows_at` (and the walk layer the macOS python walk
+ * reuses, runtimes_macos_parsers.hpp) and the injected-root leg body
  * `run_linux_at`.
  *
  * WHAT IS READ (<root> + a literal, rung 1, zero subprocess):
@@ -17,8 +18,13 @@
  *           <d>/release (parse_release_file). A home with no `release` file but a
  *           bin/java or jre/bin/java (some distro OpenJDK 8 packages, e.g. Ubuntu and
  *           Rocky, ship none) is reported with an unknown version and `release_missing`.
+ *   python  usr/bin, usr/local/bin and var/usrlocal/bin (rpm-ostree hosts, where /usr/local is a
+ *           symlink to ../var/usrlocal): the file NAMES `python3.<minor>` (regular files only). The
+ *           version is major.minor from the name; the patch level is not read (it needs the
+ *           interpreter) and that limit is documented, not a constraint token. A symlinked
+ *           `python3.X` entry (a distro alias) is skipped, the alias rule below.
  *   NOT walked: any other location (an Oracle-RPM /usr/java, tarball installs under
- *   /usr/local or a home directory). "None found" covers the roots above only.
+ *   /usr/local or a home directory; a venv or pyenv python). "None found" covers the roots above only.
  *
  * SYMLINK SAFETY. Every directory is opened O_RDONLY|O_DIRECTORY|O_NOFOLLOW
  * (private copy of autoruns_macos.cpp's open_dir_no_follow_checked /
@@ -79,6 +85,7 @@
 
 #include "runtimes_legs.hpp"
 #include "runtimes_parsers.hpp"
+#include "runtimes_python_parsers.hpp"
 
 #include <network_fstype.hpp> // yuzu::shared::is_network_fstype (agents/shared)
 
@@ -231,6 +238,13 @@ inline constexpr std::array<std::string_view, 3> kDotnetRoots{"usr/share/dotnet"
 // jvm dispatch would report `symlink_refused` for opt/java; with it the link is a covered alias.
 inline constexpr std::array<std::string_view, 4> kJvmRoots{"usr/lib/jvm", "opt/java", "usr/lib64/jvm",
                                                            "var/opt/java"};
+// python: the distro interpreters (/usr/bin) and a source build's `make install` (/usr/local/bin). The
+// sibling alias rule applies: a symlinked /usr/local naming the other candidate is a covered alias.
+// var/usrlocal/bin: on rpm-ostree hosts (Fedora CoreOS, Silverblue, RHCOS, RHEL Edge) /usr/local is a
+// symlink to ../var/usrlocal, so without this candidate every python dispatch would report
+// `symlink_refused` for usr/local/bin; with it the link is a covered alias.
+inline constexpr std::array<std::string_view, 3> kPythonRoots{"usr/bin", "usr/local/bin",
+                                                              "var/usrlocal/bin"};
 
 /// Lexically normalises a root-relative path: empty and `.` components dropped,
 /// `..` pops one. nullopt when a `..` would climb above the root. Pure text --
@@ -514,7 +528,7 @@ inline bool push_row(std::vector<std::string>& rows, std::string&& row, WalkBudg
     return true;
 }
 
-enum class EntryType { directory, symlink, other };
+enum class EntryType { directory, symlink, regular, other };
 
 struct EntryInfo {
     std::string name;
@@ -545,6 +559,7 @@ inline std::vector<EntryInfo> list_entries(DIR* d, ConstraintAccumulator& acc, W
         info.name = std::string{e->d_name};
         info.type = S_ISDIR(st.st_mode)   ? EntryType::directory
                     : S_ISLNK(st.st_mode) ? EntryType::symlink
+                    : S_ISREG(st.st_mode) ? EntryType::regular
                                           : EntryType::other;
         out.push_back(std::move(info));
         return true;
@@ -650,6 +665,57 @@ inline bool home_has_java_binary(DIR* home, ConstraintAccumulator& acc) {
     if (jre && java_in(jre.get())) return true;
     if (alias_seen) acc.add_failure(kTokSymlinkRefused);
     return false;
+}
+
+/// Whether <home>/bin/javac is a regular file or a symlink (never followed, never run: directory
+/// entry only). `bin` is opened O_NOFOLLOW; no `bin` or no `javac` is a definite `false`. A failed
+/// open of `bin`, a symlinked `bin` (refused, `symlink_refused`) or a failed stat of `javac` (other
+/// than ENOENT) is recorded and answers nullopt: undecided, never read as "no javac". A directory
+/// or other special file named `javac` is not a compiler.
+[[nodiscard]] inline std::optional<bool> home_has_javac(DIR* home, ConstraintAccumulator& acc) {
+    Opened o = open_child(home, "bin");
+    if (o.status == OpenStatus::absent) return false;
+    if (o.status == OpenStatus::alias) {
+        acc.add_failure(kTokSymlinkRefused);
+        return std::nullopt;
+    }
+    if (o.status == OpenStatus::failed) {
+        acc.add_failure(o.token);
+        return std::nullopt;
+    }
+    struct stat st{};
+    if (::fstatat(::dirfd(o.dir.get()), "javac", &st, AT_SYMLINK_NOFOLLOW) != 0) {
+        const auto tok = stat_errno_token(errno);
+        if (!tok) return false;
+        acc.add_failure(*tok);
+        return std::nullopt;
+    }
+    return S_ISREG(st.st_mode) || S_ISLNK(st.st_mode);
+}
+
+/// Flavour of a home whose `release` file names no IMAGE_TYPE: `jdk` when bin/javac is there, `jre`
+/// when it is not but a java binary is (`java_known` skips the second probe when the caller has
+/// already found one), `unmodelled` when neither can be established. Validated by real Debian,
+/// Ubuntu and openSUSE JDK/JRE package captures (tests/unit/fixtures/wave10/runtimes/linux/).
+///
+/// The probe is charged one unit of `budget.entries_left` BEFORE it runs, however many fixed-name
+/// opens it makes (up to four per home: `bin` for javac, then `bin`, `jre` and `jre/bin` for java).
+/// A spent budget answers nullopt after recording `row_cap` and exhausting the walk, exactly as
+/// list_entries does: the caller stops, and the home's flavour is never guessed.
+[[nodiscard]] inline std::optional<JvmFlavour> flavour_from_bin(DIR* home, bool java_known,
+                                                                ConstraintAccumulator& acc,
+                                                                WalkBudget& budget) {
+    if (budget.entries_left == 0) {
+        budget.exhausted = true;
+        acc.add_failure(kTokRowCap);
+        return std::nullopt;
+    }
+    --budget.entries_left;
+    const auto javac = home_has_javac(home, acc);
+    if (!javac) return JvmFlavour::unmodelled;
+    if (*javac) return JvmFlavour::jdk;
+    return (java_known || home_has_java_binary(home, acc)) ? JvmFlavour::jre
+                                                           : JvmFlavour::unmodelled;
 }
 
 /// The mount table at `path` (production: /proc/self/mountinfo) reduced to its network mount
@@ -764,7 +830,9 @@ inline MountScan scan_mounts(const char* path, std::size_t max_total = kMaxMount
 /// neither a `release` file nor a bin/java or jre/bin/java is not a JVM home (silent); one with a
 /// java binary but no `release` (e.g. Ubuntu OpenJDK 8) is a row with an unknown version plus
 /// `release_missing`; an unreadable / oversized / version-less `release` is a recorded constraint.
-/// Symlinked homes are aliases.
+/// Symlinked homes are aliases. The flavour is the release file's IMAGE_TYPE; where that is absent
+/// (Debian, Ubuntu, openSUSE, ...) it is read from the home's bin/ by directory entry (see
+/// flavour_from_bin, which states the opens and the budget charge).
 [[nodiscard]] inline std::vector<std::string> jvm_rows_at(
     const std::filesystem::path& root, yuzu::shared::ConstraintAccumulator& acc,
     const WalkConfig& cfg = {}) {
@@ -786,7 +854,9 @@ inline MountScan scan_mounts(const char* path, std::size_t max_total = kMaxMount
             if (rr.status == ReadStatus::absent) {
                 if (!home_has_java_binary(hh.get(), acc)) continue;
                 acc.add_failure(kTokReleaseMissing);
-                if (!push_row(rows, jvm_row_release_missing(path), budget, acc)) break;
+                const auto flavour = flavour_from_bin(hh.get(), /*java_known=*/true, acc, budget);
+                if (!flavour) break;
+                if (!push_row(rows, jvm_row_release_missing(path, *flavour), budget, acc)) break;
                 continue;
             }
             if (rr.status == ReadStatus::failed) {
@@ -795,12 +865,55 @@ inline MountScan scan_mounts(const char* path, std::size_t max_total = kMaxMount
             }
             const auto fields = parse_release_file(rr.text);
             if (fields.oversized) acc.add_failure(kTokFieldOversized);
-            auto row = jvm_row(fields, path);
+            // A version-less file yields no row (jvm_row): decided before the probe, so it costs
+            // no budget and no bin token.
+            if (fields.java_version.empty() && fields.java_runtime_version.empty()) {
+                acc.add_failure(kTokReleaseUnparsable);
+                continue;
+            }
+            std::optional<JvmFlavour> fallback = JvmFlavour::unmodelled; // IMAGE_TYPE decides
+            if (!has_image_type(fields)) {
+                fallback = flavour_from_bin(hh.get(), /*java_known=*/false, acc, budget);
+                if (!fallback) break;
+            }
+            auto row = jvm_row(fields, path, *fallback);
             if (!row) {
                 acc.add_failure(kTokReleaseUnparsable);
                 continue;
             }
             if (!push_row(rows, std::move(*row), budget, acc)) break;
+        }
+    }
+    return rows;
+}
+
+/// python: single-level listing of <root>/{usr/bin,usr/local/bin,var/usrlocal/bin}; every REGULAR
+/// file named exactly `python3.<minor>` is a row
+/// `python|unmodelled|3.<minor>|/usr/bin/python3.<minor>|-`. A symlink (`python3`, a distro alias),
+/// `python3.12-config`, `python3.12m` and anything else produce nothing.
+/// The version is major.minor from the NAME: the patch level is not read (it would take running the
+/// interpreter), and a missing patch level is a documented limit of this leg, never a constraint
+/// token. The only walk here is the one listing per root, on one WalkBudget shared by all roots.
+[[nodiscard]] inline std::vector<std::string> python_rows_at(
+    const std::filesystem::path& root, yuzu::shared::ConstraintAccumulator& acc,
+    const WalkConfig& cfg = {}) {
+    using namespace walk;
+    std::vector<std::string> rows;
+    WalkBudget budget{cfg.limits};
+    const std::string root_s = root.string();
+    for (const std::string_view rel : kPythonRoots) {
+        if (budget.exhausted) break;
+        const DirHandle dir = open_path(root_s, rel, kPythonRoots, cfg, acc);
+        if (!dir) continue;
+        const std::string logical = "/" + std::string{rel};
+        for (const auto& e : list_entries(dir.get(), acc, budget)) {
+            if (e.type != EntryType::regular) continue;
+            const auto version = python3_minor_from_name(e.name);
+            if (!version) continue;
+            PythonRecord rec;
+            rec.version = *version;
+            rec.install_path = join_logical(logical, e.name);
+            if (!push_row(rows, python_row(rec), budget, acc)) break;
         }
     }
     return rows;
@@ -816,6 +929,7 @@ inline MountScan scan_mounts(const char* path, std::size_t max_total = kMaxMount
     switch (a) {
     case Action::dotnet: return dotnet_rows_at(root, acc, cfg);
     case Action::jvm:    return jvm_rows_at(root, acc, cfg);
+    case Action::python: return python_rows_at(root, acc, cfg);
     }
     acc.add_failure("internal_error");
     return {};

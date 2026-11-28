@@ -41,14 +41,17 @@
 ///    read. See ADR-0039.
 
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
+#include "bounded_audit_budget.hpp"
 #include "response_tier_filter.hpp"
 
 namespace yuzu {
@@ -124,6 +127,22 @@ inline constexpr const char* kFacetDropBatchFailed = "batch_failed";
 /// server exports the series. Called once at startup from `ServerImpl`.
 void seed_response_facet_metrics(yuzu::MetricsRegistry& m);
 
+/// What `ResponseStore::store` did with a frame. A refusal of a TERMINAL frame by the per-pair cap
+/// is separate from a refusal of a non-terminal one: the first leaves the pair's terminal answer
+/// durable (the cap admits only while no terminal row exists), the second drops a frame whose
+/// output may carry membership.
+enum class StoreOutcome {
+    Stored,         ///< the frame is persisted
+    CappedTerminal, ///< a terminal frame the cap refused: the pair already holds a terminal row
+    CappedRunning,  ///< a non-terminal frame the cap refused: its output is not stored
+    Failed          ///< not persisted (store closed, a NUL in an identity field, or the transaction)
+};
+
+/// True when nothing the frame carried is lost: it is stored, or it is a refused terminal frame.
+[[nodiscard]] constexpr bool store_outcome_durable(StoreOutcome o) noexcept {
+    return o == StoreOutcome::Stored || o == StoreOutcome::CappedTerminal;
+}
+
 struct StoredResponse {
     int64_t id{0};
     std::string instruction_id;
@@ -182,6 +201,35 @@ struct ResponseQuery {
     std::optional<int64_t> until;
     int limit{100};
     int offset{0};
+    /// `query_by_execution` only: continue a newest-first read past the row with this
+    /// (`timestamp`, `id`), the last row of the previous page. Only rows that sort after it in
+    /// that read's order (`timestamp DESC, id DESC`) are returned, so a page boundary inside a
+    /// tied timestamp, or a row reaped between two pages, never skips or repeats a row (an
+    /// `offset` walk can do both). The other reads do not honour it.
+    std::optional<std::pair<int64_t, int64_t>> continue_after;
+    /// `query_bounded` only: rank candidate rows by `id DESC` alone instead of `timestamp DESC,
+    /// id DESC`. The live poll sets it because ids are the one order its reducer trusts (the
+    /// stored timestamp is the server's receipt time in epoch seconds, and it can step backwards
+    /// on a server clock step or across replicas), so the newest ROW (a separately inserted
+    /// terminal row, when the chunks were not finalized in place) survives the row limit and the
+    /// byte cut. Only the ranking changes: the WHERE
+    /// clause, the scope clause and the tier clause are untouched. For a fresh per-command poll
+    /// only: on a very large, old `instruction_id` the planner can pick a backward primary-key
+    /// scan, which is slow (measured 267 ms warm over 1.9 M rows) though still correct. The
+    /// other reads do not honour it.
+    bool order_by_id{false};
+    /// `query_bounded` only: also return `BoundedResponses::facts`, four facts computed over EVERY
+    /// row the query's WHERE admits (the same predicates, scope clause and tier clause as the row
+    /// read, so a `status`, `since` or `until` filter narrows the facts exactly as it narrows the
+    /// rows), not only over the rows that survive the row limit and the byte cut. The live poll
+    /// sets it so a stored device failure, a terminal row and an `error|` head chunk are still seen
+    /// when later rows push the older ones out of the bounded read. Facts are PER AGENT: with an
+    /// empty `agent_id` the WHERE would span every agent, so the store returns no facts then.
+    /// Cost: three scans of the (instruction_id, agent_id) pair, so O(rows of the pair), bounded by
+    /// `--response-max-rows-per-agent` (default 256: about 1 ms a read; measured about 110 ms at
+    /// the 65536 maximum). Other callers, and every caller that leaves it false, get byte-identical
+    /// SQL and no facts.
+    bool with_decision_facts{false};
 };
 
 /// Management-group scope filter for `aggregate()`, `query()`, and
@@ -207,6 +255,28 @@ struct ResponseQuery {
 ///                           sink for a corrupt RBAC store / a store-read error).
 using AggregateScope = std::optional<std::vector<std::string>>;
 
+/// Text longer than this many CHARACTERS is cut by the store in `BoundedFacts` (a decision fact
+/// needs a bounded prefix, never a whole row).
+inline constexpr int kBoundedFactsTextChars = 256;
+
+/// Decision facts over every row the query's WHERE admits (see `ResponseQuery::with_decision_facts`).
+/// The row limit and the byte cut never change them: each is computed in SQL before the cut, over
+/// the rows the scope and tier clauses admit, so a row the caller may not read cannot affect them.
+struct BoundedFacts {
+    /// Some permitted row has status >= 2 (a failure).
+    bool any_failed{false};
+    /// Some permitted row has status >= 1 (a success or a failure: the command finished). The poll's
+    /// rule on purpose: the store's own cap probe treats `status <> 0` as terminal, so a negative
+    /// status is terminal there and not here.
+    bool any_terminal{false};
+    /// `error_detail` of the NEWEST failing row by id, cut to `kBoundedFactsTextChars` characters;
+    /// empty when none failed.
+    std::string failed_detail;
+    /// `output` of the OLDEST permitted row whose output is non-empty, cut to
+    /// `kBoundedFactsTextChars` characters; empty when no row has output.
+    std::string head_output;
+};
+
 /// Result of `ResponseStore::query_bounded()`: the kept rows plus WHY any rows were
 /// left out. Both flags can be true at once (a byte cut inside a result that also
 /// exceeded the row limit); a caller that needs one cause reports `byte_cap_hit`
@@ -225,6 +295,8 @@ struct BoundedResponses {
     /// `meta` columns). Observability and a test seam for the byte bound; not a request
     /// limit. 0 when the query returned no rows.
     std::size_t result_bytes{0};
+    /// Set only when `ResponseQuery::with_decision_facts` was true.
+    std::optional<BoundedFacts> facts;
 };
 
 enum class AggregateOp { Count, Sum, Avg, Min, Max };
@@ -244,6 +316,15 @@ struct AggregationResult {
 /// Default retention (days) — matches the pre-migration SQLite default.
 inline constexpr int kDefaultResponseRetentionDays = 90;
 
+/// Default rows per (instruction_id, agent_id) pair (#561): about 16 MiB at the agent's
+/// ~64 KiB flush size; see response_cap_rules.hpp.
+inline constexpr int kDefaultResponseMaxRowsPerAgent = 256;
+
+/// The cap-refusal warning budget treats two keys that share this many leading bytes as ONE agent,
+/// so it covers a whole agent id (auth::kMaxAgentIdLength, 256; asserted in response_store.cpp
+/// where both are visible).
+inline constexpr std::size_t kCapLogBudgetKeyBytes = 256;
+
 class ResponseStore {
 public:
     /// Borrows the shared pool and runs the `response_store` schema
@@ -257,7 +338,8 @@ public:
     /// (`AuditStore::cleanup_once`'s `#2360/1d` shape), so `now_fn` can
     /// never move a reap verdict.
     explicit ResponseStore(pg::PgPool& pool, int retention_days = kDefaultResponseRetentionDays,
-                           std::function<int64_t()> now_fn = nullptr);
+                           std::function<int64_t()> now_fn = nullptr,
+                           int max_rows_per_agent = kDefaultResponseMaxRowsPerAgent);
 
     ResponseStore(const ResponseStore&) = delete;
     ResponseStore& operator=(const ResponseStore&) = delete;
@@ -293,7 +375,16 @@ public:
     /// transaction on any failed statement, unlike SQLite — the ADR-0038
     /// lesson); only the response INSERT itself failing aborts the whole
     /// call.
-    void store(const StoredResponse& resp);
+    ///
+    /// Two independent bounds: per-row bytes (kMaxIngestBytes) and per-pair rows
+    /// (max_rows_per_agent, #561); refused frames count on
+    /// yuzu_server_response_ingest_dropped_total{reason="per_agent_cap"}, and a refusal marks
+    /// the pair's newest retained row (the one before the gap) so a reader can tell the tail
+    /// was dropped.
+    /// Exact semantics: response_cap_rules.hpp.
+    /// Returns the outcome (see `StoreOutcome`; `store_outcome_durable` is the one-bit view the
+    /// ingest sites record as a lost answer). Callers that do not need it may ignore it.
+    StoreOutcome store(const StoredResponse& resp);
 
     /// Tri-state outcome of `finalize_terminal_status` so callers can
     /// distinguish "we updated rows in place" from "no matching RUNNING
@@ -328,6 +419,17 @@ public:
                                             const std::string& error_detail,
                                             const std::string& execution_id,
                                             int plugin_result_status);
+
+    /// Shortens the lifetime of the rows stored for `instruction_id` from `agent_id` so they expire
+    /// `keep` from now: one UPDATE of `ttl_expires_at` to the store's own clock (the source
+    /// `compute_ttl_epoch` uses) plus `keep`, only where the row has a LATER expiry, so it never
+    /// extends a lifetime and never gives a row kept forever (`ttl_expires_at = 0`, a server set to
+    /// keep responses forever) an expiry: such a row is left alone. For the quarantine
+    /// reconciler's recurring status replies, which would otherwise accumulate at the default
+    /// retention (#7627). Bounded acquire; returns false on any failure (the rows then keep the
+    /// lifetime they had). Not a read.
+    [[nodiscard]] bool shorten_ttl(const std::string& instruction_id, const std::string& agent_id,
+                                   std::chrono::seconds keep);
 
     // -- Reads: the Forensics tier (#4990) -------------------------------------------------------
     //
@@ -369,9 +471,12 @@ public:
     ///   2. only rows whose PRECEDING cumulative size is still below the cap are joined
     ///      back to fetch the full columns (the first row is always kept, so a single row
     ///      larger than the cap still makes progress).
-    /// Export order is `timestamp DESC, id DESC` (the id tiebreak makes the cut
-    /// deterministic; `query()` orders by timestamp alone, so rows with equal timestamps can come
-    /// back in a different order from the list routes). `q.offset` is ignored. A
+    /// Export order is `timestamp DESC, id DESC` (the id tiebreak makes the cut deterministic),
+    /// or `id DESC` alone when `q.order_by_id` is set. `query()` orders by timestamp alone, so
+    /// rows with equal timestamps can come back in a different order from the list routes.
+    /// With `q.with_decision_facts` (and a non-empty `q.agent_id`) the same statement also computes
+    /// `BoundedResponses::facts` over all rows the WHERE admits, before the cut.
+    /// `q.offset` is ignored. A
     /// concurrent delete between the two steps is one statement, so the snapshot is
     /// consistent. Returns nullopt on store-degraded, exactly like `query()`.
     [[nodiscard]] std::optional<BoundedResponses>
@@ -382,6 +487,7 @@ public:
     /// `execution_id` is rejected (returns an engaged empty vector, NOT
     /// nullopt) — that sentinel is the legacy path; callers must fall back
     /// to `query()` if they support pre-PR-2 data. `scope`: see `query()`.
+    /// Order is `timestamp DESC, id DESC` (total); `q.continue_after` pages it by keyset.
     [[nodiscard]] std::optional<std::vector<StoredResponse>>
     query_by_execution(const std::string& execution_id, const ResponseTierFilter& tier,
                        const ResponseQuery& q = {},
@@ -526,6 +632,14 @@ private:
     std::atomic<uint64_t> responses_reaped_{0};
     std::atomic<uint64_t> facets_predrained_{0};
     std::function<int64_t()> now_fn_; // test seam only; see ctor doc
+    // Rows per (instruction_id, agent_id) pair before store() refuses (#561). Callers pass >= 1
+    // (the flag's CLI::Range enforces it). No public accessor: the read tripwire freezes the
+    // public method list.
+    int max_rows_per_agent_;
+    // Bounds the cap-refusal WARN line per agent (the counter is unsampled). Keys are agent ids,
+    // so the key bound is kCapLogBudgetKeyBytes (the agent-id limit).
+    DenialAuditBudget cap_log_budget_{kDefaultAuditMaxRows, kDefaultAuditWindowMs, {},
+                                      kDefaultAuditMaxKeys, kCapLogBudgetKeyBytes};
 
     int64_t compute_ttl_epoch() const;
 };

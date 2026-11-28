@@ -1,14 +1,22 @@
-captured: windows Windows 11 Pro 10.0.26200 · bare-metal · 2026-09-07 · interactive user (elevated) · leg-hash 3abb2323b0be
+captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-11-04 · NT SERVICE virtual service account (not an administrator) · leg-hash a036c570424f
 == action=smart
-smart|PhysicalDrive0|Samsung SSD 970 EVO Plus 250GB|nvme|ssd|ok|5|100|-
-smart|PhysicalDrive1|Samsung SSD 970 EVO Plus 1TB|nvme|ssd|ok|1|100|-
+smart|PhysicalDrive0|KINGSTON OM8TAP41024K1-A00|nvme|ssd|ok|0|100|-
 [result_status] UNDECLARED / UNKNOWN / 
 
 == action=volumes
-volume|//?/Volume{0a35801e-3f40-4114-a073-3d7ea1dd7664}/|-|PhysicalDrive0|NTFS|524288000|-
-volume|//?/Volume{c9a5f911-4689-41b2-b774-5b0e25b60e10}/|C:/|PhysicalDrive0|NTFS|248158093312|-
-volume|//?/Volume{daa59534-884a-4ce4-8fc8-4244f7bbe7ae}/|-|PhysicalDrive0|NTFS|967835648|-
-volume|//?/Volume{785383ef-b682-41d9-9b28-27c4b8882d65}/|D:/|PhysicalDrive1|NTFS|1000187363328|-
-volume|//?/Volume{b188886e-39bb-4915-a893-d61a3ca3c707}/|-|PhysicalDrive0|FAT32|272629760|-
+volume|//?/Volume{f0d50cbb-4686-4831-8413-6819dc7636e6}/|C:/|PhysicalDrive0|NTFS|1021818437632|-
+volume|//?/Volume{65a27b4e-fa40-42ef-9a10-e7a2e3d6ad7e}/|-|PhysicalDrive0|NTFS|1299185664|-
+volume|//?/Volume{b084ef68-3082-4402-9bd7-ec218bbe28a5}/|-|PhysicalDrive0|FAT32|1073741824|-
 [result_status] UNDECLARED / UNKNOWN / 
+
+== action=partitions
+status|partitions|supported|-
+partition|PhysicalDrive0|Disk #0, Partition #0|1073741824|GPT: System|-|wmi
+partition|PhysicalDrive0|Disk #0, Partition #1|1021818437632|GPT: Basic Data|C:/|wmi
+partition|PhysicalDrive0|Disk #0, Partition #2|1299185664|GPT: Unknown|-|wmi
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=topology
+status|topology|unsupported|windows:planned
+[result_status] UNAVAILABLE / UNKNOWN / windows:planned
 

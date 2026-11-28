@@ -118,8 +118,8 @@ TEST_CASE("TestRouteSink: media type follows httplib's extract_media_type rules"
         CHECK(p.saw_param);
     }
     SECTION("a whitespace-padded value cannot be injected at all — set_header drops it") {
-        // NOT a media-type rule: httplib::Request::set_header (httplib.h:9436)
-        // silently discards any value failing is_field_value, and surrounding
+        // NOT a media-type rule: httplib::Request::set_header (httplib.h v0.59.0:8185-8188, 10267)
+        // silently discards any value failing is_field_valid, and surrounding
         // whitespace fails it. On the wire httplib trims the value long before
         // set_header, so this padding is unreachable in production — the sink
         // ends up with NO Content-Type and therefore does not parse the body.

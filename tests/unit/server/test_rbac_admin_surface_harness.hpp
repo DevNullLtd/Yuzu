@@ -33,8 +33,10 @@
 #include "mcp_jsonrpc.hpp" // mcp::kApprovalRequired — the ticket-then-recall dance
 #include "mcp_server.hpp"
 #include "mfa_step_up.hpp" // StepUpFn — A1's PUT /api/v1/rbac/enforcement calls it
+#include "pg/pg_exec.hpp"   // RealSessions::elevated_rows
 #include "rbac_store.hpp"
 #include "rest_api_v1.hpp"
+#include "session_store.hpp"
 #include "test_route_sink.hpp"
 
 #include "test_approval_manager_pg_helper.hpp"
@@ -43,9 +45,13 @@
 #include <catch2/catch_test_macros.hpp>
 #include <nlohmann/json.hpp>
 
+#include <libpq-fe.h>
+
 #include <httplib.h>
 #include <yuzu/metrics.hpp>
+#include <yuzu/server/auth.hpp>
 
+#include <chrono>
 #include <functional>
 #include <memory>
 #include <string>
@@ -105,6 +111,57 @@ struct RbacRoleHarness {
     yuzu::test::AuthDbPg auth_db;
     RbacStoreOnAuthPool rbac{auth_db.pool()};
     yuzu::test::ApprovalManagerPg appr;
+    /// A real durable `SessionStore` on the SAME pool plus an `AuthManager` over it, for the
+    /// tests that need an unassign to find LIVE elevations to clear. Absent by default:
+    /// every other user of this harness has no `session_store` schema and an Administrator
+    /// unassign that succeeds is not part of its test. `use_real_sessions()` creates it.
+    struct RealSessions {
+        yuzu::server::SessionStore store;
+        yuzu::server::auth::AuthManager mgr;
+        yuzu::test::AuthDbPg& db;
+        RealSessions(yuzu::test::AuthDbPg& d, RbacStoreOnAuthPool& rbac) : store(d.pool()), db(d) {
+            REQUIRE(store.is_open());
+            mgr.set_auth_db(d.get());
+            mgr.set_session_store(&store);
+            mgr.set_rbac_store(rbac.get());
+        }
+        ~RealSessions() {
+            mgr.set_rbac_store(nullptr);
+            mgr.set_session_store(nullptr);
+            mgr.set_auth_db(nullptr);
+        }
+        RealSessions(const RealSessions&) = delete;
+        RealSessions& operator=(const RealSessions&) = delete;
+
+        /// Gives `user` (created if absent) `n` durable sessions that each hold a live JIT
+        /// elevation, and returns how many durable session rows now carry one.
+        int seed_elevated(const std::string& user, int n) {
+            (void)db->upsert_user(user, "hash", "salt", yuzu::server::auth::Role::user);
+            for (int i = 0; i < n; ++i) {
+                const auto token = mgr.create_local_session_for_test(
+                    user, yuzu::server::auth::Role::user, false);
+                REQUIRE_FALSE(token.empty());
+                REQUIRE(mgr.elevate_session(token, std::chrono::seconds(300)).has_value());
+            }
+            return elevated_rows(user);
+        }
+        /// Durable `session_store.sessions` rows of `user` whose elevation is set.
+        int elevated_rows(const std::string& user) {
+            auto lease = db.pool().acquire();
+            REQUIRE(lease);
+            auto r = yuzu::server::pg::exec_params(
+                lease.get(),
+                "SELECT 1 FROM session_store.sessions WHERE username = $1 AND elevated_until_ms <> 0",
+                std::vector<std::string>{user});
+            return PQntuples(r.get());
+        }
+    };
+    std::unique_ptr<RealSessions> sessions;
+    RealSessions& use_real_sessions() {
+        if (!sessions)
+            sessions = std::make_unique<RealSessions>(auth_db, rbac);
+        return *sessions;
+    }
     // Optional Guardian stores on the SAME database as auth_db/rbac, constructed from the
     // `guardian_stores` argument. Null under the default `kNone`.
     std::unique_ptr<yuzu::server::GuaranteedStateStore> guardian_store;
@@ -170,6 +227,23 @@ struct RbacRoleHarness {
     // Mirrors test_mcp_server.cpp's `ts.metrics_for_test = &reg` idiom.
     yuzu::MetricsRegistry metrics;
 
+    /// The session this harness hands a route: the `session_*` fields above plus `tier` as the
+    /// mcp_tier. The ONE place the field list lives.
+    yuzu::server::auth::Session session_with_tier(const std::string& tier) const {
+        yuzu::server::auth::Session s;
+        s.username = session_user;
+        s.token_scope_service = session_token_scope_service;
+        s.principal_kind = session_principal_kind;
+        s.auth_source = session_auth_source;
+        s.mcp_tier = tier;
+        return s;
+    }
+    /// The session the REST routes see (`rest_session_mcp_tier`), for a test that must ask a
+    /// helper about exactly the caller the route is given.
+    yuzu::server::auth::Session rest_session() const {
+        return session_with_tier(rest_session_mcp_tier);
+    }
+
     yuzu::server::RestApiV1 api;
     yuzu::server::mcp::McpServer mcp;
     yuzu::server::mcp::McpServer::HandlerFn mcp_handler;
@@ -205,15 +279,7 @@ struct RbacRoleHarness {
         // MCP each pass their OWN member (`rest_session_mcp_tier` /
         // `session_mcp_tier`) so the two transports can never accidentally
         // share one convention again (#520/Doomgoose PR #4985 round-2).
-        auto session_of = [this](const std::string& tier) {
-            yuzu::server::auth::Session s;
-            s.username = session_user;
-            s.token_scope_service = session_token_scope_service;
-            s.principal_kind = session_principal_kind;
-            s.auth_source = session_auth_source;
-            s.mcp_tier = tier;
-            return s;
-        };
+        auto session_of = [this](const std::string& tier) { return session_with_tier(tier); };
 
         auto rest_auth_fn = [this, session_of](const httplib::Request&,
                                                httplib::Response&) -> std::optional<yuzu::server::auth::Session> {

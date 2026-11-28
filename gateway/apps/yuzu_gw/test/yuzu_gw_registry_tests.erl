@@ -22,7 +22,6 @@ registry_test_() ->
       {"register and lookup", fun register_and_lookup/0},
       {"lookup missing returns error", fun lookup_missing/0},
       {"deregister removes entry", fun deregister_removes/0},
-      {"monitor auto-cleans on process death", fun monitor_cleanup/0},
       {"re-register same agent_id replaces old", fun reregister_replaces/0},
       {"all_agents returns all ids", fun all_agents_list/0},
       {"agent_count is accurate", fun agent_count_accurate/0},
@@ -38,6 +37,8 @@ registry_test_() ->
       {"lookup dead process returns error", fun lookup_dead_process/0},
       %% Pending registration tests
       {"store_pending and take_pending round-trip", fun pending_store_take/0},
+      {"an empty session id is never stored or taken as a pending key",
+       fun pending_empty_key_refused/0},
       {"take_pending returns undefined for unknown session", fun pending_take_unknown/0},
       {"take_pending deletes entry atomically", fun pending_take_deletes/0},
       {"take_pending: exactly one winner under concurrent racers (PR #4299 round 6)",
@@ -71,6 +72,122 @@ cleanup(_) ->
     %% Don't stop the registry — other test suites share it.
     ok.
 
+%% GW-REGISTRY-OWNER-DOWN-001: the registry module's "ETS" and "Cost per
+%% agent" contracts. lookup/1 filters dead PIDs independently of cleanup, so
+%% an error from lookup alone cannot prove the registry handled its DOWN.
+registry_owner_down_lifecycle_test_() ->
+    {setup, fun owner_down_setup/0, fun owner_down_cleanup/1,
+     fun(Fixture) ->
+         {"GW-REGISTRY-OWNER-DOWN-001: remove owned rows, preserve peers, register again",
+          {timeout, 10, fun() -> owner_down_lifecycle(Fixture) end}}
+     end}.
+
+owner_down_setup() ->
+    %% The normal module run may already have a registry. Never replace it or
+    %% claim its resources; the exact-generator run owns the one it starts.
+    Keys = [conn_index, pending_index, max_sessions_per_connection, session_limit_warn],
+    Saved = [{K, persistent_term:get({yuzu_gw_registry, K}, undefined)} || K <- Keys],
+    Stamp = case proplists:get_value(session_limit_warn, Saved) of
+        undefined -> undefined;
+        Ref -> {Ref, atomics:get(Ref, 1)}
+    end,
+    PreviousRegistry = whereis(yuzu_gw_registry),
+    ok = yuzu_gw_test_registry:ensure(),
+    Registry = whereis(yuzu_gw_registry),
+    %% ensure/0 waits out stale ETS owners and replaces leaked mock processes.
+    %% Only stop a replacement linked to this fixture: another concurrent
+    %% setup may have won the shared helper's start race.
+    {links, Links} = process_info(Registry, links),
+    Owned = Registry =/= PreviousRegistry andalso lists:member(self(), Links),
+    Salt = integer_to_binary(erlang:unique_integer([positive, monotonic])),
+    #{registry => Registry, owned => Owned, saved => Saved, stamp => Stamp,
+      actors => [spawn_dummy(), spawn_dummy(), spawn_dummy()],
+      ids => [<<"yuzu_test_owner_down_", Salt/binary>>,
+              <<"yuzu_test_owner_control_", Salt/binary>>],
+      sessions => [<<"yuzu_test_dead_", Salt/binary>>,
+                   <<"yuzu_test_control_", Salt/binary>>,
+                   <<"yuzu_test_replacement_", Salt/binary>>]}.
+
+owner_down_cleanup(#{registry := Registry, owned := Owned, saved := Saved,
+                     stamp := Stamp, actors := Actors, ids := Ids}) ->
+    try
+        %% Unfenced cleanup removes only our unique IDs, even when the test
+        %% failed before its owner-DOWN observation. Await the casts before
+        %% ending the actors, so cleanup does not rely on the tested handler.
+        try
+            [yuzu_gw_registry:deregister_agent(Id) || Id <- Ids],
+            _ = sys:get_state(Registry, 2000)
+        after
+            [owner_down_stop_actor(Pid) || Pid <- Actors]
+        end
+    after
+        case Owned of
+            false -> ok;
+            true ->
+                try gen_server:stop(Registry, normal, 2000)
+                after
+                    [case Value of
+                         undefined -> persistent_term:erase({yuzu_gw_registry, K});
+                         _ -> persistent_term:put({yuzu_gw_registry, K}, Value)
+                     end || {K, Value} <- Saved],
+                    case Stamp of
+                        undefined -> ok;
+                        {Ref, Value} -> atomics:put(Ref, 1, Value)
+                    end
+                end
+        end
+    end.
+
+owner_down_stop_actor(Pid) ->
+    Ref = monitor(process, Pid),
+    exit(Pid, kill),
+    receive {'DOWN', Ref, process, Pid, _} -> ok
+    after 2000 -> demonitor(Ref, [flush]), error({owner_down_actor_did_not_stop, Pid})
+    end.
+
+owner_down_lifecycle(#{registry := Registry, actors := [Victim, Control, Replacement],
+                       ids := [Id, ControlId], sessions := [Session, ControlSession, NewSession]}) ->
+    ?assertEqual(Registry, ets:info(yuzu_gw_agents, owner)),
+    ?assertEqual(Registry, ets:info(yuzu_gw_sessions, owner)),
+    Index = persistent_term:get({yuzu_gw_registry, conn_index}),
+    ?assertEqual(Registry, ets:info(Index, owner)),
+    Request = #{agent_id => Id, hostname => <<"owner-down-host">>},
+    ok = yuzu_gw_registry:register_agent(Id, Victim, Session, [<<"svc">>],
+                                        <<"owner-down-host">>, Request, Victim),
+    ok = yuzu_gw_registry:register_agent(ControlId, Control, ControlSession, [],
+                                        <<"live-control">>, #{}, Control),
+    ?assertMatch({[{Id, Victim, _, Session, [<<"svc">>], _, <<"owner-down-host">>, Request}],
+                  [{Session, Id, Victim, Victim}], [{Victim, Id, Session}]},
+                 owner_down_rows(Id, Session, Victim, Index)),
+    ControlRows = owner_down_rows(ControlId, ControlSession, Control, Index),
+    ?assertMatch({[_], [_], [_]}, ControlRows),
+
+    owner_down_stop_actor(Victim),
+    %% This observes the owner's writes, not a liveness filter. The registry's
+    %% DOWN and our monitor notification are independent, hence the bounded wait.
+    ?assertEqual({[], [], []}, await(fun() ->
+        owner_down_rows(Id, Session, Victim, Index)
+    end, {[], [], []})),
+    ?assertEqual(ControlRows, owner_down_rows(ControlId, ControlSession, Control, Index)),
+    ?assertEqual({ok, Control}, yuzu_gw_registry:lookup(ControlId)),
+
+    ok = yuzu_gw_registry:register_agent(Id, Replacement, NewSession, [<<"svc">>],
+                                        <<"owner-down-host">>, Request, Replacement),
+    ?assertMatch({[{Id, Replacement, _, NewSession, [<<"svc">>], _,
+                   <<"owner-down-host">>, Request}],
+                  [{NewSession, Id, Replacement, Replacement}],
+                  [{Replacement, Id, NewSession}]},
+                 owner_down_rows(Id, NewSession, Replacement, Index)),
+    ?assertEqual([], ets:lookup(yuzu_gw_sessions, Session)),
+    ?assertEqual({ok, Replacement}, yuzu_gw_registry:lookup(Id)),
+    ?assertEqual(Registry, whereis(yuzu_gw_registry)),
+    ?assert(is_process_alive(Registry)),
+    ?assertEqual(ControlRows, owner_down_rows(ControlId, ControlSession, Control, Index)).
+
+owner_down_rows(Id, Session, Connection, Index) ->
+    {ets:lookup(yuzu_gw_agents, Id), ets:lookup(yuzu_gw_sessions, Session),
+     ets:lookup(Index, Connection)}.
+
 %%%===================================================================
 %%% Correctness tests
 %%%===================================================================
@@ -92,14 +209,6 @@ deregister_removes() ->
     registry_barrier(),  %% the deregister cast is async
     ?assertEqual(error, yuzu_gw_registry:lookup(<<"agent-2">>)),
     kill_dummy(Pid).
-
-monitor_cleanup() ->
-    Pid = spawn_dummy(),
-    ok = yuzu_gw_registry:register_agent(<<"agent-3">>, Pid, <<"s">>, [], <<>>),
-    ?assertMatch({ok, _}, yuzu_gw_registry:lookup(<<"agent-3">>)),
-    %% Kill the process — registry should auto-clean via DOWN monitor.
-    kill_dummy(Pid),
-    ?assertEqual(error, await(fun() -> yuzu_gw_registry:lookup(<<"agent-3">>) end, error)).
 
 reregister_replaces() ->
     Pid1 = spawn_dummy(),
@@ -233,6 +342,15 @@ lookup_dead_process() ->
 %%%===================================================================
 %%% Pending registration tests
 %%%===================================================================
+
+pending_empty_key_refused() ->
+    Info = #{agent_id => <<"a-empty">>, agent_info => #{}, peer_addr => <<"1.2.3.4">>},
+    ?assertEqual({error, invalid_session}, yuzu_gw_registry:store_pending(<<>>, Info)),
+    ?assertEqual(undefined, yuzu_gw_registry:take_pending(<<>>)),
+    %% even a row planted directly under <<>> is not handed out
+    ets:insert(yuzu_gw_pending, {<<>>, Info, erlang:monotonic_time(millisecond)}),
+    ?assertEqual(undefined, yuzu_gw_registry:take_pending(<<>>)),
+    ets:delete(yuzu_gw_pending, <<>>).
 
 pending_store_take() ->
     Info = #{agent_id => <<"pending-1">>, peer_addr => <<"1.2.3.4">>},

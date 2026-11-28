@@ -55,6 +55,7 @@
 
 #if defined(_WIN32)
 
+#include <win_rsmb.hpp>     // yuzu::shared::rsmb::read_rsmb_table (agents/shared)
 #include <wmi_bounded.hpp> // yuzu::shared::wmi bounded WMI query (agents/shared)
 
 #ifndef WIN32_LEAN_AND_MEAN
@@ -103,18 +104,6 @@ namespace yuzu::firmware_posture {
 
 namespace {
 
-// 'RSMB' as the little-endian DWORD GetSystemFirmwareTable takes (a
-// multi-character literal is implementation-defined, so spell the value).
-constexpr DWORD kRsmbProvider = 0x52534D42;
-
-// A real RawSMBIOSData table is tens of KiB; refuse anything an order of
-// magnitude past that rather than allocate whatever a broken provider claims.
-constexpr std::size_t kMaxSmbiosBytes = 1u << 20; // 1 MiB
-
-// The table can change size between the probe and the fill (rare: a
-// hot-plug SMBIOS update). Retry the pair a bounded number of times.
-constexpr int kMaxSmbiosAttempts = 3;
-
 // ── wmi ──────────────────────────────────────────────────────────────────
 
 void collect_wmi(FirmwareReport& report) {
@@ -150,44 +139,31 @@ void smbios_call_failed(FirmwareReport& report, DWORD err) {
 }
 
 void collect_smbios(FirmwareReport& report) {
-    std::vector<std::uint8_t> table;
-    for (int attempt = 0; attempt < kMaxSmbiosAttempts; ++attempt) {
-        // rung 1: in-process
-        // GetSystemFirmwareTable size probe (buffer NULL, size 0 -> returns
-        // the required byte count, or 0 with GetLastError set).
-        const UINT need = ::GetSystemFirmwareTable(kRsmbProvider, 0, nullptr, 0);
-        if (need == 0) {
-            smbios_call_failed(report, ::GetLastError());
-            return;
-        }
-        if (need > kMaxSmbiosBytes) {
-            report.fail_all(kSmbiosFields, kSrcSmbios, "smbios:oversized");
-            return;
-        }
-
-        table.assign(need, 0);
-        // The fill call returns the bytes written, or the (larger) required
-        // size if the table grew since the probe, or 0 on failure.
-        const UINT got = ::GetSystemFirmwareTable(kRsmbProvider, 0, table.data(), need);
-        if (got == 0) {
-            smbios_call_failed(report, ::GetLastError());
-            return;
-        }
-        if (got > need)
-            continue; // grew between the two calls: probe again
-        table.resize(got);
-
-        const Smbios0Result r = parse_smbios_type0(std::span<const std::uint8_t>{table});
-        if (r.constrained)
-            report.fail_all(kSmbiosFields, kSrcSmbios, r.token); // smbios:truncated|malformed|no_type0
-        else {
-            std::vector<std::string> partial; // smbios:<field>:partial (half-specified release pair)
-            report.add_all(smbios_rows(r.data, kSrcSmbios, &partial));
-            for (const auto& t : partial) report.note_failure(t);
-        }
+    // rung 1: in-process. The probe/fill/retry loop is the shared reader (agents/shared/
+    // win_rsmb.hpp, also used by the hardware plugin); the failure mapping below stays here.
+    const yuzu::shared::rsmb::RsmbRead read = yuzu::shared::rsmb::read_rsmb_table();
+    switch (read.error) {
+    case yuzu::shared::rsmb::ReadError::none:
+        break;
+    case yuzu::shared::rsmb::ReadError::call_failed:
+        smbios_call_failed(report, static_cast<DWORD>(read.win32_error));
+        return;
+    case yuzu::shared::rsmb::ReadError::oversized:
+        report.fail_all(kSmbiosFields, kSrcSmbios, "smbios:oversized");
+        return;
+    case yuzu::shared::rsmb::ReadError::size_race:
+        report.fail_all(kSmbiosFields, kSrcSmbios, "smbios:size_race");
         return;
     }
-    report.fail_all(kSmbiosFields, kSrcSmbios, "smbios:size_race");
+
+    const Smbios0Result r = parse_smbios_type0(std::span<const std::uint8_t>{read.bytes});
+    if (r.constrained)
+        report.fail_all(kSmbiosFields, kSrcSmbios, r.token); // smbios:truncated|malformed|no_type0
+    else {
+        std::vector<std::string> partial; // smbios:<field>:partial (half-specified release pair)
+        report.add_all(smbios_rows(r.data, kSrcSmbios, &partial));
+        for (const auto& t : partial) report.note_failure(t);
+    }
 }
 
 } // namespace

@@ -1,15 +1,31 @@
-# High Availability Architecture
-
 ---
 status: accepted
 owner: Fraser Jarvis (@fjarvis)
 ---
 
+# High Availability Architecture
+
 **Authors:** Fraser Jarvis (@fjarvis)
+
+> **Amendment pending: ADR-0073 (liveness-only heartbeat, proposed 2026-10-29, PR #6704).** ADR-0073
+> D14 replaces the gateway's replay of the stored `RegisterRequest` through `ProxyRegister` (the WS-4
+> replay path described below) with an id-only `GatewayUpstream.ProxyReattach`; the gateway then keeps
+> no `RegisterRequest`. The `ProxyRegister` replay branch stays only for an agent the server has no
+> registration record for. Nothing has changed in the product yet: until ADR-0073 is Accepted and
+> lands, this ADR describes what ships.
 **Review:** hardened after adversarial review by the `enterprise-architect` validator and
 `gpt-5.6-sol` (both read the codebase), then revised again per the PR #3320 `CHANGES_REQUESTED`
 review; see *Guarantees and non-guarantees*, *Deployment topology and replication axes*, and the two
 *Review findings incorporated* rounds below.
+
+> **Implementation state (2026-11-14, against dev @ 2c49b4ea0).** Partially implemented; one server
+> replica is still the only supported shape. `LeaderElector` (`leader_elector.{hpp,cpp}`) is built
+> and constructed at boot in `server.cpp`, and the singleton-loop gate (`leader_gate.hpp`, classes
+> from `background_jobs.hpp`) is wired at five `leader_gate_permits` sites: `ca.publish_crl`,
+> `policy_evaluator.dispatch_due`, `quarantine_reconciler.tick`, `command_outbox.deliver` and
+> `schedule_runner.tick`. The **safe-to-scale gate is not lifted**: the per-workstream status and
+> the open gate clauses are in `docs/ha-delivery-matrix.md`, which tracks what ships (this ADR
+> wins on conflict about the decisions).
 
 ## Context
 
@@ -30,9 +46,13 @@ be scoped to any single customer, and we must **not assume the customer runs HA 
 Three groundwork facts make this tractable rather than a rewrite:
 
 1. **The Erlang gateway already clusters** (OTP `pg` process groups, ETS registry) and already
-   tolerates *server* failover — on upstream reconnect it re-proxies a `ProxyRegister` for every
-   held agent because the new server "may be a fresh instance with an empty registry"
-   (`yuzu_gw_upstream.erl`). **But** per-agent *targeted* routing is today a **node-local ETS lookup**
+   tolerates *server* failover — it re-proxies a `ProxyRegister` for the agents a restarted or
+   replaced server no longer knows, because the new server may be a fresh instance with an empty registry.
+   Since #5695 that replay is evidence-driven (a targeted replay of the ids a heartbeat verdict lists as
+   unknown; a full replay on enough unknown ids or a truncated verdict (both limited by a cooldown), or
+   on a lost CONNECTED notice; the exact triggers are in the header block of `yuzu_gw_upstream.erl`), not an unconditional
+   replay of every held agent on reconnect.
+   **But** per-agent *targeted* routing is today a **node-local ETS lookup**
    (`yuzu_gw_registry:lookup`, `yuzu_gw_registry.erl:90`) — `pg` is used only for broadcast groups —
    so distributed intra-cluster agent→node routing is **net-new work**, not a free property (see §7).
 2. **ADR-0031 (presentation/core/engine decomposition)** already commits the direction: sessions and
@@ -185,10 +205,86 @@ coordination connections) are in §10.
 **Fencing token, made explicit (finding 3):** the advisory lock provides mutual exclusion only while
 its owning connection lives — it says nothing about a *paused* former leader resuming work after the
 lock silently moved. So leadership carries an explicit **monotonically-increasing epoch** (a Postgres
-sequence bumped on each acquisition; the acquirer records `current_leader_epoch`). Every
+sequence bumped on each acquisition; the acquirer records `current_leader_epoch`; since #6535 the epoch also carries the Postgres timeline, see the Update below). Every
 side-effecting claim (§6) checks `claim.epoch == current_leader_epoch` **in the same transaction as
 the claim**, independent of whether the actor still *believes* it holds the lock. A stale ex-leader
 therefore cannot commit a claim even in the window before it notices its lock dropped.
+
+**Update (2026-11-01, #6535) — the epoch is timeline-packed and floored by the surviving row.** A sequence
+alone is not monotonic across a *lossy* promotion: under asynchronous replication, or a degraded non-strict
+quorum, the promoted standby can lack the latest mint (both the sequence advance and the `leader_state` row),
+so a new leader can re-mint the sequence value a paused ex-leader still holds, and the equality fence admits
+both. (Postgres WAL-logs a sequence 32 values ahead, so a promoted standby normally resumes past a lost value
+and does not repeat it; the repeat needs the lost mint to be one that crossed a 32-value boundary, so the
+exposure was narrow, not absent. `scripts/ha/ha-leader-epoch-lossy-promotion.sh` forces that case.) Reading
+the surviving row cannot repair that on its own (the promoted node may have lost the row too), so the epoch
+carries the one coordinate every promotion advances regardless of what WAL was lost:
+`epoch = GREATEST((GREATEST(timeline, prev_row_epoch >> 32) << 32) + nextval(leader_epoch_seq), prev_row_epoch + 1)`.
+
+* The timeline is the Postgres WAL-insertion timeline of the primary the elector is connected to, read inside
+  the mint statement from `pg_walfile_name(pg_current_wal_lsn())` (not `pg_control_checkpoint()`, which lags
+  a fast promotion). A promotion moves it from T to T+1, so the new leader's epoch is strictly greater than
+  anything the old timeline issued. The epoch stays a single `bigint`, so `epoch_fence_sql()` and every fenced
+  claim site are unchanged.
+* `prev_row_epoch` is the `leader_state.current_leader_epoch` row for the same lock, read in the same
+  statement under the advisory lock (same schema, so ADR-0012 §3 is respected). It is a **floor**, not the
+  protection: the enablement store orders epochs (`issuer_epoch <= epoch`), so a logical restore, a
+  `pg_upgrade` or a logical-replication cutover (the new cluster restarts at timeline 1 while the restored row
+  and `issuer_epoch` keep the old, higher timeline) or a sequence older than the row (a table-only restore, or
+  `ALTER SEQUENCE ... RESTART`) must never mint below the surviving row. The packed term takes
+  `GREATEST(timeline, prev_row_epoch >> 32)` so the **sequence stays live** while a restored row pins a higher
+  timeline than the real one: with the floor alone every mint there would be exactly `prev + 1`, and a lossy
+  promotion that loses the latest mint would re-mint the very epoch a paused ex-leader holds. A row of
+  `INT64_MAX` makes the mint fail loudly (`bigint out of range`), never wrap; repair is to delete the row (or
+  `UPDATE` it to a value no higher than the epoch you want next), then run the `issuer_epoch` reset from
+  `docs/user-manual/upgrading.md`. The floor assumes the lock holder is the only writer
+  of the row: a manual `UPDATE` racing a mint can still be overwritten, as before #6535.
+* Refusals enforced rather than assumed: the sequence is capped at `MAXVALUE 4294967295` (migration v2; at
+  the cap `nextval` raises, and `ALTER SEQUENCE ... RESTART` is a safe remedy because of the floor: the first mint after it is monotonic but lands one timeline above the real one with a count of 0, so it pins the timeline as in item 3 until the real timeline catches up; the elector warns, and reaching the cap takes 2^32 elections), and a
+  timeline outside `1..2^31-1` is refused before `nextval`; both land in the existing `epoch_record` acquire
+  failure, fail closed. At boot (and on every reconnect) the elector probes the timeline and **refuses to
+  open** if it cannot read it (a DSN that resolves to a standby already fails earlier, in the migration
+  step; a Postgres platform without the WAL functions fails here); the leader-only passes stay paused and the
+  failure is counted as `acquire_failures{cause="connect"}`, the log line being the attribution.
+
+**What this covers:** a lossy promotion of a streaming standby, and a restore / `pg_upgrade` / cutover in
+which the `leader_state` row survives. **What this does not cover** (the canonical list, stated so it is not
+read as "the epoch is monotonic across any promotion"; every other document defers to it):
+
+1. two live primaries (the fence is per database, §3 above is unchanged on that);
+2. a restore or cutover that loses the `leader_state` row but keeps `plugin_config_store.enablement_meta.
+   issuer_epoch` (the elector must not read another store's schema): enablement batches are rejected as fenced
+   until `issuer_epoch` is reset (`docs/user-manual/upgrading.md`);
+3. a lossy promotion while the surviving row pins a HIGHER timeline than the real one (a restored cluster):
+   the timeline cannot separate epochs there, so only the sequence does, which is the pre-#6535 protection (a
+   repeat needs the lost mint to have crossed a 32-value boundary). A sequence that is BEHIND the row's low
+   32 bits (a logical-replication cutover or a table-only restore does not carry it) would make every mint
+   exactly the row plus one, so the elector advances the sequence to the minted count part at the first such
+   (floored) mint, best-effort and never lowering it below its current value (clamped one below the cap so the repair cannot park the sequence there; a runtime role without `SELECT` and `UPDATE` on the sequence cannot run it,
+   and then every election stays at the stored epoch plus one). The first election, and the election after it
+   (`setval` resets Postgres' sequence pre-logging, so that one always crosses a pre-log boundary), remain
+   exposed, as does any election whose `setval` record a lossy promotion also loses; the elector logs a
+   warning at every acquisition until the real timeline reaches the pinned one (the promotion that reaches
+   it is itself still unprotected);
+4. same-timeline loss: a crash recovery that loses an unflushed mint (`synchronous_commit=off`, `fsync=off`)
+   keeps the timeline;
+5. a physical-snapshot restore started without archive recovery, which keeps its timeline while the sequence
+   and the row roll back together;
+6. consecutive lossy promotions under orchestration that lets a node promote without having seen the previous
+   promotion's timeline history, and a PITR with a pinned `recovery_target_timeline` that reuses a timeline
+   (Patroni's candidate check is believed to refuse the former; **unverified, verify before relying on it**);
+7. a rolling upgrade while a pre-#6535 binary can still lead, and a downgrade: an older binary mints small
+   epochs, which are different (so the equality fence still works) but not larger (so the enablement ordering
+   rejects its batches until `issuer_epoch` is reset).
+
+Out of scope here and tracked as follow-ups: other sequence-backed ordering fences share the lossy-promotion
+class and are unchanged (`gateway_route_store`'s `connection_epoch`, and `policy_store`'s
+`remediation_claim_seq` claim ids). The enablement-store wedge described in item 2 is latent today because
+nothing in the server calls `EnablementStore::set_desired_batch`; re-derive its severity in whichever change
+first adds a production caller.
+
+Epochs are now `>= 2^32`. The evidence is the `[leader-elector]` Catch2 cases (deterministic SQL-level
+simulation of the loss) and **one** manual scenario of the WS-9 script on a 3-node Patroni async rig (passed on 2026-11-01 against the final, row-floored mint, and earlier against the timeline-only form); no workflow runs it. This update does **not** lift the safe-to-scale gate. **Decided (2026-11-01):** the project lead accepted the residuals above for this change. They are tracked as #6845 (Patroni stale-timeline promotion and consecutive lossy promotions), #6846 (database restore), #6847 (`issuer_epoch` after a downgrade), #6848 (managed-Postgres probe), #6849 (tests for the timeline source and the probe refusal), #6851 (sibling sequence fences) and #6852 (observability and test follow-ups).
 
 ### 4. Operator sessions — durable in Postgres, absolute wall-clock (Q4)
 Sessions move from the in-memory map (`AuthManager::sessions_`, `steady_clock`) to durable Postgres
@@ -289,6 +385,30 @@ claim-commit and the external send is unavoidable:
   forwards transparently, no gateway-side dedup today), so an at-least-once re-drive is effectively-once
   — **contingent on WS-0** making the agent's dedup durable (today's `dedup_current_`/`dedup_previous_`
   are in-memory and cleared on reconnect, `agent.cpp` `dedup_current_.clear()`).
+  - **Redelivery horizon (#3678).** The agent's dedup is a ring over the most recent
+    `kAgentDedupRingRows` TERMINAL commands, so a stable `command_id` re-sent after that many newer
+    commands is a fresh claim and RE-EXECUTES. The outbox therefore bounds a redrive by a COUNT, not a
+    clock. Before a row's first attempt it records the shared `dispatch_seq` (advanced once per recorded
+    dispatch call at the one dispatch chokepoint), this process's count of dispatches whose record write
+    failed, and the leader epoch (`ExecutionTracker::current_dispatch_position`). A redrive's estimate is the
+    shared delta plus the unrecorded delta — differenced when the same leadership term reads it, the reader's
+    whole local count when another term does — and one that reaches `kMaxOutboxRedeliveryHorizonCommands` is
+    dead-lettered `redelivery_horizon_exceeded`; a shared sequence that went backwards is dead-lettered
+    `redelivery_sequence_regressed`. Neither is sent. The constant is `static_assert`ed to at most half the ring
+    (`common/include/yuzu/command_replay_horizon.hpp`). It is an estimate, not a proof: it over-counts
+    (fleet-wide, per-target fan-out, `__guard__`, redrives re-recording their own id, a different-term reader's
+    whole unrecorded count that never decays inside a process — safe, an early dead-letter) and can under-count
+    when record writes fail on a replica other than the reading one OR in an earlier process lifetime of the same
+    replica (a restart or a leadership change forgets the previous process's post-stamp failures; a restart cannot
+    make the shared sequence regress, so it is not a safe refusal), when a command is dispatched before the stamp
+    but reaches the agent after it, when a restore leaves the shared sequence above a row's stamp, or when a stale
+    replica sends a row a peer has just dead-lettered (the send precedes the fenced write) — all unsafe; the 2x
+    margin is not sized for a sustained uncounted outage, and the sound close is agent-side. An unreadable or unwired position HOLDS
+    the row and ends the tick (the direction that cannot re-execute). A stamp written by an attempt that
+    provably reached no agent is cleared. Not covered: a stuck row on a quiet fleet is not capped by count (the
+    age and attempts caps remain #4167); `DeploymentEngine`'s fresh-`command_id` re-dispatch takes a new ring
+    slot each time and is not a replay; `forward_gateway_pending` re-sends the same `command_id` a bounded
+    number of times, each attempt with its own 300 s deadline.
 - **Fencing token in the claim transaction:** every claim CAS checks the leader's fencing token, so a
   stale ex-leader cannot commit a claim even before it notices its lock dropped. A boolean "I am
   leader" cached outside the lock connection is prohibited.
@@ -321,8 +441,8 @@ cases only (a real two-leader state cannot be built against one database), and a
 caught by it — that case is the epoch fence's alone (a frozen process serves no `/metrics`, so no alert on its own series can evaluate;
 `YuzuLeaderNoLeader` fires if no other replica takes over), and `YuzuLeaderCoordinationStale` is the signal for a
 leader that is alive and serving `/metrics` but whose coordination connection stopped answering. The fence is per database: replicas pointed at different databases (a split DSN, a Patroni double-primary) each pass their own fence, and that is the case `SplitBrain` can actually observe. This does not lift the safe-to-scale gate; remediation-claim
-lifecycle counters (#6526), a CRL freshness gauge (#6527) and a durable cluster-capability admission gate
-(#6528) are separate, unshipped items.
+lifecycle counters (#6526), a CRL freshness gauge (#6527, since shipped) and a durable cluster-capability admission gate
+(#6528) are separate items, unshipped unless noted.
 
 ### 7. Gateway cluster topology + routing (Q7)
 **Independent gateway clusters, one per trust zone / region** (internal-vs-external is a trust
@@ -334,11 +454,10 @@ cluster unit; intra-zone scale is more nodes.
   `ProxyRegister` with **conditional (CAS) register/deregister** keyed on `connection_epoch` — a
   delayed replay from an *older* connection **cannot overwrite** a newer re-home (the bug an
   unconditional self-healing write would create). A lease that expires without renewal marks the
-  route stale. Upgrade window (Echo rename; removed with the other legacy-name shims): the directory row also
-  carries a `legacy_echo_wire_name` flag, set at `ProxyRegister` from the agent's reported plugin
-  inventory, so a replica that holds no session for an agent can still address it by the
-  pre-rename plugin name `tar` until the agent upgrades. The column stays after the write and read
-  are removed.
+  route stale. The row holds no plugin-name state: a replica that holds no session for an agent
+  addresses it by the plugin name in the command. (The `legacy_echo_wire_name` column added by
+  `gateway_route_store` schema v6 for the Echo rename is no longer written or read; it stays as an
+  unused additive column.)
 - **Net-new intra-cluster routing (corrected claim).** Today `yuzu_gw_router:send_command` resolves an
   agent via node-local ETS (`yuzu_gw_registry.erl:90`) and returns `not_connected` on a miss — a
   targeted command landing on the wrong node of the right cluster fails even though a sibling holds
@@ -368,6 +487,60 @@ cluster unit; intra-zone scale is more nodes.
 - **Agent-side:** agents are **pinned to their zone's cluster** (no cross-zone failover). Within a
   cluster they connect through a **cluster-front (VIP / DNS-multi / node list)** and reconnect on node
   loss. Both gateway endpoints are addressable by **VIP or node list — support both**.
+
+**Update (2026-11-02, WS-13 / #291 — decided after a Fable plan review).**
+- **First design: a VIP or a multi-address DNS name, with no agent code.** The agent takes one
+  `--server` address and builds one channel (`agents/core/src/agent.cpp`, the single `CreateCustomChannel`
+  call), which keeps one gateway node per session. At the gRPC layer (1.76 per the author, a one-off
+  check with no retained record, the agent's channel settings, two test servers behind one multi-address name) the default `pick_first` policy moved to the surviving
+  address within about a second of the connected one dying. This is **not yet measured** with a real agent,
+  real TLS or a silent partition (keepalive 60 s + 20 s), so it supports "support both" in design but is
+  not evidence for the gate. An agent-side endpoint list (a gRPC target built from `--server a:p,b:p` plus a
+  fixed TLS target name) is built only if a static node list without DNS becomes a required topology; a
+  server-advertised endpoint list is WS-15 scope.
+- **Requirements this puts on the topology.** Every node's certificate must carry the name or address the
+  agent dials (the agent has no target-name override). Gateway-fronted quarantine needs addresses that do
+  not change: the quarantine allow-list is resolved **once at startup, deliberately** (#3429), so after the
+  addresses behind the name change a quarantined agent can reach no node and cannot be released remotely.
+  The resolver does not parse a list or a scheme, so any list syntax must carry a test that the
+  allow-list is not empty.
+- **Reconnect timing (13.1, done; implements #5990).** After a lost stream each retry waits a random whole number of
+  seconds in [1, 3 x the previous delay], at most 300 s (decorrelated jitter, owner decision 2026-10-17), and the previous
+  delay returns to 1 s after a successful Register. The first retry is 1 to 3 s, so the agents of a failed node return
+  in three one-second buckets at first, not without bursts, and spread wider with each retry (a 10,000-agent
+  simulation in `tests/unit/test_reconnect_backoff.cpp` bounds the share in any one second per round). **Cost, simulated
+  and pinned by a test (attempt counts and the settled mean delay):** in a sustained outage an agent retries about twice as often as the old fixed ladder did (about
+  28 attempts in 30 minutes against 13; a steady-state mean delay of about 135 s against 256 s), because a typical
+  agent's delay grows far more slowly than the mean does. The enrolled-but-no-certificate retry restarts from the base at
+  its first retry, then keeps growing its delay across its Register calls, with each of its waits at least 8 s so that
+  the four waits outlast the server's 30 s one-certificate-per-agent window (the old fixed 2+4+8+16 s ladder summed
+  to exactly 30 s). The average return after an outage is usually sooner, but the slowest 1% of agents can wait
+  longer than under the old ladder (simulated for outages of 30 to 600 s: p99 about 285 s against 250 s). A restarted agent has no wait, and the heartbeat-driven re-registration cooldown (#1894) is
+  unchanged.
+- **Known gap (precondition confirmed on one rig, consequence unmeasured).** A gateway node that is up but has lost its server still acknowledges proxied
+  heartbeats from node-local state (`yuzu_gw_agent_service:heartbeat/2`; an unknown session gets `NOT_FOUND`),
+  and the agent re-registers only on `NOT_FOUND` or `UNAUTHENTICATED`, so the agent sees success, gets no
+  trigger, its keepalives stay healthy, and the route lease (90 s) expires. The 13.0 spike confirmed the precondition on its rig (finding 4) and did not measure the consequence on two
+  replicas; if it proves harmful, a WS-13 slice (the gateway ends agent streams after an outage longer than the lease) closes it.
+- **Rollout.** Moving a direct-connect fleet behind a gateway silently stops its agents updating
+  themselves while #5619 is open (the gateway implements neither `CheckForUpdate` nor `DownloadUpdate`),
+  so the 13.4 rollout runbook must refuse unless the operator declares out-of-band package management
+  (no rollout tool exists yet). It also needs
+  agents of 0.15.0 or later (older agents wedge in their reconnect path, #2182), no quarantined devices,
+  and a statement of what changes (client-address attribution, mTLS at the edge).
+- **Gate wording.** The clause "for gateway-fronted fleets, WS-13 is done" became: WS-13's failover items for
+  a deployment with more than one gateway node, and its rollout item for any fleet that still connects
+  directly. Losing a server replica does not move agents (the gateway re-registers the agents a restarted or
+  replaced server no longer knows, on evidence since #5695: see Context and §7g); agent failover answers
+  losing a gateway node. By deployment shape: a fleet that still connects directly is newly gated (the rollout
+  item); a deployment with several gateway nodes keeps the failover items.
+- **Decided 2026-11-04 (#6920, the project lead).** The 13.0 spike record (`docs/ha-spikes/ws13-0-gateway-failover.md`) was input. Its figures are single-host and caveated; the follow-up measurements are tracked in #7051.
+  (1) **Slice 13.6** (a gateway node that is up but has lost its server) stays OUTSIDE the gate, because its harm is untested. In the six spike runs that cut a node off from the server while leaving its agents connected (faults F3 and F3x), `/readyz` never changed and the agents stayed on the node (every route went non-routable after about 60 to 90 s); in the five with a gateway log the breaker never opened in 400 s, on a quiet single-host fleet; and dispatch kept working on the single-replica server. What happens on two replicas, where the route directory is used, is not measured: by code reading, agents may be undispatchable there, protective actions included (whether a quarantine issued in that state reaches the endpoint is unmeasured). Spike finding 10 (a command accepted and then lost after a fault on the agent port only) is unexplained and is not reproduced by the 13.6 probe; its repeat is in #7051. Slice 13.6 moves INTO the gate if the two-replica probe owned by #7082 finds an agent still attached to such a node undispatchable, or if the one-replica loaded-fleet run in #7051 finds one (that run cannot show a lease-driven failure, because one replica does not consult the route directory, so such a finding is recorded as a separate defect and the project lead decides whether 13.6 moves in). The #7082 probe is a read-only dispatch sent through any replica, including one that does not hold the agent's session, at +120 s, +300 s and +420 s after the fault, in a two-replica WS-9 or lab run (never in production enablement); "delivered" means a terminal response produced by the agent (a result or an agent-reported failure) within a deadline the harness states, and a failure synthesised by the server (for example `gateway_unavailable`) is not delivered; the same probe is run before the fault as a control, and a failed control makes the run inconclusive, not a pass; results are recorded per replica; and a pass is evidence for that rig only and does not remove the known gap. #7082 records the outcome either way. Moving 13.6 in edits every hand-stated copy of the gate together: the matrix gate sentence, decision note, WS-13 row, gate column, Phase B and stamp; the ADR decision and gate-wording bullets; the `/ha` skill section 1b, both "Remaining gate items" lines, the WS-13 row and Phase B; and roadmap 14.2.
+  (2) **#5649 and #5648 are INSIDE the gate**, whatever the gateway count. ADR-2002 section 7c's convergence claim holds for one replica only until #5649 is decided and run on two replicas (section 7g), and by code reading a hung or failing server out of two can feed the gateway's only circuit breaker (on a channel with two endpoints a cleanly dead one drops out of the channel's pick, though its lost connection may still count as a failure). Done means: for #5649, the decision (sticky to one upstream endpoint, or safe on any replica) is recorded in this ADR, a WS-9 two-replica scenario (not yet written) is run repeatedly, with the number of runs recorded, and converges, with `increase(yuzu_server_gateway_route_desync_total{op="renew_leases",outcome="unknown_session"}[10m]) == 0` on every replica from a settle time after both are up, in consecutive runs (the count and the settle time are set when the scenario is written), and the one-connection guidance in `docs/user-manual/gateway.md` and the boot warning are rewritten to match the decision; for #5648, the breaker is per upstream endpoint with failover and `/readyz` stays ready while one endpoint is usable, and a rig run with one hung (not killed) server out of two, while the fleet registers and syncs so that `yuzu_gw_upstream_rpc_errors_total` rises for an `rpc_name` other than `batch_heartbeat` with a transport, timeout or server-fault code (not an encode error, a stream-limit refusal or a request-fault status), leaves the other endpoint's breaker closed (read from its `yuzu_gw_upstream_circuit_transitions_total` and `/readyz`; a heartbeat-only run proves nothing, because heartbeat flushes do not feed the breaker). #5648 is not built and #5649 is undecided, so this moves the gate further from lifted, not nearer.
+  (3) A **one-gateway** deployment is deliberately not gated on WS-13's failover items: there is no second node to fail over to. The gateway is then a single point of failure for its fleet. This gate applies only when enabling a second server replica and does not address that, and this is not a statement that one gateway is acceptable for HA. Only (2) gates it, plus the rollout item while it still has direct-connect agents. The gate is checked per deployment: a fleet with no gateway first needs the rollout item and then the row for the shape it becomes; one gateway needs #5648 and #5649; several gateways need #5648, #5649, the failover items and slice 13.7; and a second server replica stays unsupported until the row for its shape holds and every other gate clause is closed. This keeps the 2026-11-02 relaxation of the original "for gateway-fronted fleets" clause.
+  (4) **Slice 13.7 (#7062)**, for a deployment with more than one gateway node, is INSIDE the gate: the server's `--gateway-command-addr` names one node, and killing it left the fleet undispatchable although every agent had re-attached. It is inside by this decision, not on measured evidence: four spike runs (H7) used the single-node address, two of them kill runs with valid probes, and none of the six probes in those two was delivered (spike finding 5: four refused as gateway-unavailable, two accepted with no result); there is no control run (#7051). By code reading, a protective command (quarantine included) sent in that state is queued as sent and then, about six seconds later, recorded as `gateway_unavailable` on its execution row only; it is not delivered, and a missed scheduled occurrence is not retried. A release sent in that state is equally undelivered. On the device page only "Confirmed on device at the last status read" is evidence that a quarantine applied. The signal is `yuzu_server_gateway_forward_total{status="unavailable"}` rising; no shipped alert covers it. The effect on the endpoint is unmeasured.
+  Risk acceptance (the project lead, 2026-11-04; recorded on #6920, https://github.com/DevNullLtd/Yuzu/issues/6920#issuecomment-6636272238). Accepted for now: (a) slice 13.6 stays outside the gate while its harm is unmeasured, including whether a quarantine reaches an agent in that state; (b) a one-gateway deployment is a single point of failure for its fleet, which this gate does not address. Not decided: spike finding 10 (its repeat in #7051 is its review trigger). Known open defect on the supported shape, not accepted and not mitigated: behind a dead `--gateway-command-addr` node a quarantine is not delivered (slice 13.7, #7062). Not accepted: lifting the gate. One server replica is the only supported shape (`docs/user-manual/server-admin.md`, "Leader election: metrics and alerts"), and nothing in the product prevents a second replica until the cluster-capability admission gate (#6528) is built. On that supported shape with several gateways, a dead `--gateway-command-addr` node left the fleet undispatchable in the two spike kill runs (control owed, #7051; fix tracked in #7062). Owner: the project lead. Review at the first recorded outcome of #7082 or of the #7051 dispatch probe, or when every other gate clause is closed, whichever is first.
+  The gate is **not lifted**.
 
 **Status (WS-4): 4.1 done; 4.2a (writer-path hardening) done; 4.2b (Tasks A–D: store layer, per-site
 fail-closed posture + renew correlation, dispatch-wiring, `route_unreadable` consumer + alert rule) done;
@@ -530,7 +703,7 @@ alert-rule halves** (#4 RE-SCOPED, not closed — see its bullet):**
   `ProxyInventory` / `NotifyStreamStatus` session resolution is now directory-authoritative — see §7f
   (merged as PR #5694, 2026-10-12); the `ProxyRegister` known-session
   check itself is unchanged.* Under active-active a replay routed to a non-owning replica still takes
-  the fresh branch until the safe-to-scale gate work lands.
+  the fresh branch; closing that is the #5649 decision (§7g item 3), a gate clause since 2026-11-04 (#6920).
 - **Re-announce refreshes LIVENESS (lease), not PLACEMENT** — `cluster_id`/`gateway_node` are not
   re-read on the replay branch, and a fresh re-register COALESCE-preserves the OLD cluster/node until a
   CONNECTED `announce_connected` lands; a 4.2 reader must not trust placement from a replay/fail-open
@@ -855,11 +1028,20 @@ so "private range" is not the same predicate as "inside my trust zone" (`CONTEXT
 cluster" term already states clusters must not span a DMZ or a WAN) — the cookie is the actual security
 boundary and should be strengthened directly rather than proxied through an address-range heuristic that
 doesn't track the real one. Migrating the distribution protocol itself to `-proto_dist inet_tls` over the
-internal CA is filed as a follow-up, not this slice's scope. `#4555` also pins
+internal CA is a design item, not this slice's scope and not yet shipped: gateway distribution
+remains unencrypted, outside the PKI, and relies on a trusted, firewalled cluster network. `#4555` also pins
 `inet_dist_listen_min`/`inet_dist_listen_max` in the kernel config (today the distribution port is
 randomly chosen per boot and therefore unfirewallable on a bare-VM deployment) and documents that fixed
 range as what an operator firewalls alongside the existing mgmt-plane (`:50063`) and agent-edge
 (`:50051`) guidance.
+
+**Update (2026-11-17, WP09 / security scan finding F24).** The paragraph above is kept as history. Today:
+no `vm.args.src` fallback cookie exists; the container entrypoint and the systemd unit's `ExecStartPre`
+(one shared policy, `deploy/docker/gateway-cookie-policy.sh`) refuse an unset, published-default, short
+(< 32), over-long (> 255) or unsafe-character cookie before the VM starts; and `YUZU_GW_ALLOW_DEFAULT_COOKIE=1`
+does not mean "run with the published default": the entrypoint substitutes a random per-boot cookie, so
+replicas on the override are singletons that cannot cluster. The `inet_tls` migration is tracked as #8158
+(decision pending; owner: Fraser Jarvis; review by 2027-02-17).
 
 **Decision: `#4555` ships a scale-capable reference Compose rig alongside the mechanism (Fable design
 review finding).** Per the correction above, no shipped Compose file can actually exercise `--scale
@@ -1199,8 +1381,8 @@ correct action in both cases is today's behaviour (no replay).
   `register_agent` and wipes its placement until its own reannounce lands on it. A per-session replay
   guard planned for the gateway-side change bounds the replay RATE, not the NUMBER of rounds. Expected
   signature: `renew_leases`/`unknown_session` desync not decaying on some replica after both sides are
-  upgraded. The durable cross-replica session lookup (WS-5, `#4246` #3) is the real multi-replica fix;
-  until it lands the safe-to-scale gate still forbids a second replica.
+  upgraded. The durable cross-replica session lookup (WS-5, `#4246` #3) is the real multi-replica fix (it landed as §7f and is not sufficient on its own: see §7g item 3 and #5649);
+  the safe-to-scale gate still forbids a second replica.
 - **Lease window (observed on one local development rig with one agent, dev `3c8ac2c0c`; not
   reproducible from the repo; tracker #1197).** After a server-only restart a single-target command to
   an agent the new server does not know was still delivered while the lease and presence rows written
@@ -1426,8 +1608,8 @@ one core replica a server-only restart now recovers through the replay described
   some replica after both sides are upgraded, with
   `yuzu_gw_registration_replay_triggered_total{trigger="heartbeat"}` rising (it counts verdicts that queued
   at least one agent, so at most once per flush; INFERRED). The
-  durable cross-replica session lookup (WS-5, `#4246` #3) is the fix; until it lands the safe-to-scale
-  gate forbids a second replica.
+  durable cross-replica session lookup (WS-5, `#4246` #3) was the intended fix (it landed as §7f and is not sufficient on its own: see §7g item 3 and #5649); the safe-to-scale
+  gate still forbids a second replica.
 - **Observed on a local rig, not reproducible from the repository (one real agent, one core replica,
   debug builds).** After a server-only restart the replay came on the first agent heartbeat after the
   server was healthy again (17.5 s in the 10 s outage runs, with the same session id and no agent
@@ -1528,10 +1710,10 @@ one core replica a server-only restart now recovers through the replay described
   not observed to repair the row of the entry above, and that row is not caused by this change. The limit
   stands: the row waits for the agent's own reconnect. Tracked as a follow-up (no issue yet), together with
   the entry above.
-- **Planned follow-ups (tracked as follow-ups, no issue numbers yet), in this order.** (i) A bounded pending
+- **Planned follow-ups (tracked as follow-ups, in this order; (ii) is now #5380).** (i) A bounded pending
   queue for dropped notifications, a gateway-only change. (ii) A server-side re-arm of a tombstoned route
   row when a lease renewal comes up short, with a new advisory list that the gateway answers by
-  re-announcing; this needs a protocol change and is planned to land before the safe-to-scale gate.
+  re-announcing; this needs a protocol change and is planned to land before the safe-to-scale gate (tracked as #5380).
   (iii) A session-match guard and a refusal counter for the `accepted=false` disconnect.
 - **Upgrade day.** The server is upgraded first, so the server restart that ships this fix meets the old
   gateway and agents behind it can read offline (observed on one rig after a SIGKILL restart; a graceful
@@ -1899,6 +2081,23 @@ when the applied frame's `status()` is not `RUNNING` (`is_terminal_command_statu
 `gateway_mgmt_stub_pool.hpp`, unit-tested against the full status enum). The `not_connected`-repair site is
 unconditionally terminal by its classifier's own contract and needs no such check.
 
+**Third correction (2026-11-01, #2146 batch B Gate 8):** the four per-attempt synthesizing sites above sit INSIDE the
+per-command forward thread, so a command whose thread could never be started was outside every one of them. The
+other two (`unknown_cluster` and the null-pool branch) resolve in the dispatching thread, before that command's own forward thread exists
+(`server.cpp`'s `forward_gateway_pending`, ahead of the spawn).
+`forward_gateway_pending` drains the queue and spawns one detached `std::thread` per command, and `send_to` had
+already counted each queued command as sent (it returns true at the queue push), so a throwing spawn
+(`std::system_error` or `bad_alloc`) unwound the loop, destroyed every not-yet-spawned drained command with no
+terminal response, and left its execution row `running` with a targeted count it could never complete (the
+stuck-execution sweep skips a row whose targeted count is above 0). The whole per-command body, from the first
+allocating statement through the spawn, now runs as the `forward_one` lambda under `guarded_forward` (`server/core/src/gateway_forward_guard.hpp`, which also holds the reason constant and the stored detail text), so one try statement covers it: a failure resolves THAT command through
+`apply_gateway_forward_terminal_failure` with the reason code `gateway_forward_spawn_failed` and the loop continues.
+That resolution is best effort: the resolver allocates too, so under the same resource pressure it can fail as well;
+that is logged at error level (an operator `cancel_execution` is then the only way to close the row), and an
+unknown-cluster resolution that already ran is never repeated, so each later drained command gets its own spawn attempt and,
+failing that, its own terminal failure. The non-throwing path is unchanged, and no `yuzu_server_gateway_forward_total`
+status was added for it. The reason code is listed in `docs/user-manual/server-admin.md` beside the others.
+
 **Deliberately still fire-and-forget in the sense §7's original design note meant (no durable outbox
 re-drive), for two independent, load-bearing reasons — not silently, this time:**
 
@@ -1940,7 +2139,7 @@ every branch this PR's own scope covers, not that one.
 
 **Status: merged as PR #5694 (`eabc2b639`, 2026-10-12). THE SAFE-TO-SCALE GATE IS NOT
 LIFTED** — this closes one more `#4246` gap; it does not make a second replica safe (WS-6 6.1b/6.3, WS-13
-for gateway-fronted fleets, WS-5's remaining slice-1 scope and the WS-9 scenarios are still open — see
+failover and rollout items, #5648 and #5649 per the gate as decided 2026-11-04 (#6920), WS-5's remaining slice-1 scope and the WS-9 scenarios are still open — see
 `docs/ha-delivery-matrix.md`). Run exactly ONE server replica (§7c).
 
 **Problem.** `GatewayUpstreamServiceImpl` resolved a gateway `session_id` to an `agent_id` only through
@@ -1983,11 +2182,9 @@ op `session_lookup`.
   the local-map fallback is permitted only when the row is absent/tombstoned or the session id is in
   `lost_race_sessions_`; a row carrying a DIFFERENT non-null `session_id` rejects the notification
   (`notify_stream_status/stale_connected_session`). On a DEGRADED `lookup_route`, CONNECTED is
-  accepted only when this replica holds the matching local session (`gateway_sessions_[session]` names
-  the agent AND the registry's current session for the agent is that session — local state the
-  directory verified at `ProxyRegister`, which is sound only for a single replica; see "Deferred, not
-  silent"); otherwise it is refused and counted
-  `notify_stream_status/connected_unverified`. DISCONNECTED proceeds on the local-map check when the
+  ALWAYS refused and counted `notify_stream_status/connected_unverified`, whatever this replica's
+  local state says (Update 2026-11-13, #5685 (ii): local state is not evidence of the current
+  placement once a second replica can supersede the session). DISCONNECTED proceeds on the local-map check when the
   directory read fails (it is a teardown, not an admission), and its presence-row delete (#5678: now
   a session clear; the row is kept for the roster) is gated on
   `removed_current_session || store_removed`. A CONNECTED on a replica with a directory row but no
@@ -2043,14 +2240,15 @@ the row's computed `routable` flag (lease freshness). A heartbeat IS the lease-r
 re-register storm. Tombstoned rows still never match.
 
 **Decision — degraded-read posture is per site, and is not uniformly fail-closed.** CONNECTED on a
-degraded `lookup_route` is accepted only when this replica holds the matching local session (single
-replica: that local state was directory-verified at `ProxyRegister`, and `set_gateway_route` still
-rejects a superseded session) and is refused otherwise (`acknowledged=false`,
-`notify_stream_status/connected_unverified`); the same WS-4 4.4 F1 principle as the `ProxyRegister`
-decide path — never admit what nothing has verified. The gateway does not retry a refused CONNECTED
-(it ignores `acknowledged=false`) and `yuzu_gw_upstream_notify_dropped_total` does NOT count it, so the
-server-side `connected_unverified` counter is the signal; a refused session stays registered but
-without dispatch placement until the agent reconnects. The degraded read itself is also counted under
+degraded `lookup_route` is refused (`acknowledged=false`,
+`notify_stream_status/connected_unverified`), whatever this replica's local state says; the same WS-4
+4.4 F1 principle as the `ProxyRegister` decide path — never admit what nothing has verified. Since
+#5695 the gateway keeps a refused CONNECTED and sends it again (decorrelated jitter, first resend 1 to
+3 s after the refusal, at most 60 s apart for the first 15 minutes of refusals and then about 10 minutes apart, no time limit while it holds the session) and treats
+`connected_unverified` as transient, so a refusal means "placement is delayed until the directory
+reads again", not "lost until the agent reconnects". `yuzu_gw_upstream_notify_dropped_total` does NOT
+count it, so the server-side `connected_unverified` counter is the signal; a refused session stays
+registered but without dispatch placement until a resend is accepted. The degraded read itself is also counted under
 `write_failed{op="session_lookup"}`. BatchHeartbeat and DISCONNECTED are deliberately fail-soft
 because refusing them would cause the storm or the teardown loss this design exists to prevent. A
 Postgres outage longer than the 90 s lease plus 180 s grace (270 s) tombstones the rows; recovery is
@@ -2102,16 +2300,166 @@ honestly).
 
 **Deferred, not silent.** hp-1 (a local session with an empty `gateway_node` and no
 stream shadows the directory fallback in `GatewayRouteFallback::prepare`; reachable only with a second
-replica, which the gate forbids) and hp-2, both #5685. The UNIQUE partial index on `agent_routes(session_id)` (#5683) is no longer
+replica, which the gate forbids) and hp-2, both #5685 (hp-1's shadowing and hp-2's snapshot-`os` half
+are done: see the Update (2026-11-13, slice 3) below). The UNIQUE partial index on `agent_routes(session_id)` (#5683) is no longer
 deferred: see the Update below. Also deferred: the local-only surfaces that still read only
 the local registry (`to_json_obj()`, `agent_count()`, the guardian heartbeat reconcile) on a replica
-that has not yet been hydrated; the degraded-read CONNECTED local acceptance, which is sound only
-for one replica (a supersede handled on another replica is invisible to this replica's
-`gateway_sessions_` and `session_is`, so on a degraded read this replica can re-publish its
-in-memory placement for the superseded session; the durable row is untouched because the write is
-session-guarded) and must be revisited with hp-1 before the gate lifts (#5685); TSan coverage of the new
+that has not yet been hydrated; the degraded-read CONNECTED local acceptance, closed by the
+Update (2026-11-13, #5685 (ii)) below, and the remaining half of hp-1/hp-2 (the stale-placement republish
+and the guardian heartbeat reconcile), which stay open on #5685; TSan coverage of the new
 paths (not landed with this change; #5278); and the WS-9 validation script (follow-on PR-B). The
 local-only surfaces and the WS-9 script are tracked in the WS-5 row of `docs/ha-delivery-matrix.md`.
+
+**Update (2026-11-13, #5685 (ii)): CONNECTED on a degraded directory read is always refused.** The
+local acceptance described above is removed. Rule: when the route store is wired and `lookup_route`
+fails, `NotifyStreamStatus` CONNECTED answers `acknowledged=false` and counts
+`notify_stream_status/connected_unverified` (plus the existing `write_failed{op="session_lookup"}`);
+there is no local-hint branch and no `session_is` conjunct, and a lost-race session is refused too.
+DISCONNECTED and BatchHeartbeat stay fail-soft, and a server with no route store is unchanged. No
+schema change. Why this and not a multi-replica indicator or a durable per-session generation
+(Fable-tier architect adjudication): the single-replica cost that motivated local acceptance went away
+with #5695 (the gateway resends the refused notice, so the price is a delay, not a loss); no replica
+registry or count exists to key an indicator on, and `LeaderElector::is_leader()` is a belief gate that
+is also true for the leader of a two-replica fleet; and a generation column cannot be read when the
+store is unreadable, so a migration buys nothing for the degraded case. Strict is also better on one
+replica: the old accept published in memory while `announce_connected` failed open on the same pool,
+leaving the durable row without placement and nothing to repair it, whereas refuse-and-resend lands
+both together. **Residuals, not closed:** (1) on one replica, an agent whose CONNECTED lands in a
+degraded window is undispatchable for the outage plus up to 60 s of resend backoff, or up to 10 minutes
+once the refusal has lasted 15 minutes (the gateway's slow phase, `notify_unacked_slow_after_ms` and
+`notify_unacked_slow_max_ms` in `yuzu_gw_upstream.erl`; the durations are from the documented backoff, not
+measured); `register_fresh` is fail-closed, so only sessions
+registered just before the outage, or a pool-acquire timeout (`kHotReadTimeout`, 500 ms), reach this
+branch. (2) A gateway older than #5695 never resends, so the placement is lost until the agent
+reconnects (version skew: upgrade every gateway before relying on this). (3) The fallback on a
+SUCCESSFUL read is unchanged: a row that is absent or tombstoned (the agent re-registered elsewhere
+and then disconnected) still lets a late CONNECTED for the old session republish this replica's
+in-memory placement. That is the stale-placement republish (the open part of hp-1: a stale local
+session is never reaped) and stays on #5685.
+(4) The read-then-supersede window remains; the durable write stays session-guarded. (5) The #4669
+compound window (the cluster-affinity check and the write both degrading) is unchanged. The stale-placement
+republish and the guardian heartbeat reconcile stay open on #5685, so this does not lift the safe-to-scale
+gate.
+
+**Update (2026-11-13, slice 3): hp-1's shadowing, hp-2's snapshot half, #6339, plugin-capability visibility.**
+(a) *hp-1 shadowing.* A replica that handled an agent's `ProxyRegister` but not its CONNECTED holds a
+session with an empty `gateway_node` and no stream, for which `send_to` returns false; the directory fallback
+consulted the store only on a TOTAL local miss, so the agent stayed undispatchable although another replica
+held a routable row. `GatewayRouteFallback::prepare` (via `AgentRegistry::needs_directory_consult`) and
+`has_remote_presence` now treat exactly that state as a miss. It is the state in which `send_to` cannot
+deliver, so no outcome that succeeded changes; what does change on one replica is that such a session (a
+direct agent between Register and Subscribe, a gateway agent between ProxyRegister and CONNECTED) costs one
+batched directory read per dispatch, and a degraded read for it now sets `route_unreadable` (a
+classification change, not a routing change). `send_via_directory` re-checks at send time: if the CONNECTED
+landed after the decision it hands the id to `send_to` (which stamps the local placement and applies the
+dispatch-tag capability check), and it applies the per-OS kill switch (#5294) to a local session's OS. The
+delivery-path read only TRY-locks `stream_mu`, so a stalled stream write cannot stall the dispatch gate. Follow-up, deliberately not done here (touching Erlang triggers the gateway rows): the header comment of `gateway/apps/yuzu_gw/src/yuzu_gw_upstream.erl` (about lines 169-173) still quotes the old log text and describes `connected_unverified` as conditional on a local session; update it with the next gateway-touching change.
+(b) *hp-2, snapshot half.* The fleet snapshot's `os` on a replica with no session comes from the presence row
+(a primary-key read, only when this heartbeat's presence write succeeded; local wins; blank stays blank). The
+guardian heartbeat reconcile on a non-owning replica is done in part, below (Update, HA WS-5 PR A): a local session that cannot deliver is
+routed through the directory; an agent with no local session at all still reports `no_session` until the gateway's replay lands, an
+accepted residual awaiting the project lead, so #5685 stays open until then. (c) *#6339.* `resolve_sessions` refuses a session id whose
+local map and directory row name different agents (`session_lookup/agent_mismatch`) and lists it for replay (not
+counted as an unknown session), so the gateway replays `ProxyRegister` and the register path decides who holds it (the agent that is not the
+row's holder is refused `held_by_other_agent`); the no-row `announce_connected` probe is not added. This
+narrows the BatchHeartbeat and ProxyInventory attribution only: the tombstoned-victim CONNECTED window of
+the 2026-10-22 update is unchanged.
+(d) *Plugin-capability visibility (§7a presence, extended in place).* Migration v5 of `OfflineEndpointStore`
+adds a side table `endpoint_plugins(agent_id PK REFERENCES endpoints ON DELETE CASCADE, session_id,
+plugin_names text[])`, written once per session by the owning replica's heartbeat after its upsert. A side table,
+not a column on the hot row, because that row is rewritten on every heartbeat. A read joins on the list's
+session equalling the endpoint's current session, so a list from an older session is never served for a newer
+one (it reads as unknown). `AgentRegistry::ids_missing_plugin` merges the live ids whose published list lacks
+the plugin (per-plugin result cached for the presence TTL, one refresher per plugin, no registry lock held
+across the database read). Local wins; an agent with no list, a degraded or truncated read, and every protective
+action fail open or stay exempt. The read is skipped altogether unless the durable presence holds more rows than
+this replica has sessions, so a single replica never pays it (local sessions whose presence row has not landed,
+a tripped batch or a failed upsert, can offset real remote rows and switch the withhold off for that window: an
+under-withhold, not a wrong refusal); a caller that arrives while a refresh is in flight
+is served a previous entry only if it is under 30 s old (else it fails open); a list the caps would cut (over 256
+names, an empty or over-64-byte name) is not stored in part, because a missing name would read as absent; the
+heartbeat publishes only for the registry's current session and backs off 60 s after a failed write. A published absence is only a CANDIDATE: the read returns each agent
+with the session that published the list, and `ids_missing_plugin` withholds it only while the agent's ROUTABLE
+directory row (`agent_routes`) still names that same session. The check is one narrow statement per dispatch
+(`GatewayRouteStore::confirm_sessions`: the candidates' (agent, session) pairs joined to the primary key, the
+routable predicate on the DB clock, only the matches returned, bounded to 2 s by `SET LOCAL statement_timeout`),
+never cached, run with no registry lock held, admitted at most twice at once (a caller past that withholds
+nothing and is counted `shed`) and counted on `yuzu_server_plugin_absence_confirm_total{outcome}`; an agent that
+registered on this replica while the read was in flight is re-checked and not withheld. The two stores stay single-schema owners and are
+composed in C++ through an injected reader (`make_route_session_confirmer`), not in SQL, so ADR-0012 §3's
+cross-store owner is not needed. The registration that creates a new session rewrites `agent_routes.session_id`
+before the agent is handed it (`register_fresh`, which fails closed on a store error) and leaves the row
+unplaced, so a restarted agent's old list stops matching at that instant: no dependence on a best-effort clear,
+on the new session's first heartbeat, or on the candidate cache (3 s, up to `kMaxStaleServe` = 30 s while a refresh is in flight, which is harmless here because the confirmation read is never cached). No row, a tombstone, an expired or unplaced
+row, a different session, a degraded or throwing confirmation read, or no wired reader all fail open (the agent
+is dispatched to and answers for itself): an under-withhold, never a wrong refusal. Two consequences. A
+direct-connect agent has no directory row, so cross-replica `plugin_not_found` applies to gateway-fronted agents
+only (consistent with §2: gateway-fronting is mandatory in HA, and a non-owning replica cannot deliver to a direct
+agent anyway); and an agent that was gateway-connected and then reconnects directly keeps its old row, so its old
+list can still match on a non-owning replica until the row is reaped, a wrong cause label on an agent that
+replica cannot reach. The confirmation is as of the moment of the read, so a session registered an instant
+later is the ordinary race any dispatch has.
+
+The ARRIVAL mirror (`mirror_arrival_to_presence`, fired where a
+stream is established: direct Subscribe start and gateway CONNECTED on any replica, never in Register) still
+deletes plugin lists published by OTHER sessions of the agent (`clear_plugins_of_other_sessions`, best effort,
+250 ms acquire, counted `op="clear_plugins"`) as housekeeping: its failure changes no verdict. It is skipped for
+a lost-race session (it would delete the winner's list), and the direct Subscribe call site is pinned by a
+source-text gate, not by a behavioural test.
+
+Cost and limits: one directory query per dispatch over the candidate ids (up
+to the 100,000-row cap of the candidate read), only when the durable presence holds rows beyond this replica's
+own sessions; measured on a scratch Postgres at about 60 ms for 50,000 ids and 100 to 120 ms for 100,000, with
+one pool lease held for it, and not measured end to end in the server (the pool is shared with presence upserts, lease renewals and registration; the cap of two in flight and the 2 s statement bound are what keep a dispatch burst from taking it over, at the price that under a burst the cross-replica `plugin_not_found` is switched off, visibly, on `shed`). Not done, to be tracked before the safe-to-scale gate lifts: confirming only the dispatch's resolved targets, a duration histogram, an alert on `degraded`/`shed`, and a TSan/ASan run of the new locking. An agent's plugin set is fixed for its process lifetime (`plugin_names_` is appended only by the startup plugin load in `agent.cpp`), so a published list cannot go stale inside one session. A gateway crash that leaves the old route row routable keeps the reconnect-directly case above alive for the 90 s lease.
+
+Reasoned, not tested end to end: an
+OLDER session can be written back into `agent_routes.session_id` only by `reclaim_tombstoned_session` (guarded
+on `session_id IS NULL`) after the newer session's row was tombstoned, which leaves the row unplaced (so it does
+not match; pinned by a test) and needs the agent to have no live stream; the reap paths that could tombstone a
+live session take at least 300 s, so the reading holds for the default 90 s `session_timeout` and weakens as
+that value approaches 300 s (the row is then still unroutable until a re-announce); if the `endpoint_plugins` row is removed (decommission or prune racing a live session) the list is
+not republished until the agent re-registers, so visibility fails open; sustained `truncated` on
+`query_without_plugin` (above 100,000 live agents) switches the cross-replica withhold off with no alert; while
+every session lacks a delivery path (after a directory outage) an unfiltered broadcast takes the per-id path with
+one batched directory read per dispatch, and a no-path session whose directory row is stale can be reported
+queued although it never reaches the agent (the same shape as spike finding 10). Not measured: the query cost at
+fleet scale, and the one extra write per session.
+(e) *Update (HA WS-5, #5685): the Guardian reconcile's send through the route directory.* The reconcile flow
+only reaches its send for an agent this replica holds a session for. After a server-only restart (or when the
+gateway replays a registration to this replica) that session is adopted from the replay and has no delivery path
+(empty `gateway_node`, no stream) until its re-announced CONNECTED reaches this replica; `AgentRegistry::send_to`
+returns false for it, so the push counted only `yuzu_server_system_reserved_push_total{result="undelivered"}`.
+`ServerImpl::send_guardian_push` now asks `resolve_guardian_directory_route`
+(`guardian_directory_route.hpp`) when `needs_directory_consult` holds: one `lookup_routes` read, then `routed`
+only if the row is `routable` (DB clock), names a cluster, and its `session_id` equals the session this replica
+holds; `send_via_directory` queues the push for that cluster (`result="sent_remote"`, audit detail ` via the
+route directory`). A degraded read is `unreadable`: nothing is sent and the reconcile aborts as `degraded` with an
+`ABORTED` audit row. A row for another session, an expired lease, an unplaced row, a tombstone or no row is
+`no_route`: counted `undelivered`, because a push built for one registration must never reach another's cluster.
+`GuardianDirectoryRoute` reads no OS or attribute from the directory, so no scope or identity is derived from it:
+the flow's scope evaluation and OS filter still use this replica's own session, and a replica with no session at
+all still reports `no_session` (the residual below). *Accepted, documented:* (1) two replicas can each push one
+agent (the claim and the budget are per replica and the reconcile is not fenced by the leader epoch, so the pushes carry the same generation and
+converge, but each has its own command id, which the agent's replay dedup does not collapse, and its own
+`guaranteed_state.reconcile` row); (2) an agent with no local session on this replica reports `no_session`
+until the gateway's replay lands. The replay guard (`registration_replay_session_guard_ms`, 10 s per
+session) limits how often one session is re-queued, not the number of rounds, so this is bounded (about 1,200 s for 10,000 agents, the earlier estimate above) only while one replica serves the agent or the gateway's upstream channel is sticky; across replicas convergence is probabilistic (7c) and is pending #5649; (3) gateway-fronted agents only, since a
+direct-connected agent never has a route row; (4) the session-held, no-delivery-path arm of `send_via_directory` (the arm this reconcile
+uses, since it always holds a session) does not apply `send_to`'s gateway-capability check, as for operator dispatch; it also applies the per-OS kill switch, which withholds nothing here because `__guard__.push_rules` is a protective action (`is_protective_action`) and so exempt, so do not count on a kill switch to stop this push (if a CONNECTED lands between the route read and the send, `send_via_directory` hands the push to `send_to`, which does check, and the outcome is still labelled `sent_remote`). The session id is read before the directory read and re-checked after it, so a re-registration during the read is `no_route`, not a match against the new session; the flow withholds the push if the session changed since it started, immediately before the send. A re-registration after that, between the read and the send, can still queue the push for the superseded registration's cluster: the rules were built for the old session and carry the same generation, so no later heartbeat repairs it until the generation moves (accepted, documented). An undelivered push, by contrast, is retried by the next heartbeat. The match is deliberately STRICTER than the other `send_via_directory` callers (`GatewayRouteFallback`), which take any routable row, because this push is built from this replica's own session state; do not harmonise them. Whether the re-announced
+CONNECTED reaches the adopting replica depends on the gateway's upstream channel staying connection-sticky (7c,
+#5649); this change does not decide that. #5685 stays open until the residual in (2) is accepted by the project
+lead, and it also still holds the stale-placement republish (see the Updates above); the safe-to-scale gate is NOT lifted.
+(f) *Slice 13.7 (#7062).* The server's gateway management channel sends a keepalive ping every 30 s with a 10 s
+timeout, also while idle, so a node that stops answering without closing the connection is found in about 40 s
+(from the code, the cowboy listener having no minimum ping interval, and a unit test through the `channel_via`
+seam; the final call into `grpc::CreateCustomChannel` is by inspection and detection is not measured against a
+real silent-drop fault). A forward that fails UNAVAILABLE is retried up to 3 times with the same command id, so a
+drop after the gateway accepted a command can send it again; the agent's dedup store makes that effectively-once.
+The decision recorded with it (the manual and #7062): one name in front of every gateway node (TCP pass-through,
+a certificate SAN for that name, the same management peer settings on each node) is the shape the spike
+exercised; a multi-address DNS name was not tried; an address-list syntax is deferred; the server has no second
+address or failover of its own. 13.7 is not claimed closed for the gate.
+The safe-to-scale gate is NOT lifted.
 
 **Update (2026-10-22, #5683): UNIQUE partial index on `agent_routes(session_id)`.** Migration v5 of
 `GatewayRouteStore` replaces the non-unique `agent_routes_session_id_idx` with
@@ -2739,3 +3087,9 @@ core-only work to the DB-less presentation tier. Fixed:
 - **WS-2** now names the **core→presentation event spine** as an ADR-0031 prerequisite.
 - Wording: "gateway forwards **transparently (unconditionally)**" (not "idempotently"); coordination
   language qualified to **core** (§6/§10, `CONTEXT.md`); stale round-2 citation/phrasing corrected.
+
+## Leader-election standing invariants
+
+The canonical full statement of these catastrophic-if-violated invariants. The always-loaded routed-concern table carries only a compressed trigger for them.
+
+**Fenced leader election — `LeaderElector` + the singleton-loop gate (WS-3, ADR-2002 §3/§6/§10).** A COORDINATION concern parked here for the per-file ceiling; `security-guardian` territory as fenced leadership stops a second replica DOUBLE-DISPATCHING destructive commands. CATASTROPHIC: (1) `is_leader()` is the ATTEMPT gate ONLY — the guarantee against a paused ex-leader is the monotonic-epoch `epoch_fence_sql()` predicate embedded in a LEADER-DRIVEN claim's WRITE (slice 3.3's command outbox), NEVER a cached "I am leader" bool (§6); the operator-synchronous remediation claim (slice 3.4) uses its OWN guarded CAS in `PolicyStore`, never this epoch (clause 3). (2) The runtime loop gate MUST consume WS-10's `background_jobs.hpp` classification via `background_job_class()`/`leader_gate_permits` — never a second "which loops are leader-only" list. Only `FencedLeaderOnly` consults the elector; `DisabledUntilFixed` → runs (held back by the DEPLOYMENT safe-to-scale gate — denying it silently disables a live single-replica pass). (3) NEVER epoch-fence an operator-SYNCHRONOUS path, INCLUDING a shared sub-pass its COMPLETION depends on (two-dispatch-planes rule) — gate the background tick site, not the shared primitive: the CRL background re-publish is gated, the operator-revoke publish is not; `PolicyEvaluator::tick` gates ONLY `dispatch_due` while `collect_ready` (the only path that matures an operator record to a verdict) runs per-replica — gating the whole `tick` stranded remediations as `fixing` forever (PR #4134). (4) The elector owns ONE dedicated, never-recycled connection (§10), never a pooled / txn-mode-pooler lease; `is_leader()`/`epoch()` are LOCK-FREE reads so a stalled probe never blocks a worker tick (#4013). `quarantine_reconciler.tick` MUST be reclassified stream-partitioned at WS-4 (#4119). (5) **Epoch = `GREATEST((GREATEST(tl, prev>>32) << 32) + nextval(seq), prev + 1)` (#6535)** — never a bare sequence, a floor without the timeline, or `pg_control_checkpoint()` for the timeline (it lags a promotion; read `pg_walfile_name(pg_current_wal_lsn())` INSIDE the mint); pack with `+`. Not-covered list: ADR-2002 §3 Update (2026-11-01); never restate as covered.

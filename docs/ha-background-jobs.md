@@ -15,6 +15,8 @@ table disagree, the table wins.
   case (ADR-2002 §5: every replica polls its own bus, or non-leader SSE goes dark);
   the `/readyz` Postgres reachability probe (`pg_reachability_probe.tick`, HA WS-8)
   is another — each replica must measure its own path to Postgres.
+  The collation-version recheck (`pg_collation_recheck.tick`) is a third: each replica exports its
+  own `yuzu_pg_collation_version_mismatch` gauge.
 - **FencedLeaderOnly** — side-effecting singleton work that double-fires across
   replicas (agent dispatch: schedule tick, policy remediation, quarantine
   reconcile; CRL numbering). Runs only on the WS-3 fenced leader. *Enforcement is
@@ -36,18 +38,22 @@ runs ~11 (the per-replica poll, several advisory-locked reaps, gauge refreshes) 
 re-publish, a per-replica stream teardown, the two per-replica MCP maintenance
 passes (bridge sweep + session gc), and (since #5513) the per-replica, in-memory
 `guardian_reconcile_gate.sweep` of the Guardian heartbeat-reconcile claim table
-(ReplicaSafe: it touches no store and each replica owns its own claims). The same reconcile's policy-generation cache and rule-bundle cache are per-replica in-memory state too: their invalidation hooks (rule and Baseline mutation, and the push fan-out) fire only on the replica that served the mutation, and the other replicas miss a held bundle as soon as they see the new generation (about the generation cache's 2 s TTL plus its idle gap; the bundle is keyed by generation) and rely on its `max_age` (60 s) only when the bump failed. Classifying a thread wholesale would falsely
+(ReplicaSafe: it touches no store and each replica owns its own claims) and, since WP01, the per-replica `reregistration_audit.flush_summary` on its OWN thread (`reregistration_flush_thread_`, every 5 s, so a slow audit store cannot stretch the revocation sweep on `health_recompute_thread_`): it writes the closed-window dropped-audit-row summary chunks from that replica's in-memory budget to the audit log (ReplicaSafe, never leader-gated: a gated flush would lose every non-leader replica's evidence; it does write to the audit store, unlike the reconcile sweep). It brings the inventory (`kBackgroundJobs`) to 55 jobs, and its thread is not `health_recompute_thread_`. `stop()` joins it with the health thread, before the forced flush and the store teardown (worst case about 73 s inside the shipped 210 s stop grace). The same reconcile's policy-generation cache and rule-bundle cache are per-replica in-memory state too: their invalidation hooks (rule and Baseline mutation, and the push fan-out) fire only on the replica that served the mutation, and the other replicas miss a held bundle as soon as they see the new generation (about the generation cache's 2 s TTL plus its idle gap; the bundle is keyed by generation) and rely on its `max_age` (60 s) only when the bump failed. Classifying a thread wholesale would falsely
 certify an unsafe pass riding a mostly-safe thread, so each `kBackgroundJobs` entry is
 one unit of work — with the caveat that the many trivially-identical read-only gauge
 passes on `health_recompute_thread_` are folded into a single
 `health_store.recompute_metrics` entry (they are all ReplicaSafe; the CRL publish,
 which is NOT, is enumerated separately). Passes on their own dedicated component
-threads (cert reloader, catalogue rollup, provisional-MFA cleanup, OTA watchdog, MCP
-projector, the two store-worker delivery pools, and — since HA WS-8 — the Postgres
-reachability probe) each get their own entry too — the 2026-09-07 sweep
+threads (cert reloader, catalogue rollup, software-title normalisation, the PostgreSQL collation-version
+recheck, provisional-MFA
+cleanup, OTA watchdog, MCP projector, the two store-worker delivery pools, and — since HA
+WS-8 — the Postgres reachability probe) each get their own entry too — the 2026-09-07 sweep
 (methodology recorded in the `kBackgroundJobs` header) brought the table to 40 after
-an earlier revision missed eight of these; later additions (48 passes now, including the one-shot
-`inventory_store.purge_typed_sources` on `typed_purge_thread_`) are recorded in that header.
+an earlier revision missed eight of these; later additions (55 passes now, including the one-shot
+`inventory_store.purge_typed_sources` on `typed_purge_thread_`, the hourly
+`software_normalization_job.run_tick` on `SoftwareNormalizationJob::thread_`, and the per-replica
+fleet snapshot refresh on the catalogue rollup thread) are recorded in
+that header.
 
 ## How classification is enforced — and its honest limit
 
@@ -59,12 +65,13 @@ an earlier revision missed eight of these; later additions (48 passes now, inclu
   (the `command_capability.hpp` ExecuteGate precedent): all FencedLeaderOnly and
   DisabledUntilFixed passes (incl. the concurrency reconciler), plus the load-bearing
   ReplicaSafe ones (the event-outbox poll, the one-shot typed-source purge
-  `inventory_store.purge_typed_sources` (2a-1b), the four retention prunes (incl.
-  `offline_endpoint_store.run_retention_prune`, #5678), the app_perf rollup upsert,
-  and the must-run-per-replica / shared-PG-writing passes the sweep added: cert reloader, catalogue rollup, provisional-MFA cleanup, OTA watchdog, MCP
+  `inventory_store.purge_typed_sources` (2a-1b), the five retention prunes (incl.
+  `offline_endpoint_store.run_retention_prune`, #5678, and
+  `software_inventory_store.run_retention_prune_changes`, SAM-14), the app_perf rollup upsert,
+  and the must-run-per-replica / shared-PG-writing passes the sweep added: cert reloader, catalogue rollup, software-title normalisation (`software_normalization_job.run_tick`), provisional-MFA cleanup, OTA watchdog, MCP
   projector, MCP bridge sweep + session gc, the Guardian reconcile claim sweep
   `guardian_reconcile_gate.sweep` (#5513), store-worker delivery pools, the HA WS-8
-  Postgres reachability probe).
+  Postgres reachability probe, the collation-version recheck).
 - That proves **named⇒classified** for those sites. It does **not** yet prove
   **pass⇒named** for every dispatch site — a `consteval`/CI sweep visiting *all* of
   them is a tracked follow-up (#4094) — so completeness rests on this table, the
@@ -81,7 +88,10 @@ The three formerly-bare wall-clock prunes — `app_perf_fleet_store`,
 the full seven-part clock guard + a `pg_try_advisory_xact_lock` making it
 SINGLE-WRITER-safe, reading Postgres `now()` in-SQL (the shared clock). A fourth,
 `offline_endpoint_store.run_retention_prune` (#5678), adopts the same helper on
-`preflight_runner_thread_` (keyed on the PG-authored `last_seen_at`). The
+`preflight_runner_thread_` (keyed on the PG-authored `last_seen_at`). A fifth,
+`software_inventory_store.run_retention_prune_changes` (SAM-14), adopts it on the same thread
+(keyed on the replica-stamped `observed_at`; the register row records why that clock split is
+accepted). The
 `concurrency_claims` reconciler gained the same advisory lock, but **not** the shared
 clock — its clock authority stays replica-local and its part-3 sanitiser is
 floors-only, so it is **DisabledUntilFixed**, not ReplicaSafe, until the

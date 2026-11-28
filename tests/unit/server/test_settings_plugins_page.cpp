@@ -524,7 +524,7 @@ struct PgWired {
 };
 
 const char* kHelp = R"({"plugins":[{"name":"processes","actions":[{"name":"list"}]},)"
-                    R"({"name":"quarantine","actions":[{"name":"status"}]}]})";
+                    R"({"name":"firewall","actions":[{"name":"quarantine_status"}]}]})";
 
 } // namespace
 
@@ -686,7 +686,7 @@ TEST_CASE("kill-switch fragment: a per-OS switch is visible and named, names are
         CHECK(lin < mac);
     }
     // The datalist is the fleet-observed catalogue.
-    CHECK_THAT(r->body, ContainsSubstring("<option value=\"quarantine\">"));
+    CHECK_THAT(r->body, ContainsSubstring("<option value=\"firewall\">"));
 
     // Without Infrastructure:Read the lookup still answers (it is PluginConfig:Read's), but the
     // fleet-observed catalogue is not drawn and the names are not checked against it.
@@ -695,7 +695,7 @@ TEST_CASE("kill-switch fragment: a per-OS switch is visible and named, names are
     REQUIRE(no_infra);
     CHECK_FALSE(has(no_infra->body, "data-denied"));
     CHECK_THAT(no_infra->body, ContainsSubstring(">Disabled</span>"));
-    CHECK_FALSE(has(no_infra->body, "<option value=\"quarantine\">"));
+    CHECK_FALSE(has(no_infra->body, "<option value=\"firewall\">"));
     h.denied_perms.clear();
 
     // A misspelt plugin still looks up (no switch set) but is flagged: it would stop nothing.
@@ -705,7 +705,7 @@ TEST_CASE("kill-switch fragment: a per-OS switch is visible and named, names are
     CHECK_THAT(typo->body, ContainsSubstring("No switch set"));
 
     // A protective plugin carries the note.
-    auto q = h.sink.Get("/fragments/settings/kill-switch?plugin=quarantine");
+    auto q = h.sink.Get("/fragments/settings/kill-switch?plugin=firewall");
     REQUIRE(q);
     CHECK_THAT(q->body, ContainsSubstring("protective actions of this plugin are never refused"));
 

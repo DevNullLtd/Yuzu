@@ -20,10 +20,11 @@
  * unbounded value summed into a double silently annihilates every honest
  * agent's contribution via IEEE-754. A plugin publishing more than
  * kPluginHeartbeatMaxKeys keys has the excess silently dropped (sorted,
- * truncated) with no warning to the plugin author; not reachable today (every
- * current consumer publishes at most 2 keys).
+ * truncated) with no warning to the plugin author. file_search publishes exactly the cap, so a ninth
+ * key there would be dropped; every other consumer publishes at most 6 (component_inventory is the widest).
  */
 
+#include <wire_utf8.hpp> // scrub_wire_bytes: heartbeat tag values must be UTF-8
 #include <algorithm>
 #include <cstddef>
 #include <functional>
@@ -70,6 +71,10 @@ void emit_plugin_heartbeat_tags(
             auto value = get_fn(plugin, key);
             if (!value || value->size() > kPluginHeartbeatMaxValueBytes)
                 continue;
+            // A tag value is a proto3 `string` map value: one non-UTF-8 byte makes the server
+            // reject the whole direct Heartbeat RPC (the gateway repairs it, the direct path
+            // does not), so scrub it here (WP07).
+            yuzu::shared::scrub_wire_bytes(*value);
             tags["yuzu.plugin." + plugin + "." + std::string{suffix}] = std::move(*value);
         }
     }

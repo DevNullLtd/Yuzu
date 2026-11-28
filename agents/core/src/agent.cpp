@@ -21,6 +21,8 @@ __declspec(allocate(".CRT$XCB"))
 #include <yuzu/agent/guardian_engine.hpp>
 #include <yuzu/agent/kv_store.hpp>
 #include <yuzu/agent/plugin_loader.hpp>
+#include <yuzu/agent/reconnect_backoff.hpp>
+#include <yuzu/agent/server_address_parsers.hpp>
 #include <yuzu/agent/server_address_resolver.hpp>
 #include <yuzu/agent/subprocess_runner.hpp>
 #include <yuzu/agent/trigger_engine.hpp>
@@ -30,6 +32,7 @@ __declspec(allocate(".CRT$XCB"))
 #include <yuzu/metrics.hpp>
 #include <yuzu/secure_zero.hpp>
 #include <yuzu/version.hpp>
+#include <yuzu/log_token.hpp> // log_id_token (CWE-117) for the refusal log line
 
 #include <grpcpp/grpcpp.h>
 #include <nlohmann/json.hpp>
@@ -38,15 +41,24 @@ __declspec(allocate(".CRT$XCB"))
 // Generated protobuf/gRPC headers (flat output from YuzuProto.cmake)
 #include "agent.grpc.pb.h"
 #include "guaranteed_state.pb.h"
+#include "session_log_fingerprint.hpp" // #8159: the session id is a bearer credential; log a fingerprint only
 
 // Local-only helper, exposed for unit testing.
 #include "plugin_config_sync.hpp"
 #include "plugin_heartbeat_tags.hpp" // #1567 plugin heartbeat.* KV -> status tags
 #include "local_dispatcher.hpp"
+#include <wire_utf8.hpp>        // F70: yuzu::shared::scrub_wire_bytes at the plugin-output seam
 #include "ctx_slot.hpp"         // CtxSlot / cancel_ctx_slot (unit-tested, #2182)
 #include "command_frames.hpp"   // make_output_frame / make_final_frame (CommandResponse.action)
 #include "ota_update_thread.hpp" // OTA update thread lifecycle (unit-tested, #2182)
 #include "shutdown_deadline_guard.hpp" // #2233 item 3: end-to-end stop() deadline
+#include "hard_exit.hpp"                 // hard_exit / kOrphanDrainGrace: the detached-collector drain barrier
+#include "log_handoff.hpp"               // drain_log_bounded: breadcrumb before that hard_exit
+#include "command_dedup_decision.hpp"            // dedup claim/replay decision core (pure, unit-tested)
+#include "command_params.hpp"                    // command_params_have_nul (sg10 / UP-1)
+#include "command_start_gate.hpp"                // command_may_start/command_may_stagger: protective actions run at teardown
+#include "interruptible_wait.hpp"                 // sleep_interruptible: a stagger never outlives a reconnect or stop
+#include "collection_settings_agent.hpp"       // __sync__.settings decision core (pure, unit-tested)
 #include "sync_now_decision.hpp"               // __sync__.now decision core (pure, unit-tested)
 #include "sync_scheduler.hpp"                 // ADR-0016 daily-sync framework
 #include "sync_source_installed_software.hpp" // ADR-0016 source #1
@@ -58,14 +70,16 @@ __declspec(allocate(".CRT$XCB"))
 #include "dex_linux_proc.hpp" // A4 Linux heartbeat perf reads (parse_proc_stat / parse_commit_pct)
 #include "dex_perf_breach.hpp" // A4: heartbeat device-utilization tags (perf counter reads)
 #include "net_quality_sampler.hpp" // slice 4a: heartbeat network-quality facts
+#include "guardian_drift_event.hpp" // guardian_event_refused_by_server
 #include "guardian_spark_send.hpp" // rung 7.7a: OutboxEntry -> GuaranteedStateEvent send mapping
 #include "guardian_spark_timing.hpp" // #4606 criterion-10 T_wire: SendTimingRecord/format_send_timing_line
 #include "spark_engine.hpp"    // ADR-0021 Stage-2 rung 1: instantiate observe-only
 #include "guardian_arm_heartbeat.hpp"     // emit_guardian_arm_heartbeat_tags (rung 9c PR-3)
 #include "guardian_backend.hpp"           // GuardianBackend, guardian_backend_from_state/label (F7)
 #include "guardian_health_heartbeat.hpp"  // emit_guardian_health_heartbeat_tags (M1)
-#include "guardian_baseline_heartbeat.hpp" // emit_guardian_baseline_persist_heartbeat_tags (#4045)
+#include "guardian_baseline_heartbeat.hpp" // emit_guardian_baseline_* heartbeat tags (#4045, #5605)
 #include "guardian_baseline_persister.hpp" // kBaselineShutdownGrace (#4045; static_assert below)
+#include "guardian_boot_epoch.hpp"         // claim_guardian_boot_epoch (UP-14)
 #include "guardian_io_ceiling_heartbeat.hpp" // emit_guardian_io_ceiling_heartbeat_tags (rung 9c PR-3)
 #include "guardian_journal_heartbeat.hpp" // emit_guardian_journal_heartbeat_tags (item 7 PR-Ag)
 #include "guardian_legacy_sink_executor.hpp" // #4783: LegacySendOutcome (EventSink's return type)
@@ -73,6 +87,7 @@ __declspec(allocate(".CRT$XCB"))
 #include "spark_heartbeat.hpp" // emit_spark_heartbeat_tags — spark fleet telemetry
 #include "spark_mechanism.hpp" // make_{file,registry,service}_mechanism factories
 #include "thread_pool.hpp" // bounded dispatch pool + per-task exception firewall (#2037)
+#include <yuzu/protective_actions.hpp> // is_protective_action: the reserved-lane predicate (ADR-2005)
 
 #ifdef _WIN32
 #include <winsock2.h> // gethostname (must precede windows.h)
@@ -88,6 +103,7 @@ __declspec(allocate(".CRT$XCB"))
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstring>
 #include <filesystem>
 #include <format>
 #include <fstream>
@@ -196,6 +212,12 @@ constexpr std::string_view kSyncKvNamespace = "__sync__";
 static_assert(is_reserved_plugin_name(kSyncKvNamespace),
               "kSyncKvNamespace must be a reserved plugin name (plugin_loader.hpp)");
 
+// #3668. The command-dedup claim bypass (kDedupBypassPlugin, command_dedup_decision.hpp) names the
+// Guardian side channel, which is dispatched by its reserved name. Bind it to kReservedPluginNames
+// so the constant cannot drift from the loader's reserved list.
+static_assert(is_reserved_plugin_name(kDedupBypassPlugin),
+              "kDedupBypassPlugin must be a reserved plugin name (plugin_loader.hpp)");
+
 #if defined(_WIN32)
 constexpr const char* kAgentOs = "windows";
 constexpr const char* kAgentArch = "x86_64";
@@ -257,6 +279,12 @@ std::string read_file_contents(const std::filesystem::path& p) {
 // (Subscribe RPC: stream CommandResponse -> stream CommandRequest)
 using SubscribeStream = grpc::ClientReaderWriter<pb::CommandResponse, pb::CommandRequest>;
 
+// Command pool shape (ADR-2005): the queue depth every lane uses (the ThreadPool default), and the
+// number of workers held back for PROTECTIVE actions so stuck ordinary commands do not take the
+// last worker (not a completion guarantee: ADR-2005 "What this does NOT establish"). Both pool construction sites use these two names.
+constexpr std::size_t kCommandQueueDepth = 1000;
+constexpr std::size_t kReservedProtectiveWorkers = 1;
+
 // ThreadPool (bounded dispatch pool + per-task exception firewall, #2037) now
 // lives in thread_pool.hpp so the firewall behaviour is unit-testable in
 // isolation. Used unqualified below via namespace yuzu::agent.
@@ -270,12 +298,25 @@ struct PluginContextImpl {
     KvStore* kv_store{nullptr};             // non-owning; lifetime managed by AgentImpl
     TriggerEngine* trigger_engine{nullptr}; // non-owning; lifetime managed by AgentImpl
     std::string plugin_name;                // set per-plugin during init/execute for KV namespacing
+    // "agent.server_peer": the literal address of the peer the latest successful Register
+    // answered on (grpc_peer_literal of ClientContext::peer()), or nullptr before the first
+    // Register / when the peer is not a usable literal. It is NOT in `config` on purpose:
+    // that map is unsynchronised and yuzu_ctx_get_config hands out raw pointers into it, so a
+    // reconnect-time write would race a plugin's read. The pointer always names an interned,
+    // immortal string (AgentImpl::publish_server_peer), so a read is race-free with no lock.
+    // Written only by the Register thread, read by yuzu_ctx_get_config.
+    std::atomic<const char*> server_peer{nullptr};
 };
 
 // Per-command output is buffered and flushed in a single gRPC Write instead of
 // issuing one Write per line. This reduces serialized gRPC writes from N-per-
 // command to 1-per-command for most plugins.
 static constexpr size_t kOutputFlushThreshold = 64 * 1024; // 64 KB auto-flush
+
+// Commands (since process start) where a plugin output write was lost to an allocation failure.
+// Process-wide so the heartbeat can carry it as `yuzu.output_dropped` (the agent exposes no
+// /metrics endpoint; yuzu_agent_plugin_output_dropped_total is agent-local).
+inline std::atomic<std::uint64_t> g_output_dropped_commands{0};
 
 struct CommandContextImpl {
     std::shared_ptr<SubscribeStream> stream;
@@ -312,11 +353,37 @@ struct CommandContextImpl {
     // on the server (in-tree convention: same constant in two places
     // until typed proto lands and renders both moot). This is the
     // DEFAULT; a caller that needs a larger bounded payload (the
-    // installed_software sync's v2 rows, blob contract v2) overrides it
+    // installed_software sync's rows, blob contract v3) overrides it
     // per-dispatch via `capture_max_bytes` below — see dispatch_with_capture.
     static constexpr std::size_t kCaptureMaxBytes = 2ull * 1024 * 1024;
     std::size_t capture_max_bytes{kCaptureMaxBytes};
-    bool capture_truncated{false};
+    std::atomic<bool> capture_truncated{false};
+
+    // Set when a plugin write could not be buffered (allocation failure, caught at the C ABI in
+    // yuzu_ctx_write_output). The output is then INCOMPLETE: capture-mode consumers trust
+    // `rc == 0 && !truncated`, so this also sets capture_truncated, and the command's typed status
+    // is forced to CONSTRAINED/PARTIAL (apply_output_drop) so a status-only section keeps the
+    // server's stored rows rather than replacing them with a short blob. noexcept, lock-free.
+    std::atomic<bool> output_dropped{false};
+    void note_output_dropped() noexcept {
+        output_dropped.store(true, std::memory_order_relaxed);
+        capture_truncated = true;
+    }
+    // Read-time mapping: a dropped write is never reported OK/UNDECLARED. A worse reported status
+    // (UNAVAILABLE / PERMISSION_DENIED) stands.
+    void apply_output_drop() noexcept {
+        if (!output_dropped.load(std::memory_order_relaxed))
+            return;
+        if (result_status == YUZU_RESULT_STATUS_UNDECLARED ||
+            result_status == YUZU_RESULT_STATUS_OK)
+            result_status = YUZU_RESULT_STATUS_CONSTRAINED;
+        result_completeness = YUZU_RESULT_COMPLETENESS_PARTIAL;
+        try {
+            if (result_provenance.empty())
+                result_provenance = "host:output_dropped";
+        } catch (...) { // NOLINT(bugprone-empty-catch) -- the typed flags above are authoritative
+        }
+    }
 
     // CC-07 plugin→host typed result seam (ABI4, sdk/include/yuzu/plugin.h).
     // Written at most by the single plugin thread executing this command's
@@ -330,7 +397,35 @@ struct CommandContextImpl {
     YuzuResultCompleteness result_completeness{YUZU_RESULT_COMPLETENESS_UNKNOWN};
     std::string result_provenance;
 
+    // TEST SEAM (production: one relaxed load): throw std::bad_alloc from the Nth next
+    // allocation-bearing step of append_output, to prove a dropped write is made visible.
+    static inline std::atomic<int> alloc_fault_countdown{0};
+    static void maybe_inject_alloc_failure() {
+        const int c = alloc_fault_countdown.load(std::memory_order_relaxed);
+        if (c > 0 && alloc_fault_countdown.fetch_sub(1, std::memory_order_relaxed) == 1)
+            throw std::bad_alloc();
+    }
+
     void append_output(const char* text) {
+        // F70: plugin text is declared UTF-8 but nothing enforced it, and the
+        // server's proto3 `string` parse rejects the WHOLE frame on one bad
+        // byte (ending this agent's command stream). Enforce the contract once,
+        // here, with the shared RFC 3629 scrubber (bad bytes -> '?'); the copy
+        // is made only when something needs replacing.
+        std::string scrubbed;
+        if (yuzu::shared::count_invalid_wire_bytes(text) != 0) {
+            scrubbed.assign(text);
+            const auto replaced = yuzu::shared::scrub_wire_bytes(scrubbed);
+            text = scrubbed.c_str();
+            // Observable, throttled (first and every power-of-two thereafter): a plugin that
+            // keeps emitting non-UTF-8 is a plugin bug or hostile endpoint data worth seeing.
+            static std::atomic<std::uint64_t> scrubbed_writes{0};
+            const auto n = scrubbed_writes.fetch_add(1, std::memory_order_relaxed) + 1;
+            if ((n & (n - 1)) == 0)
+                spdlog::warn("agent: replaced {} non-UTF-8 byte(s) in plugin output for command "
+                             "{} (occurrence #{}, logged on powers of two)",
+                             replaced, yuzu::log_id_token(command_id), n);
+        }
         std::lock_guard lock(buf_mu);
         size_t len = std::strlen(text);
         if (capture) {
@@ -349,21 +444,42 @@ struct CommandContextImpl {
                 capture_truncated = true;
                 return;
             }
+            // Reserve FIRST: the only throwing step runs before any mutation, so a bad_alloc leaves
+            // the buffer exactly as it was (no stray '\n' separator for a chunk that never landed).
+            maybe_inject_alloc_failure();
+            // Grow geometrically (bounded by the cap): reserve(n) alone may reallocate on every
+            // append for a large run of small writes.
+            if (prospective > capture->capacity())
+                capture->reserve(std::min<std::size_t>(
+                    capture_max_bytes, std::max<std::size_t>(prospective, 2 * capture->capacity())));
             if (!capture->empty())
                 capture->push_back('\n');
             capture->append(text, len);
             return;
         }
-        output_buffer.emplace_back(text, len);
-        output_buffer_bytes += len;
+        // One plugin line is bounded so a frame never exceeds the server's receive limit.
+        if (len > yuzu::agent::kMaxOutputLineBytes) {
+            output_buffer.push_back(yuzu::agent::clamp_output_line(std::string_view{text, len}));
+            output_buffer_bytes += output_buffer.back().size();
+        } else {
+            output_buffer.emplace_back(text, len);
+            output_buffer_bytes += len;
+        }
         if (output_buffer_bytes >= kOutputFlushThreshold) {
             flush_output_locked();
         }
     }
 
-    void flush_output() {
-        std::lock_guard lock(buf_mu);
-        flush_output_locked();
+    // Contained: the final flush after execute() builds the concatenated payload (an allocation)
+    // and must not unwind to the dispatch firewall with the drop uncounted. A failure here means
+    // buffered plugin output never reached the wire: mark it exactly like a lost write.
+    void flush_output() noexcept {
+        try {
+            std::lock_guard lock(buf_mu);
+            flush_output_locked();
+        } catch (...) {
+            note_output_dropped();
+        }
     }
 
 private:
@@ -376,6 +492,7 @@ private:
         if (output_buffer.empty())
             return;
 
+        maybe_inject_alloc_failure(); // TEST SEAM (see alloc_fault_countdown)
         // Concatenate all buffered lines into a single payload
         std::string combined;
         combined.reserve(output_buffer_bytes + output_buffer.size()); // +size for newlines
@@ -387,6 +504,7 @@ private:
         output_buffer.clear();
         output_buffer_bytes = 0;
 
+        maybe_inject_alloc_failure(); // TEST SEAM: a failure AFTER the buffer was cleared
         const auto resp = yuzu::agent::make_output_frame(command_id, action, std::move(combined));
 
         std::lock_guard lock(*write_mu);
@@ -504,6 +622,13 @@ int dispatch_with_capture(const YuzuPluginDescriptor* descriptor, const char* ac
     auto* raw_ctx = reinterpret_cast<YuzuCommandContext*>(&ctx_impl);
     int rc = descriptor->execute(raw_ctx, action, params, param_count);
     ctx_impl.flush_output(); // no-op in capture mode
+    ctx_impl.apply_output_drop();
+    if (ctx_impl.output_dropped.load(std::memory_order_relaxed)) {
+        g_output_dropped_commands.fetch_add(1, std::memory_order_relaxed);
+        spdlog::error("local dispatch '{}': a plugin output write was lost to an allocation "
+                      "failure; the capture is reported truncated",
+                      yuzu::log_id_token(action ? action : ""));
+    }
     if (truncated_out)
         *truncated_out = ctx_impl.capture_truncated;
     // BR-001: read back whatever the plugin reported via
@@ -555,6 +680,25 @@ YUZU_EXPORT YuzuResultStatus set_result_status_and_read_back(YuzuResultStatus st
     return ctx_impl.result_status;
 }
 
+// Test seam (no public header, same convention as set_result_status_and_read_back above): make
+// the Nth next capture-mode append_output allocation step throw std::bad_alloc.
+YUZU_EXPORT void arm_output_alloc_failure_for_test(int nth) {
+    CommandContextImpl::alloc_fault_countdown.store(nth, std::memory_order_relaxed);
+}
+
+// Test seam: a stream-mode final flush that hits an allocation failure is contained and counted
+// as a dropped write (returns CommandContextImpl::output_dropped). No stream is needed: the
+// injected failure fires before flush_output_locked touches it.
+YUZU_EXPORT bool stream_flush_alloc_failure_marks_dropped_for_test(int nth) {
+    CommandContextImpl ctx_impl{};
+    ctx_impl.output_buffer.emplace_back("buffered plugin output");
+    ctx_impl.output_buffer_bytes = ctx_impl.output_buffer.back().size();
+    CommandContextImpl::alloc_fault_countdown.store(nth, std::memory_order_relaxed);
+    ctx_impl.flush_output();
+    CommandContextImpl::alloc_fault_countdown.store(0, std::memory_order_relaxed);
+    return ctx_impl.output_dropped.load(std::memory_order_relaxed);
+}
+
 // C ABI context function implementations
 
 extern "C" {
@@ -563,7 +707,15 @@ YUZU_EXPORT void yuzu_ctx_write_output(YuzuCommandContext* ctx, const char* text
     if (!ctx || !text)
         return;
     auto* impl = reinterpret_cast<CommandContextImpl*>(ctx);
-    impl->append_output(text);
+    // C ABI boundary: nothing may unwind into the plugin. append_output allocates (buffering, and
+    // the F70 scrub copy); on bad_alloc this write is dropped rather than crossing the ABI.
+    try {
+        impl->append_output(text);
+    } catch (...) {
+        // No logging under OOM. The drop is made visible, not silent: capture_truncated (so every
+        // capture consumer reports constrained) and output_dropped (typed CONSTRAINED/PARTIAL).
+        impl->note_output_dropped();
+    }
 }
 
 YUZU_EXPORT void yuzu_ctx_report_progress(YuzuCommandContext* ctx, int percent) {
@@ -596,17 +748,32 @@ YUZU_EXPORT void yuzu_ctx_set_result_status(YuzuCommandContext* ctx, YuzuResultS
     }
     impl->result_status = status;
     impl->result_completeness = completeness;
-    impl->result_provenance = provenance ? provenance : "";
+    // C ABI: the string assignment allocates; nothing may unwind into the plugin. On failure the
+    // typed status/completeness above stand and the provenance stays as it was.
+    try {
+        std::string prov = provenance ? provenance : "";
+        yuzu::shared::scrub_wire_bytes(prov); // a proto3 string field: well-formed UTF-8 only
+        impl->result_provenance = std::move(prov);
+    } catch (...) { // NOLINT(bugprone-empty-catch)
+    }
 }
 
 YUZU_EXPORT const char* yuzu_ctx_get_config(YuzuPluginContext* ctx, const char* key) {
     if (!ctx || !key)
         return nullptr;
     auto* impl = reinterpret_cast<PluginContextImpl*>(ctx);
-    auto it = impl->config.find(key);
-    if (it == impl->config.end())
+    // The live control peer is the one key answered from an atomic, not from `config`
+    // (see PluginContextImpl::server_peer): nullptr until a Register has published it.
+    if (std::strcmp(key, "agent.server_peer") == 0)
+        return impl->server_peer.load(std::memory_order_acquire);
+    try {
+        auto it = impl->config.find(key); // builds a std::string key: can throw
+        if (it == impl->config.end())
+            return nullptr;
+        return it->second.c_str();
+    } catch (...) {
         return nullptr;
-    return it->second.c_str();
+    }
 }
 
 YUZU_EXPORT const char* yuzu_ctx_get_secret(YuzuPluginContext* ctx, const char* key) {
@@ -623,7 +790,11 @@ YUZU_EXPORT int yuzu_ctx_storage_set(YuzuPluginContext* ctx, const char* key, co
     auto* impl = reinterpret_cast<PluginContextImpl*>(ctx);
     if (!impl->kv_store || impl->plugin_name.empty())
         return -2;
-    return impl->kv_store->set(impl->plugin_name, key, value) ? 0 : 1;
+    try {
+        return impl->kv_store->set(impl->plugin_name, key, value) ? 0 : 1;
+    } catch (...) { // C ABI: no exception into the plugin
+        return 1;
+    }
 }
 
 YUZU_EXPORT const char* yuzu_ctx_storage_get(YuzuPluginContext* ctx, const char* key) {
@@ -632,7 +803,12 @@ YUZU_EXPORT const char* yuzu_ctx_storage_get(YuzuPluginContext* ctx, const char*
     auto* impl = reinterpret_cast<PluginContextImpl*>(ctx);
     if (!impl->kv_store || impl->plugin_name.empty())
         return nullptr;
-    auto val = impl->kv_store->get(impl->plugin_name, key);
+    std::optional<std::string> val;
+    try {
+        val = impl->kv_store->get(impl->plugin_name, key);
+    } catch (...) { // C ABI: no exception into the plugin
+        return nullptr;
+    }
     if (!val.has_value())
         return nullptr;
     // Caller must free with yuzu_free_string()
@@ -649,7 +825,11 @@ YUZU_EXPORT int yuzu_ctx_storage_delete(YuzuPluginContext* ctx, const char* key)
     auto* impl = reinterpret_cast<PluginContextImpl*>(ctx);
     if (!impl->kv_store || impl->plugin_name.empty())
         return -2;
-    return impl->kv_store->del(impl->plugin_name, key) ? 0 : 1;
+    try {
+        return impl->kv_store->del(impl->plugin_name, key) ? 0 : 1;
+    } catch (...) { // C ABI: no exception into the plugin
+        return 1;
+    }
 }
 
 YUZU_EXPORT int yuzu_ctx_storage_exists(YuzuPluginContext* ctx, const char* key) {
@@ -658,7 +838,20 @@ YUZU_EXPORT int yuzu_ctx_storage_exists(YuzuPluginContext* ctx, const char* key)
     auto* impl = reinterpret_cast<PluginContextImpl*>(ctx);
     if (!impl->kv_store || impl->plugin_name.empty())
         return -2;
-    return impl->kv_store->exists(impl->plugin_name, key) ? 0 : 1;
+    // 0 present, 1 absent, negative on error (plugin.h): a store that could not answer
+    // (closed handle, SQLITE_BUSY after the busy budget, a failed prepare) is -3, never
+    // "absent" -- a plugin that treats absent as "nothing to recover" would otherwise
+    // act on a fault as if it were the answer.
+    // C ABI: the string_view->string conversions inside can throw; nothing may unwind into the
+    // plugin, and an unanswerable query is -3 (never "absent").
+    try {
+        const auto present = impl->kv_store->exists_checked(impl->plugin_name, key);
+        if (!present)
+            return -3;
+        return *present ? 0 : 1;
+    } catch (...) {
+        return -3;
+    }
 }
 
 YUZU_EXPORT const char* yuzu_ctx_storage_list(YuzuPluginContext* ctx, const char* prefix) {
@@ -667,32 +860,36 @@ YUZU_EXPORT const char* yuzu_ctx_storage_list(YuzuPluginContext* ctx, const char
     auto* impl = reinterpret_cast<PluginContextImpl*>(ctx);
     if (!impl->kv_store || impl->plugin_name.empty())
         return nullptr;
-    auto keys = impl->kv_store->list(impl->plugin_name, prefix ? prefix : "");
+    try {
+        auto keys = impl->kv_store->list(impl->plugin_name, prefix ? prefix : "");
 
-    // Build JSON array: ["key1","key2",...]
-    std::string json = "[";
-    for (size_t i = 0; i < keys.size(); ++i) {
-        if (i > 0)
-            json += ',';
-        json += '"';
-        // Escape any quotes in key names
-        for (char c : keys[i]) {
-            if (c == '"')
-                json += "\\\"";
-            else if (c == '\\')
-                json += "\\\\";
-            else
-                json += c;
+        // Build JSON array: ["key1","key2",...]
+        std::string json = "[";
+        for (size_t i = 0; i < keys.size(); ++i) {
+            if (i > 0)
+                json += ',';
+            json += '"';
+            // Escape any quotes in key names
+            for (char c : keys[i]) {
+                if (c == '"')
+                    json += "\\\"";
+                else if (c == '\\')
+                    json += "\\\\";
+                else
+                    json += c;
+            }
+            json += '"';
         }
-        json += '"';
-    }
-    json += ']';
+        json += ']';
 
-    char* result = static_cast<char*>(std::malloc(json.size() + 1));
-    if (!result)
+        char* result = static_cast<char*>(std::malloc(json.size() + 1));
+        if (!result)
+            return nullptr;
+        std::memcpy(result, json.c_str(), json.size() + 1);
+        return result;
+    } catch (...) { // C ABI: no exception into the plugin
         return nullptr;
-    std::memcpy(result, json.c_str(), json.size() + 1);
-    return result;
+    }
 }
 
 YUZU_EXPORT int yuzu_register_trigger(YuzuPluginContext* ctx, const char* trigger_id,
@@ -718,7 +915,10 @@ YUZU_EXPORT int yuzu_register_trigger(YuzuPluginContext* ctx, const char* trigge
             // parse_trigger_config already logged the specific reason.
             return -3;
         }
-        impl->trigger_engine->register_trigger(std::move(*cfg));
+        // False = the engine's trigger table is full and nothing was registered; the
+        // caller must hear it (plugin.h: non-zero on failure), not read a silent 0.
+        if (!impl->trigger_engine->register_trigger(std::move(*cfg)))
+            return -5;
         return 0;
     } catch (const std::exception& e) {
         spdlog::error("yuzu_register_trigger('{}'): threw: {}", trigger_id, e.what());
@@ -758,6 +958,26 @@ public:
         metrics_.describe("yuzu_agent_uptime_seconds", "Agent uptime in seconds", "gauge");
         metrics_.describe("yuzu_agent_commands_executed_total", "Total commands executed by plugin",
                           "counter");
+        metrics_.describe("yuzu_agent_commands_refused_nul_params_total",
+                          "Commands refused because a parameter key or value held a NUL byte (a "
+                          "plugin would read a truncated name); refused before the dedup claim",
+                          "counter");
+        metrics_.counter("yuzu_agent_commands_refused_nul_params_total");
+        metrics_.describe("yuzu_agent_commands_rejected_closing_total",
+                          "Ordinary commands answered REJECTED without running because the command pool "
+                          "was closing for a reconnect or the agent was stopping (claim released); "
+                          "a protective action is never counted",
+                          "counter");
+        metrics_.counter("yuzu_agent_commands_rejected_closing_total");
+        metrics_.describe("yuzu_agent_protective_commands_run_closing_total",
+                          "Protective commands that ran while the command pool was closing for a "
+                          "reconnect or the agent was stopping; the close waits for them, unbounded",
+                          "counter");
+        metrics_.counter("yuzu_agent_protective_commands_run_closing_total");
+        metrics_.describe("yuzu_agent_plugin_output_dropped_total",
+                          "Commands where a plugin output write could not be buffered "
+                          "(allocation failure) and the result was marked constrained",
+                          "counter");
         metrics_.describe("yuzu_agent_plugins_loaded", "Number of loaded plugins", "gauge");
         metrics_.describe("yuzu_agent_plugin_rejected_total",
                           "Plugins rejected at load time, labeled by reason", "counter");
@@ -782,7 +1002,24 @@ public:
         spdlog::info("Yuzu agent starting (id={})", cfg_.agent_id);
 
         // 1. Load plugins (with optional allowlist + code-signing verification)
-        auto allowlist = load_plugin_allowlist(cfg_.plugin_allowlist);
+        // F52: three-state load; a configured allowlist that is missing, unreadable or empty
+        // refuses to start (copy of the --plugin-require-signature guard below) instead of
+        // letting an empty map disable enforcement.
+        auto allowlist_load = load_plugin_allowlist(cfg_.plugin_allowlist);
+        if (auto refusal = evaluate_allowlist_startup(cfg_.plugin_allowlist, allowlist_load)) {
+            // Return from run() with startup_failed_ (the established fatal-startup path)
+            // instead of std::exit: the log hand-off is ASYNC, so std::exit would race the
+            // queue and could drop this very line, and main() drains the log on its normal
+            // return. main() maps startup_failed() to a non-zero exit, so systemd Restart=,
+            // the SCM and launchd observe the failure; no plugin has been loaded.
+            spdlog::critical("{}. Refusing to start: this would silently fail-open (every "
+                             "plugin would load unverified).",
+                             *refusal);
+            startup_failed_ = true;
+            return;
+        }
+        const bool allowlist_required = !cfg_.plugin_allowlist.empty();
+        const auto& allowlist = allowlist_load.entries;
         PluginSigningPolicy signing{cfg_.plugin_trust_bundle, cfg_.plugin_require_signature};
         // Fail-closed guard against silent fail-open. If the operator passed
         // --plugin-require-signature but forgot --plugin-trust-bundle (or
@@ -795,9 +1032,12 @@ public:
             spdlog::critical("--plugin-require-signature is set but --plugin-trust-bundle "
                              "is empty. Refusing to start: this combination would silently "
                              "fail-open (every plugin would load unverified).");
-            std::exit(EXIT_FAILURE);
+            // Same mechanism as the allowlist refusal above: std::exit raced the async log
+            // hand-off and could drop the line above (WP13 governance N-NC).
+            startup_failed_ = true;
+            return;
         }
-        auto scan = PluginLoader::scan(cfg_.plugin_dir, allowlist, signing);
+        auto scan = PluginLoader::scan(cfg_.plugin_dir, allowlist, signing, allowlist_required);
 
         // Collect successfully loaded handles first (before init)
         std::vector<PluginHandle> candidates;
@@ -805,6 +1045,38 @@ public:
             candidates.push_back(std::move(handle));
         }
 
+        // Resolve every credential path the agent will use BEFORE the plugin config map is
+        // published below: the filesystem plugin builds its reserved set once, at init, from
+        // that map, so an auto-discovered client key or install CA resolved later would never
+        // be refused (WP06 F55; agent_reserved_path_keys.hpp). Discovery only reads the
+        // filesystem and the environment, so running it first changes nothing else.
+        // Auto-discover client certificate if none explicitly configured
+        if (cfg_.cert_auto_discovery && cfg_.tls_client_cert.empty() && cfg_.cert_store.empty()) {
+            auto discovered = discover_client_cert();
+            if (discovered) {
+                cfg_.tls_client_cert = discovered->cert_path;
+                cfg_.tls_client_key = discovered->key_path;
+                spdlog::info("Using auto-discovered cert from {} (source: {})",
+                             discovered->cert_path.string(), discovered->source);
+            }
+        }
+
+        // HIGH-1 (#1314): resolve the effective CA path BEFORE the provisioning gate.
+        // Install-CA auto-discovery inside build_channel does not write back
+        // cfg_.tls_ca_cert, so a no-`--ca-cert` agent would connect over
+        // server-authenticated TLS while `provisioning_eligible` stayed false: no CSR,
+        // no per-agent client leaf, no error. Promoting the discovered path into
+        // cfg_.tls_ca_cert here makes both the provisioning gate and build_channel see
+        // the same effective CA (an explicit --ca-cert is left untouched, so this is a
+        // no-op when one was given).
+        if (cfg_.tls_enabled && cfg_.tls_ca_cert.empty()) {
+            if (auto ca = discover_install_ca_path()) {
+                cfg_.tls_ca_cert = *ca;
+                spdlog::info("PKI: auto-discovered install CA at {} — using it as the trust "
+                             "anchor and enabling per-agent enrollment",
+                             cfg_.tls_ca_cert.string());
+            }
+        }
         // Build the plugin context config map with agent state
         plugin_ctx_.config["agent.id"] = cfg_.agent_id;
         plugin_ctx_.config["agent.version"] = std::string{yuzu::kFullVersionString};
@@ -813,7 +1085,7 @@ public:
         plugin_ctx_.config["agent.server_address"] = cfg_.server_address;
         // Resolved ONCE, here, at startup -- see server_address_resolver.hpp
         // for why this must not be re-resolved later by a plugin at
-        // quarantine-dispatch time (the quarantine plugin used to do this
+        // quarantine-dispatch time (a plugin used to do this
         // itself; #3429 round 4 moved it here after round 3's review found
         // that let a possibly-already-compromised host's own DNS resolution
         // decide what survives its own containment).
@@ -824,6 +1096,19 @@ public:
             std::to_string(cfg_.heartbeat_interval.count());
         plugin_ctx_.config["agent.plugin_dir"] = cfg_.plugin_dir.string();
         plugin_ctx_.config["agent.data_dir"] = cfg_.data_dir.string();
+        // WP06 F55: the agent's own credential/log paths, so the filesystem plugin can refuse
+        // them (the agent_logging / status / diagnostics actions are PluginSecret-gated; a
+        // FileRetrieval:Read caller must not reach the same bytes through filesystem.read).
+        plugin_ctx_.config["agent.log_file"] = cfg_.log_file.string();
+        plugin_ctx_.config["agent.cert_dir"] = cfg_.cert_dir.string();
+        plugin_ctx_.config["agent.tls_ca_cert"] = cfg_.tls_ca_cert.string();
+        plugin_ctx_.config["agent.tls_client_cert"] = cfg_.tls_client_cert.string();
+        plugin_ctx_.config["agent.tls_client_key"] = cfg_.tls_client_key.string();
+        plugin_ctx_.config["agent.enrollment_token_file"] = cfg_.enrollment_token_file.string();
+        plugin_ctx_.config["agent.plugin_allowlist"] = cfg_.plugin_allowlist.string();
+        plugin_ctx_.config["agent.plugin_trust_bundle"] = cfg_.plugin_trust_bundle.string();
+        plugin_ctx_.config["agent.update_trust_bundle"] = cfg_.update_trust_bundle.string();
+        plugin_ctx_.config["agent.container_runtime_endpoint"] = cfg_.container_runtime_endpoint;
         plugin_ctx_.config["agent.log_level"] = cfg_.log_level;
         plugin_ctx_.config["agent.debug_mode"] = cfg_.debug_mode ? "true" : "false";
         plugin_ctx_.config["agent.verbose_logging"] = cfg_.verbose_logging ? "true" : "false";
@@ -851,13 +1136,37 @@ public:
             }
         }
 
-        // 1b''. Upgrade-window step (removed with the other legacy-name shims): the activity-record
+        // 1b'. Fleet collection settings (`__sync__.settings`): load the persisted pair and apply it
+        // BEFORE any daily-sync scheduler exists, so the first tick already runs on it. The pair is
+        // re-validated exactly as a live command; one that no longer matches its version (a crash
+        // between the two KV writes, a hand edit) is discarded, the tag reads `none` and the server
+        // re-sends. Loaded under --inventory-disable too: nothing collects there, but the agent
+        // still holds and reports the version, so the server does not re-send it for good.
+        if (kv_store_) {
+            auto stored = load_stored_settings([this](const std::string& k) {
+                return kv_store_->get(kSyncKvNamespace, k);
+            });
+            if (stored) {
+                collector_enabled_->set(stored->plugins);
+                spdlog::info("Collection settings {} restored (interval {}s{})", stored->version,
+                             stored->interval_s, stored->window ? ", windowed" : "");
+                std::lock_guard<std::mutex> lk(settings_mu_);
+                applied_settings_ = std::move(*stored);
+            } else if (stored.error() != kNoStoredSettings) {
+                spdlog::warn("Stored collection settings discarded: {}", stored.error());
+            }
+        }
+
+        // 1b''. Pre-rename install step (kept while a pre-rename tar.db can still exist): the activity-record
         // feature was renamed from TAR to Echo. Adopt a pre-rename tar.db as echo.db and re-key its
         // KV namespace, BEFORE any plugin init or dispatch (the plugin scan above only registers
         // descriptors and opens no database). This is the ONLY adopter - the plugins never
-        // rename - so nothing can have the database open while it moves, and
+        // rename - so within this process nothing has the database open while it moves, and
         // EchoDatabase::open refuses to create a fresh echo.db beside an unadopted tar.db.
-        // Neither step is fatal: a failed adoption leaves the echo plugin refusing to open.
+        // This step runs BEFORE the Guardian instance lock below, so it does not exclude a
+        // predecessor still shutting down during a service restart: on Windows its open handle
+        // can fail the rename. Neither step is fatal: a failed adoption leaves the echo plugin
+        // refusing to open for this run, and the next start resumes it (sidecars move first).
         //
         // Deferred while the plugin dir still holds only the retired tar plugin: OTA replaces the
         // agent binary alone, so the renamed plugin may not be installed yet. Adopting now would
@@ -878,8 +1187,8 @@ public:
                 spdlog::error("Legacy tar.db adoption failed: {}", adopted.error());
             }
             if (kv_store_ && !kv_store_->rename_plugin("tar", "echo")) {
-                spdlog::warn(
-                    "KV namespace re-key tar -> echo failed; Echo health history restarts");
+                spdlog::warn("KV namespace re-key tar -> echo failed; Echo health history "
+                             "restarts until the next start retries it");
             }
         }
 
@@ -895,6 +1204,15 @@ public:
                 command_dedup_ =
                     std::make_unique<CommandDedupStore>(std::move(*dedup_result));
                 spdlog::info("Command dedup store ready: {}", dedup_path.string());
+                // #3665: open() recovered from a corrupt file. Protection is back, but the
+                // history is gone — surface it (the store already logged the reason).
+                if (const auto& q = command_dedup_->quarantined_this_open()) {
+                    spdlog::warn("Command dedup history before this boot was lost (corrupt "
+                                 "store quarantined as {}) — a command redelivered after "
+                                 "its original execution may re-execute",
+                                 *q);
+                    metrics_.counter("yuzu_agent_dedup_quarantined_total").increment();
+                }
             } else {
                 spdlog::error("Failed to open command dedup store: {}",
                               dedup_result.error().message);
@@ -908,7 +1226,30 @@ public:
         // The engine persists rules into the KV store and answers __guard__
         // dispatches once the Subscribe stream is open. Construction is
         // safe even when KV failed to open (it degrades to in-memory only).
-        guardian_ = std::make_unique<GuardianEngine>(kv_store_.get(), cfg_.agent_id);
+        //
+        // UP-14: claim this boot's event-order epoch HERE, after the KvStore is open and before
+        // the engine exists, and pass it as the 4th constructor argument so the constructor
+        // stays I/O-free (the epoch must already be known when the engine builds the emit
+        // source its executor and Spark runtime share). It is NOT read in start_local(),
+        // which is deferred past the network. A null kv_store_ is handled by the claim
+        // (epoch 0 = unordered: the wire pair is 0/0, which a pair-comparing server treats
+        // as unordered and orders by the census ordering key). The literal `false` stays visible on
+        // purpose: prefer_spark_ is never passed true in production.
+        // UP-9: exclusive per-data-dir lock held for the life of the process (a member, so it
+        // outlives guardian_). The wait covers a service restart overlapping the old process's
+        // shutdown. A loser (or an unsupported file system) claims epoch 0 and emits 0/0.
+        guardian_instance_lock_ = GuardianInstanceLock::acquire(
+            cfg_.data_dir / "guardian_boot_epoch.lock", std::chrono::seconds{5});
+        // Read AFTER the wait: the clock term of the epoch is the time of the claim, and a wait of
+        // up to 5 s would otherwise make it stale.
+        const auto now_unix_s = std::chrono::duration_cast<std::chrono::seconds>(
+                                    std::chrono::system_clock::now().time_since_epoch())
+                                    .count();
+        const auto boot_epoch_claim =
+            claim_guardian_boot_epoch(kv_store_.get(), now_unix_s, guardian_instance_lock_);
+        guardian_ =
+            std::make_unique<GuardianEngine>(kv_store_.get(), cfg_.agent_id,
+                                             /*prefer_spark=*/false, boot_epoch_claim.boot_epoch);
         // Spread this endpoint's journal maintenance and its forced (boot / reconnect) replay
         // pages over their intervals - the ONLY place jitter is turned on, so every test keeps
         // a deterministic cadence. Must precede wire_spark_engine(), which builds the worker.
@@ -1108,6 +1449,10 @@ public:
             // see shutdown_deadline_guard.hpp — multiple concurrent guards need no
             // coordination with each other.
             yuzu::agent::ShutdownDeadlineGuard watchdog{kShutdownDeadlineGrace};
+            // Close the command start gate on EVERY run() exit, before any plugin is shut
+            // down: a task still queued in the pool would otherwise start against a plugin
+            // whose shutdown() has run (only protective commands may start while closing).
+            command_pool_closing_.store(true, std::memory_order_release);
             // Guardian BEFORE SparkEngine, on EVERY run() exit - not just the
             // externally-triggered Agent::stop() path (handler_ex / the shutdown
             // watcher / the console handler). A run() exit that never went
@@ -1178,6 +1523,8 @@ public:
             // universal backstop. The reconnect-loop final teardown repeats the
             // pump join to order it ahead of plugins_.clear() on the normal path.
             quiesce_run_workers();
+            // No plugin is shut down or unloaded under a detached installed-software worker.
+            drain_detached_collectors_or_exit();
             // Stop the trigger engine FIRST — before plugins are torn down —
             // so an in-flight interval/file/service trigger can't dispatch
             // into a plugin that's mid-shutdown. stop() joins the worker
@@ -1219,7 +1566,9 @@ public:
         // point of rung 1 — an agent that lives long enough to SAY spark degraded, rather
         // than a crash-loop that destroys the very signal the degrade path produces.
         try {
-            thread_pool_ = std::make_unique<ThreadPool>(std::thread::hardware_concurrency());
+            thread_pool_ = std::make_unique<ThreadPool>(std::thread::hardware_concurrency(), kCommandQueueDepth,
+                                                         kReservedProtectiveWorkers, pool_gauge_);
+            command_pool_closing_.store(false, std::memory_order_release);
         } catch (const std::exception& e) {
             spdlog::critical("could not create the command dispatch thread pool ({}) — the host "
                              "is out of threads. Exiting with a startup failure rather than "
@@ -1261,10 +1610,10 @@ public:
         // See also the member declaration order (spark_engine_ AFTER thread_pool_) so
         // spark is DESTROYED before the pool it may borrow at rung 2.
         // The next-generation event-driven detection engine is stood up here
-        // OBSERVE-ONLY: no consumer is registered at rung 1, so it is not yet wired
-        // to drive Guardian and the legacy IGuard path remains the sole ENFORCING
-        // detection path. Detection cutover is rung 2; enforce is rung 3. Standing it
-        // up now proves the engine runs and reports at rest, so its resource +
+        // OBSERVE-ONLY: Guardian's consumer is wired lifecycle-only (step 1c-ter below)
+        // and prefer_spark_ is false, so no rule is placed on spark and the legacy
+        // IGuard path remains the sole ENFORCING detection path. Detection cutover is
+        // rung 2; enforce is rung 3. Standing it up now proves the engine runs and reports at rest, so its resource +
         // observability envelope can be measured before it carries any load.
         //
         // --spark-disable / YUZU_AGENT_SPARK_DISABLE is a boot-time deploy opt-out:
@@ -1274,7 +1623,7 @@ public:
         // to start (see the DISABLED branch in the heartbeat emit block below).
         // The flag selects exactly one detection path at instantiation, establishing
         // the "old and new never both drive enforce" property the rung-2/3 cutover
-        // leans on (moot at rung 1 - spark has no consumer - but pinned here).
+        // leans on (moot while no rule is placed on spark, but pinned here).
         //
         // spark_detached_workers_ (F3, #2012/#3840 plan "Route A corrected")
         // needs no construction step here - it is already live via its own
@@ -1321,7 +1670,45 @@ public:
                 // counter (it launches no detached workers - only the
                 // Windows SCM half restructures off mech_ops_mu_by_type_).
                 try_register(SparkType::File, make_file_mechanism(spark_detached_workers_));
-                try_register(SparkType::Registry, make_registry_mechanism(spark_detached_workers_));
+                // Registry path verification is OFF unless the operator opted in at boot
+                // (--spark-registry-path-verify-interval, REG-15-I2): the factory's own
+                // default is zero, so passing the clamped config value (0 -> 0) is the
+                // only place the opt-in enters. Ignored off Windows (the factory is null).
+                const auto registry_path_verify = clamp_registry_path_verify(
+                    cfg_.spark_registry_path_verify_interval_s);
+                // ONE effective-state line on every OS, so an operator can read the
+                // verification state of the agent from its log whether or not the
+                // flag applies here. The clamped value is what the factory receives.
+                {
+                    const auto floor_ms = kRegistryPathVerifyFloor.count();
+                    if (registry_path_verify.count() == 0) {
+                        spdlog::info("SparkEngine: Registry path verification: off (default)");
+                    } else {
+#ifdef _WIN32
+                        const auto configured_s = cfg_.spark_registry_path_verify_interval_s;
+                        // 1..4 s was configured and raised to the floor.
+                        const char* note = registry_path_verify.count() > configured_s * 1000
+                                               ? "; the configured value was raised to the floor"
+                                               : "";
+                        spdlog::info("SparkEngine: Registry path verification: every {} ms "
+                                     "(opt-in; floor {} ms){}; each check re-opens every watched "
+                                     "Registry key, duplicates the held handle and reads canonical "
+                                     "names, and every establishment, re-arm and retry of a "
+                                     "non-root Target watch whose first name read succeeds opens "
+                                     "the key a second time to confirm its name; on an audited "
+                                     "key these write Security-log events (see docs/user-manual/"
+                                     "guaranteed-state.md)",
+                                     registry_path_verify.count(), floor_ms, note);
+#else
+                        spdlog::info("SparkEngine: Registry path verification: every {} ms "
+                                     "(opt-in; floor {} ms) (Windows only; ignored)",
+                                     registry_path_verify.count(), floor_ms);
+#endif
+                    }
+                }
+                try_register(SparkType::Registry,
+                             make_registry_mechanism(spark_detached_workers_,
+                                                     registry_path_verify));
                 try_register(SparkType::Service, make_service_mechanism(spark_detached_workers_));
                 spark_engine_->start();
                 spdlog::info("SparkEngine: instantiated OBSERVE-ONLY (no consumer at rung 1); "
@@ -1349,7 +1736,8 @@ public:
         // or when instantiation threw (records SparkFailed); non-null records
         // Available. The kill-switch flag disambiguates the two null cases. This is
         // the FIRST production call site of wire_spark_engine(); prefer_spark stays
-        // false (2-arg ctor above), so no rule places on spark and detection behavior
+        // false (the explicit prefer_spark=false at GuardianEngine construction
+        // above), so no rule places on spark and detection behavior
         // is unchanged - the wiring exercises construction/shutdown of the spark
         // subsystem before rung 7.7b turns on placement.
         guardian_->wire_spark_engine(
@@ -1432,6 +1820,11 @@ public:
                              plugin, action);
                 return;
             }
+            if (command_params_have_nul(params)) {
+                spdlog::warn("Trigger dispatch: {}.{} refused: a parameter holds a NUL byte",
+                             plugin, action);
+                return;
+            }
             // Convert the param map into the C-ABI YuzuParam span. The map
             // outlives this synchronous run() call (it's owned by the
             // TriggerConfig snapshot in the engine's worker loop), so the
@@ -1455,17 +1848,6 @@ public:
         ch_args.SetInt(GRPC_ARG_KEEPALIVE_TIMEOUT_MS, 20000);
         ch_args.SetInt(GRPC_ARG_KEEPALIVE_PERMIT_WITHOUT_CALLS, 1);
         ch_args.SetInt(GRPC_ARG_HTTP2_MAX_PINGS_WITHOUT_DATA, 0);
-
-        // Auto-discover client certificate if none explicitly configured
-        if (cfg_.cert_auto_discovery && cfg_.tls_client_cert.empty() && cfg_.cert_store.empty()) {
-            auto discovered = discover_client_cert();
-            if (discovered) {
-                cfg_.tls_client_cert = discovered->cert_path;
-                cfg_.tls_client_key = discovered->key_path;
-                spdlog::info("Using auto-discovered cert from {} (source: {})",
-                             discovered->cert_path.string(), discovered->source);
-            }
-        }
 
         // PKI PR3: per-agent mTLS provisioning. When TLS is on with a CA but the
         // operator supplied no explicit client cert / OS-store cert, the agent
@@ -1492,22 +1874,7 @@ public:
         int csr_attempts = 0; // Hermes HIGH-2: bound enrolled-but-no-cert retries.
         const std::filesystem::path cert_dir =
             cfg_.cert_dir.empty() ? (cfg_.data_dir / "certs") : cfg_.cert_dir;
-        // HIGH-1 (#1314): resolve the effective CA path BEFORE the provisioning gate.
-        // The install-CA auto-discovery used to live only inside build_channel and
-        // never wrote back cfg_.tls_ca_cert, so a no-`--ca-cert` agent connected over
-        // server-authenticated TLS but `provisioning_eligible` stayed false → it sent
-        // no CSR and never got its per-agent client leaf, with no error. Promoting the
-        // discovered path into cfg_.tls_ca_cert here makes both the provisioning gate
-        // and build_channel see the same effective CA (an explicit --ca-cert is left
-        // untouched, so this is a no-op when one was given).
-        if (cfg_.tls_enabled && cfg_.tls_ca_cert.empty()) {
-            if (auto ca = discover_install_ca_path()) {
-                cfg_.tls_ca_cert = *ca;
-                spdlog::info("PKI: auto-discovered install CA at {} — using it as the trust "
-                             "anchor and enabling per-agent enrollment",
-                             cfg_.tls_ca_cert.string());
-            }
-        }
+        // The effective CA path is resolved at the top of run(), before plugin init (HIGH-1, #1314).
         const bool provisioning_eligible =
             cfg_.auto_provision_cert && cfg_.tls_enabled && !cfg_.tls_ca_cert.empty() &&
             cfg_.tls_client_cert.empty() && cfg_.cert_store.empty();
@@ -1694,22 +2061,35 @@ public:
                     sleep_for(kFirstDelay);
                     LocalDispatcher dispatcher;
                     while (!stop_requested_.load(std::memory_order_acquire)) {
-                        // #1001 / arch-S3 — local-dispatch concerns
-                        // (capture buffer, byte cap, truncation sentinel)
-                        // live in LocalDispatcher. The pump just decides
-                        // what to do with each cycle's result.
-                        auto result = dispatcher.run(echo_descriptor, "fleet_snapshot");
-                        if (result.truncated) {
-                            spdlog::warn("Snapshot pump: capture truncated at {}B; "
-                                         "dropping this cycle's snapshot",
-                                         result.captured.size());
-                        } else if (result.rc == 0 && !result.captured.empty()) {
-                            std::lock_guard lock(snapshot_mu_);
-                            latest_snapshot_ = std::move(result.captured);
-                            latest_snapshot_seq_.fetch_add(1, std::memory_order_acq_rel);
-                        } else if (result.rc != 0) {
-                            spdlog::warn("Snapshot pump: echo.fleet_snapshot rc={}, captured={}B",
-                                         result.rc, result.captured.size());
+                        // This runs on snapshot_pump_thread_ (joined at shutdown); an
+                        // exception escaping a std::thread body calls std::terminate, so a
+                        // cycle's failure (the Echo plugin's process enumeration reads /proc,
+                        // which can throw when a process exits mid-read) is caught here and
+                        // logged. A failed cycle costs one snapshot; the pump goes on.
+                        try {
+                            // #1001 / arch-S3 — local-dispatch concerns
+                            // (capture buffer, byte cap, truncation sentinel)
+                            // live in LocalDispatcher. The pump just decides
+                            // what to do with each cycle's result.
+                            auto result = dispatcher.run(echo_descriptor, "fleet_snapshot");
+                            if (result.truncated) {
+                                spdlog::warn("Snapshot pump: capture truncated at {}B; "
+                                             "dropping this cycle's snapshot",
+                                             result.captured.size());
+                            } else if (result.rc == 0 && !result.captured.empty()) {
+                                std::lock_guard lock(snapshot_mu_);
+                                latest_snapshot_ = std::move(result.captured);
+                                latest_snapshot_seq_.fetch_add(1, std::memory_order_acq_rel);
+                            } else if (result.rc != 0) {
+                                spdlog::warn(
+                                    "Snapshot pump: echo.fleet_snapshot rc={}, captured={}B",
+                                    result.rc, result.captured.size());
+                            }
+                        } catch (const std::exception& e) {
+                            spdlog::warn("Snapshot pump: cycle aborted by an exception: {}",
+                                         e.what());
+                        } catch (...) {
+                            spdlog::warn("Snapshot pump: cycle aborted by an unknown exception");
                         }
                         sleep_for(kInterval);
                     }
@@ -1722,7 +2102,56 @@ public:
 
         // 3. Register with server — with reconnect loop
         int reconnect_count = 0;
-        constexpr int kMaxReconnectDelaySecs = 300; // 5 minutes max backoff
+        // Reconnect delays use decorrelated jitter (reconnect_backoff.hpp, #5990, HA WS-13):
+        // a node loss drops a whole share of the fleet at one instant, and a fixed ladder
+        // would bring them all back in lock step. `reconnect_count` still decides WHETHER to
+        // wait; `reconnect_backoff` decides HOW LONG, from its own previous delay. It is reset
+        // when registration has fully succeeded (below), when a provisioned certificate is
+        // about to be used for the mTLS re-Register, and on the first enrolled-but-no-cert
+        // retry (so that retry grows from the base, not from an approval wait's long delay);
+        // later no-cert retries keep growing across their Register calls. Main-thread only,
+        // so no lock; the engine is seeded from several OS words so two agents started from
+        // one cloned image do not share a sequence.
+        yuzu::agent::ReconnectBackoff reconnect_backoff;
+        // Minimum for the NEXT wait only: raised for the no-cert retries (server CSR throttle),
+        // consumed at the loop top.
+        int reconnect_floor_secs = yuzu::agent::kReconnectBaseSecs;
+        std::mt19937 reconnect_rng{[] {
+            // std::random_device THROWS when no entropy source can be opened, and run() has no
+            // handler on this path (main.cpp calls it bare), so a throw here would be a
+            // std::terminate at boot. reconnect_seed() routes a throw to a clock-derived
+            // fallback instead: weaker seeds, same jitter, and the agent still starts.
+            std::optional<std::random_device> rd;
+            const auto seed_words = yuzu::agent::reconnect_seed(
+                [&rd]() -> std::uint32_t {
+                    if (!rd)
+                        rd.emplace();
+                    return (*rd)();
+                },
+                [i = std::uint64_t{0}]() mutable noexcept -> std::uint32_t {
+                    // splitmix64 over two clocks, the thread id and a call index: not secret,
+                    // but different per call and per process start.
+                    std::uint64_t x =
+                        static_cast<std::uint64_t>(
+                            std::chrono::steady_clock::now().time_since_epoch().count()) ^
+                        (static_cast<std::uint64_t>(
+                             std::chrono::system_clock::now().time_since_epoch().count()) *
+                         0x9E3779B97F4A7C15ULL) ^
+                        (static_cast<std::uint64_t>(
+                             std::hash<std::thread::id>{}(std::this_thread::get_id()))
+                         << 17) ^
+                        (++i * 0xBF58476D1CE4E5B9ULL);
+                    x += 0x9E3779B97F4A7C15ULL;
+                    x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ULL;
+                    x = (x ^ (x >> 27)) * 0x94D049BB133111EBULL;
+                    return static_cast<std::uint32_t>(x ^ (x >> 31));
+                });
+            if (seed_words.degraded)
+                spdlog::warn("No OS entropy for the reconnect jitter; using a clock-derived "
+                             "seed (jitter still applies, less well spread across cloned hosts)");
+            std::seed_seq seed(seed_words.words.begin(), seed_words.words.end());
+            return std::mt19937{seed};
+        }()};
         /// Ceiling on a single Register attempt. Generous — a busy server plus TLS plus an
         /// approval check is not instant — but FINITE, which is the whole point: without it a
         /// server that completes TLS and then goes silent parks the main thread forever, and on
@@ -1755,8 +2184,13 @@ public:
 
         while (!stop_requested_.load(std::memory_order_acquire)) {
             if (reconnect_count > 0) {
-                // Exponential backoff: 2^n seconds, capped at 5 minutes
-                int delay = std::min(1 << std::min(reconnect_count, 8), kMaxReconnectDelaySecs);
+                // Decorrelated jitter: random in [1 s, 3 x the previous delay], at most 5 min.
+                const int delay = reconnect_backoff.next(
+                    [&reconnect_rng](int lo, int hi) {
+                        return std::uniform_int_distribution<int>{lo, hi}(reconnect_rng);
+                    },
+                    reconnect_floor_secs);
+                reconnect_floor_secs = yuzu::agent::kReconnectBaseSecs;
                 spdlog::info("Reconnecting in {}s (attempt #{})", delay, reconnect_count);
                 plugin_ctx_.config["agent.reconnect_count"] = std::to_string(reconnect_count);
                 for (int i = 0; i < delay && !stop_requested_.load(std::memory_order_acquire); ++i)
@@ -1961,7 +2395,8 @@ public:
                     continue; // Retry until approved
                 }
 
-                reconnect_count = 0; // Registration succeeded — reset backoff
+                reconnect_count = 0; // Registration succeeded: reset the retry count (the delay
+                                     // state, reconnect_backoff, is reset below)
 
                 // Remove the token file now that it has done its one job. A failed
                 // remove keeps the path set so the next accepted Register retries.
@@ -2010,6 +2445,9 @@ public:
                                 spdlog::error("PKI: failed to rebuild channel with issued cert");
                                 return;
                             }
+                            // This Register succeeded: the mTLS re-Register that follows starts
+                            // again from the base delay, not from an approval wait's long one.
+                            reconnect_backoff.reset();
                             continue; // re-Register over mTLS (binds the cert identity)
                         }
                         // Persist failed (disk full / perms). The server recorded the
@@ -2050,17 +2488,31 @@ public:
                         spdlog::warn("PKI: enrolled but no client cert issued (attempt {}/{}); "
                                      "backing off and retrying",
                                      csr_attempts, kMaxCsrAttempts);
-                        reconnect_count = csr_attempts; // drive exponential backoff
+                        if (csr_attempts == 1)
+                            reconnect_backoff.reset(); // grow from the base, not from an approval wait
+                        // The server issues one cert per agent per 30 s: keep these waits
+                        // long enough that the last bounded retry falls outside that window.
+                        reconnect_floor_secs = yuzu::agent::kReconnectCsrRetryFloorSecs;
+                        reconnect_count = csr_attempts; // gate the wait; the delay grows from here
                         continue;                       // retry Register with the same CSR
                     }
                 }
 
                 session_id_ = resp.session_id();
+                // Registration has fully succeeded (the later no-cert retries above
+                // `continue` before here, so their delays keep growing): the next failure
+                // starts again from the base delay.
+                reconnect_backoff.reset();
                 auto connected_since_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                                               std::chrono::system_clock::now().time_since_epoch())
                                               .count();
                 plugin_ctx_.config["agent.session_id"] = session_id_;
                 plugin_ctx_.config["agent.connected_since"] = std::to_string(connected_since_ms);
+                // The peer THIS Register answered on (the server, or the gateway that fronts
+                // it), published to the plugins as "agent.server_peer": the address the
+                // control channel really uses, which can differ from the one resolved once at
+                // start (a server that moved since). See publish_server_peer.
+                publish_server_peer(ctx.peer());
 
                 // Measure Register RPC latency
                 auto register_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -2091,7 +2543,8 @@ public:
                     }
                     plugin_ctx_.config["agent.grpc_channel_state"] = state_str;
                 }
-                spdlog::info("Registered with server (session={}, enrollment={})", session_id_,
+                spdlog::info("Registered with server (session_fp={}, enrollment={})",
+                             session_log_fingerprint(session_id_),
                              enrollment_status.empty() ? "enrolled" : enrollment_status);
 
                 // Mark Guardian as network-connected. PR 4 will use this hook to
@@ -2115,6 +2568,11 @@ public:
                     current_executable_path());
                 set_updater(updater);
 
+                // Register has succeeded, so this build is working: mark it verified BEFORE the
+                // rollback check below, which is the only one and which consumes the marker. (The
+                // marker used to be written at the first command read, after this check, so the
+                // check never saw this run's marker and a registered build could be rolled back.)
+                updater->mark_update_verified();
                 if (updater->perform_startup_maintenance()) {
                     spdlog::warn("OTA rollback was triggered - running previous binary");
                 }
@@ -2198,7 +2656,10 @@ public:
                     // running, exactly like send_guardian_outbox_entry's own capture below.
                     guardian_->set_event_sink([this](const gpb::GuaranteedStateEvent& ev) {
                         const auto outcome = emit_guardian_event(ev);
-                        const bool sent = (outcome == LegacySendOutcome::Sent);
+                        // A refused event is reported Sent (disposed by design, no Write); the
+                        // T_wire line must not claim a local write happened.
+                        const bool sent = (outcome == LegacySendOutcome::Sent) &&
+                                          !guardian_event_refused_by_server(ev);
                         // #4606 criterion-10 T_wire (legacy non-Spark drift-sink path only — the
                         // DEX observer's call to this same method stays uninstrumented, see
                         // emit_guardian_event's own comment).
@@ -2267,6 +2728,9 @@ public:
                     const YuzuPluginDescriptor* devid_descriptor = nullptr;
                     const YuzuPluginDescriptor* osinfo_descriptor = nullptr;
                     const YuzuPluginDescriptor* netcfg_descriptor = nullptr;
+                    // Optional fifth device_ci plugin: disk_actions (volume / partition /
+                    // topology sections). Absent -> those sections report plugin_not_loaded.
+                    const YuzuPluginDescriptor* diskact_descriptor = nullptr;
                     // SLE (ADR-0024): the software_licensing source's backing plugin.
                     const YuzuPluginDescriptor* license_descriptor = nullptr;
                     // Wave 7 PR7.2: the app_usage source's backing plugin (last-used
@@ -2288,6 +2752,8 @@ public:
                             osinfo_descriptor = handle.descriptor();
                         else if (pname == "network_config")
                             netcfg_descriptor = handle.descriptor();
+                        else if (pname == "disk_actions")
+                            diskact_descriptor = handle.descriptor();
                         else if (pname == "license_scan")
                             license_descriptor = handle.descriptor();
                         else if (pname == "app_usage")
@@ -2306,8 +2772,8 @@ public:
                     auto sync_stub = pb::AgentService::NewStub(channel);
                     sync_thread_ = std::thread([this, sync_plugins, echo_descriptor, hw_descriptor,
                                                 devid_descriptor, osinfo_descriptor,
-                                                netcfg_descriptor, license_descriptor,
-                                                app_usage_descriptor,
+                                                netcfg_descriptor, diskact_descriptor,
+                                                license_descriptor, app_usage_descriptor,
                                                 sync_stub = std::move(sync_stub)]() {
                         auto should_stop = [this]() {
                             return stop_requested_.load(std::memory_order_acquire) ||
@@ -2390,10 +2856,12 @@ public:
                         // being loaded (null descriptor → idle).
                         scheduler.add_source(make_app_perf_source(echo_descriptor));
                         // ADR-0016 device-CI inventory: stable hardware/OS identity (CMDB
-                        // CI record). Idles unless all four source plugins are loaded.
+                        // CI record). Idles unless the four identity plugins are loaded;
+                        // disk_actions is optional (its sections report plugin_not_loaded).
                         scheduler.add_source(make_device_ci_source(hw_descriptor, devid_descriptor,
                                                                    osinfo_descriptor,
-                                                                   netcfg_descriptor));
+                                                                   netcfg_descriptor,
+                                                                   diskact_descriptor));
                         // SLE (ADR-0024): detected software licences. Idles when the
                         // license_scan plugin isn't loaded (null descriptor). The
                         // per-user user_ref knob (Decision 11) and its persisted
@@ -2436,10 +2904,37 @@ public:
                         // Registration order carries NO persisted meaning (KV keys and
                         // request_now()'s name match are both name-keyed, per
                         // sync_scheduler.hpp's own contract), so this reorder is safe.
-                        scheduler.add_source(make_installed_software_source(sync_plugins));
-                        // Publish AFTER the last add_source: request_now() reads sources_
-                        // without the mutex on the append-only-before-publication contract.
+                        // `kv_get`/`kv_set` are the same __sync__ accessors the scheduler was built
+                        // with: the source persists its per-facet acknowledged sets through them.
+                        // `collector_workers_` is the AGENT's, not this connection's: the source is
+                        // rebuilt on every reconnect while a worker abandoned at its time limit may
+                        // still be inside a plugin, so the single-flight flags and the outstanding
+                        // count must outlive it (drain_detached_collectors_or_exit reads them).
+                        // `collector_enabled_` is agent-lifetime for the same reason, and the
+                        // applied fleet settings (loaded at start-up, replaced by each
+                        // `__sync__.settings`) set the cadence BEFORE the scheduler is published,
+                        // so a reconnect keeps them and nothing is re-placed here.
+                        auto installed_software_source = make_installed_software_source(
+                            sync_plugins, kv_get, kv_set, collector_workers_, {},
+                            collector_enabled_);
                         {
+                            // settings_mu_ is held from the read of applied_settings_ to the
+                            // publication below. The `__sync__.settings` hook replaces
+                            // applied_settings_ and reads sync_scheduler_ under the same mutex,
+                            // so a command lands either before this read (the source is built
+                            // on it) or after the publication (the hook hands it to this
+                            // scheduler): the version the heartbeat reports is never one this
+                            // scheduler is not running. Lock order: settings_mu_, then
+                            // sync_sched_mu_.
+                            std::lock_guard<std::mutex> settings_lk(settings_mu_);
+                            if (applied_settings_) {
+                                installed_software_source.interval =
+                                    std::chrono::seconds{applied_settings_->interval_s};
+                                installed_software_source.window = applied_settings_->window;
+                            }
+                            scheduler.add_source(std::move(installed_software_source));
+                            // Publish AFTER the last add_source: request_now() reads sources_
+                            // without the mutex on the append-only-before-publication contract.
                             std::lock_guard<std::mutex> lk(sync_sched_mu_);
                             sync_scheduler_ = scheduler_ptr;
                         }
@@ -2594,6 +3089,12 @@ public:
                             // KV throw must never kill the heartbeat thread.
                             try {
                                 yuzu::agent::emit_plugins_failed_tag(tags, plugins_failed_);
+                                // The applied fleet collection settings: always present, `none`
+                                // until a valid pair is applied.
+                                {
+                                    std::lock_guard<std::mutex> lk(settings_mu_);
+                                    yuzu::agent::emit_settings_tags(tags, applied_settings_);
+                                }
                                 if (kv_store_) {
                                     yuzu::agent::emit_plugin_heartbeat_tags(
                                         tags, plugin_names_,
@@ -2611,20 +3112,23 @@ public:
                                     std::lock_guard<std::mutex> lk(sync_sched_mu_);
                                     sched = sync_scheduler_;
                                 }
-                                if (sched && kv_store_)
-                                    yuzu::agent::emit_sync_skip_tags(
-                                        tags, sched->source_names(),
-                                        [this](const std::string& k) {
-                                            return kv_store_->get(kSyncKvNamespace, k);
-                                        });
+                                if (sched && kv_store_) {
+                                    const auto sync_kv = [this](const std::string& k) {
+                                        return kv_store_->get(kSyncKvNamespace, k);
+                                    };
+                                    yuzu::agent::emit_sync_skip_tags(tags, sched->source_names(),
+                                                                     sync_kv);
+                                    yuzu::agent::emit_sync_completeness_unknown_tag(tags, sync_kv);
+                                }
                             } catch (const std::exception& e) {
                                 spdlog::warn("Heartbeat plugin-tag bridge failed: {}", e.what());
                             } catch (...) {
                                 spdlog::warn("Heartbeat plugin-tag bridge failed");
                             }
                             // HA WS-0 dedup safety-net signals, emitted every
-                            // heartbeat (the agent has no /metrics; the server-side
-                            // yuzu_fleet_* derivation + alert land with WS-11).
+                            // heartbeat (the agent has no /metrics; the server derives
+                            // the yuzu_fleet_agents_dedup_* gauges + the
+                            // YuzuDedupStoreDegraded alert from these tags, #3663).
                             // "degraded"=1 means the durable store never OPENED (a
                             // real 0/1 reading, never absent-reads-as-zero). It is
                             // the OPEN-failure signal ONLY; a store that opened then
@@ -2638,6 +3142,21 @@ public:
                             // which is not separately detectable. "replays" counts
                             // served terminal replays.
                             tags["yuzu.dedup_degraded"] = command_dedup_ ? "0" : "1";
+                            // ADR-2005: the command pool's in-flight gauge (tasks executing now,
+                            // "running/workers", plus "queued"): a wedge (every ordinary worker
+                            // held by a stalled filesystem or resolver) shows here while the
+                            // reserved protective worker keeps containment running.
+                            // Read from pool_gauge_ (lock-free atomics that outlive every pool),
+                            // never from thread_pool_ itself: a reconnect destroys and re-creates it.
+                            tags["yuzu.command_pool_busy"] = std::to_string(pool_gauge_->running.load()) +
+                                                             "/" + std::to_string(pool_gauge_->workers.load());
+                            tags["yuzu.command_pool_queued"] = std::to_string(pool_gauge_->queued.load());
+                            // #3665: >0 when THIS process start recovered from a corrupt
+                            // command_dedup.db (history before the boot was lost). Without
+                            // this tag the recovery would be visible only in the endpoint's
+                            // own log, since the agent has no /metrics endpoint.
+                            tags["yuzu.dedup_quarantined"] = std::to_string(static_cast<int64_t>(
+                                metrics_.counter("yuzu_agent_dedup_quarantined_total").value()));
                             tags["yuzu.dedup_replays"] = std::to_string(static_cast<int64_t>(
                                 metrics_.counter("yuzu_agent_dedup_replays_total").value()));
                             tags["yuzu.dedup_claim_errors"] = std::to_string(static_cast<int64_t>(
@@ -2650,6 +3169,17 @@ public:
                                 metrics_.counter("yuzu_agent_dedup_record_errors_total").value()));
                             tags["yuzu.dedup_release_errors"] = std::to_string(static_cast<int64_t>(
                                 metrics_.counter("yuzu_agent_dedup_release_errors_total").value()));
+                            // Capacity signal (#3663): the store's cached row count
+                            // (in-flight + terminal), read lock-free -- the heartbeat
+                            // never takes the store mutex the reader thread claims
+                            // under. ABSENT (not "0") when there is no store or the
+                            // count is unknown, so the server cannot read "unknown"
+                            // as "empty"; dedup_degraded already carries the no-store
+                            // case.
+                            if (command_dedup_) {
+                                if (const auto rows = command_dedup_->cached_row_count())
+                                    tags["yuzu.dedup_rows"] = std::to_string(*rows);
+                            }
                             // OTA signature refusals (#416/#3807). Carried on the
                             // heartbeat for the same reason as the dedup counters
                             // above: the agent has no /metrics endpoint, so this
@@ -2674,6 +3204,12 @@ public:
                                 tags["yuzu.ota_signature_refused"] =
                                     std::to_string(static_cast<int64_t>(refused));
                             }
+                            // WP07: plugin output writes lost to an allocation failure (the
+                            // command is reported constrained). Omitted while zero.
+                            if (const auto dropped = g_output_dropped_commands.load(
+                                    std::memory_order_relaxed);
+                                dropped != 0)
+                                tags["yuzu.output_dropped"] = std::to_string(dropped);
                             // #5249: the OTA update-signature mode this process
                             // enforces (off / bundle / bundle+require), so a fleet
                             // view CAN find agents that are NOT verifying update
@@ -2877,23 +3413,43 @@ public:
                               // Group D2 (after D, its own try so it can neither drop an older
                               // tag nor be dropped by one): #4045, the Spark baseline-persist
                               // aggregate (sparse, 0 omits the tag; every channel is listed on
-                              // GuardianEngine::baseline_persist_failures()). Spark path ONLY:
-                              // a legacy FileGuard persist failure is logged, not counted, so
-                              // an absent tag is NOT evidence that baselines persisted. Not
-                              // gated on prefer_spark_ (0 while Spark is inert). This accessor
-                              // takes no lock (the Group B/C accessors above do take mtx_).
-                              // Deleting THIS call site is not caught by any test, same as
-                              // Group D's: the emitter and the accessor are pinned (E10, E15,
-                              // E23 and the doc-scrape test), the call itself is verified by
-                              // reading. Deliberately no source-grep pin: it would break
-                              // out-of-tree and packaged builds that carry no source tree.
+                              // GuardianEngine::baseline_persist_failures()), plus the two
+                              // #5605 tags described below. Spark path ONLY: a legacy
+                              // FileGuard persist failure is logged, not counted, so an absent
+                              // tag is NOT evidence that baselines persisted. The aggregate is
+                              // not gated on prefer_spark_ (0 while Spark is inert). These
+                              // accessors take no lock (the Group B/C accessors above do take
+                              // mtx_).
+                              // Deleting THIS call site is not caught by any unit test, same
+                              // as Group D's: the emitter and the accessor are pinned (E10,
+                              // E15, E23 and the doc-scrape test). The three emit calls here
+                              // are pinned only by the source-text check
+                              // tests/test_guardian_baseline_fleet_tags_lexical.py, which runs
+                              // in the docs suite against the source tree and so does not run
+                              // in out-of-tree or packaged builds that carry no source tree.
+                              //
+                              // #5605: the same group also carries the CURRENT unpersisted
+                              // backlog (present only on a live prefer_spark agent with a
+                              // published persister; a present 0 means "no capture waiting at
+                              // this persister", NOT "Spark is healthy") and the boot-scan
+                              // count (sparse, live on every agent: a boot re-arm found no
+                              // persisted baseline, which is not proof a capture was lost).
+                              // Both accessors are lock-free. One try for all three: a throw
+                              // skips the group's REMAINING emitters for that tick (tags
+                              // already written stay), counted once. The older persist_failures
+                              // tag is emitted last, so a throw in either new emitter skips it.
                               try {
+                                emit_guardian_baseline_unpersisted_heartbeat_tag(
+                                    tags, guardian_->baseline_unpersisted());
+                                emit_guardian_baseline_rebaselined_heartbeat_tag(
+                                    tags, guardian_->baseline_rebaselined_at_boot());
                                 emit_guardian_baseline_persist_heartbeat_tags(
                                     tags, guardian_->baseline_persist_failures());
                               } catch (...) {
                                   hb_guardian_contain(kHbGuardianBaseline,
                                                       "Guardian heartbeat baseline-persist tag "
-                                                      "failed (the tag was skipped this tick)");
+                                                      "failed (the remaining tags were "
+                                                      "skipped this tick)");
                               }
                             }
 #if defined(_WIN32) || defined(__linux__) || defined(__APPLE__)
@@ -3155,7 +3711,7 @@ public:
                                 if (hb_code == grpc::StatusCode::NOT_FOUND ||
                                     hb_code == grpc::StatusCode::UNAUTHENTICATED) {
                                     // A successful Register resets reconnect_count
-                                    // (the normal backoff), so without a damper here
+                                    // and the backoff delay, so without a damper here
                                     // a server that reaps every fresh session would
                                     // drive a fleet-wide register→beat→reject→
                                     // register storm (governance UP-1). Apply an
@@ -3331,7 +3887,6 @@ public:
                 // Command replay protection is now durable (command_dedup_, HA
                 // WS-0): it survives reconnect AND restart, so there is no
                 // per-connection reset here.
-                bool update_verified = false;
                 pb::CommandRequest cmd;
                 while (stream->Read(&cmd)) {
                     if (stop_requested_.load(std::memory_order_acquire))
@@ -3340,6 +3895,27 @@ public:
                     // True only when THIS delivery's claim() succeeded — gates the
                     // queue-full release so it never deletes a concurrent owner's row.
                     bool claimed_here = false;
+
+                    // sg10 / UP-1: a parameter key or value with a NUL byte would be truncated by
+                    // `c_str()` and read by a plugin as a different name. Refused BEFORE the
+                    // dedup claim and the stagger sleep (no in-flight record, no held worker).
+                    if (command_params_have_nul(cmd.parameters())) {
+                        spdlog::warn("Command {} refused: a parameter key or value holds a NUL "
+                                     "byte",
+                                     cmd.command_id());
+                        metrics_.counter("yuzu_agent_commands_refused_nul_params_total").increment();
+                        pb::CommandResponse refused;
+                        refused.set_command_id(cmd.command_id());
+                        refused.set_status(pb::CommandResponse::REJECTED);
+                        refused.set_output("command refused: a parameter holds a NUL byte");
+                        refused.mutable_sent_at()->set_millis_epoch(
+                            std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::system_clock::now().time_since_epoch())
+                                .count());
+                        std::lock_guard lock(stream_write_mu_);
+                        stream->Write(refused, grpc::WriteOptions());
+                        continue;
+                    }
 
                     // Command replay protection (HA WS-0, ADR-2002). claim() is the
                     // atomic first-writer-wins gate: on a duplicate we REPLAY the
@@ -3356,45 +3932,56 @@ public:
                     // branch resolves via its own write + continue, so claiming it
                     // would leak an unresolved in-flight record AND wrongly answer a
                     // re-sent control command RUNNING. It is the ONLY dispatch that
-                    // bypasses the claim: gating on the literal (not the whole
-                    // reserved-name set) keeps durable idempotency the SAFE DEFAULT
-                    // for any future reserved-name command — a future __update__ OTA
-                    // path is deduplicated unless it, too, opts out here.
+                    // skips claiming for a reason of its own. (A command refused above, for
+                    // a NUL parameter, claims nothing and dispatches nothing, so no claim
+                    // exists to skip.) Gating on the literal, not the whole reserved-name
+                    // set, keeps durable idempotency the SAFE DEFAULT for any future
+                    // reserved-name command: a future __update__ OTA path is deduplicated
+                    // unless it, too, opts out in should_claim().
+                    // The decision itself (which commands are claimed; replay / RUNNING /
+                    // proceed after the claim) lives in command_dedup_decision.hpp — pure
+                    // and unit-tested (tests/unit/test_command_dedup_decision.cpp, #3668).
+                    // Everything with a side effect stays here.
                     if (cmd.command_id().empty()) {
                         spdlog::warn("Received command with empty command_id — replay "
                                      "protection cannot apply");
-                    } else if (command_dedup_ && cmd.plugin() != "__guard__") {
+                    } else if (should_claim(command_dedup_ != nullptr, cmd.command_id(),
+                                            cmd.plugin())) {
                         auto claim = command_dedup_->claim(cmd.command_id());
+                        // Parse the stored outcome only for a terminal duplicate; the
+                        // decision takes the bool so it stays proto-free.
+                        pb::CommandResponse stored;
+                        const bool stored_parses =
+                            claim.status == ClaimStatus::Duplicate &&
+                            claim.state == DedupState::Terminal &&
+                            stored.ParseFromString(claim.response);
+                        const auto decision =
+                            decide_after_claim(claim.status, claim.state, stored_parses);
                         // Own the in-flight record ONLY when WE claimed it — a
                         // fall-through on Error (fail-open) must NOT later release a
                         // row a concurrent first delivery owns.
-                        claimed_here = (claim.status == ClaimStatus::Claimed);
-                        if (claim.status == ClaimStatus::Error)
+                        claimed_here = decision.owns_claim;
+                        if (decision.count_claim_error)
                             metrics_.counter("yuzu_agent_dedup_claim_errors_total").increment();
-                        if (claim.status == ClaimStatus::Duplicate) {
+                        if (decision.action != DedupAction::Proceed) {
                             pb::CommandResponse dup_resp;
-                            bool replayed = false;
-                            if (claim.state == DedupState::Terminal) {
-                                pb::CommandResponse stored;
-                                if (stored.ParseFromString(claim.response)) {
-                                    dup_resp = std::move(stored);
-                                    auto now_ms =
-                                        std::chrono::duration_cast<std::chrono::milliseconds>(
-                                            std::chrono::system_clock::now().time_since_epoch())
-                                            .count();
-                                    dup_resp.mutable_sent_at()->set_millis_epoch(now_ms);
-                                    replayed = true;
-                                    metrics_.counter("yuzu_agent_dedup_replays_total").increment();
-                                    spdlog::info("Replay of command {} — returning stored "
-                                                 "terminal outcome",
-                                                 cmd.command_id());
-                                } else {
+                            if (decision.action == DedupAction::ReplayStored) {
+                                dup_resp = std::move(stored);
+                                auto now_ms =
+                                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                                        std::chrono::system_clock::now().time_since_epoch())
+                                        .count();
+                                dup_resp.mutable_sent_at()->set_millis_epoch(now_ms);
+                                metrics_.counter("yuzu_agent_dedup_replays_total").increment();
+                                spdlog::info("Replay of command {} — returning stored "
+                                             "terminal outcome",
+                                             cmd.command_id());
+                            } else {
+                                if (claim.status == ClaimStatus::Duplicate &&
+                                    claim.state == DedupState::Terminal)
                                     spdlog::error("Stored terminal outcome for {} failed to "
                                                   "parse — answering RUNNING",
                                                   cmd.command_id());
-                                }
-                            }
-                            if (!replayed) {
                                 dup_resp.set_command_id(cmd.command_id());
                                 dup_resp.set_status(pb::CommandResponse::RUNNING);
                                 // Plain progress text — NOT a parsed sentinel (no
@@ -3415,15 +4002,6 @@ public:
                         // undeduplicated for this one command.
                     }
 
-                    // Write health marker after first successful read (OTA rollback guard)
-                    if (cfg_.auto_update && !update_verified) {
-                        update_verified = true;
-                        auto marker =
-                            current_executable_path().parent_path() / ".yuzu-update-verified";
-                        std::ofstream{marker} << "ok";
-                        spdlog::debug("Wrote update verification marker: {}", marker.string());
-                    }
-
                     spdlog::info("Received command: plugin={}, action={}, id={}", cmd.plugin(),
                                  cmd.action(), cmd.command_id());
 
@@ -3432,7 +4010,7 @@ public:
                     // load-time check in plugin_loader.cpp also rejects reserved
                     // names, but defence-in-depth keeps both halves explicit).
                     // See docs/yuzu-guardian-design-v1.1.md §7.2.
-                    if (cmd.plugin() == "__guard__") {
+                    if (cmd.plugin() == kDedupBypassPlugin) {
                         pb::CommandResponse resp;
                         resp.set_command_id(cmd.command_id());
                         auto epoch_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -3498,6 +4076,10 @@ public:
                         if (auto it = cmd.parameters().find("source");
                             it != cmd.parameters().end() && !it->second.empty())
                             source = it->second;
+                        std::optional<std::string_view> delay_max_s; // nullopt = key absent
+                        if (auto it = cmd.parameters().find("delay_max_s");
+                            it != cmd.parameters().end())
+                            delay_max_s = it->second;
                         std::shared_ptr<SyncScheduler> sched;
                         {
                             std::lock_guard<std::mutex> lk(sync_sched_mu_);
@@ -3510,8 +4092,47 @@ public:
                         // else about this command (the metrics counter below,
                         // record_command_terminal-before-write, the stream->Write)
                         // stays here, unchanged.
-                        auto decision = decide_sync_now(cmd.action(), source, cfg_.inventory_disable,
-                                                         sched.get());
+                        // `settings` (fleet collection settings) is decided first, in
+                        // collection_settings_agent.hpp: it persists the pair, then holds it
+                        // (the switches, and the version the heartbeat reports) and hands the
+                        // cadence to the scheduler when one is published. With no scheduler
+                        // (--inventory-disable, or the sync thread of this connection has not
+                        // published yet) the settings are still held and reported, and the
+                        // next scheduler is built on them. It never forces a sync; the wake
+                        // below only re-ticks so the new cadence is applied at once.
+                        auto decision =
+                            cmd.action() == kSettingsAction
+                                ? decide_sync_settings(
+                                      cmd.parameters(),
+                                      SettingsHooks{
+                                          [this](std::string_view key, std::string_view value) {
+                                              return kv_store_ &&
+                                                     kv_store_->set(kSyncKvNamespace, key, value);
+                                          },
+                                          [this](const AgentCollectionSettings& s) {
+                                              collector_enabled_->set(s.plugins);
+                                              // Assign first, THEN read the scheduler, both
+                                              // under settings_mu_ (the sync thread holds it
+                                              // from its read of applied_settings_ to its
+                                              // publication): either that build already read
+                                              // `s`, or its scheduler is visible here.
+                                              // apply_settings only queues under the
+                                              // scheduler's own short mutex.
+                                              std::lock_guard<std::mutex> lk(settings_mu_);
+                                              applied_settings_ = s;
+                                              std::shared_ptr<SyncScheduler> live;
+                                              {
+                                                  std::lock_guard<std::mutex> sl(sync_sched_mu_);
+                                                  live = sync_scheduler_;
+                                              }
+                                              if (live)
+                                                  live->apply_settings(
+                                                      kSettingsSyncSource,
+                                                      std::chrono::seconds{s.interval_s},
+                                                      s.window);
+                                          }})
+                                : decide_sync_now(cmd.action(), source, delay_max_s,
+                                                  cfg_.inventory_disable, sched.get());
                         resp.set_status(decision.status == SyncNowDecision::Status::Success
                                              ? pb::CommandResponse::SUCCESS
                                              : pb::CommandResponse::FAILURE);
@@ -3574,7 +4195,13 @@ public:
                     // so concurrent dispatch is required.
                     // Each task captures the shared_ptr to guarantee the stream
                     // outlives all writers (fixes use-after-free risk from #66).
-                    bool submitted = thread_pool_->submit([this, target, cmd, stream]() {
+                    // ADR-2005: a protective action that reaches the pool (the closed firewall
+                    // containment set) goes to its reserved lane; every other command can never
+                    // occupy the last reserved worker. __guard__.push_rules is also protective
+                    // but never reaches the pool: it is answered inline in this loop, above.
+                    const bool protective_lane =
+                        yuzu::protective::is_protective_action(cmd.plugin(), cmd.action());
+                    bool submitted = thread_pool_->submit([this, target, cmd, stream, claimed_here]() {
                         // Outer exception firewall (#2037). The ThreadPool worker
                         // already contains any escaped exception so the agent
                         // process survives; catching here additionally lets the
@@ -3582,7 +4209,7 @@ public:
                         // its own timeout for a command whose dispatch task threw
                         // outside the plugin execute() guard.
                         try {
-                            execute_command_task(target, cmd, stream);
+                            execute_command_task(target, cmd, stream, claimed_here);
                         } catch (const std::exception& e) {
                             spdlog::error("Command {} dispatch failed outside plugin execute: {}",
                                           cmd.command_id(), e.what());
@@ -3595,7 +4222,7 @@ public:
                             send_dispatch_failure(stream, cmd.command_id(),
                                                   "agent dispatch error: non-std exception");
                         }
-                    });
+                    }, protective_lane);
 
                     if (!submitted) {
                         spdlog::warn("Thread pool queue full — rejecting command {}",
@@ -3654,6 +4281,7 @@ public:
                 // Destroy thread pool BEFORE stream goes out of scope — this drains
                 // the queue, waits for in-flight tasks, and joins all worker threads,
                 // ensuring no task holds a dangling stream pointer.
+                command_pool_closing_.store(true, std::memory_order_release);
                 thread_pool_.reset();
 
                 // Stop and join the OTA update thread
@@ -3722,6 +4350,9 @@ public:
                     // for every early-return/exception exit, and re-invoking the
                     // helper there is a joinable()-guarded no-op.
                     quiesce_run_workers();
+                    // No plugin is shut down or unloaded under a detached installed-software
+                    // worker (the ScopeExit above makes the same call).
+                    drain_detached_collectors_or_exit();
                     // Stop the TRIGGER ENGINE before the plugin shutdown loop, for the same
                     // reason the ScopeExit does (:766) — its workers dispatch into plugins_
                     // from their own threads, so shutting plugins down (and clearing the
@@ -3772,7 +4403,9 @@ public:
                     // cleanly. (governance: cpp-safety BLOCKING, sre OR-5, happy-path F1.)
                     try {
                         thread_pool_ =
-                            std::make_unique<ThreadPool>(std::thread::hardware_concurrency());
+                            std::make_unique<ThreadPool>(std::thread::hardware_concurrency(), kCommandQueueDepth,
+                                                         kReservedProtectiveWorkers, pool_gauge_);
+                        command_pool_closing_.store(false, std::memory_order_release);
                     } catch (const std::exception& e) {
                         spdlog::critical("could not re-create the command dispatch thread pool on "
                                          "reconnect ({}) — the host is out of threads. Stopping "
@@ -3950,7 +4583,9 @@ private:
     // sink and the (ruleless) DEX signal observer. Drops the event if the link is
     // down between reconnects (guardian_sink_stream_ null) — durable buffering is A3.
     // Returns the delivery outcome (LegacySendOutcome, #4783: LinkDown when the
-    // stream is null, WriteFailed when Write() itself returns false, Sent otherwise)
+    // stream is null, WriteFailed when Write() itself returns false, Sent otherwise, which
+    // includes an event refused locally as unsendable: that returns Sent WITHOUT a Write, see
+    // refuse_unsendable_guardian_event)
     // so a caller can distinguish those two failure shapes and log it (#4606
     // criterion-10 T_wire) — deliberately instrumented ONLY at the drift-sink call
     // site (set_event_sink's lambda), never here and never at the DEX observer's
@@ -3960,6 +4595,8 @@ private:
     // should make the same choice deliberately rather than copy whichever pattern it
     // happens to see first.
     LegacySendOutcome emit_guardian_event(const gpb::GuaranteedStateEvent& ev) {
+        if (refuse_unsendable_guardian_event(ev, "legacy"))
+            return LegacySendOutcome::Sent; // dropped by design; a retry could never succeed
         pb::CommandResponse resp;
         resp.set_plugin("__guard__");
         resp.set_action("event");
@@ -3972,11 +4609,42 @@ private:
                                                                         : LegacySendOutcome::WriteFailed;
     }
 
+    // True (and logged) when `ev` is one the server drops at ingest for want of a rule id
+    // (guardian_event_refused_by_server). The server answers an ingest refusal with nothing, so
+    // this is the only place the agent can see it. Callers then skip the Write and report the
+    // event as Sent, meaning "disposed by design", not "delivered": a retry could never succeed,
+    // and Retain/WriteFailed would respectively wedge the outbox head or record a gap against an
+    // empty rule id. No producer reaches this today: a pushed rule set with an empty rule id is
+    // rejected whole by apply_rules' is_valid_rule_id scan, json_to_rule rejects one on boot
+    // re-arm, and DEX observations carry the `__observation__` sentinel. On the Spark path the
+    // journal mint gate only keeps such a record out of the journal (the live entry is still
+    // enqueued), so this refusal is what stops it reaching the wire; it is the last line. Logged
+    // on the first occurrence and then every 1024th, so a bad producer cannot flood; the counter
+    // exists only to set that cadence and is not exported.
+    // The legacy drift-sink lambda logs sent=0 in its T_wire line for a refused event, so the
+    // line never claims a write that did not happen.
+    bool refuse_unsendable_guardian_event(const gpb::GuaranteedStateEvent& ev,
+                                          std::string_view path) {
+        if (!guardian_event_refused_by_server(ev))
+            return false;
+        const auto n = guardian_unsendable_events_.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (n == 1 || n % 1024 == 0) {
+            try {
+                spdlog::warn("Guardian {} path: not sending event {}: its rule_id is empty and the "
+                             "server would drop it (refused so far: {})",
+                             path, ::yuzu::log_id_token(ev.event_id()), n);
+            } catch (...) { // best-effort diagnostic; never propagate onto a send worker
+            }
+        }
+        return true;
+    }
+
     // The send callback the Guardian spark outbox drain worker uses (rung 7.7a). It
     // maps one buffered OutboxEntry to the wire event and writes it over the current
     // Subscribe stream, mirroring emit_guardian_event but returning a SendResult so
     // the drain can retain-and-retry: Retain when the stream is down (pre-network arm
-    // or a reconnect gap) or the Write fails, Sent on a successful Write. Capturing
+    // or a reconnect gap) or the Write fails, Sent on a successful Write or when the event is
+    // refused locally as unsendable (no Write, see refuse_unsendable_guardian_event). Capturing
     // `this` is lifetime-safe, but NOT via a synchronous join (#2233 item 4, revised):
     // this callback runs on GuardianOutboxSendExecutor's DETACHED worker
     // (guardian_outbox_send_executor.hpp), which guardian_->stop() does NOT join. Safety
@@ -3997,11 +4665,14 @@ private:
 #else
             "linux";
 #endif
+        const auto wire_ev = guardian_outbox_entry_to_event(e, kHostPlatform);
+        if (refuse_unsendable_guardian_event(wire_ev, "spark"))
+            return SendResult::Sent; // Retain would wedge the outbox head on a row that can never send
         pb::CommandResponse resp;
         resp.set_plugin("__guard__");
         resp.set_action("event");
         resp.set_status(pb::CommandResponse::SUCCESS);
-        resp.set_payload(guardian_outbox_entry_to_event(e, kHostPlatform).SerializeAsString());
+        resp.set_payload(wire_ev.SerializeAsString());
         bool ok;
         {
             std::lock_guard lock(stream_write_mu_);
@@ -4036,8 +4707,56 @@ private:
     // FAILURE-on-throw path around it stay small and readable. A `return`
     // here skips this command's remaining status writes exactly as it did
     // inside the lambda.
+    /// True while the command pool is being destroyed for a reconnect, or the agent is stopping: a task
+    /// that has not started its plugin yet must not start (and must not sleep a stagger), because the
+    /// pool destructor waits for every task (#8247 is the unbounded join of a RUNNING task). A
+    /// protective action is the one exemption (`command_may_start`): it still runs, with no stagger.
+    [[nodiscard]] bool command_pool_closing() const {
+        return command_pool_closing_.load(std::memory_order_acquire) ||
+               stop_requested_.load(std::memory_order_acquire);
+    }
+
+    /// A command that never started (the pool is closing): answer REJECTED so the server does not wait,
+    /// release OUR claim so a redelivery after the reconnect can run it (never memoise a terminal for
+    /// work that did not happen), and erase its in-flight entry (record_command_terminal is not used:
+    /// it would memoise).
+    void reject_unstarted_command(const std::shared_ptr<SubscribeStream>& stream,
+                                  const pb::CommandRequest& cmd, bool claimed_here) {
+        const bool stopping = stop_requested_.load(std::memory_order_acquire);
+        spdlog::warn("Command {} not started: agent {}", cmd.command_id(),
+                     stopping ? "stopping" : "reconnecting");
+        metrics_.counter("yuzu_agent_commands_rejected_closing_total").increment();
+        if (!cmd.command_id().empty()) {
+            std::lock_guard lock(in_flight_mu_);
+            in_flight_ids_.erase(cmd.command_id());
+        }
+        if (command_dedup_ && claimed_here &&
+            command_dedup_->release(cmd.command_id()) == ReleaseOutcome::Error)
+            metrics_.counter("yuzu_agent_dedup_release_errors_total").increment();
+        pb::CommandResponse resp;
+        resp.set_command_id(cmd.command_id());
+        resp.set_status(pb::CommandResponse::REJECTED);
+        resp.set_output(stopping ? "command not started: agent stopping"
+                                 : "command not started: agent reconnecting");
+        std::lock_guard lock(stream_write_mu_);
+        stream->Write(resp, grpc::WriteOptions());
+    }
+
     void execute_command_task(const YuzuPluginDescriptor* target, const pb::CommandRequest& cmd,
-                              const std::shared_ptr<SubscribeStream>& stream) {
+                              const std::shared_ptr<SubscribeStream>& stream, bool claimed_here) {
+        // A task still queued (or about to sleep) when the pool closes never starts, EXCEPT a protective
+        // action (ADR-2005): a containment queued ahead of a teardown still runs, so the
+        // close can never strand it (a rule push is answered inline and is never queued). The same single predicate chooses the reserved lane at submit.
+        if (!command_may_start(cmd.plugin(), cmd.action(), command_pool_closing())) {
+            reject_unstarted_command(stream, cmd, claimed_here);
+            return;
+        }
+        if (protective_runs_while_closing(cmd.plugin(), cmd.action(), command_pool_closing()) &&
+            note_protective_run_closing(metrics_, protective_closing_runs_)) {
+            spdlog::warn("Protective command {} ({}.{}) runs while the command pool is closing; the "
+                         "close waits for it, unbounded",
+                         cmd.command_id(), cmd.plugin(), cmd.action());
+        }
         // -- Stagger/delay: prevent thundering herd on large-fleet dispatch --
         const int32_t stagger_s = std::min(cmd.stagger_seconds(), int32_t{300}); // cap 5 min
         const int32_t delay_s = std::min(cmd.delay_seconds(), int32_t{300});     // cap 5 min
@@ -4054,12 +4773,23 @@ private:
             spdlog::debug("Command {} stagger {}s + delay {}s = {}s", cmd.command_id(),
                           random_stagger, delay_s, total_delay);
 
-            if (total_delay > 0) {
-                std::this_thread::sleep_for(std::chrono::seconds(total_delay));
+            // A protective action never sleeps a stagger or delay: it runs at once, even at teardown.
+            if (total_delay > 0 && command_may_stagger(cmd.plugin(), cmd.action())) {
+                // Sliced (<= 1 s) and stop-aware: a long stagger can never hold this worker past a
+                // reconnect or a stop. An interrupted command never ran: reject it and let it be
+                // redelivered.
+                if (!sleep_interruptible(std::chrono::seconds(total_delay),
+                                         [this] { return command_pool_closing(); })) {
+                    reject_unstarted_command(stream, cmd, claimed_here);
+                    return;
+                }
             }
 
-            // Check expiration after the delay — skip stale commands
-            if (cmd.has_expires_at() && cmd.expires_at().millis_epoch() > 0) {
+            // Check expiration after the delay — skip stale commands. A protective action is never
+            // rejected as expired (command_may_expire): the stored-state reconciler stays the
+            // authority, so a late containment is applied rather than dropped.
+            if (command_may_expire(cmd.plugin(), cmd.action()) && cmd.has_expires_at() &&
+                cmd.expires_at().millis_epoch() > 0) {
                 auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                                   std::chrono::system_clock::now().time_since_epoch())
                                   .count();
@@ -4137,6 +4867,11 @@ private:
 
         // Flush any buffered output before sending timing/status
         ctx_impl.flush_output();
+        // Account a lost output write FIRST (atomic bumps only): the timing frame and the
+        // labelled counter lookup below allocate, and must not run before the drop is counted.
+        ctx_impl.apply_output_drop();
+        if (ctx_impl.output_dropped.load(std::memory_order_relaxed))
+            g_output_dropped_commands.fetch_add(1, std::memory_order_relaxed);
 
         auto end_time = std::chrono::steady_clock::now();
         auto exec_ms =
@@ -4159,6 +4894,14 @@ private:
         // for the operator log line below. It is a READ-TIME/PRESENTATION
         // derivation ONLY — see derive_effective_result_status(), unit-tested in
         // tests/unit/test_capability_descriptor.cpp.
+        if (ctx_impl.output_dropped.load(std::memory_order_relaxed)) {
+            metrics_.counter("yuzu_agent_plugin_output_dropped_total", {{"plugin", cmd.plugin()}})
+                .increment();
+            // AFTER unwinding (the allocation failure is long gone): one loud line.
+            spdlog::error("Command {} plugin {}: a plugin output write was lost to an allocation "
+                          "failure; the result is reported constrained/partial",
+                          yuzu::log_id_token(cmd.command_id()), yuzu::log_id_token(cmd.plugin()));
+        }
         YuzuResultStatus effective_result_status =
             derive_effective_result_status(ctx_impl.result_status, rc);
 
@@ -4240,8 +4983,11 @@ private:
                     *slim.mutable_sent_at() = resp.sent_at();
                 if (resp.has_error()) {
                     slim.mutable_error()->set_code(resp.error().code());
+                    // Cut on a scalar boundary: a mid-sequence cut is invalid UTF-8 in a proto3
+                    // string, which would make this stored blob unparseable on replay.
+                    const std::string& em = resp.error().message();
                     slim.mutable_error()->set_message(
-                        resp.error().message().substr(0, kMaxDedupErrorMessageBytes));
+                        em.substr(0, yuzu::shared::utf8_prefix_len(em, kMaxDedupErrorMessageBytes)));
                 }
                 slim.set_output("[output replaced in dedup store: response exceeded size cap; "
                                 "command completed]");
@@ -4257,7 +5003,9 @@ private:
                 // undeduplicated (claim had failed — fail-open) or this is a
                 // duplicate terminal write. NOT the same as the eviction-driven
                 // double-execute, which produces a fresh claim and is not
-                // separately detectable here (bounded by kMaxDedupRows).
+                // separately detectable here (limited, as an ESTIMATE, by kMaxDedupRows
+                // exceeding the server's outbox redelivery horizon, #3678; see
+                // common/include/yuzu/command_replay_horizon.hpp for what it misses).
                 metrics_.counter("yuzu_agent_dedup_record_terminal_miss_total").increment();
                 break;
             case RecordOutcome::Error:
@@ -4398,6 +5146,78 @@ private:
         update_thread_.join();
     }
 
+    /// Publish the live control peer to every plugin context as "agent.server_peer".
+    ///
+    /// TRUST RULE (#3429 round 4, kept): the value is produced here, by agents/core, from
+    /// the stream the server actually answered on (certificate-authenticated when
+    /// tls_enabled); a plugin never resolves a name and admits only a literal published
+    /// here. It is the address the agent reaches the server on RIGHT NOW, not a name the
+    /// host being contained could re-point (the firewall containment reads it at
+    /// quarantine time, so a server that moved after agent start is allowed, not the dead
+    /// address resolved at boot).
+    ///
+    /// A peer that is not a usable literal (grpc_peer_literal: empty), or a 17th distinct
+    /// one, publishes NOTHING (nullptr), so a plugin falls back to the start-resolved set
+    /// rather than keep a stale address. The strings are interned in an append-only,
+    /// capped set and never freed: yuzu_ctx_get_config hands the raw pointer to plugin
+    /// code, so what it names must outlive every possible reader.
+    void publish_server_peer(const std::string& grpc_peer) {
+        const auto literal = yuzu::agent::grpc_peer_literal(grpc_peer);
+        const char* interned = nullptr;
+        if (!literal.empty()) {
+            std::lock_guard lk(peer_intern_mu_);
+            for (const auto& known : peer_interned_)
+                if (*known == literal)
+                    interned = known->c_str();
+            if (!interned && peer_interned_.size() < kMaxInternedPeers) {
+                peer_interned_.push_back(std::make_unique<const std::string>(literal));
+                interned = peer_interned_.back()->c_str();
+            }
+        }
+        if (!literal.empty() && !interned)
+            spdlog::warn("server peer {}: more than {} distinct peers seen, not published to plugins",
+                         literal, kMaxInternedPeers);
+        plugin_ctx_.server_peer.store(interned, std::memory_order_release);
+        for (auto& [name, pctx] : per_plugin_ctx_)
+            pctx->server_peer.store(interned, std::memory_order_release);
+    }
+
+    static constexpr std::size_t kMaxInternedPeers = 16;
+    std::mutex peer_intern_mu_;
+    std::vector<std::unique_ptr<const std::string>> peer_interned_; // append-only, never freed
+
+    // The teardown barrier for the installed-software collector. Its actions run on bounded
+    // DETACHED workers (agents/shared/bounded_wait.hpp): a caller that gave up at the time limit
+    // leaves the worker inside a plugin's dispatcher. Call this AFTER quiesce_run_workers() (the
+    // sync thread, the only thing that starts such a worker, is joined by then) and BEFORE any
+    // plugin shutdown() or dlclose: wait the F3 orphan-drain grace for the count to reach zero,
+    // and if it does not, hard_exit(3) (hard_exit.hpp) rather than race shutdown against code the
+    // worker is executing. Same contract as main.cpp's Guardian orphan check; the supervisor
+    // restarts the agent. A plugin that never returns therefore makes that restart a hard exit.
+    void drain_detached_collectors_or_exit() noexcept {
+        try {
+            drain_collector_workers(*collector_workers_,
+                                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                                        yuzu::agent::kOrphanDrainGrace),
+                                    [](std::size_t n) {
+                                        try {
+                                            spdlog::critical(
+                                                "{} installed-software collector worker(s) still "
+                                                "inside a plugin {}s after shutdown began - forcing "
+                                                "process exit rather than unload a plugin under "
+                                                "them",
+                                                n, yuzu::agent::kOrphanDrainGrace.count());
+                                            yuzu::agent::drain_log_bounded(
+                                                std::chrono::milliseconds{200});
+                                        } catch (...) {
+                                        }
+                                        yuzu::agent::hard_exit(3);
+                                    });
+        } catch (...) {
+            yuzu::agent::hard_exit(3); // could not even check: fail closed
+        }
+    }
+
     Config cfg_;
     PluginContextImpl plugin_ctx_;
     // Per-plugin contexts: each plugin gets its own PluginContextImpl with the
@@ -4405,6 +5225,9 @@ private:
     // pointers remain stable after map insertions.
     std::unordered_map<std::string, std::unique_ptr<PluginContextImpl>> per_plugin_ctx_;
     std::unique_ptr<KvStore> kv_store_;
+    // UP-9: single-writer guard for the Guardian boot epoch. Declared before guardian_, so it
+    // is destroyed after it and held until the engine is gone.
+    GuardianInstanceLock guardian_instance_lock_;
     // Drives interval / file-change / service-status triggers that plugins
     // register during init(). Owned here; a non-owning pointer is handed to
     // every per-plugin context so yuzu_register_trigger can reach it.
@@ -4412,6 +5235,7 @@ private:
     // shutdown so a trigger never fires into a half-torn-down plugin.
     TriggerEngine trigger_engine_;
     yuzu::MetricsRegistry metrics_;
+    std::atomic<std::uint64_t> protective_closing_runs_{0}; // throttles the closing-run WARN
     std::chrono::steady_clock::time_point start_time_;
     std::string session_id_;
     std::atomic<bool> stop_requested_{false};
@@ -4456,7 +5280,8 @@ private:
     // arms the scheduler through this handle and breaks the sync thread's sleep.
     // sync_scheduler_ is null under --inventory-disable and between connections
     // (published by the 4b-sync thread after its sources are registered, cleared
-    // by that same thread on exit) — the intercept answers FAILURE, never blocks.
+    // by that same thread on exit) — the `now` intercept answers FAILURE, never blocks;
+    // `settings` is held in applied_settings_ and needs no scheduler.
     std::atomic<bool> sync_wake_{false};
     std::mutex sync_sched_mu_;
     std::shared_ptr<SyncScheduler> sync_scheduler_;
@@ -4562,6 +5387,8 @@ private:
     // bursts within one millisecond; agent_id (folded into the id) disambiguates
     // ACROSS agents so a fleet-wide signal wave doesn't collide on the global PK.
     std::atomic<std::uint64_t> dex_seq_{0};
+    /// Guardian events refused by refuse_unsendable_guardian_event (empty rule_id).
+    std::atomic<std::uint64_t> guardian_unsendable_events_{0};
     // Runtime arm/health of the DEX observer — flipped to false by the observer's
     // error callback on a runtime subscription failure on any channel (UP-1). A
     // shared_ptr<atomic> (not `this`) so a late OS-threadpool error callback stays
@@ -4569,6 +5396,8 @@ private:
     // tag.
     std::shared_ptr<std::atomic<bool>> dex_health_;
     std::unique_ptr<ISignalObserver> dex_observer_;
+    // Declared BEFORE thread_pool_ (it outlives every pool and is read by the heartbeat thread).
+    std::shared_ptr<PoolGauge> pool_gauge_ = std::make_shared<PoolGauge>();
     std::unique_ptr<ThreadPool> thread_pool_;
     // F3 orphan-exit accounting for mechanism-internal detached workers
     // (#2012/#3840 plan, "F3 orphan-exit accounting - Route A (corrected)").
@@ -4578,7 +5407,7 @@ private:
     // header's own doc comment ("Ticketing"). Summed into
     // guardian_active_io_workers() below, additively with guardian_'s own
     // count. First consumer: the Windows Registry mechanism (PR-B1, handed in
-    // via make_registry_mechanism(spark_detached_workers_) in the spark boot
+    // via make_registry_mechanism(spark_detached_workers_, ...) in the spark boot
     // block); File (PR-B2) and the Windows Service mechanism (PR-B3) both
     // followed the same shape.
     //
@@ -4706,6 +5535,19 @@ private:
     std::atomic<bool> ota_bundle_probe_logged_{false};
     std::thread heartbeat_thread_;
     std::thread sync_thread_; // ADR-0016 daily-sync thread (per-connection)
+    // The installed-software collector's single-flight flags and outstanding-worker count
+    // (sync_source_installed_software.hpp). Agent-lifetime, NOT per-connection: see the factory
+    // call and drain_detached_collectors_or_exit().
+    std::shared_ptr<CollectorWorkers> collector_workers_ = std::make_shared<CollectorWorkers>();
+    // The fleet collection settings last applied (`__sync__.settings`, collection_settings_agent.hpp)
+    // and the collector switches they carry. Agent-lifetime like the workers: written by start-up
+    // and the command thread, read by the sync thread (building the source on each connection) and
+    // the heartbeat thread (the version tag). Empty = nothing applied. settings_mu_ also orders a
+    // `__sync__.settings` against the sync thread's source build and scheduler publication; where
+    // both are held it is taken before sync_sched_mu_.
+    std::mutex settings_mu_;
+    std::optional<AgentCollectionSettings> applied_settings_;
+    std::shared_ptr<CollectorEnabledSet> collector_enabled_ = std::make_shared<CollectorEnabledSet>();
 
     // PR 10 / UAT 2026-05-12 — Push-based fleet topology ingestion.
     //
@@ -4730,6 +5572,9 @@ private:
     // during startup and never reassigned, so the reader thread and the dispatch
     // workers read the pointer freely; the store serialises its own access.
     std::unique_ptr<CommandDedupStore> command_dedup_;
+    /// Set just before the command pool is destroyed on a reconnect (cleared when a pool is created):
+    /// tasks that have not started their plugin reject instead of starting or sleeping a stagger.
+    std::atomic<bool> command_pool_closing_{false};
 
     // CHAOS-TTL-1 (PR #3784 fix round, governance ledger): a plugin-cooperation-
     // independent liveness signal for the server's per-device concurrency claim

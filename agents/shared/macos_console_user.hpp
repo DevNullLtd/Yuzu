@@ -407,8 +407,8 @@ inline std::optional<std::string> resolve_delete_keychain_path(std::string_view 
 // is_valid_home_dir (forces a leading '/'). So `--` is defence in depth and
 // canonical-form conformance, NOT the control that closes option injection.
 //
-// `caller_is_root` mirrors the sudo_prefix() idiom already established in
-// quarantine_plugin.cpp (geteuid() == 0 -> no sudo round-trip needed) --
+// `caller_is_root` mirrors the idiom in sudo_argv.hpp
+// (geteuid() == 0 -> no sudo round-trip needed) --
 // passed in rather than queried here via geteuid() so this function stays a
 // PURE argv builder the unit test can exercise with a literal true/false
 // fixture, matching every other function in this header (the .cpp does the
@@ -432,8 +432,7 @@ inline std::optional<std::string> resolve_delete_keychain_path(std::string_view 
 // UID, so dropping to that specific user is always a separate step. `-n`
 // on both sudo calls is critical: non-interactive mode fails fast with a
 // clear error if a grant is missing, rather than blocking the daemon on a
-// password prompt it can never answer (mirrors quarantine_plugin.cpp's
-// sudo_prefix() comment).
+// password prompt it can never answer (as sudo_argv.hpp's form does).
 //
 // Absolute paths throughout (/bin/launchctl, /usr/bin/sudo,
 // /usr/bin/security -- not the bare `security` the pre-existing

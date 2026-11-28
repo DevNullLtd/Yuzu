@@ -20,9 +20,12 @@ Failure-mode runbook: `docs/ci-troubleshooting.md`.
   jobs `need`, and the `preflight` job ("Preflight (runner health)", the
   required-check name) that carries the source gates and runs alongside the
   builds.
-- **Tier 2 — push to dev/main** (`ci.yml` on push): full 4-way Linux matrix
-  (gcc-15 / clang-21 × debug / release), 2-way Windows, 2-way macOS (except
-  a docs-only push, which runs the preflight jobs plus the required-check stubs, #5320).
+- **Tier 2 — push to dev/main** (`ci.yml` on push): a push to `main` runs the
+  full 4-way Linux matrix (gcc-15 / clang-21 × debug / release), 2-way Windows
+  and 2-way macOS; a push to `dev` runs the **debug legs only** (Linux gcc-15 and
+  clang-21 debug, Windows MSVC debug, macOS debug), and its release/LTO legs move
+  to Tier 2b below. Either way a docs-only push runs the preflight jobs plus the
+  required-check stubs instead (#5320).
   **No
   sanitizers, no coverage** — those moved out (#410). **Since #3443 Phase 2**,
   the Linux matrix's `pg_mode` key (via `include:`, never a third axis) means
@@ -30,15 +33,165 @@ Failure-mode runbook: `docs/ci-troubleshooting.md`.
   push; the other three legs run a small `[pg-smoke]`-tagged subset instead —
   see "PG push-leg policy" below. PR coverage is unaffected (the PR `exclude:`
   already trims the matrix to gcc-15/debug alone, which always resolves to
-  `pg_mode: full`). **Since the Windows CI test-phase-split PR (#3443,
-  2026-08-28)**, the Windows matrix carries the identical `pg_mode` key via
-  the same `include:` mechanism (debug=full, release=smoke) — Windows and
-  Linux now share one `pg_mode` concept, not two independently-invented ones.
+  `pg_mode: full`). **Since ADR-0035 ladder step 1**, the Windows and macOS legs
+  are agent-only (the `server` option is `auto`, off on any non-Linux target; step 1 passed `-Dbuild_server=false`): they build and test no server code and
+  run no Postgres suite, so `pg_mode` exists on the Linux matrix only. (From the
+  Windows test-phase split, #3443 on 2026-08-28, until then the Windows matrix
+  carried the same `pg_mode` key: debug=full, release=smoke.)
   **Since #5320** the push trigger has no `paths` filter: a docs-only push
   (for example a changelog-only release commit) runs the preflight jobs and the
   `docs-required-checks` stubs instead of the matrix, so the required contexts
   still appear on the `main` commit a release tags. See "Docs-only changes
   (#1978, #5320)" below.
+- **Tier 2b — daily release legs on dev** (`release-legs-daily.yml`, cron
+  `30 2 * * *` UTC — nominal, GitHub starts scheduled runs late under load —
+  plus `workflow_dispatch`): dispatches `ci.yml` against dev's tip with
+  `legs=release`, which expands to the four release legs only (Linux gcc-15
+  release LTO, Linux clang-21 release, Windows MSVC release LTO, macOS release
+  LTO); the debug legs normally already ran on that commit's push. It skips
+  when dev's tip already has a dispatch run that succeeded or is in flight; a
+  failed or cancelled run does not count, so a red tip is retried the next day.
+  While a bot-opened `release-legs-broken` issue is open, only an in-flight run
+  counts, so the tip is re-checked daily until a green run closes the issue.
+  No release leg is a required check, so moving them off the per-push path
+  costs no gating; it saves 9–23 min of self-hosted runner time per leg per dev
+  push. These legs are the only place the test suite runs in release/NDEBUG
+  mode between promotions (`release.yml` builds with `-Dbuild_tests=false`), so
+  a release-only defect now surfaces within about a day instead of on the push
+  that caused it; `main` pushes still build release, so nothing tags untested
+  in release mode. (Since ADR-0035 ladder step 2, `release.yml` builds no
+  Windows or macOS server either, so nothing it ships goes untested by CI for
+  that reason; `tests/test_release_agent_only.py` keeps it that way.)
+  - **Failure signal.** A dispatched run is started by `github-actions[bot]`,
+    which emails nobody. Whether to open, comment on or close a
+    `release-legs-broken` issue is decided in one place,
+    `scripts/ci/release-legs-issue.sh` (tested by
+    `tests/shell/test_release_legs_issue.sh`), which two paths call:
+    - **Listener (fast path).** `release-legs-alert.yml` is a `workflow_run`
+      listener on CI runs, dev only, dispatch runs only. It fires as each run
+      completes.
+    - **Reconcile (backstop).** `release-legs-daily.yml`'s `reconcile` job
+      re-judges the last completed, non-cancelled dispatch run every day,
+      before that day's dispatch. It shares the listener's concurrency group,
+      so the two never act on one run at once. A listener run that was
+      dropped, failed or never fired is still reported within a day.
+
+    What the script does:
+    - **Opens or comments** on any failing conclusion. A late report is
+      dropped when the newest completed, non-cancelled dispatch run is newer
+      than it and has given a verdict: it failed, or it was fully green. A newer green run
+      with a skipped leg never swallows it. This includes a run that
+      never started (`startup_failure`), and words it by cause: a code
+      failure, infrastructure (the preflight gate, or only preflight jobs,
+      failed; proto-compat then fails closed too), or a run that started no
+      job.
+    - **Closes** only when the run is the newest completed dispatch run on
+      dev, and every OS (Linux, Windows MSVC, macOS) had at least one
+      `[dispatch]` build leg and all of them passed. Even then it closes only
+      issues opened before that run finished. A green re-run of an older run
+      never closes an issue while a newer run is red, and a green run answers
+      nothing reported after it, such as a later reconcile or dispatch
+      failure.
+    - **Does nothing** on a cancelled or skipped run.
+    - **Fails red** if listing the open issues fails, rather than reading that
+      as "none open" and opening a duplicate.
+    - **Matches** only open issues authored by `github-actions[bot]`, so a
+      hand-added label is never commented on or closed.
+
+    A failure of the daily workflow itself (its `reconcile` or `dispatch`
+    job) opens the same issue from its `alert` job, worded by which job
+    failed. All three writers (listener, reconcile, alert) share one
+    concurrency group. There is no merge discipline attached, unlike
+    `nightly-broken`, but the release skill checks the label before tagging.
+  - **When `release-legs-broken` opens (triage).**
+    1. Read the issue's cause line. A "dispatcher failed" or "daily
+       reconcile failed" issue means `release-legs-daily.yml` itself failed:
+       read that run's log and fix it. Re-dispatch (step 4) if the dispatch
+       did not happen. If the preflight gate (or only preflight jobs) failed,
+       it is infrastructure: a runner pool, a runner-health check or a source
+       gate. Fix that, then re-run the failed jobs (GitHub re-runs the gate
+       and everything that depends on it) or re-dispatch. Never re-run
+       proto-compat alone: it would reuse the gate's earlier result. If the
+       run started no job, dev's `ci.yml` failed to load, and every dev push
+       is likely red too.
+    2. Otherwise, open the failed leg. A timeout, a test-slot wait or a
+       Postgres restart mid-run is a flake: re-run the failed jobs.
+    3. A real test or link failure in release mode is a release-only
+       regression. Take the commit from the leg's "Record built commit
+       (dispatch)" step and bisect back to the last green dispatch (below).
+    4. The issue closes itself on the next fully green dispatch that is the
+       newest on dev. A re-run of the newest run counts, as does a fresh
+       `gh workflow run ci.yml --ref dev -f legs=release`, so there is no need
+       to wait a day. Three cases do not close it:
+       - a green run in which a dispatch build leg was skipped;
+       - a green run that finished before the issue was opened;
+       - a re-run of an older run.
+
+       A CANCELLED run neither opens nor closes one.
+    Each dev push also shows a skipped "Release legs (alert)" run in the
+    Actions tab; that is the listener filtering out non-dispatch runs.
+  - **Required contexts.** A dispatch must never post a SKIPPED (= satisfied)
+    required check on any SHA, including the dev tip that a dev → main
+    promotion PR uses as its head. There are two mechanisms, because GitHub
+    does not evaluate a skipped job's `name:` expression (it posts the raw
+    template, [community #13261](https://github.com/orgs/community/discussions/13261)):
+    - **Renamed.** On a direct dispatch, Preflight (runner health) and the
+      Linux/Windows/macOS legs get a ` [dispatch]` suffix. Preflight always
+      runs, and a skipped matrix leg already posts an unexpanded name, so the
+      suffix is always rendered or harmless.
+    - **Never skipped.** Proto backward-compat is routinely skipped (every
+      docs-only PR, #1978), so it keeps its literal name. On a dispatch it
+      always runs (`always()`, so a cancel does not skip it either, and a final
+      step fails it red if the run was cancelled). It runs the real
+      `buf breaking` on the branch it checks out (dev; main on a by-hand
+      dispatch), the same thing
+      every dev push already posts. If dev moved since the dispatch, its
+      "Record built commit" step names the commit actually checked. If
+      `preflight-gate` did not succeed (an infrastructure failure, or a
+      dispatch cancelled during preflight), it fails red on a hosted runner
+      instead of skipping. That red is a real, fail-closed "Proto
+      backward-compat" on the dev tip. Before merging a promotion PR whose
+      head is that commit, re-run that dispatch's failed jobs (not
+      proto-compat alone), or re-run the PR's own CI.
+
+    As defence in depth, `trusted_inputs` refuses a direct dispatch on any ref
+    but `dev` or `main`.
+  - **Mechanism.**
+    - **Concurrency.** The dispatched run uses its own `-dispatch` concurrency
+      group. GitHub keeps one pending run per group, so sharing the dev push
+      group would let a dispatch evict a queued push run.
+    - **Matrix.** The `include:` lists are conditional on a `legs=release`
+      dispatch, because GitHub applies `include:` after `exclude:` and would
+      re-add an excluded debug leg.
+    - **Trusted-fork path.** A direct dispatch is told apart from the
+      trusted-fork `workflow_call` path by `inputs.head_sha`, because a
+      reusable workflow inherits its caller's `workflow_dispatch` event name.
+      Trusted-fork runs keep the full matrix and their names.
+    - **Permissions.** `ci.yml` requests no write permission. Its jobs are
+      checked against the trusted-fork caller's read-only token when the
+      workflow loads, so the alert's `issues: write` lives in the separate
+      listener. `scripts/ci/test_runner_health_check.py` pins this, the
+      matrix lockstep, the dispatch name suffix and proto-compat's literal
+      name and never-skip rule;
+      `tests/shell/test_trusted_inputs_validate.sh` pins the ref refusal.
+    - **Telemetry.** Dispatch runs record `event_name=workflow_dispatch`, so
+      release-leg history moves from `push` to `workflow_dispatch` events.
+  - **Go-live and interim gap.** `schedule:` and `workflow_run:` both fire
+    only from `main`, so the cron and the alert go live at the first dev →
+    `main` promotion that carries them. Until then dev gets no automatic
+    release coverage except the promotion push itself; dispatch by hand with
+    `gh workflow run ci.yml --ref dev -f legs=release`. That works once the
+    `workflow_dispatch:` trigger itself is on `main`, which is unverified
+    before then. `gh workflow run release-legs-daily.yml` needs that file on
+    `main`. `-f legs=all` runs the full matrix on `dev` or `main`.
+  - **Dead-man.** Nothing detects a cron that never fires (the reconcile job
+    runs inside it). If no `release-legs-daily` run appears in the Actions tab
+    for two days, check that the workflow is enabled.
+  - **Bisecting a red day.** A direct dispatch is accepted on `dev`/`main`
+    only, and PR runs never build release, so CI cannot bisect it. Bisect
+    locally instead: check out each candidate commit and build the release
+    configuration (`./scripts/setup.sh --buildtype release --lto --tests`),
+    then run the failing test.
 - **Tier 3 — nightly cron** (`nightly.yml`, `0 6 * * *` UTC +
   `workflow_dispatch`): ASan+UBSan, TSan, coverage on the Big Tam pool
   (`yuzu-bigtam-linux`, gated on `bigtam_pool_healthy`), plus a Windows ASan
@@ -177,6 +330,45 @@ code.
 
 ## Gates outside the tier ladder
 
+### Browser smoke (`/test` Phase 5, `tests/puppeteer/ui-smoke.mjs`)
+
+A gate in two parts. The live scenarios run from `/test` only: they need a running dashboard, so they
+are not a required CI job. The selftest pair also runs in CI, in the path-filtered, non-required
+`ui-smoke-selftest` workflow (`.github/workflows/ui-smoke-selftest.yml`, described below). In `/test`
+the gate drives a headless browser against the running dashboard: it crawls every route the shell nav
+links to (200, the `Content-Security-Policy` header, no page error, `console.error` or HTTP status of 400 or more), cross-checks the
+discovered routes against `EXPECTED`, a hand-copied list of the nav in `app_shell.cpp`, in both
+directions, checks that submit controls stay inside their form or dialog at two viewport sizes,
+and runs nine scenarios (five that each force their own precondition, with writes answered by a
+request stub in the browser so nothing reaches the server; the DEX Apps tab: a live keyboard half
+plus a committed golden page served through a GET stub; a held Apps response superseded by Overview;
+the DEX controls operated from the keyboard; and the Find software panel on `/software`: live
+searches plus Load more served through a GET stub). The gate first runs
+`ui-smoke.mjs --selftest`, which checks against a local fixture (no stack) that each crawl and
+layout check fails when it should, and that the Apps expander check fails on the committed golden when
+its `:has()` rules are removed; a selftest failure fails the gate.
+
+The selftest half also runs in CI: the path-filtered `ui-smoke-selftest` workflow
+(`.github/workflows/ui-smoke-selftest.yml`) runs `node tests/puppeteer/ui-smoke.mjs --selftest` on a
+hosted `ubuntu-24.04` runner when `server/core/src/*_ui.cpp`, `server/core/src/dex_pane.hpp`,
+`server/core/src/dex_routes.cpp`, `server/core/src/plural.hpp`, `server/core/static/**`, `tests/puppeteer/**`, the Apps goldens or the install script change. It is **not a required check**: it
+is path-filtered, and the `dev` ruleset blocks a merge on a required check that was skipped. The live
+half (the scenarios against a running dashboard) stays in `/test`, because it needs the UAT stack. A failure records FAIL (the
+older `Puppeteer` gate is warn-only). `/test` Phase 0b runs `scripts/test/ensure-puppeteer.sh`,
+which installs the Node dependencies and Chrome for Testing when absent and proves the browser
+launches headless; if it cannot, the run aborts before the build. A missing
+`tests/puppeteer/node_modules/puppeteer` at Phase 5 records FAIL, never SKIP.
+`/test` Phase 0b also runs `scripts/test/ensure-gcovr.sh` (Linux only). A gcovr you already have at the
+version pinned in `requirements-ci.in` that can produce the gate's reports is used as it is; otherwise it
+installs that version from the hash-pinned `requirements-ci.txt` (the file CI uses) into a private
+virtualenv. If neither works, default mode records WARN and Phase 7b measures nothing; `--full` stops in
+Phase 0b.
+Phase 7b re-checks gcovr before it measures (another worktree may have rebuilt the shared virtualenv since):
+if it is no longer usable the Coverage gate is not run and is recorded as WARN in default mode and as FAIL
+in `--full`.
+Shared browser mechanics are in `tests/puppeteer/lib/harness.mjs`;
+`tests/puppeteer/README.md` covers running it by hand.
+
 ### Release re-publish guard (`release-guard`, #5282)
 
 The first job in `release.yml`. It refuses any run whose ref is not a tag
@@ -219,10 +411,9 @@ each publishing job runs it once, before its first push.
 
 **There is no override.** A published release's assets and signatures describe
 the images it shipped, so any re-push over it breaks verification. To ship
-different images, cut a new version. To redo a release whose published content
-is itself wrong, delete the GitHub release first (destructive; the release
-skill requires operator confirmation), then start a fresh run, which recreates
-the release with a `SHA256SUMS` that matches its images.
+different images, cut a new version. Deleting a published release, or redoing
+one under its tag, is not a release procedure: see "Release tag policy" below
+(an owner-decided incident; Limit 2).
 
 Limits: the guard's read-only token cannot see a **draft** release — one made
 by hand, or one `gh release create` leaves behind when interrupted while
@@ -246,9 +437,15 @@ flattened, and before `SHA256SUMS`, signing, the `.intoto.jsonl` bundles and
 `gh release create`. When it fails, no GitHub release, `SHA256SUMS` or
 signature exists yet, but **the container images are already published**:
 the `release` job needs `docker-publish`, `docker-publish-postgres` and
-`docker-publish-chisel`, which push `:X.Y.Z` (and, on a stable tag, `:X.Y` and
-`:latest`) first (the agent-bundle image needs `release`, so it is not
+`docker-publish-chisel`, which have moved `:X.Y.Z` (and, on a stable tag, `:X.Y` and
+`:latest`) to their verified, signed digests first (each of their publish journals
+ends `tagged`; the agent-bundle image needs `release`, so it is not
 published), and the build jobs' provenance attestations are already recorded.
+An image is never published ahead of a failed build: every image-publish job (`docker-publish`,
+`docker-publish-chisel`, `docker-publish-postgres`) also needs all four builds
+(`build-linux`, `build-gateway`, `build-windows`, `build-macos`; ADR-0035 step 3,
+a success gate, not an artifact dependency), so a failed build, including a failed
+agent packaging step, pushes no versioned image.
 `docker-publish-chisel` joined the release's needs in #5242, so the release
 waits for the chisel builds (minutes with a warm cache, much longer cold) and
 the three chisel images' SBOMs are always release assets, inside `SHA256SUMS`;
@@ -258,6 +455,85 @@ at a release that does not exist until the release is fixed. It fails the
 release when:
 
 - an expected archive, installer glob or SBOM is missing or empty (#362/#408);
+- a `.deb`/`.rpm`/`.exe`/`.pkg` has no SBOM pair of its own
+  (`<name without the extension>.{cdx,spdx}.json`), or an SBOM belongs to no
+  archive, package or image of the release (supply-chain S8);
+- an artifact SBOM (every SBOM but the `*-image` ones) names a file that is not
+  in the release or whose SHA-256 differs, has more entries than the bound in
+  `scripts/ci/artifact-sbom.py` (400; measured locally: 16 to 63 for the
+  Linux files, where the counts for the files holding the server include its
+  10 vendored entries described below, and 212 for v0.15.0's Windows archive,
+  the largest), has no entries and no record
+  that its file was unpacked and held files, or lists a path under `vcpkg/`,
+  `vcpkg_installed/`, `build-*/`, `_build/`, `_build_*/`, `site/`, `tests/`,
+  `.git/` or `.github/`, the marks of a checkout, build-tree or test-tree scan
+  ("Check artifact SBOM scope", S8; a scan of some other wrong directory is
+  caught only by the bound);
+- an image SBOM pair (`<image>-image.{cdx,spdx}.json`) lacks a half, lacks
+  the incomplete marker its image calls for or carries only part of it, or is
+  named as a release image (`yuzu-server-image`, ...) without that image's
+  title label, on which the marker it needs is decided: each image-publish job runs
+  `artifact-sbom.py mark-image` on its pair after signing and before its
+  release tags move ("Tag the release"), which marks an image
+  holding `yuzu-server`, `yuzu-agent`, the Erlang emulator or the source-built
+  pgvector (what syft cannot list there), and the same step refuses a pair
+  that describes two different images. These SBOM steps run after the images
+  are pushed: a failure about the SBOM itself needs a fix and a new tag, while
+  a transfer fault (a SHA-256 mismatch, a missing file) needs only a re-run
+  (the release skill's failure table). The build jobs make these SBOMs with
+  that script: each artifact is unpacked and scanned on its own with syft
+  pinned to v1.57.2 (the image SBOM steps pin the same version), and the vcpkg
+  ports its binaries are built from are added from the installed tree for the
+  release triplet; the Windows installer's SBOM lists the files the Inno
+  Setup compiler's own manifest says it packed, each checked against the
+  build directory by SHA-256 (the installer manifest contract below). An
+  artifact holding `yuzu-server` also gets the third-party files compiled
+  into it (web assets, the QR-code library) from
+  `server/core/vendored-components.json`, and generation fails if that
+  manifest does not match the source tree. The docs-lint step "Vendored
+  components manifest" (`tests/test_vendored_components.py`) fails a PR that
+  adds or changes a file under `server/core/vendor/` or `server/core/static/`
+  without its entry. Two kinds of file there are not held to an entry's
+  SHA-256: a NOTICE a component names is checked only for its SPDX and
+  SHA-256 lines (its other text can change freely, provided it stays UTF-8
+  with no NUL byte and holds no run of more than 64 hex digits), and the first-party
+  `server/core/static/yuzu-*.js` and `yuzu.css` files (`first_party_patterns`,
+  the directory itself only, never a subdirectory) are exempt. The image SBOMs stay a syft scan of the pushed image, but
+  `docker-publish` and `docker-publish-chisel` then run `artifact-sbom.py
+  augment` on each leg's pair, after "Record signed and attested" and before
+  `mark-image`, the SBOM upload and "Tag the release", which adds the same
+  components to the `yuzu-server` and `yuzu-server-chisel` image SBOMs (syft
+  lists the binary only as an SPDX file) and leaves the other legs' untouched.
+  The entries carry fixed identifiers in every SBOM that lists them: CycloneDX
+  components whose `bom-ref` starts `vendored-`, SPDX packages whose SPDXID
+  starts `SPDXRef-Package-vendored-`, `yuzu:vendored:*` properties on each
+  CycloneDX component, and the `yuzu:sbom:vendored` note on the root; they are
+  not an incompleteness reason (the `server-vendored` token is retired, never
+  released, and never to be reused). `augment` fails the leg, before the SBOM
+  is uploaded and before any tag of that image moves (its publish journal ends
+  `signed-attested`), on a manifest that disagrees with the checkout or on an
+  image labelled as the release's server image in which syft lists no
+  `yuzu-server`.
+  On an image leg, while `build-linux` passed the same check on the same tag,
+  a manifest that disagrees with the checkout means the runner's reused
+  (`clean: false`) workspace holds a file the tag does not: reset that
+  workspace ("Persistence and recovery") and re-run the failed jobs, with no
+  new tag (the release skill's failure table). Each `generate` command runs
+  with a timeout. `tests/test_artifact_sbom.py`
+  (Docs Lint, every PR) pins that contract against a fixture in the
+  compiler's format; the `CBOM schema` job runs the same suite with
+  `YUZU_REQUIRE_JSONSCHEMA=1`, validating each SBOM it generates against the
+  vendored CycloneDX 1.7 and SPDX 2.3 schemas. **Owner item:** `CBOM schema`
+  is not a required check, so a schema-validation failure does not block a
+  merge; making it required is a decision on the branch ruleset, not taken
+  here;
+- an image SBOM pair of an image in which syft lists `yuzu-server` does not
+  list yuzu-server's vendored components (the `yuzu:sbom:vendored` note, and
+  exactly the component ids of the tag's `vendored-components.json`, each
+  once) in both formats, or the pair of an image in which syft lists no
+  `yuzu-server` carries any part of them (the `augment` step above adds them;
+  like the marker tokens, the expected ids are recomputed from the manifest,
+  never read from the pair);
 - an asset name contains a character GitHub rewrites on upload (anything but
   letters, digits, `.`, `_`, `-`, or a name not starting with a letter or
   digit), which would make `SHA256SUMS` and the provenance name an asset that
@@ -282,10 +558,161 @@ For a builder naming defect, a fresh run builds the tag's original commit
 again, so fix the builder, then delete and re-push the tag at the fixed commit.
 Either way the images are rebuilt and re-pushed under the same tags.
 
-If the release cannot be fixed promptly on a stable tag, move `:latest` back
-to the previous release's images. The gate has no override; the naming forms
+If the release cannot be fixed promptly on a stable tag, `:latest` and `:X.Y`
+keep naming its unreleased images until it is fixed and re-tagged or a later
+release moves them; moving a release tag by hand is not a release procedure ("Release tag policy",
+below). The gate has no override; the naming forms
 it checks are a second copy of the builders' naming, and its header lists
 where each lives.
+
+#### The installer manifest contract (`OutputManifestFile`)
+
+**Decision record (2026-11-18).** After five governance passes found the `.iss` parser kept accepting forms it then mapped differently from the Inno Setup compiler, the enterprise-architect review recommended replacing it with the compiler's own manifest, verified by SHA-256 against the build directory; the project owner (fjarvis) accepted that ruling on 2026-11-18. The manifest format below was checked against issrc tag is-6_7_3. Review this decision if Inno Setup changes the manifest format, or if the installer starts taking files at install time (`external`, `download`).
+
+The Windows installer's SBOM is made from the file list the Inno Setup
+compiler (ISCC) writes when it builds the installer. The installer script is
+never parsed. `deploy/packaging/windows/yuzu-agent.iss` sets
+`OutputManifestFile=YuzuAgentSetup.manifest.txt`. In `release.yml`, the
+"Build Windows installers (InnoSetup)" step deletes any old manifest, runs
+ISCC, fails if that run wrote none, and copies it beside the installer as
+`YuzuAgentSetup-<version>.manifest.txt`. "Generate per-artifact SBOMs" then
+runs `artifact-sbom.py generate --inno-manifest <that copy> --build-dir
+build-windows --inno-build-dir <the /DBuildDir that ISCC run was given>`. The
+script reads each listed file from `build-windows`, checks its SHA-256, copies
+the checked bytes into a scratch tree at the file's path below the build
+directory, and runs syft and the vcpkg closure over that tree, as for any
+other artifact. The manifest is not a release asset (it records the runner's
+paths); the Windows job keeps it for 90 days, the repository maximum, as the
+`windows-installer-manifest` workflow artifact, so it is available as evidence of how the
+installer SBOM was produced (owner decision, 2026-11-18).
+
+**The format,** read from Inno Setup's source at tag `is-6_7_3`, the version
+v0.15.0 was built with:
+
+- UTF-8 with a byte order mark, and every line, the last included, ends in
+  CR LF: `TTextFileWriter` (`Projects/Src/Shared.FileClass.pas`, 508-573)
+  encodes with `Utf8Encode`, writes the mark at the start of a new file, and
+  `WriteLine` appends CR LF.
+- A tab-separated header, exactly `Index`, `SourceFilename`, `TimeStamp`,
+  `Version`, `SHA256Sum`, `OriginalSize`, `FirstSlice`, `LastSlice`,
+  `StartOffset`, `ChunkSuboffset`, `ChunkCompressedSize`, `Encrypted`,
+  `ISSigKeyID`, then one row per file location, `Index` counting from 0
+  (`Projects/Src/Compiler.SetupCompiler.pas`, `CreateManifestFile`,
+  7942-8005).
+- `SourceFilename` is the source path as ISCC built it at compile time: the
+  `[Files]` `Source` with `{#BuildDir}` expanded, joined to the file name it
+  found, not normalised. ISCC merges two entries naming the same path
+  (compared case-insensitively) into one location, so it lists a file once.
+- `SHA256Sum` is 64 lowercase hex digits (`SHA256DigestToString`,
+  `Components/SHA256.pas`) over the file's own bytes, taken before any
+  compression transform (`Compiler.CompressionHandler.pas`, 243-260).
+
+**Path mapping.** A `SourceFilename` and `--inno-build-dir` are both read as
+drive-absolute Windows paths (Python's `ntpath`) and normalised with
+`normpath`, so a `..` that stays inside the build directory is resolved and
+`/` reads as `\`. The drive and every component are compared
+case-insensitively, as Windows compares them. The components after the build
+directory's are the file's build-relative path, looked up under
+`--build-dir`; the file's real location, with symlinks and junctions
+resolved, must be inside `--build-dir`.
+
+**Refused.** `generate` fails, naming the manifest line and the problem, on:
+
+- an encoding other than ISCC's: no UTF-8 byte order mark, or bytes after it
+  that are not UTF-8;
+- a line not ended by CR LF, or a bare CR or LF;
+- a header that is not exactly the one above;
+- no rows;
+- a row with a column count other than 13, an `Index` out of sequence, or a
+  `SHA256Sum` that is not 64 lowercase hex digits;
+- a `SourceFilename` not strictly inside the build directory after
+  normalisation: a `..` out of it, another drive, a UNC or `\\?\` path, a
+  relative path, or the build directory itself; or a component Windows reads
+  differently (a reserved character such as an NTFS stream colon, a trailing
+  dot or space);
+- the same path listed twice with two hashes;
+- a file missing from `--build-dir`, not a regular file, or resolving outside
+  it (a symlink or junction);
+- a SHA-256 that differs from the one ISCC recorded.
+
+**Residuals** (stated, not fixed):
+
+- The installer's InnoSetup runtime (setup loader and uninstaller) and what
+  the compiler embeds beside the packed files (the licence text, the icon and
+  the compiled `[Code]` script) are not listed. The SBOM is marked incomplete
+  for them (`installer-runtime`).
+- A `[Files]` entry that takes its file at install time (`external`, or Inno
+  Setup 6.5's `download`) has no file location, so ISCC does not list it. The
+  script has none today.
+- Install paths and components are not recorded: the paths are
+  build-relative.
+- The manifest is trusted as ISCC's statement of what it packed. The hash
+  proves that each listed file is the file in the build directory, not that
+  the list is complete.
+- The compiler version is not pinned: `release.yml` uses whichever Inno Setup
+  6 the runner has, and installs the current one with winget only when it
+  finds none. A version that writes another header fails the release's
+  Windows SBOM step until the contract and its fixture are updated, after
+  reading the new format in that version's source.
+- **No real manifest has been checked yet.** The contract and its fixture
+  come from issrc's source; the first real verification is the Windows job
+  of the first tag that carries this, which should be a pre-release
+  (`-rcN`, the release skill's first-run advice).
+
+**Future findings.** A defect in this contract is an accepted row whose listed
+file differs from the bytes the installer packs, or a residual not stated
+above. A manifest shape the contract refuses is an expected refusal, not a
+finding, and so is any `.iss` edit, including one that makes ISCC write a
+manifest the contract refuses (the script is not parsed). Extend the contract
+deliberately: a change of format is a change to `artifact-sbom.py`, its
+fixture in `tests/test_artifact_sbom.py` and this section together.
+
+### Windows agent runtime gates (`build-windows` job, release only)
+
+Three checks in `release.yml`'s `build-windows` job keep the Windows agent
+payloads (`yuzu-agent-windows-x64.zip` and `YuzuAgentSetup-<version>.exe`)
+self-contained. They run only on a release tag; none has run on a real tag
+yet, and the PR-time coverage is the `docs`-suite tests named below
+(`docs-lint.yml` runs the pwsh ones with `YUZU_REQUIRE_PWSH_TEST=1`).
+
+- **App-local Visual C++ runtime.** "Package archive" runs
+  `deploy/packaging/windows/stage-msvc-runtime.ps1`, which copies
+  `vcruntime140*.dll` and `msvcp140*.dll` from the runner's Visual Studio
+  redistributable directory (`VCToolsRedistDir`) into the zip's `bin` and into
+  `build-windows\msvc-runtime`, which `yuzu-agent.iss` installs into
+  `{app}\bin`. It refuses a missing required DLL, a redistributable older than
+  the toolset and, on Windows, a DLL not validly signed by Microsoft. It
+  writes the staged DLLs and file versions to the step summary, which covers
+  that workflow run and is kept only as long as the run is; the authoritative
+  version is the file version of the Microsoft-signed DLLs in the shipped
+  payload (the zip's `bin`, or `{app}\bin` after an install). A failed
+  summary write is a warning, not a failure.
+- **MSVC toolset pin.** The same script refuses the release when
+  `VCToolsVersion`'s major.minor differs from
+  `deploy/packaging/windows/msvc-toolset.pin` (14.44). Agent self-update
+  replaces only `yuzu-agent.exe`, never the app-local runtime (#8219,
+  decision #8218), and an executable built by a newer toolset can need
+  runtime exports an older copy lacks and then does not start. Moving the
+  pin is a reviewed change whose release notes must state that agent
+  self-update does not carry the new runtime. Wee Tam's MSVC is otherwise observed,
+  not pinned, by `deploy/windows/toolchain-contract.json`.
+- **Import closure.** "Check the DLL import closure of both payloads", after
+  "Verify the agent runs from the packaged archive" and before the installer
+  is compiled, runs `scripts/ci/check-windows-payload-imports.py` over the
+  zip and over the files `yuzu-agent.iss` packs from `build-windows`: every
+  DLL a shipped `.exe` or `.dll` imports (normal and delay-load) must be in
+  that payload's `bin`, be an API set, or be an OS DLL in `System32`, except
+  the Visual C++ runtime, which counts as missing unless shipped, because the
+  runner has it installed.
+
+Pinned by `tests/test_windows_payload_imports.py` (the checker over
+synthetic PE32 and PE32+ images, the wiring and step order, and the staging
+script under pwsh) and `tests/test_agent_installer_plugin_coverage_lint.py`
+(every built plugin has an installer line or a recorded
+`; plugin-not-installed:` reason; `[UninstallDelete]` deletes every excluded
+plugin's DLL and the two files agent self-update leaves in `bin`,
+`[InstallDelete]` deletes those two, and neither section uses a wildcard).
+Reference: `docs/windows-build.md`.
 
 ### Linux ELF floor gate (`scripts/ci/check-elf-floor.sh`, ADR-2003 S0)
 
@@ -439,8 +866,9 @@ It runs as its **own workflow**, not folded into `ci.yml`: a source
 grep needs no build, so it doesn't share `ci.yml`'s build-dependent
 PR fast-path or `changes`-job path filtering — there is nothing
 expensive to skip, so the workflow simply always runs on every PR and
-push to `main`/`dev`. A failing lexical scan is a **merge-blocking**
-required check; remediation is either moving the call into the
+push to `main`/`dev`. A failing lexical scan fails the PR's checks,
+but it is **not a required status check** in the `dev` or `main`
+rulesets today, so it does not by itself block a merge; remediation is either moving the call into the
 registered allowlist (if it is a legitimate, reviewed acquisition
 path) or removing the raw spawn in favour of the sanctioned subprocess
 runner.
@@ -463,8 +891,17 @@ requests only, not a required check today) runs
 `scripts/ci/check-plugin-readme-touch.sh`: a change under
 `agents/plugins/<name>/src/**` must also touch that README, or the PR body
 must carry a visible `docs-unchanged: <section> — <reason>` line, which
-the job prints. Both scripts carry a fixture self-test that the `docs`
-suite also runs (the touch-rule one off Windows only, #5428).
+the job prints. It diffs the `refs/pull/<N>/merge` commit against that
+commit's first parent, so the change it judges is exactly the PR's own,
+however far the target branch has moved since `base.sha` was recorded;
+the spawn scan's grandfathering base is taken the same way. The two
+bases come from `scripts/ci/pr-merge-parent.sh`, which fails the job
+closed when the checked-out merge commit does not merge the PR's head
+(push again for a fresh run: a re-run reuses the same event); its
+`--selftest`, run by the touch-rule job and the `docs` suite, also pins
+both workflows to it. All three scripts carry a fixture self-test that
+the `docs` suite also runs (the touch-rule and merge-parent ones off
+Windows only, #5428).
 
 A third `docs-lint.yml` gate, the personal-data guard
 (`scripts/ci/check-personal-data.py`, run `--strict-baseline --ratchet`), keeps
@@ -475,7 +912,8 @@ of `docs/plugin-readme-standard.md` give the detectors, scope and baseline rules
 ### Docs drift gate (`docs` suite + `docs-lint.yml` + `doc-coupling.yml`, `docs/docs-drift-gate.md`)
 
 `scripts/ci/check-docs-drift.py` extends the plugin README idea to the rest of the
-product, in two layers. Fact parity (hermetic, in the required `changelog-order` job and
+product, in two layers. Fact parity (hermetic, in the required "CHANGELOG order" check's
+`docs-lint-changelog-docs` shard and
 the `docs` suite) asserts every `/api/vN/` route, MCP tool and server/agent CLI flag is
 named in the user manual, reusing `check-api-parity.py`'s extractors. It ratchets
 against the by-name `scripts/ci/docs-drift-baseline.json` with the same only-shrinks rule
@@ -512,12 +950,31 @@ runs that suite, "Test suites by leg" below), so the ratchet is enforced on the 
 `Linux gcc-15 debug` leg without depending on the advisory job. A PR that changes only `docs/**` or root `*.md` builds nothing (see "Docs-only changes"),
 but it cannot touch `content/` or the baseline, which are classified as code.
 
+### Execution owner key tripwire and self-test (`docs` suite + `docs-lint.yml`, #5557)
+
+`tests/test_execution_owner_key_tripwire.py` is a best-effort lexical check, not a control-flow
+proof, that execution admission is keyed on the owner key and that neither list gate hands a
+service-scoped session unrestricted authority; its self-test
+(`tests/test_execution_owner_key_tripwire_selftest.py`) mutates the server sources in memory and
+proves each mutation is caught. The tripwire runs as a step of the `docs-lint-wiring-tripwires` job, one of
+the shards the required "CHANGELOG order" check aggregates. The self-test costs about half a minute of CPU, more on
+a hosted runner, so it is its own job, `execution-owner-key-selftest` (check name "Execution owner
+key tripwire self-test"), which keeps it out of the required check's shard budgets. That job
+is **advisory**: the workflow's own header names only "CHANGELOG order" as required, and the
+repository owner may add the job to branch protection. Both tests are also registered in
+`tests/meson.build` (suite `docs`), and the `linux` job of `ci.yml` lists `--suite docs`, so the
+self-test still gates on the required `Linux gcc-15 debug` leg without depending on the advisory
+job. A red self-test job means a frozen set no longer matches or a mutation went undetected; it is
+fixed by reviewing the edit, not by re-running the job.
+
 ### ClusterFuzzLite (`cflite-pr.yml` + `cflite-batch.yml`)
 
 PR-scoped libFuzzer fuzzing of the untrusted-input parsers (target
 inventory: `.clusterfuzzlite/README.md`). Not a required status check, and
-deliberately path-gated to the fuzzed compile closure — six parser families
-under `server/core/src/` plus `tests/fuzz/` and `.clusterfuzzlite/` — so
+deliberately path-gated to the fuzzed compile closure — the parser families under
+`server/core/src/` and `agents/shared/`, the component_inventory ZIP reader, ordered walker and native-library adapter under
+`agents/plugins/component_inventory/src/`, and the file_search sources under
+`agents/plugins/file_search/src/`, plus `tests/fuzz/` and `.clusterfuzzlite/` — so
 "why did the fuzz check not run on my PR" is almost always "the PR touches
 nothing a harness compiles". The two workflows share one paths list;
 KEEP-IN-SYNC banners in both plus `.clusterfuzzlite/build.sh` bind them.
@@ -695,11 +1152,1001 @@ when the matrix is skipped, and fails red rather than hanging if the classifier
 itself dies. **Only with that stub are the five contexts safe to add to branch
 protection.**
 
+**`gateway-base-index` job (#6711).** The same workflow also runs one plain (non-matrix)
+job, "Gateway builder index matches runtime Alpine", whenever the classifier says the
+image surface changed. It runs `scripts/ci/check-gateway-base-index.py` on a hosted
+runner with no Docker: it fetches the pinned `hexpm/erlang` builder index from Docker Hub
+(anonymous, retried, body hashed against the pinned digest) and fails when a platform
+on `Dockerfile.gateway`'s `# yuzu:gateway-platforms` marker (today `linux/amd64`) is not
+shown as built on the runtime stage's Alpine release, or when the builder tag names
+another Alpine release. The evidence is the entry's base-name annotation when the
+publisher sets one, otherwise the first history entry of the entry's image config
+(`ADD alpine-minirootfs-<X.Y.Z>-<arch>.tar.gz /`; hexpm sets no annotation), the
+per-platform manifest and config each hashed against the digest that names it. That is
+the early check on a builder re-pin; the build's abi-guard stays the build-time enforcement.
+Exit 1 is a mismatch, 2 an unreadable registry or a body that is not the pinned digest (the
+log says whether a re-run can help), 3 an input the script does not understand. A skipped
+plain job satisfies a required check, so it needs no stub. To disable the networked
+check, put `if: false` on the job (and take it out of branch protection first if it was
+ever made required). Keep the script, `tests/test_gateway_base_index.py` and
+the `docs-lint.yml` "Gateway base index lint" step: that test also holds the executed
+arch-guard contract for `Dockerfile.gateway`.
+
 The PR matrix reuses release.yml's local buildcache **read-only** (`cache-from`
 with no `cache-to`), so it never evicts release layers and adds no cache directory
 `cache-prune.yml` doesn't know about. Inside `release.yml` the verification build
 likewise has no `cache-to`: it shares one buildkitd instance with the push build,
 so the push hits BuildKit's own solver cache and rebuilds nothing.
+
+### Release image vulnerability gate (`scripts/ci/image-vuln-gate.sh`, WP15/S9)
+
+**What it checks.** Every image `release.yml` publishes (server, gateway, postgres, the three
+chisel variants and the agent bundle) is scanned with two pinned scanners, Trivy and grype,
+**before it is pushed**. The gate fails when either reports a CRITICAL vulnerability that has a
+fix available and is not accepted in that scanner's acceptance file (`.trivyignore.yaml` for
+Trivy, `.grypeignore.yaml` for grype; "The second scanner" below). HIGH findings and unfixed
+CRITICALs are printed for the record and do not fail it. It also fails, rather than pass a scan
+that could not mean anything:
+
+- a scan that cannot complete (Trivy error, DB download failure, wrong Trivy version, missing
+  ignore file);
+- the **DB**: downloaded once per run into a fresh, empty cache directory the script creates in
+  its per-run work directory; an inherited `TRIVY_CACHE_DIR` is ignored (with a note), so a
+  preseeded cache can never be scanned with. Each source's tag (`mirror.gcr.io/aquasec/trivy-db:2`,
+  then `ghcr.io/aquasecurity/trivy-db:2`) is first resolved to its manifest digest and the download
+  pinned to `repository@digest` (Trivy checks the manifest and layers against it); that
+  `repository@digest` is recorded in every `.gate.txt` and the step summary. The gate fails when
+  no source can be resolved and downloaded, or when the DB's `UpdatedAt` is older than 72 hours,
+  more than an hour in the future, or unreadable, or its `DownloadedAt` is earlier than the run.
+  Every scan then runs on that one DB (`--skip-db-update`). **The DB is not signed upstream:**
+  `aquasecurity/trivy-db` is pushed with `oras` and carries no cosign signature, no OCI referrer
+  and no GitHub attestation (checked 2026-11-18 with `cosign tree`, the referrers API and the
+  attestations API), so the gate cannot verify it. A DB substituted at, or on the way from, the
+  registry is detectable only by TLS to the registry and, after the fact, by the recorded digest;
+  a tampered DB with a fresh `UpdatedAt` (one CVE's version range edited) passes the gate. Every
+  long call has its own deadline and the gate has an overall budget ("Time budget" below), so a
+  registry that trickles bytes ends the attempt instead of holding the job until its timeout;
+- **no advisory data for the OS release**: Trivy marks the OS end of service life
+  (`Metadata.OS.EOSL`), or its family is not one the gate has a canary for (Debian, Ubuntu, Alpine:
+  every image the release publishes), or its version is a pre-release (`verdict=pre-release`, "no
+  advisory data for a pre-release": `_alpha`, `_beta`, `_pre`, `_rc`, `_git`, `~`, `-rc`, `.rc`,
+  `sid`, `testing`, `edge`, ...) or not a released version number (`N`, `N.N`, `N.N.N`), or the
+  canary matches nothing. A pre-release is refused before the canary because Trivy reads it against
+  the released version's advisories (Alpine `3.24.0_alpha...` as 3.24, Debian `13.0~rc1` as 13), so
+  the canary would match and the image would read as covered. The canary is a tiny root
+  filesystem of the image's exact OS release holding `openssl` and `zlib` at versions older than
+  every fix, scanned against the run's DB once per OS release per run; it proves the DB holds
+  advisories for that release. Trivy matches nothing for an OS release with no advisory bucket, so without this an
+  image on Debian testing/sid (Trivy reports `forky/sid`), Alpine edge or an Ubuntu devel series
+  (read as Debian sid) reads as scanned and clean (checked 2026-11-18: `debian:sid-slim` had 77
+  packages, 0 findings and was `covered`). Trivy's "not on the EOL list" warning is not used: it
+  also fires for Ubuntu 26.04, which has data;
+- **no OS packages seen**: an image whose OS package scan found no package (no OS detected, or a
+  0-package OS target) was not scanned for OS vulnerabilities, so the gate fails unless the image
+  is listed, in force, in `scripts/ci/image-vuln-gate-not-covered.txt` (exact name match). Each
+  listing carries the reason, `approved_by`, `approved_on`, `approval_ref` (the approving pull
+  request) and an expiry at most 92 days out; an expired listing is not in force, and one whose
+  `approval_ref` is `pending` is not in force in a release (`--release`). A listing applies only
+  while Trivy sees no OS package in the image: it is then printed as `NOT COVERED` (and a step
+  warning) on every run. When Trivy sees OS packages in a listed image, the gate treats the image
+  as covered (`verdict=covered`), prints a `warning:` that the listing is stale, runs the OS-family,
+  end-of-life and advisory-canary checks, and refuses on a fixable CRITICAL from Trivy or grype like
+  any other image; the listing's expiry is not consulted in that case (the release skill's
+  `pending` pre-flight does report an expired listing). No image is listed. The three chisel
+  images and the agent bundle are assembled FROM scratch from chisel slices: all four
+  Dockerfiles cut `base-files_{base,etc,var,tmp,release-info,chisel}`, run
+  `deploy/docker/chisel-emit-status.py` on the same slice list, then `COPY --from=chisel /rootfs /`.
+  The scanners read a dpkg package database, including `/var/lib/dpkg/status.d` (the distroless
+  format). Chisel writes none; it writes a manifest (`base-files_chisel`), and a string check of
+  the Trivy 0.70.0, grype 0.122.0 and syft 1.57.2 binaries found `dpkg/status.d` in all three and
+  neither `manifest.wall` nor `var/lib/chisel` in any (string evidence, not a scan, and on grype
+  0.122.0 rather than the pinned 0.121.3). The script converts the manifest into one `status.d`
+  stanza per package (`Package`, `Status`, `Architecture`, `Version`, and the archive's `Source`,
+  which the Ubuntu advisories are keyed on: a stanza without it makes Trivy and grype report
+  nothing for a package built from a differently named source) and fails the build if a slice's
+  package is missing from the manifest, a package has no archive record at its version, the
+  manifest or an archive record is malformed, or the written set differs from the manifest. The
+  cut, the index refresh and the script run in one retried step, so a transient archive failure
+  retries all three. The records are per package: a slice is recorded as its whole package, so a
+  finding in a file the slice does not ship can be reported; no finding is hidden by that.
+  Reading these records with Trivy was checked by hand on one image (not reproducible from the
+  repository, and not a CI check); the gate behaviour above is covered by
+  `tests/test_image_vuln_gate.py` and the script's behaviour and call sites by
+  `tests/test_chisel_emit_status.py`. None of the four is listed, so if the records regress to
+  zero OS packages the gate refuses the image as unscanned (`tests/test_image_vuln_gate.py`
+  pins that for each of the four names). The gate does not compare the packages Trivy reads
+  with the Dockerfile's `SLICES`: it refuses zero packages, not a missing one.
+  The gate learns an image's name from
+  `NAME=IMAGE` (release.yml) or the tag (pre-release.yml); a bare image ID can never match the list.
+- an ignore file that `scripts/ci/image-vuln-gate-checks.py` does not accept (below).
+
+The environment cannot steer the scan: the script clears every inherited `TRIVY_*` variable
+(`TRIVY_CACHE_DIR` included), names the DB repositories explicitly, and gives Trivy an empty
+config file so a `trivy.yaml` in the working directory is not read. `TRIVY_BIN` (use another trivy
+binary) is for local runs and tests and is refused on GitHub Actions. `YUZU_TRIVYIGNORE` (another
+ignore file, which on GitHub Actions may name only the repository's `.trivyignore.yaml`) goes
+through the same parser, and Trivy never reads the named file at all: it reads
+the checker's canonical YAML copy of the entries in force, so a plain-format file or an entry the
+parser did not see cannot reach it. Trivy's temporary files go under the script's own work
+directory.
+
+**The second scanner: grype (WP15).** Trivy does not identify the Erlang/OTP runtime the gateway
+image bundles (its ERTS), so OTP CVEs never reached its report: the gateway shipped OTP 28.5.0.2,
+which grype reports with 1 CRITICAL and 22 HIGH fixed CVEs, through a Trivy-only gate. grype
+matches the runtime from `beam.smp`'s version string, and each scanner has matchers and data the
+other lacks, so the gate runs both and a fixable CRITICAL from EITHER refuses the image. Per image,
+after Trivy:
+
+- grype scans the image in the local daemon only. The gate resolves the reference to its local
+  image ID (`docker image inspect`; a missing image, or an answer that is not an ID, fails),
+  `docker save`s that ID into its work directory and scans the archive (`docker-archive:`). It
+  never uses grype's `docker:` source, which asks the daemon to PULL an image it does not have
+  and would scan, and pass, a same-named image from a registry. Neither `docker image inspect` nor
+  `docker save` pulls.
+- A record scan writes `grype-<image>[.attempt-<N>].json` (every match, every severity, and the
+  accepted ones as `ignoredMatches`) and `.txt` (the table) in one run, plus a CycloneDX list of
+  every component grype catalogued (kept in the work directory, not published); a scan that cannot
+  complete, a report that is not grype's, or an empty table fails the image. The gate scan then
+  runs `--only-fixed --fail-on critical`: exit 0 passes, 2 is a finding, anything else is an
+  error and fails closed. A pass also fails the image when the record of the same archive lists a
+  fixable CRITICAL no acceptance covers (`grype's record and gate scans disagree`), so a pass is
+  never published beside a report that contradicts it. grype's `.gate.txt` records the grype
+  version, the DB (below), the image ID (as the gate resolved it and as grype read it), the distro
+  grype detected, the OS packages grype catalogued (a count), the matches not accepted and the accepted ones (`ignoredMatches`, as the record
+  scan applies the acceptances) with the fixable CRITICALs among each, the required components
+  (below), the provider waivers it used (or `provider waiver: none used`), the acceptance file's
+  hash and what was in force, and the result. The two IDs are recorded, not
+  compared: on a daemon with the containerd image store `docker image inspect` returns the image's
+  manifest or index digest and grype the config digest, so they legitimately differ there (checked
+  on Docker 29.10 with the containerd store: `docker save` of the index digest of a partly pulled
+  multi-platform image succeeds, and grype reads it).
+- **OS cross-check.** When Trivy scanned the image's OS packages (`coverage: covered`), grype must
+  have detected the same OS family; otherwise it matched none of those packages and the image
+  fails (`grype did not detect the OS (<family>)`). An image listed as not covered (no image is listed)
+  has no OS packages Trivy could see, so there is nothing to cross-check. This check can only refuse an
+  image; Trivy's report stays the only coverage reader.
+- **OS packages catalogued.** A distro match alone does not show grype read any package. For an
+  image whose OS packages Trivy scanned, the image fails when grype's CycloneDX holds no component
+  that grype read from an OS package database (`syft:package:foundBy` of `dpkg-db-cataloger`,
+  `apk-db-cataloger` or `rpm-db-cataloger`), or cannot be read. Packages found another way, such as
+  the `pkg:deb/` components syft builds from ELF `.note.package` sections, are not counted. The count is reported as
+  `os packages catalogued (grype)`. The check is for at least one; it does not compare the count
+  with Trivy's, because the two scanners count packages differently and no ratio has been measured.
+- **Required components.** grype's JSON lists matches only, so a runtime grype did not recognise
+  would read as clean. For `yuzu-gateway` and `yuzu-gateway-chisel`, whose Erlang/OTP runtime is
+  the reason grype runs, the image fails unless grype itself identified `erlang` (purl
+  `pkg:generic/erlang@<version>`, not an OS package of that name) at exactly the OTP version the
+  image's Dockerfile pins (`grype did not catalogue erlang`, or `erlang <version> (expected ...)`
+  for a version grype misread). Both images were checked to show `erlang 28.5.0.8` on 2026-11-20.
+  The table is `GRYPE_REQUIRED_COMPONENTS` in the script; `tests/test_image_vuln_gate.py` fails when
+  its versions differ from the OTP that `Dockerfile.gateway` and `Dockerfile.gateway.chisel` pin, so
+  a builder bump updates the table in the same change (and runs the real gate, "grype" below).
+- **The grype DB** is set up once per run: the gate fetches grype's v6 listing
+  (`https://grype.anchore.io/databases/v6/latest.json`, grype 0.121.3's default, named explicitly),
+  refuses it unless its status is `active`, its schema is v6, its `path` is a bare archive name,
+  its checksum is a sha256, and its `built` time is at most 72 hours old and not more than an hour
+  in the future; downloads the archive it names into its work directory; checks the archive's
+  sha256 against the listing; has grype import it; and then requires `grype db status` to report
+  the DB valid with the listing's build time and schema, and `grype db providers` to list `nvd`
+  captured at most 72 hours ago (the DB's `built` time says when it was assembled, not how fresh each
+  source in it is; NVD supplies the OTP runtime's matches). Each image whose OS packages Trivy scanned
+  also needs that OS family's provider (`alpine`, `debian` or `ubuntu`) captured within 72 hours, or
+  that image fails (`grype DB provider <family> is stale`); a lagging provider refuses only the images
+  on its OS. A missing provider, or a capture time that is unreadable or more than an hour in the
+  future, always fails; a capture that is only older than 72 hours fails unless a reviewed provider
+  waiver for that provider is in force ("Provider waivers" below), and then the image passes
+  DEGRADED. Every scan runs with DB updates and the update check off and grype's own 72-hour age
+  check on, so grype never fetches a DB of its own.
+  **The listing is not signed upstream:** TLS to its host and the recorded URL and checksum are
+  the only evidence of which DB was used, exactly as for Trivy's DB.
+- grype reads only a config the checker generates from `.grypeignore.yaml` (`-c`, holding nothing
+  but the `ignore:` rules in force), from a working directory and `HOME` of the run, so a
+  `.grype.yaml` in the repository, the working directory or a user's home is never read; every
+  inherited `GRYPE_*` variable is cleared (grype reads its whole config from the environment too:
+  `GRYPE_EXCLUDE`, `GRYPE_ONLY_FIXED`, `GRYPE_DB_*`, ...). `GRYPE_BIN` is for local runs and tests
+  and is refused on GitHub Actions, like `TRIVY_BIN`; `YUZU_GRYPEIGNORE` names another acceptance
+  file, which goes through the same parser, and on GitHub Actions it may name only the repository's
+  `.grypeignore.yaml` (so no workflow variable can supply a provider waiver or an acceptance).
+
+Disk: the imported grype DB takes about 3.3 GB and each image's `docker save` archive the image's
+size, both under the run's work directory (removed on exit; the archive after each image), on top
+of Trivy's DB.
+
+`tests/test_image_vuln_gate.py` runs the gate against a stub grype and a stub docker for each of
+these rules, and requires each rule's mutant (grype's exit 2 read as a pass, grype not run, the
+archive checksum or the imported DB's status not checked, the DB age not checked, the OS
+cross-check dropped, a pending acceptance honoured in a release) to give the wrong answer on its
+scenario. The provider waivers have their own mutants (a waiver admitting a missing provider, an
+unreadable or future capture time, or another provider than the one it names; an expired, a
+more-than-14-day or a pending waiver honoured in a release; an unknown or duplicate provider, or a
+waiver with no statement or approval, accepted; the waiver lines dropped from the report or the
+summary; another acceptance file honoured on GitHub Actions), and the tests check that a waiver
+changes no other verdict: a finding from either scanner, the DB's age, checksum, status or schema,
+Trivy's DB download, the OS cross-check, coverage and the gateway's `erlang` all still refuse. The tests use stubs; the real scanners run only in `release.yml` and in the pre-release
+QA scan.
+
+**Time budget.** Every long call runs under `timeout`, bounded by its own deadline and by what is
+left of the gate's overall budget: the DB digest lookup 60 s per source, the whole Trivy download
+(all of curl's retries) 180 s, each DB download 420 s per source, each scan 600 s (with Trivy's own
+`--timeout` 10 s inside it; Trivy's default is 5 minutes); for grype, its download 180 s, its DB
+listing 60 s, its DB archive 420 s, the import 300 s, each `docker image inspect` 60 s, each
+`docker save` 600 s and each scan 600 s. Trivy's network calls alone are at most
+2 x 60 + 180 + 2 x 420 = 1140 s (19 minutes) with both DB sources failing slowly; with grype's
+download, listing, archive and import (960 s more) the worst case exceeds the budget, which then
+stops the gate. The budget is 1500 s
+(25 minutes) by default (`GATE_BUDGET`; `--budget SECONDS` overrides it, 1 to 3600): when it runs
+out the gate stops, writes `gate: FAIL: gate stopped before this image was judged: the gate ran out
+of its <N>s budget` for every image not yet judged, and exits 1. So the gate ends by itself, with its
+reports, within its budget plus a few seconds (the 2 s `--kill-after`, the cleanup).
+`pre-release.yml`'s `security-scan` (timeout 30 minutes) passes `--budget 1200`, leaving 10 minutes
+for checkout and the seven pulls before it; the `release.yml` jobs that run it have 60 to 120 minute
+timeouts, but each builds its image first, so a slow build can still bring the job timeout before the
+gate's budget, which is then a cancel (next paragraph). `tests/test_image_vuln_gate.py` checks that
+every call names a deadline and that each call's budget (or the default), plus 10 minutes for the
+job's other work before it, fits its job's `timeout-minutes`; mutants of the pre-release call (raised,
+dropped, moved to a continuation line) must fail that check.
+
+**Where.** `docker-publish` and `docker-publish-chisel` scan the image their healthcheck
+verification build already loaded (step "Scan image for fixable CRITICAL vulnerabilities
+(pre-push gate)", between the healthcheck probe and the tag re-check). `docker-publish-postgres`
+gains its own no-push build for the scan. `docker-publish-agent-bundle` runs
+`scripts/build-agent-bundle.sh` without `--push`, scans the local image, then pushes it.
+`pre-release.yml` `security-scan` runs the same script on all seven published tags afterwards
+with a fresher DB (detective: see "Pre-release QA"); it pulls each tag first.
+
+**Evidence.** Each publish job runs the gate with `--release --attempt <run attempt> --report-dir`,
+which writes, per image, `trivy-<image>.attempt-<N>.json` (the full Trivy report: image ID, layer
+diff IDs, OS, every package, the HIGH/CRITICAL findings and the accepted ones),
+`trivy-<image>.attempt-<N>.txt` (the table) and `trivy-<image>.attempt-<N>.gate.txt` (mode, run
+attempt, Trivy version, the DB's `repository@digest`, `UpdatedAt` and `DownloadedAt`, image ID, OS,
+OS package count, coverage, the advisory canary's result, the ignore-file hash with how many entries
+were in force and pending, and the result), and grype's three, `grype-<image>.attempt-<N>.json`,
+`.txt` and `.gate.txt` ("The second scanner" above). A `.gate.txt` of each scanner is written for
+every image on every exit the script reaches after reading its arguments: a refused image's says `gate: FAIL: <reason>`, when
+the gate stops before judging an image (a refused ignore file, a stale DB) each image's says why, and
+a SIGINT or SIGTERM (a cancelled run or a job timeout) writes `gate: FAIL: cancelled (SIGINT) before
+this image was judged` (or `(SIGTERM)`). The step `exec`s the script so the runner's signal reaches
+it, and the script runs each long child (Trivy, curl, the digest lookup) in the background and
+`wait`s, so the trap runs at once rather than after the scan. The runner cancels with SIGINT, then
+SIGTERM about 7.5 s later, then SIGKILL: on the first signal the trap ignores any further SIGINT or
+SIGTERM, writes the reports at once, then stops the child (SIGTERM, SIGKILL after 3 s at most) and
+exits 130 or 143, well inside the 7.5 s. A SIGKILL, or a usage error before the image list is read,
+leaves no report. The `.gate.txt` is the gate script's alone: no other step writes to it. The
+upload, as the `<image>-image-vuln-gate-attempt-<N>` artifact (for example
+`yuzu-server-image-vuln-gate-attempt-1`) with
+`retention-days: 90` (the repository's maximum) and no `overwrite`, runs whenever the gate step ran,
+passed, failed or was cancelled (`if: always() && (steps.gate.outcome == 'success' ||
+steps.gate.outcome == 'failure' || steps.gate.outcome == 'cancelled')`), so a refusal, the control
+operating, is retained too, and **a re-run adds its attempt's reports beside the refused attempt's
+instead of replacing them**. The same artifact carries the attempt's publish journal (next
+paragraph) when its gate passed; the upload is the job's last publishing-related step, after the tags
+move. The `release` job downloads every attempt's gate artifact of the run (`pattern:
+'*-image-vuln-gate-attempt-*'` with `merge-multiple`; an artifact an earlier run attempt uploaded is
+listed in a re-run, which "Re-run failed jobs" already relies on for the build artifacts) and
+attaches every file to the GitHub Release, inside the signed `SHA256SUMS`, the same way it ships the
+image SBOMs. `scripts/check-release-artifacts.sh` refuses a release in which a gate report or a
+journal is not named per attempt, any journal is not a legal prefix (below) or sits beside a gate
+report that does not record exactly `gate: pass`, or, for one of the six images, no attempt's journal
+ends `tagged`, an attempt above the published one ends `tagging`, or the published attempt lacks
+Trivy's or grype's three non-empty reports. Earlier and later attempts' reports may record a failure; they are
+kept as the evidence. The agent bundle's job runs after the release exists, so its reports cannot be
+inside `SHA256SUMS`; `attach-bundle-gate-report` attaches them to the GitHub Release afterwards. It
+runs whenever the bundle job ran at all (`needs.docker-publish-agent-bundle.result != 'skipped'`),
+downloads every attempt's bundle gate artifact the same way, fails when there is none, refuses an
+attempt with no Trivy `.gate.txt`, or one with a publish journal but no grype `.gate.txt`, and
+attaches, per attempt, its reports, its journal and a checksum list
+`yuzu-agent-bundle-chisel-image-vuln-gate.attempt-<N>.SHA256SUMS` signed keyless by the same
+`release.yml` identity and verified in-job. Each run of it converges: after the last one, every
+attempt's files are on the release.
+
+**The publish journal** (`scripts/ci/image-publish.sh`). A release tag (`:X.Y.Z`, and on a stable
+tag `:X.Y` and `:latest`) is public the moment it moves, so it moves LAST, and every push of the
+image and every tag move is announced before it runs. (The SBOMs, the provenance attestation and the
+cosign signature are pushed as referrers of the digest before `signed-attested` records them: the
+digest was announced at `push-started`, and no tag names it yet.) The contract:
+
+- The journal is `publish-<image>.attempt-<N>.txt`, beside the gate's reports. Only
+  `image-publish.sh` writes it, appending one line per completed step; it is never rewritten, and
+  its LAST line is the state. The only legal contents are a prefix of exactly this sequence, with
+  one digest throughout:
+  1. `publish: none`, written when the gate passed (the script refuses unless every
+     `<scanner>-<image>.attempt-<N>.gate.txt`, Trivy's and grype's (both must exist), records exactly
+     `gate: pass`);
+  2. `publish: push-started <candidate>`, appended BEFORE the push (`<candidate>` is the
+     repository for a push by digest, or `<repository>:candidate-<run id>-<N>` for the agent
+     bundle's `docker push`);
+  3. `publish: verified <repository>@<digest>`, after `image-identity.sh verify-pushed` proves the
+     digest has the scanned image's layers;
+  4. `publish: signed-attested <repository>@<digest>`, after the SBOMs, the provenance attestation
+     and the cosign signature are made BY DIGEST and the signature verifies for the workflow's
+     identity;
+  5. `publish: tagging <tags> <digest>`, appended BEFORE the first tag moves;
+  6. `publish: tagged <tags> <digest>`, once every tag, applied with `docker buildx imagetools
+     create --prefer-index=false -t <tag> <repository>@<digest>`, resolves to the digest.
+- No journal for an attempt means one of three things: its gate refused the image (its `.gate.txt`
+  is not `pass`), the job stopped before the journal was opened, or the journal never reached the
+  artifact (the evidence upload and its one retry both failed, or the runner was lost: residuals
+  below). The first two pushed nothing; the third is absence of evidence, not proof that nothing
+  was pushed.
+- A failure or a cancellation simply stops the journal. There is no failure label, and nothing is
+  written on a cancel. So a journal's last label claims at least what the registry holds:
+  `push-started` may have pushed an untagged digest (or the bundle's candidate tag), `tagging` may
+  have moved some of the tags. A cancel reaches the script itself: every step runs it as `exec
+  scripts/ci/image-publish.sh ...`, because the Actions runner signals only the step's PID (SIGINT,
+  SIGTERM 7.5 s later, SIGKILL 2.5 s after that; `actions/runner` `ProcessInvoker`), never its
+  process group. On SIGINT or SIGTERM the script stops at the next step boundary: it stops the
+  registry call it is waiting on (each runs in the background, so the trap acts at once), appends
+  nothing further and exits 130 or 143. No process of it outlives the step to append or move a tag
+  after the evidence upload has read the journal (G8P6-chaos-injector-1), in this run or in a later
+  run of the same tag (G8P6-chaos-injector-2: the chisel and bundle jobs' `cancel-in-progress`
+  groups cancel an older run's leg the same way).
+- The pushes carry no release tag: the buildx jobs push with `outputs:
+  type=image,name=<repository>,push-by-digest=true,name-canonical=true,push=true` and no `tags:`,
+  and the agent bundle pushes `:candidate-<run id>-<attempt>` and resolves its digest. The tags are
+  applied only by `image-publish.sh tag`, which moves every one of them from the digest; a failed
+  check that a tag resolves to the digest leaves the journal at `tagging`.
+- The journal is uploaded with the gate reports under the same `if: always()` status function, and
+  a retry step (`if: always() && steps.upload_gate.outcome == 'failure'`, no `overwrite`) uploads
+  it again when that upload failed. Job outputs carry no publish state; consumers read the journal
+  through `image-publish.sh state` (one attempt) or `published` (all attempts), and accept only a
+  legal prefix.
+- Across attempts, the published image is the HIGHEST attempt whose journal ends `tagged`. The
+  release check and the attach job fail when any attempt above it ends `tagging`: a tag may then
+  name either digest. A re-run that completes `tagged` heals it.
+
+**Decision record (2026-11-18).** This contract and the "Future findings on this path" rule
+below are the enterprise-architect contract, accepted by the project owner (fjarvis) on 2026-11-18.
+After repeated Gate 8 governance passes kept finding orderings in which the publish state reported
+by job outputs and the attach job disagreed with what the registry held, the enterprise-architect
+review recommended replacing further point fixes with this write-ahead journal and a closed
+definition of a defect on this path; the project owner accepted that ruling, and later passes
+judge findings on this path by it. Evidence, in the repository: the journal and this contract
+landed on branch `fix/wp15-images` in commits `6240c1f945` (the code) and `1763a7bdac` (this
+section), and the record in `1679c0f50d`; the Gate 8 findings that led to it (pass 5) and the
+later passes' verdicts judged by it (passes 6 and 7) are rows of the governance ledger
+`governance.d/0000-wp15-images.UVdbCU.jsonl`. The enterprise-architect review itself is not a
+committed artifact, and the author and the owner are the same account, so the pull request's
+approving review is the independent confirmation. Review this decision if a publish job gains a registry
+write the journal does not announce; if a release tag starts moving, within `release.yml`,
+anywhere other than `image-publish.sh tag` in a "Tag the release" step; or if a new tool or
+documented procedure gains a way to delete a GHCR image or to move a release tag by hand (the
+pre-existing hand push paths are Limit 1 of the "Release tag policy" below). Amended three times on 2026-11-18: commit
+`03bdfb9290` (Gate 8 round 7) added a hand tag-repair carve-out to the second condition, and the
+Gate 8 round 8 commit that adds "Release tag policy" below withdrew it, after round 8 found new
+defects in the hand procedure; the Gate 8 pass 9 commit that freezes the "Release tag policy"
+scoped the second condition to `release.yml` and the third to new paths. All three amendments were
+made by the author account, so, as for the record itself, the pull request's approving review is
+their independent confirmation.
+
+Verified before this contract was frozen (2026-11-18): `docker buildx imagetools create
+--prefer-index=false -t <tag> <repository>@<digest>` keeps a single-platform manifest's digest byte
+for byte (a local `registry:2`, both a `docker push`ed Docker v2 manifest and a buildx push-by-digest
+OCI manifest; without `--prefer-index=false` it wraps the manifest in a new index with another
+digest), and a cosign signature made by digest before the tag existed verifies against the new tag;
+`actions/download-artifact` v8 lists the run's artifacts through the runtime token's run scope, and
+a release run whose attempt 3 re-ran only the Windows build created its release from attempt 1's
+`yuzu-*` artifacts (v0.11.0-rc1).
+
+**What the journal does not cover** (residuals, disclosed once here):
+
+- **No evidence reaches the artifact** for an attempt when the runner is killed or lost before the
+  upload, or when the evidence upload and its retry both fail (an artifact-service outage, or a
+  first upload that failed part-way and left the artifact's name taken, which the retry, with no
+  `overwrite`, then cannot reuse). That
+  is absence, not disagreement: no journal claims less than the registry holds. Its cost: for one
+  of the six images the release job does not run (it needs that job green, and a re-run tags a new
+  digest the release then names). For the agent bundle, if that attempt had moved `:X.Y.Z`, the
+  attach job reads only the other attempts, so it may name an older attempt as published (or none)
+  while `:X.Y.Z` names the missing attempt's verified, signed digest (G8P6-architect-4); the bundle
+  job is red. The release skill's terminal check (resolve `:X.Y.Z`, compare it with every journal)
+  is how that is caught before the release is announced.
+- **A SIGKILL of the script, or a lost runner process, mid-call.** The script stops its own
+  registry call within about 3 s of the first signal, well before the runner's SIGKILL (10 s), so
+  only a runner that kills or loses the script earlier can leave a registry call running. The
+  journal already announced that call; the runner's orphan cleanup (at the end of the job) stops
+  what remains unless the runner itself died, and such a call could then still move a tag after a
+  later run's `tagged`.
+- **A re-run moves the tag to a new digest.** Each attempt pushes and tags its own build; the
+  release check requires the release's assets to name the published (highest `tagged`) attempt.
+  That holds only until the release exists. When a job is re-run, GitHub also re-runs every job
+  that depends on it, but not the jobs it depends on ("Re-running workflows and jobs" in GitHub's
+  Actions docs), so `release-guard` is not repeated and each re-run publish job passes its tag
+  re-check. Once the GitHub Release exists, do not re-run a build or publish job (a forbidden
+  re-run, "Release tag policy" below):
+
+  | Re-run, after the GitHub Release exists | What runs | |
+  |---|---|---|
+  | "Re-run all jobs", or `release-guard` alone | `release-guard`, which refuses the existing release; every other job is skipped | safe, does nothing |
+  | `build-linux`, `build-gateway`, `build-windows` or `build-macos` | that build, then every publish job (all of them need all four builds): all six images move `:X.Y.Z` (and `:X.Y`, `:latest`) to new digests the release does not name; `release` fails `already PUBLISHED` | **forbidden** |
+  | `docker-publish`, `docker-publish-postgres` or `docker-publish-chisel` | that job's images move the same way; `release` fails `already PUBLISHED` | **forbidden** |
+  | `release` | it refuses at `already PUBLISHED` before uploading; the bundle and attach jobs are skipped (#5479) | safe, does nothing |
+  | `docker-publish-agent-bundle` that FAILED ("Re-run failed jobs") | it and the attach job; it builds from the release's own assets and its attempt joins the attached record | safe: the recovery |
+  | `docker-publish-agent-bundle` that SUCCEEDED | moves the announced `yuzu-agent-bundle-chisel:X.Y.Z` to a new digest | **forbidden** |
+  | `attach-bundle-gate-report` | adds missing assets, replaces only an incomplete upload | safe |
+
+  "Re-run failed jobs" is safe only when every failed job is `release`,
+  `docker-publish-agent-bundle` or `attach-bundle-gate-report`. Undoing a forbidden re-run by
+  hand is not a release procedure ("Release tag policy" below): it is an owner-decided incident,
+  recorded in a tracking issue opened for it and announced, and the next stable patch release
+  moves `:X.Y` and `:latest` on. The re-run release's own `:X.Y.Z` keeps naming the re-run's
+  digest, because no later release moves it, and no signed record shows which digest was first
+  announced (Limit 3).
+- **Several tags do not move atomically.** That is what `tagging` records; the next attempt to end
+  `tagged` moves all of them again.
+- **Release assets can change after publication (G8P8-compliance-officer-3).** GitHub's immutable
+  releases setting is off for the repository (read from the API on 2026-11-18), so anyone holding
+  `contents: write` can delete, replace or add an asset. The release process itself changes assets
+  after publication in two ways: the attach job adds the agent bundle's files and replaces only an
+  incomplete upload of its own (not `uploaded`, or bytes not matching GitHub's size or digest),
+  and the release skill's Phase 4 re-uploads an asset missing from the release by hand. What a
+  verifier can rely on is the signed `SHA256SUMS` (keyless; the identity is `release.yml` at the
+  release's tag, which binds the workflow file and the tag, not one run): a listed file that is
+  present and matches was produced by that workflow, and `sha256sum -c SHA256SUMS`, run without
+  `--ignore-missing`, fails on a listed file that is missing or changed. An asset no signed list
+  names proves nothing. The agent bundle's files are covered per attempt by their own signed
+  lists, but nothing signed lists the attempts, so removing one attempt's whole set (list,
+  signature and files) is not detectable from the release.
+- **Untagged candidate digests and the bundle's candidate tags stay in GHCR (decided 2026-11-18,
+  Gate 8 round 7).** A digest that was pushed but never tagged (a verify failure, a cancel) and the
+  `:candidate-<run id>-<attempt>` tags are left in place: they are not release tags, nothing pulls
+  them by name, and each was gate-scanned before its push, so they hold no unscanned content.
+  "Left in place" is a practice, not an enforced control: nothing technical stops a package admin
+  from deleting one. The release workflow deletes no image, and no deletion procedure is documented: an earlier
+  deletion script was withdrawn after it was shown, against a real registry with a simulated
+  lagging packages API, deleting a live release tag that the API had not listed
+  (G8P7-security-guardian-1), and the hand check that replaced it was withdrawn after it was shown
+  to judge deletable a published digest whose release tag a re-run had moved
+  (G8P8-consistency-auditor-1): a check keyed on today's tags cannot protect a digest whose tag
+  has moved. Deleting a GHCR package version deletes that digest under EVERY tag that names it;
+  what the release process does instead is "Release tag policy", below. GitHub lets a package admin restore a deleted version within 30 days ("Deleting and restoring a
+  package" in GitHub's Packages docs); it does not say whether the version's tags come back with it.
+
+**Release tag policy (frozen 2026-11-18).**
+
+**Controls (enforced by `release.yml`).** Within the release workflow, a release tag (`:X.Y.Z`,
+`:X.Y`, `:latest` of the six release images; the agent bundle's `:X.Y.Z`) is written only by the
+"Tag the release" step (`scripts/ci/image-publish.sh tag`), after the gate, verify, sign and attest
+steps and behind the publish journal. `release-guard` refuses a run for a tag that has a published
+release. The workflow deletes no image.
+
+**Practices (not enforced).** A wrong or superseded published release is fixed by a new patch
+release. Deleting a published GitHub release, redoing a release under its tag, moving a release tag
+outside the workflow, and deleting a GHCR package version are not release procedures: each is an
+owner-decided incident, recorded in a tracking issue opened for it and announced. First step for a
+suspected-compromised digest: open that issue and announce the digest; delete or move nothing until
+the owner decides.
+
+**Limits (disclosed).** (1) `scripts/docker-release.sh` and `scripts/build-agent-bundle.sh --push`
+predate the gate and can push release tags with maintainer credentials; they bypass the gate and the
+journal and are not used to publish a release. (2) Once a published release is deleted,
+`release-guard` passes a fresh run of its tag; that run destroys the release's signed `SHA256SUMS`,
+moves every tag including `:latest`, and leaves the earlier digests untagged with no signed record.
+(3) No signed record of "digests ever announced" exists. A journal records what each attempt
+published; it does not show which digest was first announced, nor whether a re-run was sanctioned,
+and releases up to v0.15.0 have no journals. (4) Nothing technical stops a package admin deleting a
+version or moving a tag.
+
+Frozen by the enterprise-architect ruling of 2026-11-18 (Gate 8 pass 9 non-convergence); adopted by
+the project owner via this pull request's review.
+
+**Future findings against this policy.** A finding against the Release tag policy is a defect only
+if (a) a statement under **Controls** is false against the code at HEAD; (b) a doc site states as
+enforced, or with "never / nobody / no tool / only", something not under Controls; (c) a site
+documents a procedure for an action listed under Practices as an incident; (d) this change creates a
+new path that moves a release tag or deletes an image, or worsens a listed Limit; or (e) a site
+contradicts the frozen text. Not defects: pre-existing behaviour listed under Limits and not
+worsened; a practice being unenforced; a missing runbook step for an owner incident; the absence of
+a signed announced-digest record. Those are follow-up issues, never blockers on this branch.
+
+Hand procedures were withdrawn because each round's version opened a new defect class: a deletion
+script trusted a lagging packages API (round 7); the hand deletion check that replaced it judged
+deletable a published digest whose tag had moved, and a hand tag-repair block accepted a release
+whose journal was missing, had no check for an in-flight run and could not download one release
+twice (round 8). Limits of the patch-release remedy: no later release moves the superseded
+release's own `:X.Y.Z`, and no signed record shows which of its digests was announced (Limit 3);
+and `release.yml` moves `:latest` on every stable tag, so a patch to an older `X.Y` line moves
+`:latest` to that line until the next stable release on the newest line.
+`release-guard` passes the new version: it refuses only a ref that is not a release tag or a tag
+that already has a published release, and checks no ordering between versions. The release skill
+carries the same policy, and its post-release check compares every image's `:X.Y.Z`, `:X.Y` and
+`:latest` with the release's journals.
+
+**Future findings on this path.** A defect is a reachable row (a gate outcome, a point where the
+job stops, a publish shape, and for attach an attempt order) in which the journal's last label
+claims LESS than the registry holds, or in which the attach job or `check-release-artifacts.sh`
+accepts an illegal sequence. Anything else on this path is non-blocking.
+`tests/test_image_publish.py` is the table: gate pass, fail, SIGINT, SIGTERM and budget, times
+stop points before the push, mid-push, a verify failure or cancel, an attest or sign failure,
+before the tags, mid-tag with and without a tag applied, a cancel while `tag` is still loading the
+journal, a tag move in flight that would complete later, another writer moving a tag, after the
+tags before `tagged`, a failed evidence upload, and complete, for both the buildx and the bundle
+shapes, run in `release.yml`'s own step order against a stub registry, with every cancel delivered
+to the step's PID only (as the runner delivers it) and the evidence read as uploaded; cross-attempt
+rows with the attach job interrupted at each attempt; a cross-run row (an older run cancelled
+mid-tag while a newer run publishes); journal-reader rows; and mutants (adjacent step swaps, named
+reorders, a dropped intent line, `tagged` recorded early, a writing step without `exec`, a script
+that ignores the signal or waits on its registry call in the foreground, unchecked late journal
+lines) that must be killed.
+
+It never replaces a completed asset. For each name already on the release (the attach job re-run
+for the same attempt) it reads GitHub's asset `state`, `size` and `digest`: an asset whose state is
+not `uploaded` (`starter`, `open`: an upload that was interrupted, which GitHub never served), or
+whose downloaded bytes do not match GitHub's own size or digest for it, is an incomplete upload, not
+evidence, and is deleted and uploaded again; a completed asset is kept when identical to this run's
+file (a `.sigstore` when it verifies this run's list) and fails the job when it differs. Every
+refusal is decided before anything is deleted, and a failed download stops the job rather than
+counting as incomplete. If the attach job fails, the Release run is red, so Pre-release QA does not
+start (it runs only on a successful Release run), and the report exists only as the 90-day artifact,
+which is shorter than a SOC 2 Type II observation window (except when the only failure is a higher
+attempt stopped while tagging: the files are attached first, then the job fails):
+
+- **A transient failure, or an interrupted upload** (a network error, a cosign or GitHub outage, a
+  cancel during `gh release upload`): "Re-run failed jobs" re-runs the attach job (and any other job
+  that failed); it replaces the incomplete assets and adds the rest. Dispatch `pre-release.yml` with
+  the tag if QA still has not started once the run is green.
+- **A refusal** (`already on the release with different content`, `does not verify`, or a publish
+  journal that is not a legal prefix): a re-run fails the same way. A completed asset under
+  this attempt's name with other content means something other than this job wrote it; do not
+  delete it to make the job pass. Investigate it as a release-integrity incident with the owner.
+- **A higher attempt stopped while tagging** (`stopped while moving the bundle's tag`): the record is
+  attached, then the job fails, because `:X.Y.Z` may name either attempt's digest. "Re-run failed
+  jobs" re-runs the bundle job; once an attempt ends `tagged`, this job passes. When the bundle
+  job's re-run cannot pass (its gate refuses for a reason that needs a commit), this state is
+  terminal for the release: do not keep re-running. Resolve `:X.Y.Z` (`docker buildx imagetools
+  inspect ghcr.io/<owner>/yuzu-agent-bundle-chisel:X.Y.Z --format '{{.Manifest.Digest}}'`) and
+  compare it with every attempt's journal: a digest on a `tagging` or `tagged` line was verified
+  and signed before any tag moved (`cosign verify` it), so that is the bundle image this version
+  ships, and the announcement says so. A digest on no uploaded journal's line is looked for in the
+  bundle job's logs (the script prints every line it records; an attempt whose report never
+  uploaded shows its tag move only there); found nowhere, or no tag at all, it is an incident to
+  investigate with the owner. The same check applies whenever the run is red around the bundle,
+  because an attempt whose evidence never uploaded can have moved the tag (residuals above).
+
+Do not attach the report by hand: a hand upload has no signed checksum list. If the bundle job never
+uploaded a report there is nothing to attach; its job log is the record. The report globs
+in the release job, `SHA256SUMS`, the release upload, the pre-release upload and the bundle
+attachment take every scanner's files (`trivy-*` and `grype-*`), while the coverage check reads
+Trivy's JSON report only (it refuses any other); grype's report feeds only grype's own verdict and
+the OS cross-check, which can only refuse an image. The script also writes a step summary table,
+including the rows of a run that stopped early.
+
+**Scanning the right image.** Four Big Tam runners share one Docker daemon, so a tag is not a
+safe handle. Each verification build gets a tag salted with the commit, run id and run attempt
+(under `yuzu-hc-verify/`, so `cache-prune.yml`'s sweep still reclaims a leaked one), and
+`scripts/ci/image-identity.sh pin` resolves it to its image ID once, right after the build;
+the healthcheck probe and the gate then use the ID. Every Trivy call passes
+`--image-src docker`, so a missing local image fails the gate instead of a same-named image
+being fetched from a registry and scanned. The push build is a second build that normally
+reuses the scanned build's layers, but nothing forces it to: right after the push, before any
+SBOM, attestation or signature, `image-identity.sh verify-pushed` reads the pushed digest's
+layer diff IDs from the registry and fails the job unless they equal the scanned image's (the
+image config, with its labels and timestamps, legitimately differs); `image-publish.sh verified`
+runs it and records the result. The agent bundle is pushed from the scanned local image itself,
+under its candidate tag, after checking its local tag still names the scanned ID. A mismatch leaves
+an untagged digest (or the bundle's candidate tag) in GHCR, unsigned; no release tag names it, the
+journal stays at `push-started`, and the release job does not run.
+
+**Current packages.** The Debian and Alpine images upgrade their packages in the final stage
+(`apt-get upgrade`, `apk upgrade`; `yuzu-postgres` holds the PGDG server packages so the
+PostgreSQL minor stays the pinned one), and the chisel images cut their slices from the live
+Ubuntu archive (a fact about build time, not a scan; the chisel images' OS packages reach the
+scanners as `status.d` records, see "Release image vulnerability gate"). A package index that cannot be fetched fails the build: the Debian runtime
+stages run `apt-get update --error-on=any` (plain `apt-get update` exits 0 when, say, the
+security pocket is unreachable, and the upgrade then ships without it; checked 2026-11-18 on
+bookworm's apt 2.6 and trixie's apt 3.0, both exit 100 with the option), and Alpine's
+`apk upgrade` already refuses an unavailable repository (exit 99). After the upgrade each Debian
+build logs what apt still keeps back (`apt-get -s upgrade`). The Big Tam publish jobs build with
+a persistent local cache, so each of those steps reads the `YUZU_PACKAGE_REFRESH` build argument,
+which the workflow sets to `<run_id>-<run_attempt>`: every run attempt takes current packages,
+and the scan build and the push build of one attempt share the layer. That writes new blobs into
+the cache on every attempt; `cache-prune.yml` removes the ones no cache index references (see
+"Cache pruning + weekly maintenance"). `tests/test_image_vuln_gate.py` (`docs` suite) is a
+lexical tripwire over every workflow job: it flags a job whose steps match a push marker (the
+`push:` input, `docker`/`podman`/`buildah`/`nerdctl` push or manifest push, one through a
+variable named for the tool, `--push` or `--push=true`, an `--output`/`-o`/`outputs:` of
+`type=registry` or `push=true`, a registry copy or retag with `imagetools create`, crane, skopeo,
+oras, regctl or `cosign copy`), following local composite actions, local reusable workflows and
+the repository scripts a job names, and counting a remote reusable workflow as a push; it fails
+unless the job is a gated release job or listed as not a release image. It reads text, so it
+cannot see a push assembled at run time (an `eval`, a command read from a file) or inside a remote
+action. It also pins the gate-before-push order, `--release`, the evidence upload and its status
+function, `--error-on=any` and the refresh argument.
+
+**Trivy.** The script downloads Trivy `0.70.0` and checks it against a sha256 pinned in the
+script (the release's checksums file and tarball were verified with `cosign verify-blob` when
+pinned; re-verify on a bump). It installs into `RUNNER_TEMP` and keeps its DB there, never under
+`$HOME`: the four Big Tam runners share one OS identity (#1871). No marketplace action is used.
+Trivy (Apache-2.0) is a CI-time tool only; it ships in no image.
+
+**grype.** The script downloads grype `0.121.3` (the newest release at least seven days old when
+pinned, the Dependabot cooldown) and checks the tarball against a sha256 pinned in the script,
+taken from the release's checksums file, whose signature was verified with `cosign verify-blob`
+(identity `anchore/grype` `release.yaml@refs/heads/main`) when pinned; re-verify on a bump. It
+installs into the same per-run directory and keeps its DB and the image archive there. grype
+(Apache-2.0) is a CI-time tool only; it ships in no image. A bump also runs the real gate once by
+hand on a locally built image and on one with a known fixable CRITICAL, because the CI tests use a
+stub grype; the pin was checked that way on 2026-11-20 (the rebuilt gateway passed; the OTP
+28.5.0.2 builder base failed on CVE-2026-89422; a generated `ignore:` rule for that CVE, package
+`erlang` `28.5.0.2` `binary`, moved exactly that match to `ignoredMatches`, and the same rule with
+another version suppressed nothing).
+
+**Accepting a finding.** Add an entry to `.trivyignore.yaml` with a scope, a `statement` (why it
+does not apply, with the evidence), an unquoted `expired_at` at most 92 days out, `approved_by`
+(the GitHub login of the person who accepted it), and `approval_ref` (the pull request in which
+they approved it, `"#N"` or its URL) with `approved_on` (the date). The scope is never a bare CVE
+id: a `paths` item is one concrete relative path to a file in the image (it contains a `/`; no glob
+character, no empty string, no leading `/`, no `.`/`..` component, and not a Trivy result target,
+class or type name such as `Python`, `Node.js`, `Java`, `gobinary` or `os-pkgs`), because Trivy
+matches `paths` as globs against a package's path AND its result's target, and an OS package's path
+is empty: `**`, `*` or `""` would suppress the CVE in every package, and `Python` in every Python
+package (verified with Trivy 0.70.0: an entry scoped `Python` hid CVE-2020-14343, a fixable CRITICAL
+in PyYAML 5.3.1, from a `--release` run). A `purls` item is a full package URL with its version,
+because Trivy matches a purl without one against every version. Until the approval is recorded,
+`approval_ref: pending` (and no `approved_on`) records a proposed acceptance: the release gate
+(`--release`) does not honour it, local runs and the post-release scan do and report it as pending.
+`image-vuln-gate-checks.py` parses the file (a strict block-style subset of YAML: flow style,
+anchors, a comment after a value, an unknown key or a second top-level section are refused, so a
+decoy line cannot satisfy it), the gate refuses a file that breaks any rule, and Trivy reads only
+the checker's canonical copy of the entries in force. It warns 21 days before an entry expires. An
+expired entry is not in force, so the next release fails on that finding again. Today there is one
+entry: the Go standard library CVE-2025-68121 in the upstream postgres image's `gosu` (gosu does not
+link `crypto/tls`); it records its approval as `"#8315"`. An
+entry is a commit, so it is in the tag a release builds: it can only help a release cut after it.
+
+A grype finding is accepted in `.grypeignore.yaml`, which the same checker parses with the same
+shape, statement, expiry and approval rules; only the scope differs, because grype matches a
+package rather than a path or a purl: `package_name` and `package_version` are both required
+(exactly as grype reports them, the NAME and INSTALLED columns of its table), `package_type` is
+optional, and none may hold whitespace or a glob character, so an entry never hides a
+vulnerability in every package or in every version of one. grype reads the package NAME as an
+anchored regular expression (checked with grype 0.121.3: `er+lang`, `erl[a]ng` and `erlang|zzz`
+each suppressed package `erlang`), so a name may also hold no regular-expression character: no
+`+`, brackets, `|`, `\`, `^`, `$`, `*`, `?`, parentheses or braces (`.` is read literally). A
+package whose name needs one, such as `libstdc++`, cannot be accepted: its finding fails the gate
+until it is fixed. The file is not a grype config and is
+not named `.grype.yaml`, so a grype run in the repository does not pick it up; grype reads only the
+generated `ignore:` rules of the entries in force. A finding both scanners report needs an entry in
+each file. Today `.grypeignore.yaml` has no entry.
+
+**Provider waivers (a degraded pass).** grype's DB is rebuilt daily, but each provider in it is
+captured from its upstream source, and one can stall upstream (an NVD API outage, an OS feed that
+stops publishing) while the DB around it stays fresh. The gate then refuses every image that needs
+that provider, and re-running does not help until upstream recovers. For a release that cannot
+wait, `.grypeignore.yaml` may hold a `provider_waivers:` section beside `vulnerabilities:`, parsed by
+the same parser under the same shape rules:
+
+```yaml
+provider_waivers:
+  - provider: nvd
+    statement: >-
+      Why the release cannot wait, and the evidence that the upstream source is stalled.
+    expired_at: 2026-12-01
+    approved_by: some-login
+    approved_on: 2026-11-21
+    approval_ref: "#1234"
+```
+
+- `provider` is one of `nvd`, `alpine`, `debian`, `ubuntu` (the providers the gate requires), at
+  most one waiver each; `statement` is required; `expired_at` is an unquoted date at most **14**
+  days out; the approval fields follow the same rules as an acceptance, and `approval_ref: pending`
+  is not honoured by a release (`--release`).
+- A waiver admits exactly one thing: that provider's capture when it reads as a time and is older
+  than 72 hours. It does not admit a missing provider, a capture time that is unreadable or in the
+  future, a DB whose own build time is stale or that does not match its listing's checksum or
+  grype's status, a retired DB schema, a Trivy DB that is stale or not this run's download, a
+  finding from either scanner, the gateway's `erlang` not catalogued, grype not detecting the OS,
+  or an image whose OS packages were not scanned. A waiver for one provider admits no other.
+- An expired waiver, one more than 14 days out, an unknown or duplicate provider, or a waiver
+  missing a field refuses the whole file, like any malformed entry: the gate stops before any scan
+  (an expired acceptance is only not in force, but an expired waiver must be removed).
+- Nothing else enables one: no workflow input, environment variable or option of the gate does
+  (`YUZU_GRYPEIGNORE` is limited to the repository's file on GitHub Actions, above). A waiver is a
+  commit, so it is in the tag a release builds.
+- An image that PASSES under a waiver is DEGRADED, and says so: its grype `.gate.txt` keeps
+  `gate: pass` (so the publish journal opens) and adds `provider waiver: provider <name> captured
+  <time>, <N> hours old (over the 72-hour limit), admitted by the provider waiver at
+  .grypeignore.yaml:<line>: expires ..., approved_by ..., approval_ref ..., approved_on ...` and
+  `DEGRADED: provider waiver in force (<name>)`; its step-summary row says so, the log prints a
+  `::warning::` per image-level waiver used, and the end-of-run line (log and summary) counts the
+  images that passed under a waiver. The word DEGRADED appears nowhere else: an image that did not
+  pass is never DEGRADED, whatever the waiver, and the start of the run announces a waiver in force
+  without the word. A report that used none says `provider waiver: none used`. A waiver in force
+  for a provider that is current is not used and changes nothing.
+- **Decision record (2026-11-21).** The project owner decided that a release must be able to
+  ship through a stalled upstream grype provider, under the bounds above (one named provider, at
+  most 14 days, the committed file only, every use reported DEGRADED), and fixed that design for
+  this change; the routed-concern row states the bound. Revisit it if a waiver is ever needed for
+  more than one release in a row, or if grype adds per-provider freshness of its own.
+- The waiver bounds how long it is in force, not how old the capture it admits may be: a
+  capture of any age is admitted while it is in force, and its age is printed on the
+  `provider waiver:` line. Its approval fields are, as for an acceptance, a recorded reference
+  checked for format only ("What the approval fields are" below).
+- Nothing warns about a waiver between releases (the same tracked gap as for acceptances): the
+  pre-tag `pending` check refuses one expiring within two days, and an expired one refuses the
+  whole file wherever it is read, the repository's own tests of that file included, so remove a
+  waiver before it expires. The pre-tag check's 21-day warning fires for every waiver (none is
+  ever more than 14 days out), so it gives no early notice.
+- What a degraded pass means: grype matched that provider's packages (for `nvd`, the gateway's
+  Erlang/OTP runtime and other binaries grype identifies by version) against advisories as old as
+  the capture, so a fixable CRITICAL published upstream since then can be missed. Remove the waiver
+  as soon as the provider is current again. The post-release scan (`pre-release.yml`) reads the
+  `.grypeignore.yaml` of the commit it checks out, which is the default branch's tip on its
+  automatic run (the dispatched ref on a manual one), not the release tag: a waiver there degrades
+  that scan the same way, and a release scanned with a waiver that is no longer on that branch
+  turns that scan red while the provider is still stale.
+- A run that starts on an `nvd` waiver re-checks it for each image, before the image's own
+  provider check, so an image judged after the waiver lapsed (a run crossing UTC midnight on its
+  expiry day) fails (`provider waiver lapsed during the run`). A lapse is reported only on the
+  checker's positive answer that the provider is stale and no waiver admits it, with an explicit
+  `provider waiver: stale and not waived: the <name> waiver lapsed during this run ...` line. A
+  waivers file that cannot be read again fails the image as `provider waivers unreadable`
+  (`provider waiver: not admitted: the waivers file could not be read again`), and any other
+  re-check failure as `provider waiver re-check failed` (`provider waiver: not admitted:
+  re-checking ...`); neither is called a lapse. An image that failed for any other reason with a
+  waiver in force says `provider waiver: in force (...), but the image did not pass, so nothing was
+  admitted by it`. An image the gate never judged (a stop or a cancel) records `provider waiver: in
+  force for this run (...), but the image was not judged` (or `stale and not waived: ... lapsed
+  during this run, and the image was not judged`). None of these is DEGRADED, and the `ignore file:`
+  line counts the waivers in force and those pending approval (and how many of them were not
+  honoured).
+
+**What the approval fields are, and what the control is.** `approved_by`, `approved_on` and
+`approval_ref` are a RECORDED REFERENCE: the gate checks that they are present and well formed (a
+GitHub login, a past date, `#N` or a pull-request URL) and nothing else. It does not ask GitHub
+whether that pull request exists, was merged, or was approved by `approved_by`, so a typed `"#9999"`
+with a date passes it exactly like a real approval. They are not a verified approval and no
+document may present them as one. The control is human review of every change to
+`.trivyignore.yaml`, `.grypeignore.yaml`, `scripts/ci/image-vuln-gate-not-covered.txt`, the gate scripts
+(`scripts/ci/image-vuln-gate.sh`, `scripts/ci/image-vuln-gate-checks.py`,
+`scripts/ci/image-identity.sh`, `scripts/ci/image-publish.sh`, `scripts/ci/release-degraded.sh`, `scripts/check-release-artifacts.sh`) and the workflows that run them
+(`release.yml`, `pre-release.yml`): the approval is the review of the pull request that adds or
+changes the entry, and the fields record where to find it. That review is as strong as the branch
+protection that requires it.
+
+**The approver can be the change's author.** Nothing in the gate, the checker or the format stops
+`approved_by` from naming the person who wrote the entry. GitHub does not let a pull request's
+author approve it, but nothing ties `approved_by` to whoever did review it, and without branch
+protection that requires a review the pull request can merge with none. Separation of duties
+therefore rests entirely on that branch protection, and it is not enforced: the `.github/CODEOWNERS`
+entries for these paths (PR #8243) request a review from either owner (`@fjarvis`, `@Tr3kkR`),
+and they only REQUEST it: "Require review from
+Code Owners" is off on the Protect Dev and Protect Main rulesets by owner decision (2026-11-18), and both owners can bypass the rulesets as organisation admins. So any one
+approval merges a change to an acceptance, a not-covered listing or the gate, and an approver
+recorded in `approved_by` may be the change's own author. By practice, when one of the two owners
+writes an entry, the other approves it; a reviewer of these paths checks that the named approver
+actually approved.
+
+**Recording an approval.** For an acceptance, a provider waiver or a not-covered listing:
+
+1. Open a pull request that adds (or changes) the entry with `approved_by: <the approver's login>`
+   and `approval_ref: pending` (no `approved_on`; in the not-covered list, `approved_on=-
+   approval_ref=pending`), and the evidence in `statement` (or `reason=`). A pending entry is not
+   honoured by a release, so merging it changes no release yet.
+2. The approver reviews that pull request and approves it in GitHub's review UI. The approval is
+   that review; it is not given anywhere else.
+3. In the same pull request, after the approving review, set `approval_ref` to that pull request
+   (`"#N"`, or its URL) and `approved_on` to the date of the review (in the not-covered list,
+   `approved_on=<YYYY-MM-DD> approval_ref=#N`). A push after an approval may dismiss it under the
+   branch rules; then the approver re-approves the final diff, and `approved_on` is that date.
+4. Merge. Before tagging, the release skills run `python3 -I scripts/ci/image-vuln-gate-checks.py
+   pending .trivyignore.yaml scripts/ci/image-vuln-gate-not-covered.txt .grypeignore.yaml`, which fails while any
+   entry or provider waiver in force is still pending, and while any entry, waiver or listing has
+   expired or expires today or tomorrow (each publish leg re-reads the date, so one that lapses during the release fails the legs
+   that run after it); it warns for one expiring within 21 days.
+
+Steps 1 and 3 are alternatives for when the reference is filled in: in the same pull request after
+the approving review (step 3), or in a follow-up pull request after merging the pending entry (step
+1). Either way, a tagged tree that still holds a pending entry fails the pre-tag check.
+
+Whoever audits an acceptance later follows `approval_ref` to the pull request and checks the
+approving review there; the gate does not.
+
+**When it fails.** The leg whose gate failed pushed nothing (a failure in "Verify the pushed image
+is the scanned one" pushed an untagged digest: see that paragraph and the release skill). Its sibling matrix
+legs are `fail-fast: false`, so they may already have moved `:X.Y.Z` (and, on a stable tag,
+`:X.Y` and `:latest`, leaving those tags on a mix of this release and the previous one), and the
+release job does not run (same state as any other publish failure; the release skill's Recovery
+covers it; `:latest` and `:X.Y` keep naming the unreleased digests until the release is finished,
+re-tagged or superseded, and moving them by hand is not a release procedure: Release tag policy). Read the step log first. For every publish job
+except the agent bundle:
+
+- **A distro package with a fix**: the fix usually landed after the run started. "Re-run failed
+  jobs" on the newest run takes current packages (the refresh argument changes per attempt).
+- **A stale DB** (`more than 72` in the log): the published DB is rebuilt every few hours and
+  the mirror normally lags by under a day, so wait and "Re-run failed jobs"; if it stays stale,
+  check whether the mirror or Trivy's DB publishing is broken before anything else.
+- **OS packages not scanned** (an image newly showing 0 OS packages): something removed the
+  package database from an image that used to have one. For a chisel image, check that
+  `deploy/docker/chisel-emit-status.py` ran in its Dockerfile and that `/var/lib/dpkg/status.d`
+  holds records; after a Trivy version bump, scan one chisel image and confirm it reports more than
+  zero OS packages. Fix the image; listing it in `image-vuln-gate-not-covered.txt` is a reviewed
+  decision that its OS packages ship unscanned by Trivy, and it needs its own reviewed pull request.
+  Either is a commit, so re-tag. On a listed image the log says why the listing is not in force:
+  it expired (re-review it), or its `approval_ref` is `pending` (record the approval, above).
+- **An acceptance `NOT IN FORCE`**: its `approval_ref` is `pending`. Record the approval as
+  "Recording an approval" describes; a commit, so re-tag.
+- **No advisory data** (`end of service life`, `no advisory data`, `no advisory data for a
+  pre-release`): the image's base moved to an unreleased, pre-release, rolling or end-of-life OS
+  release. Move it back to a released, supported one; a
+  commit, so re-tag. An unknown OS family needs a canary added to `image-vuln-gate-checks.py`
+  first.
+- **An acceptance that expires mid-release, or a CRITICAL disclosed between legs**: the legs that
+  ran before it have pushed and the rest fail, and "Re-run failed jobs" fails the same way. Renew
+  the entry (a commit) and re-tag. The pre-tag `pending` check fails on an entry or listing that has
+  expired or expires within two days, and warns 21 days ahead, as does every gate run's log; nothing
+  warns between releases (a tracked gap).
+- **The gate ran out of its budget** (`ran out of its <N>s budget`): a registry or the DB mirror
+  was slow, or a scan hung. "Re-run failed jobs"; if it recurs, look at which call used the time
+  in the step log before raising the budget.
+- **A fix that is not in the distro yet, or in a binary the base image ships** (a Go tool, an
+  upstream-built binary): refresh the base image digest if upstream has rebuilt it; otherwise
+  accept it in `.trivyignore.yaml` with the evidence. Either is a commit, so re-tag.
+- **grype found a fixable CRITICAL** (`grype found a fixable CRITICAL`; Trivy may be clean): the
+  same choices, and an acceptance goes in `.grypeignore.yaml` (by grype's package name and
+  version). For the gateway's Erlang/OTP runtime the fix is a newer OTP in `Dockerfile.gateway`'s
+  pinned `hexpm/erlang` builder. Either is a commit, so re-tag.
+- **A stale or unverifiable grype DB** (`grype DB listing`, `does not match the listing`,
+  `grype db status`): wait and "Re-run failed jobs". When the log says the listing's status is not
+  `active`, the pinned grype's DB schema is retired: re-running will not help; bump grype (a commit,
+  so re-tag). grype's DB has one source (no mirror to fall
+  back to, unlike Trivy's) and the gate has no override for the DB itself (a provider waiver covers
+  one stale provider, never the DB), so while grype's DB publishing is down or stale no release leg
+  passes; check that publishing before anything else.
+- **A scanner could not be installed, fetch or import its DB, or scan** (`could not download`,
+  `could not import`, `could not scan the image`, `Trivy exited`, `grype exited`): a network or
+  runner fault, or a scanner error on that image. "Re-run failed jobs"; if it recurs on the same
+  image, read the scanner's error in the step log (grype's is printed above the gate's line).
+- **The image could not be exported for grype** (`could not export ... for grype`, `not an image in
+  the local Docker daemon`): `docker save` failed, usually a full disk under `RUNNER_TEMP` or a
+  daemon fault. "Re-run failed jobs"; if it recurs, check the runner's free disk.
+- **grype catalogued no OS package** (`grype catalogued no OS package`): grype's CycloneDX holds no
+  package-database component for an image whose OS packages Trivy scanned, so grype matched none.
+  The report directory keeps `grype-<image>.attempt-<N>.json` and `.txt`, which list matches only and
+  cannot show what was catalogued. Reproduce with the pinned grype
+  (`grype <image> -o cyclonedx-json`) and read each component's `syft:package:foundBy`: ELF-note
+  entries only means the package database was not read. Find the grype or package-database change
+  that did it; a fix is a commit, so re-tag.
+- **grype OS packages unreadable** (`FAIL: grype OS packages unreadable`): grype's CycloneDX output
+  was missing, malformed or had a components entry that was not a list. The log shows the reason. Re-run the failed
+  jobs once; a repeat is a grype or export fault to find before re-tagging.
+- **grype did not detect the OS** (`grype did not detect the OS`): the image's OS release is one
+  the pinned grype does not recognise; a newer grype or a supported OS release is a commit, so re-tag.
+- **grype did not catalogue erlang** (`grype did not catalogue erlang`, or `erlang <version>
+  (expected ...)`): grype no longer recognises the gateway's bundled OTP runtime, or reads another
+  version than the table pins (a grype bump, a builder change that moved or stripped `beam.smp`, or
+  a builder bump without the table). Find which change did it; a fix is a commit, so re-tag. Do not drop the requirement
+  to pass: without it the runtime ships unscanned.
+- **grype's record and gate scans disagree** (`grype's record and gate scans disagree`): the gate
+  scan passed while the record lists a fixable CRITICAL no acceptance covers. Treat it as a
+  finding: read the record (`grype-<image>.attempt-<N>.txt`), and fix or accept it.
+- **A grype DB provider is stale** (`provider ... is not in the DB`, `provider ... built ... hours
+  ago`, `grype DB provider <family> is stale`): the log names the provider and how old its capture
+  is. A missing one (`is not in the DB`): the DB may have renamed it, so re-running will not help;
+  update `GRYPE_REQUIRED_PROVIDERS` or bump grype (a commit, so re-tag); a waiver never admits it.
+  An old one, as for a stale DB: wait and "Re-run failed jobs". When the upstream source itself is
+  stalled and the release cannot wait for it:
+  1. Confirm the stall upstream (the provider's own status, or grype's and vunnel's issue trackers)
+     and that the rest of the DB is current. Reaching the provider check means the DB's own build
+     time already passed its 72-hour check; to see every provider's capture time, run the pinned
+     grype's `grype db providers -o json` against the same DB. A stale DB, or a provider whose
+     capture time is unreadable, is not a stall and no waiver helps.
+  2. Open a pull request adding a provider waiver for exactly that provider to
+     `.grypeignore.yaml` ("Provider waivers" above): the evidence of the stall in `statement`, an
+     `expired_at` as short as the release needs but at least two days past the tag, with headroom
+     for re-runs (at most 14 days; the pre-tag check refuses one expiring today or tomorrow, and
+     a re-run after it expires refuses the whole file), and the approval recorded as
+     "Recording an approval" above describes. A pending waiver is not honoured by the release.
+  3. Merge, run the pre-tag `pending` check, and re-tag (the waiver is a commit). Every image that
+     needed the provider passes DEGRADED; check that each grype `.gate.txt` names the waiver. The
+     release workflow writes the release notes' statement itself, an "Image scan: DEGRADED"
+     section (the provider, its capture age, the waiver's expiry and `approval_ref`, taken from
+     the published attempt's own `.gate.txt` by `scripts/ci/release-degraded.sh`, linking
+     `docs/user-manual/release-verification.md` "A degraded pass"), and
+     `scripts/check-release-artifacts.sh` prints a non-fatal `::warning::` and the same lines (to its
+     output and the step summary). The agent-bundle image is scanned after the notes are written, so
+     the statement does not cover it. A
+     report whose marker cannot be read is stated as undetermined, never omitted. Neither changes
+     `gate: pass` or what the publish journal accepts. After the publish legs,
+     `grep -H -e '^gate:' -e '^provider waiver:' -e '^DEGRADED:' grype-*.attempt-*.gate.txt` over the run's reports lists
+     every attempt's verdict and any DEGRADED line; only the highest attempt whose publish journal
+     ends `publish: tagged` counts, because a refused attempt's report is attached too.
+  4. Remove the waiver in a follow-up pull request as soon as the provider is current again (on
+     the default branch too, which the post-release scan reads); once it expires the gate refuses
+     the whole file until it is removed. Then dispatch `pre-release.yml` for the degraded release
+     (`gh workflow run pre-release.yml --repo DevNullLtd/Yuzu -f tag=vX.Y.Z`), so its images are
+     scanned again with the provider current: a fixable CRITICAL the stale capture hid surfaces
+     there, and is then handled
+     as a CRITICAL in a published release (a patch release; the security policy's advisory path
+     if it is exploitable).
+
+**When the agent bundle's gate fails, never re-tag.** `docker-publish-agent-bundle` runs after
+the `release` job has published the GitHub Release, so the tag is already a published release:
+re-tagging it is forbidden (#5282), and `release-guard` refuses a fresh run of it. The gate runs
+from the tag's own checkout, so a fix that needs a commit (a new `.trivyignore.yaml` or
+`.grypeignore.yaml` entry, a new base digest, a list entry) cannot reach this release's bundle at
+all. So:
+
+- **A distro package with a fix, a stale DB, the gate's budget running out, or a cancel**: "Re-run
+  failed jobs" on that run (the only recovery the release skill allows for this job); the chisel
+  cut takes the current archive.
+- **Anything that needs a commit** (including a provider waiver for a stalled grype provider, and
+  a waiver in the tag that has expired since, which refuses the whole file on a re-run): this
+  version ships without the agent-bundle image. The
+  release itself is complete and its other images are signed; say so in the release notes or
+  announcement, land the fix, and cut the next version (a patch release) to deliver the bundle.
+  Publishing a bundle outside `release.yml` bypasses the gate and journal (Release tag policy,
+  Limit 1); it is an owner-decided incident, recorded in a tracking issue opened for it and announced.
+
+A failed bundle job also leaves the Release run red, and Pre-release QA starts only on a
+successful Release run, so that version gets no post-release scan or QA at all; a manual dispatch
+of `pre-release.yml` stops at `docker pull` of the missing bundle tag before scanning the six
+published images (a tracked gap).
+
+**What it does not see.**
+
+- **The chisel images' and the agent bundle's OS packages, at package granularity.** The scanners
+  read one `status.d` record per cut package (above), not a file list: a slice is recorded as its
+  whole package, so a finding in a file the slice does not ship can be reported, and no finding is
+  hidden by that. Unfixed MEDIUM and lower findings in these Ubuntu packages are reported and not
+  gated, as everywhere else. The records exist only if the build ran the script. The gate
+  refuses an image with no OS package at all, but not one that lost some of them. The gate
+  does not check what grype matched in these images beyond the gateway images' `erlang`
+  component.
+- **PostgreSQL itself.** In `yuzu-postgres` Trivy lists `postgresql-18`, `libpq5` and
+  `postgresql-common` as packages but matches no vulnerability to them: they come from the PGDG
+  repository, and Trivy's Debian advisories cover Debian's own packages only. And the image holds
+  the PGDG packages at the pinned minor on purpose, so no release build ever takes a PostgreSQL
+  fix: only a deliberate `PG_BASE` bump in `Dockerfile.postgres` does. The build log names every
+  held package with a newer version available (`kept back (held PGDG package)`), so a kept-back
+  fix is visible in the publish job; reading it, and the PostgreSQL security announcements, is a
+  release-time task for the release engineer.
+- **The gateway's Erlang/OTP runtime, to Trivy.** Trivy does not identify the OTP runtime in the
+  gateway's bundled ERTS. grype does (from `beam.smp`'s version), so a fixable CRITICAL in it fails
+  the gate through grype; a CVE grype's data does not attribute to that version is seen by neither.
+- **Statically linked code.** Nothing in a statically linked C++ binary (the server and agent) is
+  visible to either scanner.
+- **A tampered DB.** Neither DB is signed upstream (above). The canary catches a Trivy DB with no
+  advisories for the image's OS release, not one whose individual advisories were edited; grype's
+  archive is checked against a listing fetched over TLS from the same publisher, which an attacker
+  able to replace the archive there can replace too.
+
+**Routed-concern invariants** (the `.claude/routed-concerns.md` row points here). Every publish
+job gates its pinned image ID with `--release` BEFORE any push, and checks the pushed layers
+BEFORE any SBOM, attestation or signature. The release tag moves only after verify, sign and
+attest, and the publish journal is write-ahead ("The publish journal" above): only
+`image-publish.sh` writes it, within `release.yml` only `image-publish.sh tag` moves a release tag, every writing step
+runs it with `exec` and it appends nothing after a SIGINT or SIGTERM, consumers read it only through
+`image-publish.sh state` or `published` (one reader), and accept only a legal prefix; the published
+image is the HIGHEST attempt ending `tagged`, and any higher attempt ending `tagging` fails both the
+release check and the attach job. Within `release.yml` no step deletes an image or moves a release
+tag outside "Tag the release"; the pre-existing hand push paths bypass the gate, so never extend
+them or add another ("Release tag policy" above, Limit 1). The gate fails closed:
+a scan, DB, coverage or advisory-data failure is never a pass, and every exit it reaches after reading its arguments,
+SIGTERM/SIGINT included, writes a report that the upload keeps, named per run attempt so a re-run
+never replaces a refusal's. An acceptance is in force only when its scope is concrete (a path inside
+the image, containing a `/` and naming no Trivy target, or a full purl with its version), it has not
+expired, and, in a release, its approval fields are filled in and well formed (not `pending`); the
+same holds for a not-covered listing. A grype provider waiver admits ONE named provider (`nvd`,
+`alpine`, `debian` or `ubuntu`) whose capture is only older than 72 hours, for at most 14 days, on
+GitHub Actions from the committed `.grypeignore.yaml` only, on the same approval terms; it waives no
+finding, no missing provider or unreadable capture time, no DB age, checksum, status or schema check, no coverage or
+component check, and an image judged with one says DEGRADED in its grype `.gate.txt` and the step
+summary only when the image passed. Those fields are a recorded reference, checked for format only;
+the review of the change is the control. Trivy reads only the checker's canonical copy of the ignore
+file, and the DB only from this run's fresh cache, pinned by digest. A grype acceptance is in force on
+the same terms with a package name AND version as its scope; grype reads only the generated `ignore:`
+config, the DB only from this run's import of the archive checked against the listing, and the image
+only from a `docker save` of its local ID, and a fixable CRITICAL from either scanner refuses the image;
+grype must catalogue the gateway images' `erlang`, and the published attempt must carry both scanners'
+reports.
+Widening any of these (a glob, one-word or versionless scope, a bare id, an honoured pending approval,
+a provider waiver that admits anything beyond one named stale provider or is enabled on GitHub Actions
+by anything but the committed file,
+an inherited cache, a grype source that can pull, a grype finding that does not refuse, a second coverage
+reader that is not Trivy's report, an overwritten or clobbered report, a push that carries a
+release tag, a second journal writer or reader, a consumer that accepts an illegal sequence, a
+tool or documented procedure that deletes an image or moves a release tag by hand) is a security
+decision, not a fix.
 
 ### Pre-release QA (`pre-release.yml`)
 
@@ -745,9 +2192,13 @@ than the tag under test (#5150). The other jobs check the following:
   `.deb` control `Version` equals the tag's Debian spelling (`0.14.0~rc3`); a
   mismatch fails. The RPM metadata step only prints. The ARM64 archive is checked only when the
   release ships one (#5135).
-- **security-scan**: Trivy scans the server and gateway images. Its findings
-  are informational and do not fail the run, but an image that cannot be
-  pulled fails the job.
+- **security-scan**: runs the release image vulnerability gate
+  (`scripts/ci/image-vuln-gate.sh`) on all seven published images (server,
+  gateway, postgres, the three chisel variants, the agent bundle). A CRITICAL
+  with a fix that `.trivyignore.yaml` does not accept fails the job, as does an
+  image that cannot be pulled or scanned; HIGH findings are informational.
+  `release.yml` already ran the same gate before each push, so a failure here
+  usually means a CVE disclosed after the release.
 - **soak-test**: ten minutes on the stack. Every 30s it checks that all four
   services are running with 0 restarts, at least one agent is connected, and
   the gateway is ready. About once a minute it also round-trips a command. At
@@ -801,6 +2252,8 @@ of reading as NOT TESTED.
   crypto NIF needs OpenSSL SM4 symbols that Red Hat's OpenSSL lacks. The
   same defect is waiting behind #5143 on rockylinux:9.
 
+**Known environment-dependent test.** In `tests/unit/test_echo_local_dispatcher.cpp`, the case "echo plugin: a rollup pass on an over-budget legacy database evicts to the byte target, converts it to incremental auto_vacuum and publishes the result" (one of the `[budget]`-tagged cases) fails intermittently on one Linux workstation, not always on the same check, while the Linux and macOS CI legs pass it. Its cause is unknown and it is tracked as #7039. It is not in `tests/known-flaky.json`, so a red on it is not retried.
+
 **Gateway-upstream peer authorization and the rigs.** The server refuses to start with
 `--gateway-upstream` unless gateway peer authorization is configured or acknowledged as disabled
 (`--insecure-gateway-peer`, or `YUZU_INSECURE_GATEWAY_PEER=1`). The rigs that run the server from
@@ -839,12 +2292,13 @@ the gateway source and rerunning the suite).
 
 The same run covers the **management hop**, server to gateway (`:50063`, the privileged command
 plane; the symptom of #5175 was every `SendCommand` reaching the server as `Socket closed`). The
-gateway's management listener runs in the production posture except for the mode: strict mutual TLS
+gateway's management listener runs in the production posture, in the shipped mode by default: strict mutual TLS
 (`verify_peer` + `fail_if_no_peer_cert`), `auth_fun => fun yuzu_gw_authz:check_mgmt_peer/1`, and
-`mgmt_peer_pins = [{cert_file, <server default-server.pem>}]` (the shipped form: the gateway pins that
-leaf's SPKI and requires `serverAuth`), plus `mgmt_peer_auth_mode = identity_or_pin`. The rig opts in to
-that mode (#6016); the shipped configs stay on `pin`, so the shipped `pin` configuration (resolved and judged by the real boot-guard functions) is covered by
-the eunit module `yuzu_gw_config_posture_tests`, not exercised on the real stack; the server is pointed at it with `--gateway-command-addr` and
+`mgmt_peer_auth_mode = identity` with no `mgmt_peer_pins` (the shipped form since release N+1, #6016: the
+gateway derives the identity from the single-certificate `default-ca.pem` and requires `serverAuth`);
+`YUZU_GW_MGMT_AUTH_MODE=identity_or_pin` is the one setting that differs from the shipped
+posture: it runs the transition mode, also pinning `<server default-server.pem>`. The shipped configurations (resolved and judged by the real boot-guard
+functions) are also covered by the eunit module `yuzu_gw_config_posture_tests`; the server is pointed at it with `--gateway-command-addr` and
 presents its own default leaf. Three layers check it. (1) The script dispatches `os_info.os_name` to
 the real agent through the server's REST API (admin login, `POST /api/command`, poll
 `/api/responses/{id}`): one round trip, then 300 commands, 16 at a time, whose streams all share the
@@ -868,11 +2322,12 @@ pin fails `unpinned_leaf_is_refused`. It cannot skip: the script has no skip pat
 prerequisite exits non-zero, and `YUZU_REAL_UPSTREAM_STRICT=1` turns a check the suite cannot make
 (server unreachable, `/metrics` unreadable) into a failure. The four runner agents share one OS
 identity (#1871), so every named resource is per-run: all 8 ports come from the OS in one
-allocation (`--free-ports`), the Postgres database is `yuzu_test_<epoch>_gwint_<random>` created on
+allocation (`--free-ports`). A start-up that loses one to another process before binding it is retried, up to 3 attempts, on an unambiguous bind failure only, and a retry is a `::warning::` annotation and a step-summary line (#7538). The Postgres database is `yuzu_test_<epoch>_gwint_<random>` created on
 the job's `YUZU_TEST_POSTGRES_DSN` and dropped on exit, the work directory is a `mktemp` name under
 `runner.temp`, and the gateway's Erlang node name and cookie carry a random salt (the release's own
 fixed `yuzu_gw` short name would contest the shared EPMD). A failed run keeps its work directory and
-the step "Upload gateway real-wire logs on failure" uploads its logs (`failure() &&` leads the
+the step "Upload gateway real-wire logs on failure" uploads its logs, including each retried
+attempt's `server.attemptN.log` / `gateway.attemptN.log` (`failure() &&` leads the
 condition) and the Common Test logs, never the run's throwaway CA or agent keys. The burst's own log
 (`mgmt_driver.log`) is among the uploaded `*.log` files.
 
@@ -927,18 +2382,153 @@ tooling, not a CI gate (the CI coverage job is `nightly.yml`'s, with its own gco
 invocation). Its behaviour (build-dir lock, inconclusive runs, DB-write handling, the
 Linux-only refusal, option and baseline validation) is pinned by the mock-based harness
 `tests/shell/test_pr2_gates.sh`. Preflight's "Shell gate tests" step runs the fast
-scenarios only, `CH-18 CH-20 CH-21 CH-22 CH-24` (about 25 s; bash, python3 with sqlite3, procps
-and findutils, all on the hosted image; the fixtures stub `ps`, `find` and `ln`). The
+scenarios only, `CH-6 CH-18 CH-20 CH-21 CH-22 CH-24 CH-25 CH-26` (bash, python3 with sqlite3, procps
+and findutils, all on the hosted image). CH-6/CH-25 check performance parser,
+requested-scale and evidence-write verdicts. CH-26 captures coverage at two real
+Git revisions and again at the same revision, retaining distinct evidence identities.
+The coverage fixtures stub disk space as well as `ps`, `find` and `ln`, so host capacity cannot change the expected result. The
 slow scenarios (`CH-19`, the process-tree kill, about 2.5 minutes; `CH-23`, signal bursts,
 about 35 s) and the rest of the harness are not in CI yet; wiring them into a nightly job,
 and hardening them for the shared-identity runner pools, is #6116.
+
+## Release build environment and provenance
+
+This states how a release is built today, as checked against `release.yml` on
+2026-11-17. It describes the pipeline; it is not a certification.
+
+**Owner role:** the release manager (the maintainer who cuts releases with the
+`/release` skill). Re-check this section against `release.yml` before each
+minor release, and in the same change as any edit to a release job's runner,
+cache or signing wiring.
+
+**Trigger.** `release.yml` runs on a `v*` tag push or a `workflow_dispatch` on
+a tag ref. Anyone with write access can push such a tag: the repository has
+branch rulesets for `dev` and `main` but no tag ruleset, and nothing checks
+that the tagged commit is on `main`. The `release-guard` job refuses a non-tag
+ref, a malformed tag and a tag that already has a published release
+(see [Release re-publish guard](#release-re-publish-guard-release-guard-5282)).
+
+**Where each job runs.**
+
+| Job | Runner |
+|---|---|
+| `release-guard`, `release` (assembles, checksums and signs the release), `docker-publish-agent-bundle` | GitHub-hosted `ubuntu-24.04` (fresh VM per job) |
+| `build-linux`, `build-gateway`, `docker-publish`, `docker-publish-postgres`, `docker-publish-chisel` | self-hosted `yuzu-bigtam-linux` (Big Tam) |
+| `build-windows` | self-hosted `yuzu-weetam-windows` (Wee Tam) |
+| `build-macos` | self-hosted `yuzu-bigmags-macos` (BigMags) |
+
+The self-hosted runners are persistent (not ephemeral or just-in-time; #1595
+tracks that for Windows) and are the same runner agents that run `ci.yml`,
+`nightly.yml`, `sanitizer-tests.yml` and `codeql.yml` (table below). `ci.yml`
+runs on every pull request to `dev` or `main` from a branch in this
+repository, so code from any write-access branch executes on the hosts that
+later build a release. On Big Tam and Wee Tam the four runner agents of a pool
+share one OS account. Fork pull requests do not run there unless a maintainer
+approves a revision through `trusted-fork-ci.yml`, which isolates its caches
+([Trusted fork pull-request CI](#trusted-fork-pull-request-ci)). The automated
+vcpkg baseline PR (branch `deps/vcpkg-baseline*`, opened by
+`vcpkg-baseline-update.yml`) does not run there either until a maintainer who
+is not its author, did not push its head and is on none of its commits has
+reviewed its upstream range and approved the PR at the head the CI run
+builds: until then `preflight-gate` fails, its self-hosted
+legs are skipped and `Preflight (runner health)` is red
+([Dependency updates](dependency-updates.md), "Self-hosted CI is held until a
+maintainer approves the head"). That limits when unreviewed upstream code reaches these
+hosts; it does not separate the caches below from release builds.
+
+**State that persists into a release build.** Release builds reuse local state
+left by earlier jobs on the same host; none of it comes from the GitHub
+Actions cache service.
+
+- ccache, on all three build platforms, in the same directory the CI jobs on
+  that runner use: per runner agent on Big Tam (each agent has its own
+  `HOME`, [`deploy/linux/`](../deploy/linux/README.md)), one machine-wide
+  `CCACHE_DIR` shared by all four agents on Wee Tam
+  ([`deploy/windows/`](../deploy/windows/README.md)), and the runner's
+  ccache on BigMags.
+- `build-linux` checks out with `clean: false` and deletes only `build-linux/`,
+  so `vcpkg_installed/` survives in the workspace between jobs (validated by
+  the [vcpkg sentinel](#universal-vcpkg-cache-key-contract)). `build-windows`
+  and `build-macos` check out clean and reinstall `vcpkg_installed/`, from
+  vcpkg's default binary cache for the runner account (Windows) or from
+  `runner.tool_cache/yuzu-vcpkg-binary-cache-macos`, which the `ci.yml` macOS
+  leg also fills (macOS).
+- The image jobs read and write a BuildKit layer cache under
+  `runner.tool_cache/yuzu-docker-buildcache/`. Base images are pinned by
+  digest.
+
+**Provenance and signing.**
+
+- Every build job runs `actions/attest-build-provenance` on its own artifacts,
+  inside the same job as the build steps, with `id-token: write` granted to
+  the whole job. The attested assets are the platform archives, the native
+  installers and the images; each attested archive and installer also ships
+  its provenance bundle as `<asset>.intoto.jsonl`. The SBOMs, `SHA256SUMS`
+  and the Compose Wizard zip are not attested; the signed `SHA256SUMS`
+  covers the SBOMs and the zip.
+- Every published image is cosign-signed keyless by digest and attested
+  (`push-to-registry: true`). BuildKit's own provenance is turned off
+  (`provenance: false`) in favour of those.
+- `SHA256SUMS` lists every asset, is cosign-signed keyless in the hosted
+  `release` job and is verified there against the exact tag-bound
+  `release.yml` identity before the release is created.
+- Per-platform and per-image CycloneDX and SPDX SBOMs are generated with syft.
+  The Windows agent payloads also carry Microsoft's Visual C++ runtime DLLs
+  app-local. Each Windows SBOM describes its own
+  artifact: the archive's SBOM is made from the unpacked archive, which holds
+  them in `bin`, and the installer's SBOM lists the files its ISCC manifest
+  names, at their build-directory paths (`msvc-runtime\...`). Syft's
+  cataloguer lists each DLL in the archive's SBOM as an application component named and versioned from
+  its version resource, with a CPE and no package URL (purl), possibly more
+  than once, so a purl-matching scanner does not see them (not yet inspected in
+  a release SBOM). Their authoritative version is the file version of the
+  Microsoft-signed DLLs in the shipped payload; the `build-windows` job's step
+  summary lists them for that run only
+  ([Windows agent runtime gates](#windows-agent-runtime-gates-build-windows-job-release-only)).
+- Authenticode and Apple signing and notarization run only when their
+  secrets are set, and skip silently otherwise. On 2026-11-17 none of
+  `WINDOWS_SIGNING_CERT`, `MACOS_SIGNING_CERT` or the notarization secrets
+  exist in the repository, so the Windows and macOS installers ship unsigned
+  (#239). Making a stable release refuse, rather than skip, unsigned
+  installers is planned but held until the secrets exist; update this bullet
+  when it lands.
+
+**SLSA Build level.** Provenance is generated and signed through GitHub's
+attestation service from the workflow's OIDC identity, and the build runs on
+CI infrastructure rather than a developer machine. That is roughly SLSA Build
+L2, and L2 is the most that should be claimed. The pipeline does not meet L3:
+the runners are persistent and shared with CI that runs code from any
+write-access branch; release builds consume caches (ccache, vcpkg, BuildKit,
+the Linux workspace) that those jobs can write; and the build steps run in
+the job that holds the OIDC token used to sign the provenance, so they could
+mint an attestation themselves. Reaching L3 means isolated ephemeral runners
+for release builds with no shared caches, and provenance generated outside
+the build job (for example a reusable workflow on GitHub-hosted runners).
+
+**Open gaps.** Disclosed here, not yet fixed, and each needs a tracking
+issue:
+
+- **No tag ruleset.** Anyone with write access can push a `v*` tag, which
+  starts `release.yml`, and nothing checks that the tagged commit is on
+  `main`.
+- **Release builds read caches that CI can write.** CI jobs from any
+  write-access branch fill ccache, the Linux workspace's `vcpkg_installed/`
+  and the vcpkg binary caches that release jobs on the same host then read
+  (the macOS binary cache is the same
+  `runner.tool_cache/yuzu-vcpkg-binary-cache-macos` directory in `ci.yml` and
+  `release.yml`). Only release jobs write the BuildKit layer cache through
+  BuildKit, but a CI job running as the same OS account (any job on the same
+  Big Tam or Wee Tam pool, or on the same runner agent) can write its
+  directory directly. The vcpkg baseline PR's approval gate narrows
+  one unattended route into these caches; it does not close the gap, which
+  needs release builds that start from no cache a CI job can write.
 
 ## Self-hosted runner topology
 
 | Runner | Host | Jobs |
 |---|---|---|
 | `yuzu-bigtam-linux-{0..3}` | Big Tam Threadripper 9970X, native Ubuntu **26.04** (gcc-15/clang-21) — 4 L3/CCD-pinned runners (`0-7,32-39`; `8-15,40-47`; `16-23,48-55`; `24-31,56-63`), Ninja capped at `-j16` | **all self-hosted Linux** (shared label `yuzu-bigtam-linux`): ci.yml `linux` matrix, `proto-compat`, sanitizer-tests (asan/tsan), nightly (asan/tsan/coverage), codeql Linux leg, **release.yml** (build-linux, build-gateway, docker-publish\*), cache-prune-linux. 4 runners on one host. Provisioned from [`deploy/linux/`](../deploy/linux/README.md). |
-| `yuzu-weetam-windows-{0..3}` | Wee Tam 9970X native Windows 11 — 4 CCD-pinned runners, shared label `yuzu-weetam-windows` | **all self-hosted Windows**: ci.yml `windows`, nightly `windows-asan`, codeql Windows leg, release `build-windows`, instructions-windows-validate, cache-prune-windows. Provisioned from [`deploy/windows/`](../deploy/windows/README.md). |
+| `yuzu-weetam-windows-{0..3}` | Wee Tam 9970X native Windows 11 — 4 CCD-pinned runners, shared label `yuzu-weetam-windows` | **all self-hosted Windows**: ci.yml `windows`, nightly `windows-asan`, codeql Windows leg (since ADR-0035 step 1 the Windows CodeQL row analyses the agent only; server code is CodeQL-scanned on Linux only), release `build-windows`, cache-prune-windows (the dispatch-only `instructions-windows-validate.yml` server smoke rig was deleted by ADR-0035 step 1). Provisioned from [`deploy/windows/`](../deploy/windows/README.md). |
 | `yuzu-bigmags-macos-{0,1}` | BigMags Mac Mini (Apple M4 Pro, 24 GiB, macOS 26) — 2 runners as headless LaunchDaemons, shared label `yuzu-bigmags-macos` | **self-hosted macOS**: ci.yml `macos` matrix + `release.yml` build-macos. Only pre-release `install-macos` stays GitHub-hosted (`macos-14`, an install-to-root smoke test). Release **signing/notarization is deferred** — macOS releases currently ship UNSIGNED (Phase B = on-token `rcodesign`). Provisioned from [`deploy/macos/`](../deploy/macos/README.md). |
 
 **Retired 2026-06-21** (removed from the inventory afterwards): `yuzu-wsl2-linux` (Shulgi WSL2 Ubuntu 24.04, label
@@ -949,7 +2539,8 @@ previously used the bare `[self-hosted, Linux, X64]` label, which Shulgi's WSL2
 runner also carried, so they could land there instead of on Big Tam. The runners
 were deregistered on the GitHub side on 2026-10-03 (per the repo admin). With the pin, `proto-compat` queues (it does not fail) while all four
 Big Tam slots are busy. When no Big Tam runner is online, the `preflight-gate` job
-fails (required pool `bigtam`) and `proto-compat` is skipped.
+fails (required pool `bigtam`) and `proto-compat` is skipped on a PR or push
+(on a Tier 2b dispatch it instead fails red on a hosted runner, see Tier 2b).
 
 ### Ubuntu 26.04 migration (Big Tam) — COMPLETE
 
@@ -989,18 +2580,40 @@ versioned source and verification commands are in
 
 ### Build speed (Big Tam)
 
-The `runner` user (shared `HOME=/home/runner` across r0–r3) is provisioned once
-for fast, download-free builds:
+All four runners run as the `runner` user, but each runner's `.env` sets its own
+`HOME` (`/home/runner/rN/home`, checked 2026-11-17), so jobs see a per-runner
+home directory. The user is provisioned once for fast, download-free builds:
 
-- **ccache** `max_size=50G`, compression on — the host default is 5 GiB, far too
-  small for ~700 TUs × variants. ci.yml/nightly cap at 30G via the
-  `CCACHE_MAXSIZE` env; release.yml now sets `CCACHE_MAXSIZE=30G` too (it had been
-  inheriting the host default).
+- **ccache**: one cache per runner, at `/home/runner/rN/home/.cache/ccache`
+  (with the per-runner `HOME` set, see
+  [`deploy/linux/`](../deploy/linux/README.md)). Every self-hosted job that runs
+  ccache sets `CCACHE_MAXSIZE=30G`, with compression on. ccache's built-in
+  default of 5 GiB is far too small for ~700 TUs × variants, and the
+  `max_size=50G` in `/home/runner/.config/ccache` is not read, because jobs
+  don't run with that home directory. **Every job on a pool must use the same
+  cap.** ccache trims the directory to the cap of whichever job is writing, so
+  one job with a smaller cap empties the cache the other jobs rely on. Until
+  2026-11-17, `codeql.yml` and `sanitizer-tests.yml` set 500M. Each daily CodeQL
+  trace cut its runner's cache to 2.8-5.2 GB (the trace's own `ccache -s`), from
+  the 18-30 GB the runner's previous CI job ended at, or 7.9 GB on a runner
+  trimmed the day before. After four of the five traces from 2026-11-12 to -16,
+  that runner's CI over the next 12 hours hit the cache 13-24 points less often
+  than the other three runners did, depending on where the window starts; the
+  fifth showed no gap. The windows hold 5-17 jobs and the comparison is
+  observational, so treat the size of the gap as an estimate; the trim itself is
+  not in doubt. `tests/test_ci_ccache_cap.py` now requires one cap per pool, and
+  the CodeQL-traced build runs with `CCACHE_DISABLE` (see the comment on that
+  step). At 30G a runner's cache sits at the cap and holds about two days of
+  objects (r3's cache on 2026-11-17: 4.4 GB dated 11-15 or earlier, the rest
+  11-16 and 11-17). Nothing measured shows that limit costing hits: r3, which no
+  trim reached in that window, ended every job at the cap and its hit rate
+  (79.1%) was close to the best of the others (73.8-79.8%). That does not show a
+  larger cap would not help.
 - **mold** linker (`apt install mold`), wired via `-fuse-ld=mold` in the gcc-15 /
   clang-21 native files — large cut in link time on the big `yuzu-server` /
   `yuzu-agent` binaries and the release LTO link.
-- **meson** 1.12.0 + the rest of `requirements-ci.txt` persist in the runner
-  user's `~/.local`, so the per-job `pip install --user --require-hashes` is a
+- **meson** 1.12.0 + the rest of `requirements-ci.txt` persist in each runner's
+  `~/.local`, so the per-job `pip install --user --require-hashes` is a
   no-op (no re-download).
 - **rpm** (rpmbuild) installed for release.yml's packaging step — absent on a
   fresh 26.04 (it was the first-Big-Tam-release blocker). Note: Big Tam ships RPM
@@ -1018,6 +2631,33 @@ user/system `%TEMP%` or the whole `D:\ci` tree. The pin wrapper routes native
 telemetry start step exports the same values for already-running listeners.
 
 ### Windows test-phase concurrency gate
+
+**Update (ADR-0035 ladder step 1).** The Windows leg is now agent-only: it
+configures agent-only (step 1 passed `-Dbuild_server=false`; since step 3 it passes nothing and the `server` option's `auto` is off on Windows) into `build-windows-agent-{debug,release}`
+and has one test step, `Test (non-pg suites)`, selecting `--suite agent --suite
+platform --suite proto --suite echo --suite gateway`. The `Ensure Postgres`,
+`Resolve pg_mode + assert Postgres DSN`, `Test (pg shards, full)` and `Test (pg
+smoke)` steps and the `yuzu_pg_canary.exe` libpq import check are gone, and so
+is the `pg_mode` key on the Windows matrix. The `with-test-slot.sh 2` gate, the
+30-minute slot timeout and the `assert-suite-cover.py` guard stay. The server
+`[pg]` measurements in this section (the c0/c2/c4 figures and Pushes 1–4) are
+kept as historical evidence for the Wee Tam box; they describe steps that no
+longer run. The build dirs were renamed so that a branch cut before this change
+(which still configures the server) and one cut after it never share a stored
+`build_server` value; the job deletes the old `build-windows-{debug,release}`
+dirs on every run, so an unrebased branch rebuilds cold (ccache-warm) until it
+is rebased onto `dev` (see `docs/ci-troubleshooting.md`).
+
+**Measuring the saving.** Baseline: the Windows MSVC debug job on `dev`
+pushes took 25.4–28.6 min wall time over 5 runs on 2026-11-10 (runs
+42908124262, 42902526001, 42895515198, 42879744786, 42865414562), of
+which `Test (pg shards, full)` was 14.3–17.0 min. Compare against the
+median wall time of 5 post-cutover warm runs of the same job, excluding
+each runner's first (cold) run after the cutover and any docs-only stub
+run. Record the cold-run wall time and the ccache hit rate separately
+(the MSVC `/Zi` hit rate is unverified). Leave the Windows job's
+`timeout-minutes: 120` unchanged until at least 10 post-cutover samples
+exist.
 
 Wee Tam's 4 runners are CCD-pinned, but affinity partitions only **cores** — not
 DRAM bandwidth, the disk, or the Defender minifilter. So when several Windows jobs
@@ -1042,16 +2682,17 @@ through two real widening rounds (k=4, then k=6 — see the Push 2 and
 Push 3 paragraphs below for the actual numbers); the slot count (2) has
 not moved.
 
-`ci.yml`'s Windows job now splits what used to be one combined `Test` step
-into `Test (non-pg suites)`, `Test (pg shards, full)`, and (release/push
-only) `Test (pg smoke)` — see "PG coverage by platform" below for the full
-shape. Each gated step still wraps the run in
+From #3443 (2026-08-28) until ADR-0035 ladder step 1, `ci.yml`'s Windows job
+split what used to be one combined `Test` step into `Test (non-pg suites)`,
+`Test (pg shards, full)`, and (release/push only) `Test (pg smoke)`; only the
+first remains. It wraps the run in
 [`scripts/ci/with-test-slot.sh`](../scripts/ci/with-test-slot.sh) — a crash-safe
 `flock` gate (a killed job releases its slot via OS fd-close, so a timeout never
 leaks a slot) that caps concurrent heavy test phases to **2 per box** (the
 **build** phase stays 4-wide). `Test (non-pg suites)` passes `--num-processes 4`
-(one consolidated invocation now covers what used to be five separate
-suites plus the four non-pg server shards). Since 2026-10-21 that
+(one consolidated invocation covered what used to be five separate
+suites plus the four non-pg server shards; since ADR-0035 step 1 it covers
+the five agent-side suites only). Since 2026-10-21 that
 invocation selects `--suite platform` instead of `--suite docs` (the
 `docs` suite is Linux-only, "Test suites by leg" below) and its
 `assert-suite-cover.py` guard names `--exclude-suite docs`, so a missed
@@ -1059,18 +2700,30 @@ label still fails loud.
 
 `Test (non-pg suites)` also carries the registry plugin's real-registry cases (#6488). It sets
 `YUZU_REQUIRE_WINDOWS_REGISTRY_TESTS=1`, so a case that would skip (no `registry.dll`, or a process that
-cannot write `HKLM`; the job runs as LOCAL SYSTEM, which can) fails instead. The job-level
+cannot write `HKLM`) fails instead. The flag is honoured by `test_registry_win_internals.cpp` and, for the Spark
+Registry `[7877]` cases (the HKCR pair, the link case, the deny-ACE cases, the deep-name case, the log-capture cases and the
+root-key case), by `test_spark_mechanism.cpp` through its `skip_or_fail_registry` helper; a leg whose token cannot write
+`HKLM\SOFTWARE\Classes`, create a registry link or set a DACL therefore FAILS those cases rather than skipping them. The one exception is the Echo bam live case (#6898): a runner account can be refused
+(error 5) creating its scratch keys under `HKLM\SYSTEM\CurrentControlSet\Services\bam` (measured on one test host as an elevated non-SYSTEM
+user: a key directly under `bam` was allowed, `bam\State\UserSettings` was refused; LOCAL SYSTEM could write both on that host; the Windows CI leg's own account is not LOCAL SYSTEM and was refused at `bam\State\UserSettings` in CI run 43294719354, #7637), and then
+the case SKIPs even with the flag set. The exclusion is proven live only where the account may write (e.g. a LOCAL SYSTEM
+host), so while the Windows runner's account stays refused CI does not run it (#7637; the missing test of the skip
+decision is #7638). Any other failure of that case still fails the job, including a refusal to open `bam\State` for reading, which has not been measured (#7637). The job-level
 `YUZU_TEST_REGISTRY_SCOPE` (`<run id>-<attempt>-<build type>`) puts every scratch key under
 `YuzuTest-<scope>-`, so two test phases sharing a box through the 2-slot gate judge only their own keys. The script
-scans only the direct children named `YuzuTest-*` of `HKLM\SOFTWARE`, its `Wow6432Node` and `HKCU\Software`; the
+scans only the direct children named `YuzuTest-*` of `HKLM\SOFTWARE`, its `Wow6432Node`, `HKCU\Software` and (for the
+#6898 Echo bam-exclusion live case) `HKLM\SYSTEM\CurrentControlSet\Services\bam` and its `State\UserSettings`; the
 local dispatcher's `Software\YuzuTest\RegistryPr17Ld_<salt>` keys (`test_registry_local_dispatcher.cpp:228,248`) are
 outside the scan.
-Before the suite, `Self-test the registry leftover check` plants a probe key under each root the script scans and proves both decisions of
+Before the suite, `Self-test the registry leftover check` plants a probe key under each root the script scans (except a `bam` root the runner account is refused at, below) and proves both decisions of
 `scripts/ci/check-registry-test-leftovers.ps1` (the probe's own scope: exit 1 with an `::error` naming it; any
-other scope: exit 0 with a `::warning`); after it, `Assert this job left no YuzuTest-* registry keys behind` runs
+other scope: exit 0 with a `::warning`). A probe under one of the two `bam` roots where the runner account is refused
+is replaced by a check that the script still lists that root, with a `::warning` that also names the runner's identity
+and says the bam live case is expected to skip; the three other roots always need a live probe. After the self-test,
+`Assert this job left no YuzuTest-* registry keys behind` runs
 the same script with the job's scope; a root it cannot list fails the step (a missing root is skipped). The
 could-not-list arm has no self-test of its own (accepted residual): a persistent listing failure is caught pre-suite,
-because the self-test's probes go unnamed. It reports and never deletes (a leftover can be a registry link, and a
+because the other-scope self-test arm expects exit 0 and a failed listing makes it exit 1. The check reports and never deletes (a leftover can be a registry link, and a
 tree delete follows links), so a key orphaned by a cancelled job stays as a warning in later jobs until a human
 removes it.
 
@@ -1078,6 +2731,63 @@ Removing a leftover is the job of whoever owns the runner. For each `YuzuTest-*`
 progress, open the key with `REG_OPTION_OPEN_LINK` and `DELETE` access, then call `NtDeleteKey` on that handle (a key
 with subkeys: delete them first, leaf first, the same way). Never use `Remove-Item -Recurse` or `RegDeleteTreeW`:
 both follow a registry link and can delete its target.
+
+The Echo bam live case (#6898) sets a deny-read DACL for Everyone on its scratch key under `bam\State\UserSettings`,
+so a leaf it left behind (a killed run) is expected to refuse `Get-Item`, `Remove-Item` and `reg delete`, which open the key for read
+first. The recipe above still applies: the deny covers read only, so open the key with `DELETE` access and call
+`NtDeleteKey`; its sibling directly under `bam` carries the default DACL.
+
+**Spark Linux Service case (`YUZU_REQUIRE_SPARK_DBUS_TESTS`, #5719 item 5; a Linux-leg concern, not part of the Windows test phase above).** The Linux Service case in
+`test_spark_mechanism.cpp` needs a `dbus-daemon` binary on `PATH` (it starts a private one on a per-process salted
+socket and drives a child process against it). Where the daemon is missing, or the socket path is too long for
+`sockaddr_un`, the case SKIPs; with `YUZU_REQUIRE_SPARK_DBUS_TESTS` set to anything non-empty other than `0` the same
+condition FAILs instead (the same contract as `YUZU_REQUIRE_WINDOWS_REGISTRY_TESTS` above). No workflow sets it
+today and no workflow installs `dbus-daemon`, so whether a leg runs the case depends on its runner image, and where
+the daemon is missing the case skips silently; installing the daemon and setting the variable on a leg that is
+meant to have it is tracked in #7901.
+
+**Leaked ETW sessions (#7175).** The echo plugin's registry source starts a system-wide real-time ETW session named
+`YuzuEchoRegistryEtw-<pid>` (`agents/plugins/echo/src/echo_registry_source.cpp`, the session-name function). A
+real-time session outlives its process until something stops it, so a test process that is killed (a meson timeout),
+crashes or is cancelled leaves its session running, and the four runner agents share one OS identity, so the leak is
+shared state. On 2026-11-05 `logman query -ets` on Wee Tam showed one such session for a dead pid while `echo unit
+tests` failed on every Windows run waiting for its own registry event (#7173, #7135); the leg passed in the two runs
+after the session was stopped by hand. Whether the leak is the cause is not established (35 of the 64 system sessions
+were in use, so the limit was not reached, and no mechanism by which a dead session starves a new one is known), so
+the guard is preventive and the root-cause question stays on #7135.
+The Windows job runs `scripts/ci/stop-dead-etw-sessions.ps1` three times, each step capped at 5 minutes: `Self-test
+the ETW leaked-session cleanup` before the suite (canned `logman` output with injected liveness and stop functions,
+plus one arm that runs the host `pwsh` as a short-lived child to prove the call timeout: it starts and stops no ETW
+session and writes plain `selftest note:` lines, never an annotation), `Stop ETW sessions leaked by dead Yuzu test
+processes (pre-test)` before `Test (non-pg suites)`, and a `(post-test)` run under `always()` after the registry
+leftover assertion, so a session leaked by this job's own killed or cancelled test process is stopped and logged
+against this job rather than the next one. Each real run logs the total session count (limit 64, `::warning` from 48)
+and the Yuzu count. It stops a session by exact name only when the name matches `^Yuzu[A-Za-z]*Etw-[0-9]+$`
+(case-sensitive) and its pid is not a running process, so a live job on another runner slot keeps its session and no
+system or Defender session is ever matched; a liveness probe that fails for any reason other than "no such process"
+counts as alive. The pid is checked a second time just before `logman stop`, which only guards against a flip between
+the two checks; the window is not closed, which is safe because a live owner's session always has a live pid. It never
+fails the job: a listing or stop error is a `::warning` and the script exits 0. Every `logman` call runs in a child
+process that is killed after 45 s, inside a 180 s budget for the whole run, so a wedged ETW service costs a step at
+most about three minutes and then warns; the 5-minute step cap is only a backstop. "Never fails" describes the
+script's own logic: the step envelope can still fail the job (`pwsh` missing, or a failed self-test arm, which is
+deliberate: a broken guard should be loud). A listing with fewer than 3 session rows (a healthy box lists its kernel
+loggers) is treated as not understood and stops nothing. A stop that fails is checked against a fresh listing, and a
+session that has gone (a concurrent job stopped it first) is logged as gone. A successful stop is also annotated as a
+`::warning`, deliberately, so a leak shows on the job, and each run appends its counts to the job summary. `logman` is
+run from the Windows system directory only: if it is not there, nothing is stopped. *Acceptance check, one-off:* in
+the first three Windows runs after this change merges, read the `ETW sessions (pre-test):` line (`N total (system
+limit 64), M Yuzu`). A green run whose log instead shows `could not list sessions`, `listing not understood`, `timed
+out` or `could not stop leaked ETW session` means the guard is not working there; those are warnings, not failures,
+and nothing pages anyone, so someone must look. Residuals: a pid reused by an unrelated live process keeps its session
+until that process exits (and a leak whose pid was reused persists until a check happens to find that pid free); a
+process killed after the post-test step leaves its session for the next job's pre-test step; output the parser does
+not understand (a non-English Windows) stops nothing and warns; a session name of about 39 characters or more would be
+undercounted in the total (the Yuzu names are about 30). A name outside `^Yuzu[A-Za-z]*Etw-[0-9]+$`, such as one with
+a digit before `Etw`, is left alone. If the guard is itself broken, recover by hand on the runner host: `logman query
+-ets`, then `logman stop <exact name> -ets` for a `Yuzu*Etw-<pid>` session whose pid is not running, with no job
+running on any of the four slots. `nightly.yml`'s `windows-asan` job runs only the `agent` suite, whose tests do not
+start the echo session, so it needs no such step.
 
 `nightly.yml`'s `windows-asan` job now joins this same `with-test-slot.sh 2`
 gate and carries `--timeout-multiplier 2` (#4018) — previously it ran
@@ -1164,7 +2874,8 @@ stopped rather than continuing to k=8; going wider buys no
 round-reduction here and only adds CCD-thread-contention risk on Wee
 Tam's fixed 16-thread envelope.
 
-**Push 4 (staged 2026-10-21, not yet applied).** The CI test-phase tuning PR
+**Push 4 (staged 2026-10-21, never applied; its pg-shards half is moot since
+ADR-0035 step 1 removed that step).** The CI test-phase tuning PR
 (#4884) lands as a push ladder (the table in "Staged widening — Linux" below)
 and its second push takes the Windows widths: `Test (pg shards, full)` 6 → 8
 and `Test (non-pg suites)` 4 → 6, each judged by the decision rule above.
@@ -1209,8 +2920,9 @@ cross-job contention explicitly unmeasured at merge time, and it turned out
 NOT to be a rare edge case: the post-split E/G pair was still measured at
 86–96% of that ceiling across several runs the same week `--num-processes 2`
 shipped, and a subsequent push to `dev` timed E out again at exactly 600.01s.
-The mechanism: a single push to `dev` launches its own 4-way Linux matrix
-(gcc-15/clang-21 × debug/release) **simultaneously**, saturating all 4 Big Tam
+The mechanism: a single push to `dev` launched its own 4-way Linux matrix
+(gcc-15/clang-21 × debug/release; since Tier 2b a `dev` push expands only the
+2 debug legs, a `main` push is still 4-way) **simultaneously**, saturating all 4 Big Tam
 runners by itself — so Big Tam was never suffering primarily from OTHER
 unrelated jobs the way Wee Tam does, but its OWN push-triggered matrix is
 enough on its own. A concurrently-queued PR's Linux job was directly observed
@@ -1234,13 +2946,16 @@ attributable error — the 90-minute budget also covers checkout/build time
 before Test starts, so a slow build can still leave less than 30 minutes of
 headroom when the wait begins. **Since the Windows CI test-phase-split PR
 (#3443, 2026-08-28), Windows pins this same `YUZU_TEST_SLOT_TIMEOUT_MIN: "30"`
-explicitly too** (on both of its two gated steps, "Test (non-pg suites)" and
-"Test (pg shards, full)") — not for the Linux `SLOT_DIR`/`SLOT_NAME` reason
+explicitly too** (then on both of its two gated steps, "Test (non-pg suites)"
+and "Test (pg shards, full)"; since ADR-0035 step 1 on the one remaining step,
+"Test (non-pg suites)") — not for the Linux `SLOT_DIR`/`SLOT_NAME` reason
 above (`RUNNER_TOOL_CACHE` IS box-wide on Wee Tam already), but because two
 slot acquisitions per Windows job at the script's 115-minute default could
 together exceed the job's own 120-minute budget — the identical
 "ambiguous kill vs. attributable error" reasoning, applied to a different
-constraint. This fix gates contention only *inside* a
+constraint. With one acquisition left, a 115-minute wait would still leave
+almost nothing of the 120-minute budget for checkout, build and the run, so
+the explicit 30 minutes stays. This fix gates contention only *inside* a
 job that already holds a runner — it does not address a job that cannot
 start at all because no runner is free; see "Cross-job — runner
 acquisition, a fourth layer" later in this section for that gap.
@@ -1295,7 +3010,10 @@ overwrites meson's single `testlog.junit.xml`, so only the pg-gated call's
 (last) per-suite telemetry survives the default import — and separately,
 `flake-retry.py` writes `meson-logs/flake-retry.json` unconditionally on every
 clean invocation, so a clean pg-shard pass can silently overwrite recovered-
-flake evidence the cheap-suite calls found earlier. And groups 1/2 now run
+flake evidence the cheap-suite calls found earlier. (Both telemetry losses are
+closed on Linux since 2026-11-10: each invocation has its own `--logbase` and
+all three are imported; see "Linux test step: concurrent non-pg and pg
+halves". Windows still has them.) And groups 1/2 now run
 entirely outside `with-test-slot.sh` — before this split, one gated invocation
 covered all 32 tests; up to 4 concurrent Linux jobs' cheap-suite phases can now
 overlap unrestrained. Judged low-risk (cheap suites measured ~1-2 min combined,
@@ -1440,14 +3158,35 @@ own cap, not an expected case: the degenerate figure applies only when every
 shard runs to 700s, and the makespan is lower whenever any shard finishes
 under its cap (the earlier "BEST and WORST makespan are the same number" holds
 only in that all-at-cap case). The expected case moves the other way, see the
-measured Windows run of the 16-shard layout below. On Windows the pg step runs
+measured Windows run of the 16-shard layout below. On Windows the pg step ran
 `--num-processes 6` (`ci.yml`, "Test (pg shards, full)" in the `windows`
-job), so 14 shards are ceil(14/6) = 3 rounds, 3 * 700 = 2100s = 35 minutes,
+job, until ADR-0035 step 1 removed it; the Windows arithmetic in the rest of
+this paragraph is historical, and the Windows job now pays at most one
+30-minute slot wait, for its single test step), so 14 shards were ceil(14/6) = 3 rounds, 3 * 700 = 2100s = 35 minutes,
 65 minutes with a 30-minute slot wait for the pg step alone. The job also
 acquires a slot for its non-pg step, so the worst case with both 30-minute
 waits is 95 minutes plus that step's own run time, still under that job's
-`timeout-minutes: 120`. At np=2 the Linux slot-wait case was the one that
-needed attention: the "revisit the 700s per-shard budget or the Linux
+`timeout-minutes: 120`. Since #7135 a hung agent shard C holds the step for up to
+480 s (was 240 s; shards A and B keep 240 s) and a hung echo entry up to 180 s (was
+90 s). Where `flake-retry.py` can start its enumeration re-run of the failed suite,
+an entry that hangs again on the re-run costs its limit twice before the job fails
+(nothing is masked): about 16 minutes for shard C on Linux (480 s twice), and about
+24 on macOS, where the first run uses `--timeout-multiplier 2` (960 s) and the re-run
+does not. On Windows the re-run has not produced a classification in any of the four
+logs read for this: in the one TIMEOUT log (run 41919798385 attempt 4) shard C's
+verdict `not a classifiable Catch2 run` arrived 0.4 s after its TIMEOUT line (echo's
+TIMEOUT line was two minutes earlier, and both verdicts print at the end of the
+run), and three runs with a plain echo exit-42 failure (42040619981, 42049202343,
+42056811785) gave the same verdict. That fits the open #6316 (flake-retry spawns the
+DLL-linked test binary without meson's `extra_paths`), so a hung entry on Windows
+costs its limit once: about 8 minutes for shard C, 3 for echo. It is an inference
+from those logs, not a guarantee; fixing #6316 would make it twice (16 minutes for
+shard C). The sanitizer and coverage legs call
+`meson test --timeout-multiplier 2` directly, with no re-run, so a hung shard C
+there costs 16 minutes. The 95 minutes above leaves 25 minutes inside
+`timeout-minutes: 120` for checkout, build and that step's own run time, so several
+hung entries are bounded by that job timeout, not by this arithmetic.
+At np=2 the Linux slot-wait case was the one that needed attention: the "revisit the 700s per-shard budget or the Linux
 `--num-processes 2` cap" follow-up tracked on #3443 (see the shard-K paragraph
 above) had a less severe trigger than at 16 shards (the all-at-cap ceiling alone
 fit the job limit, the ceiling plus a full slot wait did not). At np=4 (Push 2c)
@@ -1554,8 +3293,9 @@ now carries `suite: ['server', 'server-pg']`, so `ci.yml` selects the whole
 group with `--suite server-pg` instead of enumerating names, and a new
 `scripts/ci/check-pg-shard-partition.py` runs as its own meson test
 (`'server pg shard partition invariant'`, `suite: ['server', 'server-checks']`
-— the second label is what lets the Windows non-pg step's
-`assert-suite-cover.py` select it) that discovers
+— the second label let the Windows non-pg step's
+`assert-suite-cover.py` select it until ADR-0035 step 1 made that leg
+agent-only; Linux selects it by name) that discovers
 every `server-pg`-suite entry via `meson introspect --tests` and proves, via
 `--list-tests --reporter xml` against the real compiled binary, that every
 `[pg]`-tagged Catch2 case lands in exactly one shard — none lost, none
@@ -1575,20 +3315,26 @@ exactly, reusing one chokepoint instead of a second hand-rolled copy. See
 "Sharded 2026-07-13") for the full incident history this replaces.
 
 **PG push-leg policy — full on one leg, smoke elsewhere (#3443 Phase 2,
-2026-08-26; extended to Windows 2026-08-28):** Phase 1's load asymmetry
+2026-08-26; extended to Windows 2026-08-28; Linux-only again since ADR-0035
+ladder step 1, which removed the server suites from the Windows leg):** Phase 1's load asymmetry
 diagnosis (a `dev`/`main` push originally ran the full pg-shard suite on
 all 4 Linux legs, ~85% of each job's time, vs 2 Windows legs both running
 the same full set on their own 4-runner box) is cut by narrowing what the
 non-primary legs run on both platforms: Linux's 3 non-primary legs and
-Windows' release leg (push-only; PRs are debug-only, so only one Windows
-leg runs at all there) now run the `[pg-smoke]` subset instead. The Linux `matrix:` carries a
+Windows' release leg (a `main` push or the Tier 2b daily dispatch only; PRs
+and `dev` pushes are debug-only, so only one Windows leg runs there) now run
+the `[pg-smoke]` subset instead. The Linux `matrix:` carries a
 `pg_mode: full|smoke` key, added via `include:` on the existing
 compiler/build_type combinations — never a third axis (would double the
 matrix and break `max-parallel`'s 4-runner arithmetic) and never in the
 job `name:` (job names are the branch-protection ruleset's required-check
 contexts; `docs-required-checks` mirrors them). `full` resolves on
 gcc-15/debug only (every PR, plus that leg's push); the other three push
-legs (clang-21/debug, gcc-15/release, clang-21/release) resolve to `smoke`.
+legs (clang-21/debug, gcc-15/release, clang-21/release) resolve to `smoke`
+(the release legs run only on a `main` push or the Tier 2b dispatch). The
+`include:` list is conditional: on a `legs=release` dispatch it is the smoke
+default alone, because GitHub applies `include:` after `exclude:` and a static
+gcc-15/debug entry would re-add the excluded debug leg as a new combination.
 
 The smoke set is 11 hand-picked `[pg-smoke]`-tagged existing cases (no new
 test bodies) covering: libpq connection/RAII (`test_pg_raii.cpp`),
@@ -1684,8 +3430,8 @@ fix earlier in this section (`with-test-slot.sh`) gates contention only
 cannot START because no runner is free. That is a structurally lower-level
 gap than any of the three fixes above address, and the 35-minute-wait
 incident that paragraph cites is actually an instance of THIS gap, not one
-`with-test-slot.sh` closes: a `dev`/`main` push's own 4-way Linux matrix
-could claim all 4 Big Tam runners simultaneously, leaving nothing reserving
+`with-test-slot.sh` closes: a `main` push's (and, before Tier 2b, a `dev`
+push's) own 4-way Linux matrix could claim all 4 Big Tam runners simultaneously, leaving nothing reserving
 a runner for a concurrently-queued PR job. Fix: `ci.yml`'s Linux job's
 `strategy.max-parallel: 3` (3 at the time; 4 since 2026-10-21, see the update
 below) caps how many legs of that SAME matrix run
@@ -1705,7 +3451,7 @@ which needs direct access to the Big Tam box and is tracked as a follow-up
 on #3443, not done here.
 
 **Update 2026-10-21 — `max-parallel` 3 → 4.** The cap is now 4 (all four Big
-Tam runners): a `dev`/`main` push's 2x2 matrix runs in one wave instead of two,
+Tam runners): a `main` push's 2x2 matrix (a `dev` push's before Tier 2b) runs in one wave instead of two,
 which shortens the push's wall. The trade is the one named above, accepted by
 the owner: that push now claims every runner at once, so a concurrently-queued
 PR's Linux leg waits for a runner. `with-test-slot.sh 3` still caps the heavy
@@ -1761,7 +3507,7 @@ time. (Push 2c later widened it to 4 on its own axis; box-wide that is
 
 Not starvation-proof: `with-test-slot.sh` has no FIFO or PR-aware
 admission — a freed slot goes to whichever waiter's 5s poll tick happens
-to fire next, not to whichever waiter arrived first. If 3 dev-push legs
+to fire next, not to whichever waiter arrived first. If 3 push or dispatch legs
 hold all 3 slots, a 4th job still waits the full 30 minutes, same as
 before. Raising the count reduces how often that happens; it does not
 eliminate it. Also unenforced: `nightly.yml`'s and `sanitizer-tests.yml`'s
@@ -1836,6 +3582,209 @@ is still short, so the within-job cap ships first per this section's "one axis
 at a time" practice; #4580's outcome may argue for cross-job gating here too,
 once the actual mechanism is understood.
 
+### Linux test step: concurrent non-pg and pg halves (2026-11-10)
+
+The Linux job used to run three test steps one after another: `Test (non-pg
+suites)` (two `flake-retry.py` invocations, about 6.6 to 7 min), then either
+`Test (pg shards, full)` (about 10 min, `gcc-15`/`debug`) or `Test (pg smoke)`
+(the other push legs). They share nothing but the build directory, so they are
+now one step, `Test (non-pg + pg halves, concurrent)`, that starts two
+background halves and waits on both:
+
+| Half | What it runs | Slot gate |
+|---|---|---|
+| non-pg | `--num-processes 4` over `agent docs proto echo gateway platform`, then `--num-processes 2` over server shards A to D plus the four named checks (cheap first; the second does not start if the first fails) | none, as before |
+| pg, `pg_mode=full` | `--num-processes 4 --suite server-pg` | `with-test-slot.sh 3`, as before |
+| pg, `pg_mode=smoke` | `"server pg smoke"` by name | none, as before |
+
+Selections, widths, the slot gate and the `Resolve pg_mode + assert Postgres DSN`
+step are unchanged; the step also rejects a `pg_mode` other than `full` or
+`smoke`. Both halves always run to the end. Each half's output is printed, in
+one collapsed group, as soon as that half ends; a failing half gets an
+`::error::` line naming it just before its group, so a red non-pg half is
+visible while the pg half is still running. The step fails if either half exits
+non-zero, and prints both exit codes with each half's wall seconds (also written
+to the job summary as a "Linux test half" table).
+
+Running two `meson test` processes in one build directory needs four kinds of
+isolation, all in the step:
+
+1. **Log names.** Every invocation passes its own meson `--logbase`
+   (`testlog-nonpg-cheap`, `testlog-nonpg-server`, `testlog-pg`), so none
+   overwrites another's `testlog.{txt,json,junit.xml}`. `flake-retry.py` reads
+   the `--logbase` back from its passthrough arguments and uses it for the junit
+   it classifies, its retry report (`<logbase>-flake-retry.json`) and its
+   preserved enumeration junit and stale-file sweep
+   (`<logbase>-flake-retry-enum-*`). Without `--logbase` (Windows, macOS) every
+   path keeps its old name. `test-durations-summary.py` and the telemetry
+   finalizer (`ci-telemetry.py finish`, one `--logbase` per base) take the same
+   names. First thing in the step, before the `pg_mode` check and the
+   `meson-test-prereq` build, it deletes all three bases' files left by an
+   earlier run in the persistent build directory, and the legacy default
+   `testlog.{txt,json,junit.xml}` from before the per-invocation names, so an
+   invocation that never ran this time (or a step that failed before either half
+   started) cannot upload or import a stale file.
+2. **ninja.** `meson test` runs `ninja` before testing; two of those at once in
+   one build directory race on `.ninja_log`. The step builds
+   `meson-test-prereq` once, serially, and every invocation passes
+   `--no-rebuild`.
+3. **Job summary.** Each half writes its own summary file in `meson-logs/`;
+   each is appended to the job summary when its half ends.
+4. **Step log.** Each half's output goes to `meson-logs/ci-half-{nonpg,pg}.log`
+   and is printed when that half ends. A heartbeat prints each running half's
+   latest line every two minutes. Because the output is printed per half, the
+   runner's per-line timestamps show when a line was printed, not when the test
+   wrote it; use the times in the meson lines themselves. If the job times out or
+   is cancelled the logs are not printed, but the `meson-logs` artifact upload
+   (which runs on failure or cancel) carries them.
+
+**Cancel and timeout.** Each half runs in its own process group, so the
+runner's SIGINT/SIGTERM to the step's shell does not reach the halves on its
+own. The step traps both: it sends SIGTERM to the process group of each half
+that bash still tracks as a running job (`jobs -rp`; a PID already reaped is
+never signalled, since it may belong to another process by then), waits up to
+about 5 s for those groups to empty so `meson test` can stop its per-test
+sessions and write its logs before the upload and telemetry steps read them,
+then exits 1 whether or not they have. On a cancel the runner sends SIGINT and
+waits 7.5 s before SIGTERM, so the wait fits inside that grace. If the step's
+shell exits non-zero any other way while a half is running, an EXIT trap sends
+the same SIGTERM (without the wait). When a half ends, its process group is
+also sent SIGTERM, so children that outlive a half whose own shell was killed
+do not keep running. The runner's final SIGKILL cannot be trapped; if it lands
+first, the runner's end-of-job orphan sweep is what reaps the halves, and until
+then a pg half can still hold its `with-test-slot.sh` slot. All of this is
+exercised by `tests/shell/test_linux_concurrent_step.sh` against stubs.
+
+**Windows has nothing to run side by side.** When this change landed, the
+Windows job kept its separate `Test (non-pg suites)`, `Test (pg shards, full)`
+and `Test (pg smoke)` steps, sequential, because its widths were measured that
+way on a box (Wee Tam) this change had not measured. Since ADR-0035 ladder step
+1 the Windows leg is agent-only and has a single `Test (non-pg suites)` step, so
+there is no second half to overlap.
+
+**Kill switch.** Setting the repository variable `YUZU_CI_SEQUENTIAL_HALVES`
+to `1` makes the step run the non-pg half, then the pg half, and skip the pg
+half if the non-pg half failed: the old back-to-back behaviour, with the same
+log names and outputs. Set it under Settings, Secrets and variables, Actions,
+Variables tab, as a repository variable (not a secret). Only the exact value
+`1` enables it; any other non-empty value prints a `::warning::` and the halves
+stay concurrent. It is read when a job starts, so it applies to runs that start
+after it is set, not to runs already in progress. It needs no code change, so
+use it first; a revert of the change is the fallback.
+
+**Revert triggers.** Set `YUZU_CI_SEQUENTIAL_HALVES=1` on any of these on the
+`gcc-15`/`debug` leg after the change: a spark or guardian `spin_until` (or
+`ArmOutcomeKind`/`ReceiptStatus`) failure; a `blocked log sink SIGTERM
+harness` failure; a pg-shard TIMEOUT or repeated 560 s watchdog warnings; a
+non-pg entry passing 80% of its meson timeout. Each of these is a load
+symptom the non-pg width history and Push 2c already treat as revert-grade. A
+red that also occurs at a comparable rate with the switch set is recorded,
+not a reason to keep the switch on.
+
+**Slot-gate sizing.** `with-test-slot.sh 3` was sized for a slot holder that
+runs only pg shards. A job holding a slot now also runs up to 4 non-pg
+workers at the same time, so each slot carries more load than when the count
+was chosen. Nothing changes the count here; watch the triggers above, which
+are where the extra load would show.
+
+**Expected effect and measurement plan.** The saving applies to the
+`pg_mode=full` leg (`gcc-15`/`debug`) only: on the smoke legs the pg half takes
+seconds, so the step lasts about as long as the non-pg half, as before. On the
+full leg the step should last about as long as the longer half, the pg half.
+Both halves share the job's 16 CPUs (up to 4 non-pg workers: 4 for the cheap
+suites, 2 for the server-shard invocation; beside up to 4 pg shards), so the
+saving is an estimate until measured:
+
+- Baseline: the `gcc-15`/`debug` job wall time (`started_at` to
+  `completed_at`, jobs API) of the last 12 or more successful dev-push runs
+  before the change.
+- Candidate: two or more same-SHA runs of the change (the PR run plus a re-run).
+- Per entry: in each candidate, no entry of the non-pg half or pg shard
+  reaches 80% of its meson timeout, and no entry of 5 s or more takes more
+  than 1.5x its baseline mean. Each entry's baseline mean comes from the meson
+  lines in the step logs of those same 12 or more baseline runs. Read the
+  halves' wall seconds from the "Linux test half" summary table.
+- Acceptance: keep the concurrency only if the median candidate
+  `gcc-15`/`debug` job wall time is at least 10% below the baseline median (the
+  same ≥10% bar as the widening rule) and the per-entry checks hold; otherwise
+  set `YUZU_CI_SEQUENTIAL_HALVES=1`, record why here, and revisit.
+- Record the samples, run and job ids, SHAs, runner names and slot waits here.
+
+**Measured (2026-11-13), after the merge (#7460, merge commit `0f8a891fb2`, 2026-11-10).**
+The per-entry 1.5x check failed in 2 of the 10 candidate runs, and the median job wall
+time fell 35%, from 18.8 min to 12.2 min. The owner kept the concurrency (2026-11-13),
+accepting the misses as the cost of sharing the CPUs, not as a revert trigger. Both
+results are recorded below, so the next change to this step starts from them.
+
+- Samples. The candidate is the first 10 successful `dev`-push runs of the job after the
+  merge, not a same-SHA pair: the PR's own same-SHA samples are not recorded (not in the
+  PR, its ledger fragment or this doc). One run in that window (42913101361, 2026-11-10
+  22:17, 0.1 min) is excluded because its job skipped every step. The baseline is the 12
+  successful `dev`-push runs before the merge. All 22 ran on Big Tam
+  (`yuzu-bigtam-linux-0` to `-3`), and every `with-test-slot` acquisition in every run
+  waited 0 s.
+- Job wall time (jobs API, `started_at` to `completed_at`): baseline median 18.8 min
+  (range 17.6 to 24.8), candidate median 12.2 min (range 10.6 to 16.6), so 35% below the
+  baseline against the 10% bar.
+- 80% of timeout: no entry of either half reached it. The closest was
+  `gateway eunit shard A`, at 267 s of 600 s (45%); the slowest pg shard, A, reached
+  187 s of 700 s (27%).
+- 1.5x baseline mean (entries of 5 s or more): **failed in 2 of 10 runs**, by two pg
+  shards on the same two adjacent runs (2026-11-10 21:11 and 21:45): shard O at 79.9 s
+  and 82.9 s against a 48.0 s mean (1.73x worst), and shard E at 146.5 s and 147.9 s
+  against a 93.9 s mean (1.57x worst). In the other 8 runs no entry exceeded 1.5x; the
+  next-worst entries were pg shards G (1.49x) and D (1.47x).
+- What the misses show: the halves share the job's CPUs, and the pg shards pay for it. The
+  14 pg shards' serial time per run rose from a 1,482 s baseline mean to a 1,710 s
+  candidate median (+15%; per-run sums, mean of the 12 baseline runs against median of the
+  10 candidates), while the pg half still finishes in 448 s to 578 s. Not all of that rise
+  is contention: the shard definitions are unchanged across the window, but they select by
+  tag, and 117 files under `tests/unit/server/` changed between the first baseline and the
+  last candidate SHA, so the shards also gained tests. Neither half dominates: the non-pg
+  half took 471 s to 488 s in every run.
+- None of the revert triggers above fired in the 10 candidate runs: no meson test
+  failed (so nothing was retried as a flake), no entry raised the over-80%-of-timeout
+  warning, and no pg shard timed out. The triggers still apply unchanged; setting
+  `YUZU_CI_SEQUENTIAL_HALVES=1` on one of them is the way back, and the accepted 1.5x
+  misses are not one of them.
+- Per-entry values come from the meson summary lines in each job log (the `OK <secs>s`
+  column). Runs:
+
+Candidate (after the merge):
+
+| Run | Job | SHA | Runner | Job wall | Slot wait | non-pg / pg half |
+|---|---|---|---|---|---|---|
+| 42895515198 | 130107665542 | `0f8a891fb2` | `yuzu-bigtam-linux-0` | 16.5 min | 0 s | 476 s / 513 s |
+| 42902526001 | 130132146775 | `9d7ee88511` | `yuzu-bigtam-linux-3` | 14.9 min | 0 s | 484 s / 576 s |
+| 42908124262 | 130151599835 | `f4c2c95aa7` | `yuzu-bigtam-linux-2` | 12.4 min | 0 s | 480 s / 578 s |
+| 42991568006 | 130425661643 | `7e3e782456` | `yuzu-bigtam-linux-0` | 11.9 min | 0 s | 471 s / 449 s |
+| 43005450029 | 130471818809 | `43e65ea5e1` | `yuzu-bigtam-linux-0` | 10.6 min | 0 s | 471 s / 461 s |
+| 43008185580 | 130481028464 | `71519912c4` | `yuzu-bigtam-linux-1` | 11.2 min | 0 s | 483 s / 503 s |
+| 43011603201 | 130492527502 | `b357fe186e` | `yuzu-bigtam-linux-3` | 16.6 min | 0 s | 488 s / 542 s |
+| 43035122774 | 130572045791 | `dcd9a0a29e` | `yuzu-bigtam-linux-1` | 10.8 min | 0 s | 480 s / 448 s |
+| 43038808720 | 130584994620 | `5814e80383` | `yuzu-bigtam-linux-1` | 11.6 min | 0 s | 482 s / 522 s |
+| 43064481453 | 130675854942 | `7088f0cf2b` | `yuzu-bigtam-linux-0` | 13.4 min | 0 s | 481 s / 483 s |
+
+Baseline (before the merge):
+
+| Run | Job | SHA | Runner | Job wall | Slot wait |
+|---|---|---|---|---|---|
+| 42879744786 | 130052739576 | `cd163fe4dd` | `yuzu-bigtam-linux-3` | 18.6 min | 0 s |
+| 42865414562 | 130002550762 | `8846f70cfc` | `yuzu-bigtam-linux-1` | 17.6 min | 0 s |
+| 42832393723 | 129885791745 | `97122a2f26` | `yuzu-bigtam-linux-0` | 24.8 min | 0 s |
+| 42822889919 | 129852765513 | `1f2698663b` | `yuzu-bigtam-linux-1` | 19.4 min | 0 s |
+| 42816558875 | 129831141504 | `a7721dced7` | `yuzu-bigtam-linux-2` | 18.2 min | 0 s |
+| 42674958480 | 129353923619 | `f362bc7bb0` | `yuzu-bigtam-linux-1` | 19.0 min | 0 s |
+| 42658377286 | 129303139031 | `a11b1660d6` | `yuzu-bigtam-linux-3` | 17.7 min | 0 s |
+| 42640706924 | 129240990338 | `4482311586` | `yuzu-bigtam-linux-1` | 18.5 min | 0 s |
+| 42620776217 | 129172220558 | `dcadb36a85` | `yuzu-bigtam-linux-1` | 20.5 min | 0 s |
+| 42614415550 | 129150732618 | `29df02ac0b` | `yuzu-bigtam-linux-3` | 18.9 min | 0 s |
+| 42607751220 | 129128112839 | `6bb06db296` | `yuzu-bigtam-linux-1` | 19.3 min | 0 s |
+| 42593254595 | 129079839035 | `bc4296f651` | `yuzu-bigtam-linux-0` | 18.3 min | 0 s |
+
+This is a topology change; measure it on its own, as for the ladder below,
+before bundling it with a width push.
+
 ### Staged widening — Linux (2026-10-21)
 
 Until Push 2a (below), and for the pg-shards step until Push 2c, Linux ran
@@ -1860,7 +3809,8 @@ delta is attributable to one axis ("never bundled with a topology change"):
 | 2a | Linux np 2 → 4 on the cheap-suites invocation only (see Push 2a below) | width | | | | | | |
 | 2b | `gateway eunit` meson `priority: 120`, so it starts first in the cheap-suites invocation (see Push 2b below) | ordering | | | | | | |
 | 2c | Linux np 2 → 4 on the pg-shards step only (see Push 2c below) | width | | | | | | |
-| 2 | Linux np 2 → 4 on the server-shard invocation (not planned: that invocation is about 66 s of wall time, Push 2a, so there is little to gain); Windows pg 6 → 8, non-pg 4 → 6 (held) | width | | | | | | |
+| 2d | Gateway EUnit shards without cover, three shards, `gateway ct` `priority: 120` (see Push 2d below) | cost + ordering | | | | | | |
+| 2 | Linux np 2 → 4 on the server-shard invocation (not planned: that invocation is about 66 s of wall time, Push 2a, so there is little to gain); Windows pg 6 → 8 (moot: the step was removed by ADR-0035 step 1), non-pg 4 → 6 (held) | width | | | | | | |
 | 3 | tmpfs PGDATA, cap from the push-1 probe (see "Postgres for server tests") | storage | | | | | | |
 | 4 | Linux np 4 → 6, then stop | width | | | | | | |
 
@@ -1901,7 +3851,11 @@ triggers. A `priority:` on `gateway eunit` is a separate, later axis (Push 2b be
 - Find the job. After a re-run, `gh api repos/DevNullLtd/Yuzu/actions/runs/<run>/attempts/<n>/jobs`
   gives the new job id.
 - Step duration: `gh api repos/DevNullLtd/Yuzu/actions/jobs/<id>`, the step named
-  `Test (non-pg suites)` (`started_at`, `completed_at`).
+  `Test (non-pg suites)` (`started_at`, `completed_at`). Since 2026-11-10 that step
+  is the non-pg half of `Test (non-pg + pg halves, concurrent)` (section above),
+  so the jobs API no longer times it: read the half's wall seconds from the
+  step log line `non-pg half: exit N in Ss` or the job summary's "Linux test
+  half" table.
 - Per-entry times: `gh run view --repo DevNullLtd/Yuzu --job <id> --log`, then
   take the lines matching `[0-9]+/[0-9]+ .* - yuzu:` up to the first `Ok:` line
   (that is the first invocation, 105 entries today; the second prints `N/8`).
@@ -1910,8 +3864,16 @@ triggers. A `priority:` on `gateway eunit` is a separate, later axis (Push 2b be
   the `Ok:`, `Fail:` and `Skipped:` lines: Ok 100, Fail 0, Skipped 5 for the first
   invocation and Ok 8 for the second.
 - Timeouts are not in the log: read `timeout:` in `tests/meson.build`. The ones
-  that matter: agent shards 240 s, `blocked log sink SIGTERM harness` 300 s, echo
-  90 s, `gateway eunit` and `gateway ct` 600 s.
+  that matter: agent shard C 480 s (shards A and B 240 s), `blocked log sink
+  SIGTERM harness` 300 s, echo 180 s (`echo unit tests`; `echo fold sizing` and `echo v10 migration` are 300 s), `gateway eunit` and `gateway ct` 600 s. (Shard
+  C was 240 s until #7135, a deliberate, temporary raise: see the sizing comment in
+  `tests/meson.build`, and #7177 for the split that brings C back down. Echo was 90 s
+  and is now 180 s, which keeps its measured passing runs under 50% of the limit.
+  Every "of 240 s" sample below for shard C, every "of 90 s" sample for echo, and the
+  192 s and 72 s 80% thresholds for them in the decision rule are against those old
+  values; the current marks are 384 s for shard C and 144 s for echo, so while the
+  raise stands neither warns as early as it did. Shards A and B are unchanged at
+  240 s and a 192 s mark.)
 - Not usable: the step summaries are not exposed by the jobs API, the meson-logs
   artifact uploads only on failure, and the runner telemetry database does not
   carry these entries (the junit import runs once at job end and reads the last
@@ -1924,11 +3886,12 @@ triggers. A `priority:` on `gateway eunit` is a separate, later axis (Push 2b be
   and counts as a new sample.
 
 *Decision rule.* The one under "Windows test-phase concurrency gate" above,
-applied to this step: (a) the `Test (non-pg suites)` median improves by 10% or
+applied to this step (now the non-pg half, timed as above): (a) the `Test (non-pg suites)` median improves by 10% or
 more (about 40 s); (b) no entry of 5 s or more at np=2 takes more than 1.5x the
 mean of its two np=2 times (shorter entries have no stable ratio); (c) no entry
 reaches 80% of its own meson timeout (480 s for `gateway eunit` and `gateway ct`,
-240 s for the harness, 192 s for an agent shard, 72 s for echo); and the entry
+240 s for the harness, 192 s for agent shards A and B, 192 s for shard C before #7135
+and 384 s now, 72 s for echo before #7135 and 144 s now); and the entry
 count (105) and skip count (5) are unchanged. Revert at once on any of: a spark or
 guardian case failing (a `spin_until` that never resolves, an
 `ArmOutcomeKind`/`ReceiptStatus` mismatch), even if a manual re-run is green
@@ -1936,7 +3899,9 @@ guardian case failing (a `spin_until` that never resolves, an
 `blocked log sink SIGTERM harness` failing (it asserts a fixed 8 s exit after
 SIGTERM and is not scaled for load); a `gateway eunit` or `gateway ct` failure;
 any red cheap-suites invocation. To revert, set `--num-processes` on the first
-`flake-retry.py` call of the Linux job's `Test (non-pg suites)` step back to 2.
+`flake-retry.py` call of the Linux job's `Test (non-pg suites)` step back to 2
+(since 2026-11-10: the first call in `nonpg_half` of `Test (non-pg + pg halves,
+concurrent)`).
 Before the next rung, add a flake-rate check: two green samples cannot tell a 10%
 flake rate from none, so require 10 or more push runs on the leg with no
 non-timing red.
@@ -1946,11 +3911,12 @@ non-timing red.
 the BEAM are multi-threaded, so load follows threads, not entries. With four
 runner agents, Linux can now have 16 concurrent entries box-wide (up from 8). The
 Linux non-pg step has no `with-test-slot.sh` gate, whereas the Windows non-pg
-step runs a similar set (it adds the server non-pg entries and drops docs) at 4
-behind a slot of 2. Both boxes have 256 GB of RAM (owner-reported; the probe
+step runs the agent, platform, proto, echo and gateway suites (no server
+entries since ADR-0035 ladder step 1; no docs) at 4 behind a slot of 2. Both boxes have 256 GB of RAM (owner-reported; the probe
 measurement above is still pending) and no per-runner memory limit is documented.
 This was measured on one leg (`gcc-15`/`debug`) but ships on all four: the
-clang-21 and release legs run only on a push, where all four non-pg steps can
+clang-21 and release legs never run on a PR (clang-21 debug on any push; release
+on a `main` push or the Tier 2b dispatch), where up to four non-pg steps can
 overlap at four wide on the box, so the 10-push-run check above is the only
 coverage for them.
 
@@ -2094,7 +4060,8 @@ priority. Eunit's duration on the first nightlies after merge is still to be
 read (see above).
 
 **Push 2c (Linux pg-shards step only, `--num-processes 2 → 4`).** The width of the
-`Test (pg shards, full)` step; the slot count (3), the 14 shards, their priorities
+`Test (pg shards, full)` step (since 2026-11-10 the `pg_mode=full` branch of the pg
+half of `Test (non-pg + pg halves, concurrent)`); the slot count (3), the 14 shards, their priorities
 and timeouts, and the other invocations are unchanged. The step runs only on the
 `gcc-15`/`debug` leg (`pg_mode=full`), on PR runs and dev pushes; the other three
 Linux legs do not run it. The 14 shards of one job share that job's single
@@ -2221,7 +4188,10 @@ here (as Push 2a did) and (a) to (c) pass. After the merge 2c stays open until t
 next 10 or more dev-push `gcc-15`/`debug` runs show no pg-shard TIMEOUT, no
 repeated 560 s watchdog warning (two or more in the 10 runs, on one shard or
 scattered across several) and no red of the `Test (pg shards, full)` step itself
-(a red elsewhere in the run, such as the Windows legs, is not one). The np=2 red
+(a red elsewhere in the run, such as the Windows legs, is not one). Since
+2026-11-10 that step is the pg half of `Test (non-pg + pg halves, concurrent)`:
+read "red of the step" as the line `::error::pg half (pg_mode=full) failed`, not
+the step's own conclusion, which is also red when only the non-pg half fails. The np=2 red
 rate of that step is the control: 0 of the 20 dev-push runs from 2026-10-23 11:05Z
 to 2026-10-25 17:52Z (counted on 2026-10-25; the run before them had a cancelled
 step) had a red pg step. A red of the step that also occurs at np=2 at a
@@ -2321,7 +4291,193 @@ and 1.96 to 1.97 at np=2. Shard times show no change from the width beyond the
 about the 12-shard regime, which only the post-merge watch can reach. The
 max_connections and `pg_stat_activity` peak were not measured.
 
+**Push 2d (gateway EUnit shards without cover, three shards, `gateway ct` at
+`priority: 120`).** Three changes to the gateway entries of the Linux cheap-suites
+invocation, made together because each one alone leaves the gateway as that
+invocation's tail. (1) The EUnit shards run with the `test` profile's
+`cover_enabled` false (`gateway/eunit_shard.config.script`; a plain
+`rebar3 eunit --dir` and `gateway ct` keep cover). meck preserves cover data on
+every `meck:new`/`meck:unload` of a cover-compiled module, and the foreach
+fixtures pay that per test: the whole suite took 459 s with cover and 268 s
+without, the same 2807 tests passing, and nothing reads a shard's cover data.
+(2) Three shards instead of two, balanced by weights measured without cover
+(`scripts/gateway_eunit_shards.py`). (3) `gateway ct`, last to finish in all 22
+sampled runs because it had no priority and is defined after every `tests/`
+entry, gets the shards' `priority: 120`, so the four gateway entries start at t=0.
+
+*Baseline.* The concurrent-halves runs (2026-11-10 to -13): shard A 234 s to
+267 s, shard B 191 s to 214 s, `gateway ct` 124 s to 136 s, cheap-suites
+invocation 362 s to 375 s where the log carries per-line timestamps.
+*Expectation (an estimate).* A replay of a four-worker list scheduler in meson's
+priority order, which reproduces two observed baseline walls to within 3 s, gives
+269 s to 279 s with the shards at about 100 s and `gateway ct` at 130 s to 160 s,
+and 290 s to 302 s with the shards at 130 s; the invocation only gets longer than
+today if each shard runs past about 190 s. This takes the `gateway ct` half of the
+rung Push 2b named, at the shards' 120 rather than its own duration: ct is no
+longer the 37 s entry Push 2b measured but 124 s to 136 s under the concurrent
+halves, so it needs to start with the shards. Local runs, all four entries at
+once: 92 s to 100 s per shard on a quiet box, 131 s to 175 s under a load average
+of 20 to 60. The new tail is `blocked log sink SIGTERM harness` (59 s, no
+priority); a priority for it is the next rung. The non-pg half should fall from
+about 480 s to about 390 s to 400 s, which leaves the pg half the longer one.
+*Measurement and rule* are Push 2b's (two same-SHA samples, attempt-specific
+logs), judged on the cheap-suites invocation wall and the non-pg half's wall:
+(a) the invocation median improves by 10% or more; (b) no entry of 5 s or more
+other than the gateway entries takes more than 1.5x its baseline; (c) no entry
+reaches 80% of its own meson timeout, and the EUnit test count across the three
+shards equals a contemporaneous `dev` push's (2807 at the time of writing; a test
+module added to `dev` meanwhile would move it). Windows (Wee Tam) runs the same entries: its
+`agent tsan-heavy checkpoints` barrier (`is_parallel: false`) now waits for C and
+`gateway ct` as well as A and B, which should still be shorter than the two
+covered shards were, but is not measured; read its first runs. Unfiltered nightly
+runs now start `gateway ct` with the shards, after the pg shards. Faster code
+without cover can move a race: watch about five runs per leg for a gateway flake
+and name the module before any re-run. To revert, take the shards back to two in
+the root `meson.build` table, `REQUIRED` in `scripts/ci/assert-gateway-tests.py`
+and the names in `tests/test_gateway_test_summary.py` (and the shard count in
+`docs/erlang-gateway-build.md`, `docs/testing/integration-tests.md` and
+`docs/rhel9-build-setup.md`),
+delete the `NoCover` wrapper from the config script, and delete `gateway ct`'s
+priority; each of the three is separable.
+*Samples (measured, 2026-11-13 to -14).* Three same-SHA samples per leg on the
+PR #7703 head `f17fcc7c26`, run 43456524845 (Linux attempts 1, 2 and 4, jobs
+131992161922, 132062790009, 132464908320; Windows attempts 1, 3 and 5, jobs
+131992161930, 132075575242, 132467714240). Every gateway entry passed on its
+first attempt in all six.
+
+| Leg | Shard A (s) | Shard B (s) | Shard C (s) | `gateway ct` (s) | non-pg half (s) |
+|---|---|---|---|---|---|
+| Linux | 100, 98, 103 | 107, 103, 113 | 130, 127, 109 | 143, 145, 142 | 411, 401, 394 |
+| Windows | 154, 155, 154 | 149, 152, 145 | 170, 170, 165 | 48, 49, 48 | — |
+
+The cheap-suites invocation's wall is not printed on its own (the half's log is
+written at its end); taking the non-pg half less the server-shard invocation
+(about 95 s to 110 s at two workers, from its entries' durations) gives about
+290 s to 300 s in each Linux sample, against the 362 s to 375 s baseline: rule
+(a) holds (about 19%), and the non-pg half fell from about 480 s to 394 s to
+411 s. Rule (c): the longest shard is 130 s on Linux (22% of its 600 s meson
+timeout) and 170 s on Windows (31% of the wrapper's 540 s deadline). Not
+checked from CI: rule (b) entry by entry, and the EUnit test count (a green run
+uploads no test logs, and meson's summary shows each shard passing, not its
+count); the 2807 is from the local cover-off run. The Windows job took 7.6 to
+10.3 min; its barrier wait is not measured separately.
+
+### Contract migration evidence
+
+The Linux gcc-15 debug leg enables `build_contract_tests` in the dedicated
+`build-linux-contracts-gcc15-debug` directory and runs all six registered
+migration pilots after the regular suites, under the same three-slot
+Big Tam admission limit. PostgreSQL contracts use
+the job's test database; gateway and plugin contracts retain their native
+reports. The collector's default portable bundle is uploaded after success or
+failure with the GitHub run ID and attempt in its artifact name, retained for
+30 days. Raw local inputs are excluded from that upload. A failed contract
+fails the step; its evidence does not replace the regular suite verdicts.
+See `docs/testing/contract-evidence.md` for the obligations and bundle format.
+
+The step compiles the pilots' build targets (the union of `build_targets` in
+`tests/contracts/pilots.json`) at the leg's full `YUZU_BUILD_JOBS` width
+**before** it takes a slot, then runs the collector inside the slot; the
+collector's own `meson compile -j 2` finds nothing to do. Before this, that
+compile ran inside the slot at two jobs: across the 20 gcc-15 debug jobs of
+2026-11-15 and -16 the step took 6 to 50 min (slot wait included), and in one
+sampled run the build was 996 s and the six pilots ran in 26 s, all while
+holding one of the three slots the Linux test step also needs. A compile error
+in the precompile is a warning only: the collector repeats the build and
+records the failure in its evidence. A precompile that runs past the job's
+90-minute limit cancels the job, which uploads no bundle, as a slow collector
+build could before. The Configure step sets `CCACHE_NOHASHDIR=1` for this leg
+only: ccache otherwise hashes the working directory for a `-g` compile, so the
+contract build directory never reused the standard build's objects (the two
+directories' compile commands are identical). The cost is debug info only: an
+object's recorded compile directory may name the other build directory (each
+runner has its own cache, through its per-runner `HOME`, so never another
+runner's workspace), and nothing in
+this leg reads it. The step prints the precompile's wall time with its own
+ccache hit and miss counts (from a per-step stats log, since the cache's
+counters cover the whole job), and the collector's
+time including its slot wait. The contract build's compiles, previously ccache
+misses, now mostly hit, so the job's overall ccache hit rate is not comparable
+with earlier runs. Each runner compiles each source cold once under the new
+cache keys, in whichever directory compiles it first: the standard build is
+incremental, so on a runner whose standard build directory survived, the
+contract precompile pays it (on 2026-11-16, 393 s with 1% hits on linux-0's
+first run, then 5 s with 100%). Most sources are compiled with include paths that name the
+runner's own workspace, so the runners share few of these entries.
+
+The collector's build-directory lease is an OS lock (`flock`, or
+`msvcrt.locking` on Windows) on `.contract-evidence.lease` in the contract
+build directory, so it ends with the collector however the collector ends. The
+earlier lease was a directory, `.contract-evidence-lock`, which a cancelled job
+could leave behind in this uncleaned workspace; every later contract run on
+that runner then failed within seconds until a branch-switch wipe removed it
+(#7986). A leftover directory of that name is inert and can be deleted. A
+`BuildDirectoryBusy` now means a live collector holds the lease, and clears
+once it exits. When a run ends in ERROR, the step log prints the exception
+type, a fixed explanation for a known type, and which error fields the
+manifest recorded, for example `contract-evidence: ERROR (BuildDirectoryBusy:
+a live collector holds .contract-evidence.lease; retry after it exits);
+recorded: error; error text stays in the private capture`. The portable
+bundle carries the type and the field names, as `error_kind` and
+`error_fields`. The error text
+itself stays in the private capture on the runner, because it can carry
+values derived from the environment.
+
 ### Persistent runner-local test history
+
+The local `/test` recorder now uses schema v4. `test_gates` remains the latest
+observation for each run/gate, while `test_gate_attempts` appends every recorded
+write in the same transaction. An observation is not necessarily a fresh test
+execution: repeated reporting also creates an entry. `--latest` shows repeated
+gate history and JSON exports include `gate_attempts`. Migration preserves each
+surviving v3 gate with an unknown recording time; it cannot reconstruct results
+already overwritten by older clients.
+
+**Compatibility and rollback:** schema v4 is a one-way local test-history
+migration, not a product database migration. Older v3 recorders reject v4;
+older `/test` preflight checks fail, and nonblocking CI telemetry may warn and
+skip recording. Before the first upgrade, take a consistent SQLite backup
+(using SQLite's backup API or `.backup`, not a lone copy of a live WAL-mode
+file). When switching to an older checkout, set `YUZU_TEST_DB` to a separate
+v3 database. To restore pre-upgrade history instead, stop its writers, retain
+the v4 database and its logs separately, and restore the pre-upgrade backup;
+there is no in-place downgrade or automatic merge of later v4 observations.
+The newer recorder can still read and migrate the retained v3 history.
+
+Finalization keeps earlier gate FAIL/ABORTED/WARN evidence, treats unfinished gates or
+an empty run as ABORTED, and reports an all-skipped run as SKIP. An explicit
+`run-finish --status` can worsen the result but cannot improve it; its floor
+survives refinalization and late gate observations. A late observation reopens
+the run until it is finalized again. Manual run IDs keep their original source
+identity and start time; writes from another revision require a new run ID.
+An ABORTED observation remains ABORTED after a later PASS; an ordinary
+RUNNING → PASS transition completes the gate. For hand-run coverage captures,
+`bash scripts/test/coverage-gate.sh --capture-baselines` generates a fresh
+`manual-<UUID>` when `--run-id` is omitted. This preserves separate captures on
+the same revision as well as across revisions.
+The recorder still cannot detect a required gate that was never recorded: a
+declared execution plan is future work. Metrics/timings still replace values,
+and preserving a log path does not preserve overwritten log bytes.
+
+The gateway's Meson, local, `/test` and release EUnit entrypoints share strict
+summary grading: nonzero exits, cancellation, failed summaries and zero executed
+tests fail. The old `cancel-tolerant` CLI spelling remains a strict compatibility
+alias. The wrapper retains its deadline after output EOF and shares one budget
+across retries/backoff, leaving separate bounded cleanup headroom. This does not
+yet establish a complete per-case execution inventory.
+
+The Instructions gate requires terminal SUCCESS from every agent counted in an
+untargeted dispatch's `agents_reached`, reads response pages, validates command
+and agent identities, and rejects any failure or malformed/incomplete evidence. Rows the runner skips by name (`agent.http_client.get`/`head`, `crossplatform.echo.configure` and `windows.rdp.set_state` always; `network_actions.ping`/`flush_dns` when `YUZU_INSTRUCTIONS_SKIP_PRIVILEGED=1`) are never dispatched by this gate: they are skips, not passes, and the reasons are printed at the start and kept in each row's note.
+Earlier RUNNING chunks are allowed when that agent has terminal success. The
+opt-in destructive/forensic path retains its separate stricter grading. These
+checks establish reported execution success, not action-specific postconditions.
+
+The performance gate remains measure-only: thresholds are not enforced. A failed
+requested perf/scale process, missing metrics from either requested suite, or a
+failed evidence write cannot produce PASS. Workflow shell tests select actual
+YAML `jobs.*.steps` entries using the already-required PyYAML dependency; missing
+or ambiguous selectors and step-shaped text inside script literals are refused.
 
 Every self-hosted runner agent owns a separate `test-runs.db` outside its
 checkout. Big Tam stores it below that agent's registered tool cache at
@@ -2333,28 +4489,33 @@ deliberately per-agent rather than per-host: telemetry must not introduce a
 shared SQLite writer lock between the four jobs whose contention it measures.
 
 The Linux and Windows jobs in `ci.yml` call `scripts/ci/ci-telemetry.py` near
-job start and from an `always()` finalizer. Schema v3 records GitHub run attempt,
+job start and from an `always()` finalizer. Schema v4 retains the v3 GitHub run attempt,
 job/platform/runner, commit/branch/event, conclusion and wall time, ccache ratio,
 each Meson test entry's result/duration/timeout, and any listed flake recovered
 by `flake-retry`. A cancelled job normally finalizes as `cancelled`; a hard kill
 that prevents post-steps intentionally leaves an `in_progress` row, which is
 itself evidence of runner/job termination rather than a fabricated result.
 
-**Linux AND Windows gap, since the "Suite isolation" split above:** the
-finalizer imports one `meson-logs/testlog.junit.xml`, and both platforms'
-Test steps now run multiple separate `meson test` invocations against the
-same builddir (Linux: 3; Windows: always 2 — the non-pg step plus
+**Multi-invocation telemetry gap (Linux closed 2026-11-10; Windows closed by
+ADR-0035 ladder step 1), since the "Suite isolation" split above:** on Linux
+each invocation now has its own meson `--logbase` and the finalizer imports all
+three (`ci-telemetry.py finish --logbase ...`); the Windows leg is now
+agent-only with ONE test invocation, so its single `testlog.junit.xml` is the
+whole record. The rest of this paragraph is history for both. Before
+that, the finalizer imported one `meson-logs/testlog.junit.xml`, and both platforms'
+Test steps ran multiple separate `meson test` invocations against the
+same builddir (Linux: 3; Windows: then 2 — the non-pg step plus
 exactly one of pg-full/pg-smoke, `matrix.pg_mode` resolves to exactly
-one or the job fails loud earlier), each overwriting that file. Only
+one or the job failed loud earlier), each overwriting that file. Only
 the LAST invocation's per-suite `ci_test_suites` rows and any `flake-retry`
-recovery it reports survive — the earlier, cheaper invocation(s) still gate
-the job (their own exit code), but produce no queryable history via
+recovery it reported survived — the earlier, cheaper invocation(s) still gated
+the job (their own exit code), but produced no queryable history via
 `test-db-query.sh ci-suite-stats`/`ci-flakes` for this job. This was true
 for Linux from the original #3443 restructuring and became true for
 Windows too once this PR mirrored that shape — see the "Telemetry note"
-above for the Windows-specific ordering detail (pg runs last on both
-platforms, for the same reason). macOS remains genuinely unaffected — it
-never runs a `[pg]`-tagged suite (ADR-0035) and still has one invocation.
+above for the Windows-specific ordering detail (pg then ran last on both
+platforms, for the same reason). macOS was never affected — it never ran a
+`[pg]`-tagged suite (ADR-0035) and has one invocation.
 
 Provisioning is versioned in
 [`deploy/linux/Provision-BigTam-Runner-Telemetry.sh`](../deploy/linux/Provision-BigTam-Runner-Telemetry.sh)
@@ -2479,27 +4640,35 @@ Which contexts are required is a repository ruleset setting ("Protect Main",
 
 The meson `docs` suite is OS-independent (lexical gates, selftests, lint
 tests) and runs on the **Linux leg only**. Its "runs on every leg" premise was
-false at the test-file level: nine entries pin OS-specific behaviour inside the
-test file or script itself, not behind a meson guard. Those nine carry the
-`platform` suite instead, which every leg runs:
+false at the test-file level: platform entries pin OS-specific behaviour inside
+the test file or script itself, not behind a meson guard. Twelve entries now carry the
+`platform` suite instead, which every leg runs (except where an entry is not
+registered: since ADR-0035 ladder step 1 the Windows and macOS legs configure
+agent-only (the `server` option is off for a non-Linux target), so a `build_server`-gated entry runs on Linux only):
 
 | Entry | Why it is OS-contract |
 |---|---|
 | `gateway build wrapper` | the Windows-only taskkill case and win32 branches in `tests/test_build_gateway.py`; its POSIX stdio and Ctrl-C behaviour must also keep running on Linux |
 | `gateway OTP pin resolution` | pins the `erl.exe` resolution that `scripts/erlang_toolchain.py` branches on for win32 (`tests/test_erlang_toolchain_otp.py`) |
 | `instructions runner hardening` | `WindowsConsoleBreak` (win32) next to about two thousand lines of POSIX tests |
+| `gateway wrapper guard selftest` | exercises the real wrapper subprocess, native exit/status handling and diagnostic captures on each OS, including Windows pipe decoding |
+| `contract evidence selftest` | exercises subprocess deadlines, child cleanup and native-path evidence handling; Windows task-tree termination and POSIX signals need separate observations |
+| `local test runner platform selftest 1 of 3` to `3 of 3` | three shards of one case set (each runs every third case); drives bash with native fixture paths (MSYS2 `cygpath` on Windows), UTF-8 output and the per-OS supported target selection |
 | `windows sdk contract` | exercises the MSYS2 bash setup contract on win32 |
 | `Windows toolchain contract` | registered only where `pwsh` is installed (not the Linux image) |
 | `build_examples=false gating smoke test` | selects the per-OS vcpkg triplet with `uname -s` and configures a real build on each leg |
 | `start-UAT.sh kill_stale scoping (#5333)` | sources `scripts/start-UAT.sh`, the macOS/Linux rig with Darwin branches; registered off Windows, so it runs on Linux and macOS |
 | `capability matrix gate shell tests (#2204 F10)` | picks `.so`/`.dylib`/`.dll` and loads the real fixture plugins through `capmatrix-gen` on each leg |
-| `healthcheck CLI contract (#5906)` | a bash test that drives the real native `yuzu-server` binary (`.exe` probe, `MSYS2_ARG_CONV_EXCL`, `cygpath`); labelled `['server', 'platform']` |
+| `healthcheck CLI contract (#5906)` | a bash test that drives the real native `yuzu-server` binary (`.exe` probe, `MSYS2_ARG_CONV_EXCL`, `cygpath`); labelled `['server', 'platform']` (Linux only since ADR-0035 step 1; not registered when `build_server=false`) |
 
-Linux selects `--suite docs … --suite platform`; Windows selects `--suite platform`
-(not `docs`) with `--exclude-suite docs` on its coverage guard; macOS runs
-everything but `--no-suite docs`. The two dual-labelled node tests
-(`shell bell script behaviour`, `tokens page rotate behaviour`; `['server', 'docs']`)
-therefore no longer run on Windows or macOS, by intent.
+Linux selects `--suite docs … --suite platform`; Windows selects `--suite agent
+--suite platform --suite proto --suite echo --suite gateway` (not `docs`) with `--exclude-suite docs` on its coverage guard; macOS runs
+everything but `--no-suite docs`. The five dual-labelled node tests
+(`shell bell script behaviour`, `tokens page rotate behaviour`,
+`echo timeline script behaviour`, `mcp http adapter behaviour` and
+`swagger page behaviour`; `['server', 'docs']`)
+therefore no longer run on Windows or macOS, by intent. Like its siblings, the
+`mcp http adapter behaviour` test skips (exit 77) wherever `node` is absent.
 Before moving an entry, grep the docs-suite tests, Python and shell, for a
 Windows- or macOS-positive branch: `skipUnless(... win32`,
 `if sys.platform == "win32":` guarding assertions, a Python ternary on
@@ -2515,14 +4684,29 @@ excluded.
 
 ADR-0006 decision 8: every tier that runs the server **`[pg]`** suite gets a
 real PostgreSQL and exports `YUZU_TEST_POSTGRES_DSN`. The shipped substrate is
-**PostgreSQL 18** (`deploy/docker/Dockerfile.postgres`), and the Linux/docker +
-Windows legs test against it; the server SQL is version-agnostic (13+), so a
-runner-native cluster on an older major still exercises the suites correctly.
+**PostgreSQL 18** (`deploy/docker/Dockerfile.postgres`), and the Linux/docker
+legs test against it; the server SQL is version-agnostic (13+), so a
+runner-native cluster on an older major still exercises the suites correctly,
+except where a step sets `YUZU_TEST_PG_CLONE_STRATEGY` (the Linux test step's
+pg half does), which needs 15+.
 One script implements it everywhere — `scripts/ci/ensure-postgres.sh`, inserted
 as an `Ensure Postgres (server tests)` step between Build and Test in ci.yml
-(linux / windows) and nightly.yml (asan / tsan / coverage).
+(linux) and nightly.yml (asan / tsan / coverage).
 
-**macOS does NOT run the server `[pg]` suite (ADR-0035; #2394).** The Yuzu
+**Only Linux runs the server suites (ADR-0035 ladder step 1).** The Windows and
+macOS legs of `ci.yml` configure agent-only (`server` option `auto`, off on any
+non-Linux target), so they build no server code, register no server suite and need no Postgres; the Windows job no
+longer runs `Ensure Postgres`. Wee Tam's per-agent PostgreSQL services stay
+provisioned until ladder step 4 deprovisions them, and
+`deploy/windows/Assert-Toolchain.ps1` still health-checks them in the Windows
+job's `Assert toolchain manifest (self-hosted)` step, so a Wee Tam Postgres
+outage still fails the Windows leg although no step uses the database. The
+Windows-specific paragraphs below (path 1, the per-agent ports) describe that
+still-provisioned setup and the pre-step-1 CI use of it.
+
+**macOS does NOT run the server `[pg]` suite (ADR-0035; #2394).** Since ADR-0035
+step 1 it builds no server at all; the history below explains why the `[pg]`
+suite was dropped there first. The Yuzu
 server is a Linux-only component (macOS/Windows are agent-only platforms), and
 GHA-hosted macos-15 runs a *single* brew Postgres cluster. After the
 auth→Postgres migration (ADR-0006) roughly doubled the `[pg]` population to
@@ -2533,13 +4717,9 @@ hit their timeout). So the macOS leg deliberately **does not provision Postgres
 / export the DSN**: every `[pg]` server test then SKIPS (env-unset → skip, the
 same contract the Catch2 PG fixtures use), completing in milliseconds, while
 the non-PG server suite (`~[pg]`), the agent suite, and the Apple-Clang compile
-still run. Linux + Windows both run the full `[pg]` shard set (macOS runs
-none) — Windows additionally skips 44 migration-in-substance fresh-DB
-cases within that set (#2354, "PG coverage by platform" below); that is a
-narrower, Windows-specific exclusion, not a return to macOS's all-or-nothing
-skip. Re-enabling full macOS `[pg]` coverage requires first solving the
-single-cluster capacity problem (per-shard clusters or a cheaper per-test
-isolation model than database-per-test).
+still ran. At the time Linux + Windows both ran the full `[pg]` shard set
+(Windows additionally skipping 44 migration-in-substance fresh-DB cases,
+#2354, "PG coverage by platform" below); since ADR-0035 step 1 only Linux does.
 Resolution order inside the script:
 
 1. **Pre-set `YUZU_TEST_POSTGRES_DSN`** (runner-level env) — the escape
@@ -2590,6 +4770,45 @@ Resolution order inside the script:
    if the pg step's two samples show a gain; reverting is dropping the flag and
    bumping the label again. Docker Linux path only. Probe output and the
    decision: pending — filled by the push that applies or declines it.
+
+   **Clone-strategy knob (2026-11-10; measured and wired 2026-11-14).** Every
+   template-cloned `[pg]` case runs `CREATE DATABASE ... TEMPLATE ...`
+   (`PostgresTestDb`, `tests/unit/test_helpers.hpp`). Setting
+   `YUZU_TEST_PG_CLONE_STRATEGY` to `wal_log` or `file_copy` (any case) appends
+   `STRATEGY WAL_LOG` or `STRATEGY FILE_COPY` to that statement; unset leaves the
+   SQL unchanged (the server default, `WAL_LOG` on PostgreSQL 15+), and any other
+   value fails the fixture with a message naming the variable. Measured on Big
+   Tam in two runs of draft PR #7701, each running the `server-pg` suite four
+   times in one job (default, file_copy, file_copy, default) so that load drift
+   hits both strategies alike:
+
+   | Run | default (wall / serial) | file_copy (wall / serial) | default (wall / serial) |
+   |---|---|---|---|
+   | 1 | 751 s / 2633 s | 739 s / 2625 s, 711 s / 2499 s | 807 s / 2850 s |
+   | 2 | 927 s / 3303 s | 869 s / 3133 s, 870 s / 3136 s | not finished (step timeout) |
+
+   Every default pass was slower than both file_copy passes of its run: about
+   6-7% wall and 5-7% serial. Run 2 was on a busier box (all of its numbers
+   about 20% higher), so compare within a run, not across. Result: the Linux
+   test step's `pg_half` exports `YUZU_TEST_PG_CLONE_STRATEGY=file_copy` for
+   both `pg_mode`s (a value leaking in from the runner is warned about and
+   overridden; `tests/shell/test_linux_concurrent_step.sh` pins both). The
+   checkpoint `FILE_COPY` forces stays inside the job's own per-runner
+   Postgres container. No other workflow sets it. It needs PostgreSQL 15+ (every
+   Big Tam agent runs the pinned 18 image), and it is only a gain with
+   `fsync=off`, as `ensure-postgres.sh`'s Docker cluster runs: on that image a
+   25 MB template cloned in 44 ms against 65 ms (`WAL_LOG`) with fsync off, but
+   636 ms against 68 ms with fsync on. The pg half sets it whatever the
+   cluster, so a Linux runner whose pre-set DSN or native fallback reaches a
+   durable cluster would lose time instead (no Big Tam agent does). It moves the
+   pg step's baseline: pg-step samples for a later push (the tmpfs push, Push 3)
+   compare only against runs that include it, and samples taken before it (the
+   concurrent-halves runs, and #7703's Push 2d samples) do not. Revert:
+   `git revert -m 1` the merge commit of the PR that wired it. The
+   concurrent-halves kill switch (`YUZU_CI_SEQUENTIAL_HALVES=1`) does not undo
+   it: if a pg-half revert trigger persists with the switch set, revert this
+   next. Contract:
+   `docs/testing/unit-test-conventions.md`.
 3. **brew** (GHA-hosted macOS, no docker) — `postgresql@18` bottle +
    throwaway trust-auth cluster under `$RUNNER_TEMP` on
    `127.0.0.1:15432`.
@@ -2605,7 +4824,8 @@ Resolution order inside the script:
    Prefer the runner-level env override (path 1) if the box already runs
    Postgres with different credentials.
 
-   **Wee Tam (`yuzu-weetam-windows`) uses path 1, not path 4:** each runner
+   **Wee Tam (`yuzu-weetam-windows`) uses path 1, not path 4 (unused by CI
+   since ADR-0035 step 1):** each runner
    provides native PostgreSQL **18** services — agent 0's winget-installed
    `postgresql-x64-18-yuzu-ci` on `:5433` plus one initdb'd cluster per
    further agent (`postgresql-x64-18-yuzu-ci-<n>` on `:5433+<n>`, #2094) —
@@ -2617,12 +4837,12 @@ Resolution order inside the script:
    `yuzu-local-windows` box ran a PG 16 binaries-zip service on 5433 — see
    git history if that bootstrap pattern is ever needed again.)
 
-   Windows CI test-phase restructuring (#3443, 2026-08-28): `ci.yml`'s
-   Windows job runs the `Test (pg shards, full)` / `Test (pg smoke)`
-   split described in "PG coverage by platform" below, mirroring the
-   Linux job's `pg_mode` shape. Neither the ensure-postgres.sh mechanism
-   above nor the per-agent cluster topology changed — only which meson
-   suites a given job invocation selects.
+   From the Windows CI test-phase restructuring (#3443, 2026-08-28)
+   until ADR-0035 ladder step 1, `ci.yml`'s Windows job ran the
+   `Test (pg shards, full)` / `Test (pg smoke)` split, mirroring the
+   Linux job's `pg_mode` shape. Since step 1 no `ci.yml` job on Wee Tam
+   uses these clusters; they stay provisioned (and health-checked by
+   `Assert-Toolchain.ps1`) until ladder step 4.
 5. Nothing found → `::error`, exit 1.
 
 **Fatal on every non-success path since #1320 PR 1 (`SOFT_EXIT=1`):**
@@ -2641,8 +4861,9 @@ get the authenticated gate instead). Locally the tests still skip when
 `YUZU_TEST_POSTGRES_DSN` is unset; when it is set but unreachable they
 fail rather than skip.
 
-On the Windows pool (path 1, #3443 restructuring): `ci.yml`'s `Resolve
-pg_mode + assert Postgres DSN` step loud-fails (`::error`+`exit 1`,
+On the Windows pool, until ADR-0035 step 1 removed it (path 1, #3443
+restructuring), `ci.yml`'s `Resolve pg_mode + assert Postgres DSN` step
+loud-failed (the Linux job's step of the same name still does) (`::error`+`exit 1`,
 checked before any test invocation runs, not just the PG-tagged ones) on
 three separate conditions — `pg_mode` resolving to neither `full` nor
 `smoke`, `YUZU_TEST_POSTGRES_DSN` being unset/empty after Ensure Postgres,
@@ -2651,9 +4872,10 @@ does NOT check DSN *parseability* — a syntactically malformed but
 non-empty DSN clears this step and only fails later, at the first actual
 libpq connection attempt inside a PG-tagged test.
 
-**Connect cap on the Linux and Windows test legs.** The
-`Resolve pg_mode + assert Postgres DSN` step in each of those two jobs appends
-`PGCONNECT_TIMEOUT=30` to `$GITHUB_ENV`, so every connect libpq makes in the
+**Connect cap on the Linux test legs.** The
+`Resolve pg_mode + assert Postgres DSN` step in the Linux job appends
+`PGCONNECT_TIMEOUT=30` to `$GITHUB_ENV` (the Windows job did the same until
+ADR-0035 step 1 removed its Postgres steps), so every connect libpq makes in the
 later steps has a bound, including a connect to a backend that accepts the TCP
 connection and then never answers (libpq has no connect timeout by default).
 30 s is deliberately looser than `PgPool`'s own 10 s default: the pool lets the
@@ -2663,8 +4885,8 @@ in these steps the pool's connect bound is 30 s unless the DSN itself carries a
 must therefore put it in the DSN.
 A 10 s cap failed a fixture connect on a heavily loaded dev box, which is why
 the value is not 10. `scripts/ci/sweep-test-databases.sh` exports its own 10 s
-for itself. macOS is not given the variable: that leg exports no DSN, so no
-`[pg]` test connects. On POSIX the `[pg_reachability]` unit tests unset the
+for itself. Windows and macOS are not given the variable: those legs build no
+server and export no DSN, so no `[pg]` test connects. On POSIX the `[pg_reachability]` unit tests unset the
 variable for the duration of each case (`test_pg_reachability_probe.cpp`),
 because the probe lets it override the 3 s deadline those tests bound; the
 timing-sensitive cases are compiled out on Windows. A case that needs another
@@ -2675,22 +4897,22 @@ value sets it itself.
 | Platform | pg shards | Migration-DDL tests | Notes |
 |---|---|---|---|
 | Linux (gcc-15/debug, every PR + primary push) | full (14 shards) | run | ADR-0006 reference platform |
-| Linux (other push legs) | smoke (`[pg-smoke]`, 11 cases) | run | #3443 Phase 2 |
-| Windows (debug, every PR + push) | full (14 shards) | **skipped** (`YUZU_REQUIRE_PG_MIGRATION_DB`) | #2354; behaviour covered on Linux |
-| Windows (release, push only) | smoke | **skipped** (2 of the 11 smoke cases) | never runs on a PR |
-| macOS | none (ADR-0035) | n/a | server is Linux-only |
+| Linux (other legs: clang-21 debug on a push; release legs on a `main` push or Tier 2b dispatch) | smoke (`[pg-smoke]`, 11 cases) | run | #3443 Phase 2 |
+| Windows | none (ADR-0035: agent-only, `server` option off) | n/a | server is Linux-only |
+| macOS | none (ADR-0035: agent-only, `server` option off) | n/a | server is Linux-only |
 
-**#3508 (moving pg shards off Windows PRs entirely) is deliberately NOT
-adopted here** — Windows PR legs keep full `server-pg` coverage rather than
-dropping to `[pg-smoke]`. The Windows server still ships (ADR-0035 is
-`proposed`, not accepted, and `release.yml` signs `yuzu-server.exe` +
-builds `YuzuServerSetup`), and there is no agent<->server integration step
-in the Windows job that would make full pg coverage there redundant — the
-#3508 premise for narrowing Windows PR coverage does not hold today. This
-PR's non-pg/pg-shard split closes the time gap #3508 was trying to close
-by a different, more targeted route instead.
+Until ADR-0035 ladder step 1, Windows debug (every PR and push) ran the full
+14 shards and Windows release (a `main` push or a Tier 2b dispatch) the smoke
+subset, both with the migration-DDL tests skipped (next paragraph).
 
-44 migration-in-substance fresh-DB Postgres test sites (a real from-scratch
+**#3508 (moving pg shards off Windows PRs) is superseded.** It was
+deliberately not adopted while the Windows server still shipped and ADR-0035
+was `proposed`. ADR-0035 was accepted on 2026-11-10 (#7465) and step 1 goes
+further than #3508 asked: the Windows leg runs no server suite at all, on any
+event, so the `server-pg` shard set is Linux-only. (Since ladder step 2,
+`release.yml` builds neither `yuzu-server.exe` nor `YuzuServerSetup`.)
+
+**Historical (Windows, before ADR-0035 step 1):** 44 migration-in-substance fresh-DB Postgres test sites (a real from-scratch
 migration, `!is_open`-on-failure, backfill/upgrade, drift detection) SKIP
 on Windows via `YUZU_REQUIRE_PG_MIGRATION_DB` in `tests/unit/test_helpers.hpp`
 — each pays EXEC_BACKEND CreateProcess-per-connection plus the migration
@@ -2788,6 +5010,8 @@ sibling vcpkg tool root, owned by lukka/run-vcpkg), never
 (per-triplet, outside workspace). macOS joined this model with the BigMags
 cutover; its former `actions/cache@v5` round-trip was removed.
 
+**Install profile (ADR-0035 ladder step 3).** The key deliberately has no install-profile term. Every Windows and macOS workflow now installs an agent-only profile with no `server` feature (`--x-no-default-features`, plus `--x-feature=tests` where tests build; `release.yml` omits `tests`), so the persistent self-hosted tree (each Wee Tam runner keeps its own `vcpkg_installed/x64-windows` in its workspace, under its own work root, and the CI, nightly and CodeQL Windows jobs it picks up reuse it) is never reconciled between a full and an agent-only shape in steady state (when main and dev carry different `VCPKG_COMMIT` values the sentinel key changes and the tree is wiped and rebuilt instead). Linux legs install the full manifest; the Linux agent images use the agent-only profile in their own containers. A workflow that mixes profiles on one tree pays an incremental vcpkg reconcile on each switch (`docs/build-guide.md` "Dependency features"); do not add a second profile on Wee Tam without updating that section and the pins in `scripts/ci/test_runner_health_check.py`.
+
 The script must run cleanly under MSYS2 bash on Windows. **Do NOT use
 `set -e` + `[[ test ]] && cmd` short-circuits** — they silently exit under
 MSYS2 (cost us run #25051196135). Use `if/fi` blocks and explicit
@@ -2808,7 +5032,10 @@ sanctioned in-repo nuke path**; never `rm -rf` runner caches (memory
 
 ## Per-OS build directory names
 
-Matrix: `build-{linux,windows,macos}`. Nightly variants:
+Matrix: `build-{linux,windows,macos}`. `ci.yml`'s Windows job uses
+`build-windows-agent-{debug,release}` (agent-only since ADR-0035 step 1; the
+earlier `build-windows-{debug,release}` dirs are deleted on every run so a
+server-configured tree is never reused). Nightly variants:
 `build-linux-{asan,tsan,coverage}`. `sanitizer-tests.yml` + `release.yml` +
 `pre-release.yml` follow the same convention so the warm asan binary cache
 is shared. Closes #406.
@@ -2849,7 +5076,8 @@ combined with an OS. Expiry uses the UTC calendar date; the validator's clock is
 injectable for hermetic tests.
 
 The job summary + annotations remain the immediate signal. In addition,
-`flake-retry.py` writes `meson-logs/flake-retry.json`; the job finalizer imports
+`flake-retry.py` writes `meson-logs/flake-retry.json` (`<logbase>-flake-retry.json`
+when its meson arguments carry `--logbase`, as on Linux); the job finalizer imports
 recovered listed cases into the runner's `ci_flake_events` table alongside the
 suite timings. `tests/known-flaky.json` remains the reviewed source of truth —
 the database is observation history, never an implicit allowlist. This is
@@ -2858,19 +5086,25 @@ reversible test tooling — no ADR (rationale in the wrapper header).
 **Per-case duration summary (#4884).** The suite-budget table above is
 per meson entry. Next to it, `scripts/ci/test-durations-summary.py` appends a
 "Test durations — <label>" block to the job summary after each
-`flake-retry.py` invocation in the Linux (three), Windows (two) and macOS (one)
-Test steps: every entry's wall seconds, meson timeout and share of it, then the
-25 slowest Catch2 cases (entry, case, seconds, runs). The push-only `Test (pg smoke)`
-steps are deliberately not summarised: each runs one ~3 s entry. The case data is Catch2's
+`flake-retry.py` invocation in the Linux (three), Windows (one, since ADR-0035
+step 1) and macOS (one) Test steps: every entry's wall seconds, meson timeout and
+share of it, then the 25 slowest Catch2 cases (entry, case, seconds, runs). The
+non-PR pg smoke run (the Linux step's smoke branch; the Windows `Test (pg smoke)`
+step went with ADR-0035 step 1) is deliberately not summarised: it runs one ~3 s entry. The case data is Catch2's
 own `--durations=yes`, now on every Catch2 entry except the two pinned exemptions
-(the push-only pg smoke entry and the `[tsan-heavy]` checkpoints entry; the `=`
+(the non-PR pg smoke entry and the `[tsan-heavy]` checkpoints entry; the `=`
 form is required: a space would add a positional
 `yes` that `check-pg-shard-partition.py` rejects as a second spec). It is
-parsed from `meson-logs/testlog.json`, which meson overwrites on every
+parsed from `meson-logs/testlog.json` (on Linux `meson-logs/<logbase>.json`, via
+`--logbase`, because its invocations run concurrently), which meson overwrites on every
 invocation, hence one call per invocation rather than one at the end of the
-job (each step removes the file first, so a run that selects no tests warns and
-skips instead of re-reporting the previous log); on a red invocation `bash -e` stops before the summary and the uploaded
-`meson-logs` artifact carries `testlog.json` for running the script locally.
+job. The stale file is removed first, so a run that selects no tests warns and
+skips instead of re-reporting the previous log: on Windows and macOS each
+step removes `testlog.json` before its run; on Linux the step deletes every
+base's files once, up front, before either half starts. On a red invocation
+`bash -e` stops before the summary, and the uploaded `meson-logs` artifact
+carries the log for running the script locally (`testlog.json`; on Linux
+`<logbase>.json`).
 
 Catch2 prints a duration line at the end of every *section*, with the test
 case's own line last on each re-entry, so the script keeps a line only when its
@@ -2909,12 +5143,17 @@ one file is one PG-instance event, not a test bug.
 The agent suite's single `agent unit tests` entry (one serial Catch2 process,
 240 s budget) is three entries over the same `yuzu_agent_tests` binary:
 `agent unit tests shard A`, `shard B`, `shard C`, each `suite: ['agent',
-'agent-shard']`, one positional tag spec, `timeout: 240` (unchanged per shard,
-and conservative headroom rather than a measured need: the only measured
-contention figure is for the server `~[pg]` suite, 289 s with no other test
-phase running (c0) to 603 s with four overlapping (c4), about 2.1x, across jobs on
-the pre-#3443 combined step, per "Windows test-phase
-concurrency gate"; it has not been re-measured for the agent shards) and
+'agent-shard']`, one positional tag spec, a per-shard `timeout:` (A and B 240 s;
+C 480 s, raised from the old single entry's 240 s by #7135 as a deliberate,
+temporary exception to the 50% budget rule in `docs/testing/unit-test-conventions.md`,
+to come back down with the split tracked as #7177). #7135 measured shard C at
+185 s to 212 s as a pass on Windows MSVC debug (three of the 206 s to 212 s samples
+are from jobs that failed on the echo ETW case, not from green jobs) and at the old
+240 s limit once under load; the sizing comment beside the `timeout:` records the
+runs. The contention figure for the server `~[pg]` suite, 289 s with no other test
+phase running (c0) to 603 s with four overlapping (c4), about 2.1x, was measured on
+the pre-#3443 combined step; see "Windows test-phase concurrency gate". The entries
+also take
 `--allow-running-no-tests`. That flag is what stops the zero-match shard C from
 failing when `meson test --suite agent --test-args '[tag]'` appends a second
 positional spec. It does not make that a targeted run: Catch2 binds the extra
@@ -2928,7 +5167,9 @@ the 2026-10-04 re-balance; A's did not).
 Every CI leg selects the shards by `--suite agent` (ci.yml Linux step and Windows step,
 nightly.yml windows-asan) or runs `meson test` unfiltered (macOS, nightly and
 sanitizer legs); none selects the old entry name. `agent tsan-heavy checkpoints`
-is unsharded and unchanged.
+is unsharded and unchanged. `component_inventory windows host walk` (Windows only, suite `agent`,
+240 s) is a separate entry too: it runs the one hidden `[.][component_inventory_host_walk]` case, which
+walks the host's real Program Files twice (one walk per action, 45 s each at most) and has no room in a shard.
 
 Partition rule and measured balance live in the comment above the entries in
 `tests/meson.build`: a case runs in the lowest-numbered shard holding any of its
@@ -2943,7 +5184,8 @@ fails if a shard spec term does not end with that suffix (the meson
 `agent_shard_suffix` and the script literal are hand-synced), if a spec is not a
 shape flake-retry's isolated retry can strip, or if two shard entry names are
 equal or one contains another. It proves exactness, not balance: it prints per-shard case counts as an informational
-notice, and the drift signal is the 80%-of-budget table above. Per-entry history
+notice, and the drift signal is the 80%-of-budget table above (shard C's mark is 384 s while
+the #7135 raise stands, so it is a late warning until #7177 lands). Per-entry history
 in `test-runs.db` / `ci_test_suites` is keyed by entry name, so it restarts under
 the new names.
 
@@ -3021,11 +5263,44 @@ itself re-warm the new key.
 Deletes `${RUNNER_TOOL_CACHE}/yuzu-vcpkg-binary-cache-*/<file>` >30 days
 old. Does not touch ccache (own LRU at `CCACHE_MAXSIZE=30G`).
 Also sweeps the buildx local cache the chisel images write
-(`/mnt/d/docker-buildcache/*-chisel`, `mode=max` — several GB/arch, no
-built-in eviction); whole-`*-chisel`-dir mtime sweep >30 days, Linux only.
+(`$RUNNER_TOOL_CACHE/yuzu-docker-buildcache/*-chisel`, `mode=max` — several
+GB/arch, no built-in eviction); whole-`*-chisel`-dir mtime sweep >30 days, Linux
+only, each removal under an exclusive non-blocking `flock` on `<dir>.lock`, so a
+directory a publish job holds is skipped with a notice, never removed under it.
 Since #1367 the same run also executes `scripts/ci/sweep-test-databases.sh`
 on both boxes — the weekly out-of-band janitor for leaked `yuzu_test_*`
-databases (thresholds and semantics: "Test-database lifecycle" above).
+databases (thresholds and semantics: "Test-database lifecycle" above). It runs
+even when a prune step before it failed (`if: success() || failure()`).
+
+**Release buildx caches (WP15/S9).** The Big Tam publish jobs export
+`type=local,mode=max` caches to `$RUNNER_TOOL_CACHE/yuzu-docker-buildcache/<image>`
+(`server`, `gateway`, `postgres`, `<image>-chisel`); an export never deletes
+superseded blobs, so `scripts/ci/prune-buildcache.py` removes the blobs no cache
+index references. Each Big Tam runner has its own tool cache
+(`/srv/ci/work-N/_tool`) and all four run as one OS identity, so the weekly job,
+which lands on one runner, prunes all four runners' caches every week. In use is
+decided by a lock, not the clock: each publish job holds a shared `flock` on
+`<dir>.lock` from before its first build until the job ends
+(`scripts/ci/buildcache-lock.sh`), and the prune takes it exclusively without
+waiting and skips a directory in use; a publish job waits up to 30 minutes for a
+prune holding it. As defence in depth the prune also skips a directory written
+in the last 3 hours, removes only unreferenced regular files older than 24
+hours, removes a BROKEN directory (unparseable index, or an index naming a
+missing blob, which would fail its next import) whole so the next build runs
+cold, and refuses a symlinked directory or lock. A directory it cannot read is
+an error: reported, left untouched, and the step exits 1 after the last
+directory. So is a directory holding a file dated more than an hour in the
+future (a clock or file time that would otherwise keep the 3-hour window open
+for ever), and one holding a blob that starts like JSON but is over the 64 MiB
+read cap (read as a layer, its references would be lost and blobs a manifest
+needs removed). Its clock-guard disposition is in `docs/clock-guarded-retention.md`.
+
+**A corrupted release cache** (a publish build failing to import its cache with
+`NotFound content`, or a prune error naming a directory): on the runner that ran
+the leg, delete `/srv/ci/work-N/_tool/yuzu-docker-buildcache/<image>` (leave
+`<image>.lock`; check no publish job is running on that runner), then "Re-run
+failed jobs": that build runs cold (the C++ images take the longest). The weekly
+prune removes a broken directory itself the next Sunday.
 
 ## Chiselled demo images + agent bundle (release-time)
 
@@ -3040,10 +5315,17 @@ a stale build instead of queueing behind it, and a 120-min timeout. Since
 failed or cancelled chisel leg skips the release.
 
 `docker-publish-agent-bundle` runs **after** `release` (it repackages the
-release's own signed agent archives) on a GitHub-hosted runner — no
-compilation, so no self-hosted dependency — and cosign-signs + SBOMs +
-attests the pushed `yuzu-agent-bundle-chisel` image like the other publish
-jobs.
+release's own agent archives, after verifying the release `SHA256SUMS` cosign signature) on a GitHub-hosted runner — no
+compilation, so no self-hosted dependency — builds the image without pushing,
+runs the release image vulnerability gate on it, pushes it, and cosign-signs +
+SBOMs + attests the pushed `yuzu-agent-bundle-chisel` image like the other
+publish jobs.
+
+Each chiselled rootfs is cut with `base-files_chisel` and then given a dpkg `status.d` record per
+package by `deploy/docker/chisel-emit-status.py` (see "Release image vulnerability gate"), so the
+scanners and the published SBOMs list the cut OS packages at package granularity. The script and
+the cut run in one retried step, and the bundle's build context carries the script
+(`scripts/build-agent-bundle.sh` stages it).
 
 ## vcpkg state corruption — recovery path
 

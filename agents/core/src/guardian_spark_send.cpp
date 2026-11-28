@@ -1,6 +1,7 @@
 #include "guardian_spark_send.hpp"
 
 #include "guardian_drift_event.hpp" // apply_drift_to_event (shared with the legacy path)
+#include "guardian_emit_seq.hpp"    // stamp_emit_pair (UP-14)
 
 #include <nlohmann/json.hpp>
 
@@ -38,6 +39,11 @@ void set_common(gpb::GuaranteedStateEvent& ev, const OutboxEntry& e, std::string
     ev.mutable_timestamp()->set_seconds(secs);
     ev.mutable_timestamp()->set_nanos(static_cast<std::int32_t>(nanos));
     ev.set_platform(std::string(platform));
+    // UP-14: the (boot_epoch, emit_seq) ordering pair, both-or-neither. Driven ONLY by the
+    // entry's own boot_epoch/seq: the runtime leaves boot_epoch 0 on journal-paged entries, so
+    // replays carry no pair. Deliberately NOT keyed on journal_batch_key, which
+    // backfill_batch_provenance also sets on LIVE entries.
+    stamp_emit_pair(ev, e.boot_epoch, e.seq);
 }
 
 } // namespace

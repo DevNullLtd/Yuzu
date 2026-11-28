@@ -17,6 +17,7 @@
                          // CaRoutes::PublishCrlFn below) — reused verbatim by issue_code_signing_cert
                          // rather than re-declared, so the two error-prefix constants stay one copy.
 #include "ca_store.hpp"
+#include "instruction_execute.hpp" // #2146: Ports for execute_instruction_definition
 #include "command_capability.hpp" // #3685: CommandCapability / ClassificationError — ClassifyFn's return type
 #include "config_write.hpp" // config::Backing: get/set_runtime_config's backing pointers
 #include "dispatch_caller.hpp" // PLAN-006: DispatchCaller — the principal threaded to dispatch_fn
@@ -29,7 +30,11 @@
 #include "file_retrieval_routes.hpp"
 #include "dex_perf_model.hpp"
 #include "discovered_devices_model.hpp" // list_discovered_devices read seam (DiscoveredDevicesReadFn)
+#include "software_collection_settings_api.hpp" // the four collection-settings tools: the shared REST body
+#include "software_list_model.hpp"    // query_installed_software + query_software_components: the shared lookup core
+#include "software_read_api.hpp"       // the five installed-software v3 read tools: the shared REST body
 #include "software_sync_runner.hpp"      // sync_hardware_software: the shared fleet-run (Runner)
+#include "software_sync_status.hpp"      // get_software_sync_status: the shared status function
 #include "network_api.hpp" // ADR-0031 WS-A4: the public in-process /network API seam
 #include "verify_api.hpp" // ADR-0031 WS-A4 #4250: the public in-process VERIFY API seam
 #include "dex_api.hpp"    // ADR-0031 WS-A4 (fifth family): the public in-process DEX signals API seam
@@ -39,11 +44,14 @@
 #include "compliance_api.hpp" // ADR-0031 WS-A4: the public in-process compliance/policy API seam
 #include "device_api.hpp" // ADR-0031 WS-A4 wave 2: the public in-process DEVICE API seam
 #include "network_perf_model.hpp"
+#include "event_emit.hpp"        // EmitEventFn: legacy-equivalent events for the execution twins
+#include "execution_mutation.hpp" // cancel_execution/record_execution_rerun test seam type
 #include "execution_tracker.hpp"
 #include "execution_statistics_model.hpp" // #2146 Batch B3: shared REST+MCP statistics builders
 #include "fleet_topology_store.hpp" // #2146 Batch B3: FleetTopologyStore + merge_offline_topology
 #include "offline_endpoint_store.hpp" // #2146 Batch B3: OfflineEndpoint -- see set_viz_deps below
 #include "guaranteed_state_store.hpp"
+#include "instruction_referrers.hpp" // DefinitionReferrersFn
 #include "instruction_store.hpp"
 #include "inventory_store.hpp"
 #include "kek_routes.hpp" // KekOps / KekOpResult (#2395 track C): reused, not redefined
@@ -72,6 +80,7 @@
 #include "workflow_api.hpp" // ADR-0031 WS-A4 (eighth family): the public in-process workflow-read API seam
 #include "guardian_api.hpp" // ADR-0031 WS-A4 (ninth family): the public in-process Guardian-read API seam
 #include "workflow_engine.hpp" // still needed for the WorkflowEngine* build_handler param -- see set_workflow_api's doc comment
+#include "workflow_run_port.hpp" // WorkflowRunFn: the run port set_workflow_run_fn takes
 // #4027: DeviceRow (via device_routes.hpp) + EchoRetentionPausedScan/
 // EchoPausedSourceRow + the echo_*_json pure builders the read-twin MCP tools
 // share with their REST siblings (api-twin-recipe.md Rule 1).
@@ -99,6 +108,8 @@ class MetricsRegistry; // optional bundle-metrics sink (yuzu_bundle_*)
 namespace yuzu::server {
 class HttpRouteSink; // #2542 PR-6: register_routes(HttpRouteSink&, ...) overload
 class SoftwareInventoryStore; // typed daily-sync software store (ADR-0016)
+class SoftwareLifecycleStore; // SAM-29: lifecycle-rule twins (list/import/delete_software_lifecycle_rules)
+class ProductRegistryStore;  // SAM-29: normalisation curation twins
 class SoftwareLicensingStore; // ADR-0024 discovery store (query_software_licenses)
 class AppUsageStore; // wave 7 PR7.2 app-usage projection (get_agent_app_usage)
 // EnginePrincipalStore backs BOTH the PR 4.2 role-assignment MCP twins
@@ -169,6 +180,12 @@ namespace yuzu::server::detail {
 class AgentRegistry;
 } // namespace yuzu::server::detail
 
+// ADR-0070 R1: the revocation-source seam behind the six *_revocation_source* tools
+// (revocation_source_service.hpp). Pointer-only here; the .cpp includes the definition.
+namespace yuzu::server::revocation_source {
+class RevocationSourceService;
+} // namespace yuzu::server::revocation_source
+
 namespace yuzu::server::mcp {
 
 // Progress bridge core (track 2f PR 3a). Forward-declared (pointer-only here,
@@ -200,6 +217,11 @@ public:
     /// (sorted) plus a count; all are logged individually.
     McpServer();
 
+    /// Resolves the request's session, or writes the refusal response and returns nullopt.
+    /// The PRODUCTION hook MUST be built with `mcp::make_admission_auth_fn`
+    /// (mcp_admission.hpp) so /mcp/v1/ refuses empty-tier credentials on every verb (#4309);
+    /// a harness that passes a bare resolver lacks that rule (McpTestServer deliberately does,
+    /// so the per-tool tier guards stay testable as defence in depth).
     using AuthFn =
         std::function<std::optional<auth::Session>(const httplib::Request&, httplib::Response&)>;
     using PermFn =
@@ -479,6 +501,14 @@ public:
     /// immediately above (the handler's `[=]` lambda captures `this`, so the
     /// injection is a live read on the next request).
     void set_authorize_dispatch_fn(AuthorizeDispatchFn fn) { authorize_dispatch_fn_ = std::move(fn); }
+    /// #2146: the shared pipeline's ports for `execute_instruction_definition`
+    /// (instruction_execute.hpp). server.cpp builds them with `instruction_execute::make_ports`
+    /// from the SAME stores, dispatch closure and authorizer the REST twin uses. Left unset,
+    /// every seam is empty and the tool FAILS CLOSED (definition store unavailable) rather than
+    /// running anything. Same setter idiom as `set_capability_classify_fn`.
+    void set_instruction_execute_ports(instruction_execute::Ports ports) {
+        instr_exec_ports_ = std::move(ports);
+    }
 
     /// Progress bridge (2f PR 3a). Same setter idiom + lifetime argument as
     /// set_engine_principal_store above (the handler's `[=]` lambda captures
@@ -512,6 +542,32 @@ public:
     /// (api-parity rows get.api-config, put.api-config-param). Same objects the config routes
     /// hold. Unset (all nullptr, the default) => both tools answer "unavailable".
     void set_runtime_config_backing(config::Backing backing) { runtime_config_ = backing; }
+
+    /// TEST SEAM for cancel_execution / record_execution_rerun. Production leaves this unset and
+    /// the tools bind `make_tracker_mutation_ports(execution_tracker)`; a test with no Postgres
+    /// installs fake ports. An unwired set is ignored, never used as "no store".
+    void set_execution_mutation_ports_for_test(ExecutionMutationPorts ports) {
+        execution_mutation_ports_for_test_ = std::move(ports);
+    }
+
+    /// The platform event emitter (`ServerImpl::emit_event`) for the tools whose LEGACY siblings
+    /// publish an event: cancel_execution -> `execution.completed`, record_execution_rerun ->
+    /// `execution.created`, execute_instruction_definition -> `approval.created` /
+    /// `instruction.executed`. Best effort, after the effect; unset = no event. MUST be called
+    /// before the server starts listening.
+    void set_emit_event_fn(EmitEventFn fn) { emit_event_fn_ = std::move(fn); }
+    /// What still references a definition (UP-6): `delete_definition` refuses a referenced one.
+    /// Unset or failing is a retryable store fault and nothing is deleted. Same instance as the
+    /// v1 DELETE twin's `RouteDeps::referrers_fn`.
+    void set_definition_referrers_fn(DefinitionReferrersFn fn) {
+        definition_referrers_fn_ = std::move(fn);
+    }
+
+    /// The advisory pack lookup (M2-3): `delete_definition`'s success row notes `packs=<ids>`.
+    /// Unset or failing = no note. Same instance as the v1 DELETE twin's `pack_advisory_fn`.
+    void set_definition_pack_advisory_fn(DefinitionPackAdvisoryFn fn) {
+        definition_pack_advisory_fn_ = std::move(fn);
+    }
 
     /// ADR-0031 operator surface (PR1.6c) — upload-grant store + the
     /// ADR-0017 list-admit resolver for list_upload_grants, backing
@@ -696,11 +752,59 @@ public:
     void set_guardian_push_fn(GuardianPushFn fn) { guardian_push_fn_ = std::move(fn); }
 
     /// The fleet "Sync now" run behind `sync_hardware_software` - the SAME instance
-    /// `POST /api/v1/hardware/sync` uses, so the per-operator cooldown and the single in-flight
-    /// slot bind both surfaces. Wired once before register_routes (permanent when unset).
+    /// `POST /api/v1/hardware/sync` uses, so the run keys, the cooldown window and the pacing
+    /// budget bind both surfaces. Wired once before register_routes (permanent when unset).
     void set_software_sync_runner(std::shared_ptr<software_sync::Runner> runner) {
         software_sync_runner_ = std::move(runner);
     }
+
+    /// The lookup reads behind query_installed_software and query_software_components: ONE
+    /// software_list::bind_lookup_reads over the SAME store and the SAME device-table roster the
+    /// REST lookup routes bind, so the two surfaces answer from one core (lookup_installs /
+    /// lookup_components). Unset = both tools answer "Software inventory store unavailable".
+    void set_software_lookup_reads(software_list::LookupReads reads) {
+        software_lookup_reads_ = std::move(reads);
+    }
+
+    /// The tracker read and the unfiltered-Execution:Execute answer behind get_software_sync_status:
+    /// the SAME two closures `GET /api/v1/hardware/sync/{execution_id}` is given. Wired once
+    /// before register_routes (permanent when unset): an unset read answers an internal error with
+    /// no retry hint (never an empty result); an unset unfiltered fn means nobody is unfiltered
+    /// (a caller reads only the runs it started).
+    void set_software_sync_status_fns(software_sync::StatusReadFn read,
+                                      software_sync::UnfilteredFn unfiltered) {
+        software_sync_status_fn_ = std::move(read);
+        software_sync_unfiltered_fn_ = std::move(unfiltered);
+    }
+
+    /// The installed-software v3 read context behind list_software_hosts, get_software_host,
+    /// list_software_changes, get_software_summary and get_software_plugin_health: the SAME
+    /// software_read_api::Ctx construction the REST SoftwareReadRoutes get (the store reads, the
+    /// roster and the fleet snapshot), so the two surfaces answer from one body. Unset = those
+    /// tools answer "unavailable" (a build without the software inventory store).
+    void set_software_read_ctx(software_read_api::Ctx ctx) { software_read_ctx_ = std::move(ctx); }
+
+    /// The collection-settings stores behind the four *_software_collection_settings tools (the
+    /// SAME instances SoftwareCollectionSettingsRoutes borrows) and the RBAC-unavailable-aware
+    /// permission probe (AuthRoutes::probe_permission_unavailable_aware) the per-group read and the
+    /// write decide authority from. Unset = those tools answer "unavailable"; an unset probe fails
+    /// the per-group read and the write closed.
+    void set_collection_settings_deps(software_collection_settings_api::Stores stores,
+                                      PermFn probe_perm_fn) {
+        collection_settings_stores_ = stores;
+        collection_settings_probe_perm_fn_ = std::move(probe_perm_fn);
+    }
+
+    /// The lifecycle rule store behind list/import/delete_software_lifecycle_rules: the SAME
+    /// instance SoftwareLifecycleRoutes borrows. Wired once at construction; unset = those tools
+    /// answer an internal error with no retry hint.
+    void set_software_lifecycle_store(SoftwareLifecycleStore* store) { software_lifecycle_store_ = store; }
+
+    /// The product registry behind get_software_normalization_status, list_software_curation_queue,
+    /// curate_software_alias, reject_software_curation and replace_software_normalization_pack: the
+    /// SAME instance SoftwareCurationRoutes borrows. Wired once at construction; unset = those tools
+    /// answer an internal error with no retry hint.
+    void set_product_registry_store(ProductRegistryStore* store) { product_registry_store_ = store; }
 
     /// #4143 review fix (external colleague review, BLOCKING, confirmed against
     /// ADR-0017 INV-4/INV-7 by direct source inspection): `list_echo_process_
@@ -711,9 +815,9 @@ public:
     /// member) could see an incomplete or empty list despite being admitted
     /// (INV-4/INV-7 violation, not a merely-conservative narrowing). Fixed:
     /// both tools now read this UNFILTERED registry snapshot — the SAME
-    /// zero-arg source `list_agents`' own `agents_fn` and REST's
+    /// zero-arg source `list_agents`' own `DeviceApi` and REST's
     /// `GET /api/v1/devices` (#4033) use (`registry_.to_json_obj()`) — with
-    /// `gate.scope` as the SOLE filter. `list_agents`' unscoped `agents_fn` was
+    /// `gate.scope` as the SOLE filter. `list_agents`' unscoped `DeviceApi` read was
     /// never the gap: `require_fleet_read`'s `gate.scope` is the actual
     /// authorization boundary in that pattern, applied after the unfiltered
     /// read, exactly as here.
@@ -820,6 +924,73 @@ public:
     /// `!workflow_engine` guard's behaviour exactly.
     void set_workflow_api(std::shared_ptr<const WorkflowApi> a) { workflow_api_ = std::move(a); }
 
+    /// ADR-1007 per-device concurrency variant of `DispatchFn` (REST's `WorkflowRoutes::
+    /// ConcurrencyDispatchFn`, same shape), used ONLY by `execute_workflow` so a workflow step
+    /// honours its instruction's `concurrency_mode` exactly as the REST twin does. Unset (the
+    /// default, and every harness that does not wire it) means `execute_workflow` dispatches each
+    /// step through the plain `DispatchFn` with no concurrency claim: the pre-ADR-1007 behaviour
+    /// `execute_instruction` still has. server.cpp wires the identical closure the REST route gets.
+    using ConcurrencyDispatchFn = std::function<yuzu::server::ConfinedDispatchOutcome(
+        const std::string& plugin, const std::string& action,
+        const std::vector<std::string>& agent_ids, const std::string& scope_expr,
+        const std::unordered_map<std::string, std::string>& parameters,
+        const std::string& execution_id, const yuzu::server::DispatchCaller& caller,
+        const std::string& definition_id, const std::string& concurrency_mode)>;
+    void set_workflow_concurrency_dispatch_fn(ConcurrencyDispatchFn fn) {
+        workflow_concurrency_dispatch_fn_ = std::move(fn);
+    }
+
+    /// The run port `execute_workflow` starts a run through (`workflow_run_port.hpp`); server.cpp
+    /// wires the identical closure the REST route gets. Unset (the default) means
+    /// `execute_workflow` answers "workflow engine not available" and dispatches nothing.
+    void set_workflow_run_fn(WorkflowRunFn fn) { workflow_run_fn_ = std::move(fn); }
+
+    /// The idempotency pre-check `execute_workflow` asks beside the run port; server.cpp wires the
+    /// identical function the REST route gets. Unset means a keyed call (every MCP call is keyed)
+    /// answers "workflow engine not available".
+    void set_workflow_idempotency_lookup_fn(WorkflowIdempotencyLookupFn fn) {
+        workflow_idempotency_lookup_fn_ = std::move(fn);
+    }
+
+    /// True while the server is draining. `execute_workflow` refuses a new run then
+    /// (`StreamBudget::try_acquire` does not consult its own closing flag). Unset (the default)
+    /// is never draining: a harness that does not wire it. server.cpp wires `draining_`.
+    void set_draining_fn(std::function<bool()> fn) { draining_fn_ = std::move(fn); }
+
+    /// The typed per-device scoped gate: the SAME body as `ScopedPermFn` (server.cpp wires the one
+    /// `scoped_gate_fn` lambda it hands the REST routes), returning the refusal class instead of a
+    /// bool. `get_device_live` uses it at its #7110 re-decision only, to tell a withdrawn
+    /// permission from a gate that could not read its authority (a store degrade, which is
+    /// retryable and is not a revocation). Unset (a harness that does not wire it) = the re-decision
+    /// fails closed: `get_device_live` answers a retryable `gate_unreadable` and sends nothing.
+    using ScopedGateFn = std::function<ScopedGateOutcome(
+        const httplib::Request&, httplib::Response&, const std::string& securable_type,
+        const std::string& operation, const std::string& agent_id)>;
+    void set_scoped_gate_fn(ScopedGateFn fn) { scoped_gate_fn_ = std::move(fn); }
+
+    /// The wait before the single retry of an indeterminate per-step credential check in an
+    /// `execute_workflow` run. Unset (the production default) is `kReauthorizeRetryDelay`; set
+    /// only by a test that drives the indeterminate path.
+    void set_workflow_reauthorize_retry_delay(std::chrono::milliseconds d) {
+        workflow_reauthorize_retry_delay_ = d;
+    }
+
+    /// The per-step credential check of an `execute_workflow` run, asked against the principal
+    /// and the request of THAT call. Separate from the `StreamRevalidateFn` that `build_handler`
+    /// takes for the GET stream pump, which may answer from the token and engine caches: a run
+    /// asks at a step boundary, so server.cpp wires the authoritative question here. Unset is
+    /// "no per-step check" (a harness that does not wire it); there is no fallback to the
+    /// stream function, so a missing wire cannot quietly turn into the cached question.
+    void set_workflow_revalidate_fn(StreamRevalidateFn fn) {
+        workflow_revalidate_fn_ = std::move(fn);
+    }
+
+    /// The digest `execute_workflow` binds a ticket's step effects with. Unset (the production
+    /// default) is `sha256_hex`; set only by a test that drives the fail-closed refusal.
+    void set_workflow_digest_fn(std::function<std::optional<std::string>(std::string_view)> fn) {
+        workflow_digest_fn_ = std::move(fn);
+    }
+
     /// ADR-0031 WS-A4 (ninth family): the SAME in-process Guardian-read API
     /// seam the REST `GET /api/v1/guaranteed-state/*` handlers use —
     /// server.cpp wires the IDENTICAL instance so the eight Guardian read
@@ -864,13 +1035,19 @@ public:
         const httplib::Request&, crypto_widgets::WidgetGate, const std::string& securable_type,
         const std::string& operation)>;
     void set_crypto_access_fn(CryptoAccessFn fn) { crypto_access_fn_ = std::move(fn); }
+    /// ADR-0070 R1: the revocation-source seam the six `*_revocation_source*` tools call - the
+    /// SAME instance the REST routes use. Borrowed; null = unwired (the tools answer an internal
+    /// error, never an empty result).
+    void set_revocation_source_service(::yuzu::server::revocation_source::RevocationSourceService* s) {
+        revocation_source_service_ = s;
+    }
 
     /// B4 (#2146 API-parity): mirrors `RestApiV1::LockoutClearFn` (rest_api_v1.hpp)
     /// so the MCP `unlock_account` tool clears an account's lockout counter
     /// exactly as the REST `POST /api/v1/users/{name}/unlock` handler does,
     /// without pulling in rest_api_v1.hpp for one nested type (same mirror-not-
     /// reuse discipline as `PublishCrlFn` below, which mirrors `CaRoutes::
-    /// PublishCrlFn`). Wraps `AuthDB::clear_failed_logins`. Returns true when
+    /// PublishCrlFn`). Wraps `AuthDB::clear_account_lockouts` (password lockout AND MFA failure budget). Returns true when
     /// the underlying auth store write succeeded. Empty/unset callback = the
     /// tool answers "lockout subsystem unavailable" (503-equivalent), matching
     /// the REST route's degrade when `lockout_clear_fn` is unwired.
@@ -1078,9 +1255,9 @@ public:
     /// Separate builders so tests can drive them without the httplib acceptor
     /// thread (#438), mirroring build_handler(). GET is the SSE channel (PR 2:
     /// heartbeats, Last-Event-ID resume, stream caps — the tail lives in
-    /// mcp_stream.cpp); DELETE terminates a principal-bound session. Both no-op
-    /// to 405 when streaming is disabled and to a kMcpDisabled JSON-RPC error
-    /// when MCP is disabled.
+    /// mcp_stream.cpp); DELETE terminates a session bound to the caller's principal
+    /// and credential class. Both no-op to 405 when streaming is disabled and to a
+    /// kMcpDisabled JSON-RPC error when MCP is disabled.
     ///
     /// `stream_budget` / `revalidate_fn` are trailing-defaulted for the test
     /// seams; PRODUCTION MUST WIRE BOTH — without the budget there is no
@@ -1284,6 +1461,8 @@ private:
     // pre-dispatch dry run in mcp_server.cpp fails closed rather than
     // silently reverting to the pre-#3687 collapsed-envelope behaviour.
     AuthorizeDispatchFn authorize_dispatch_fn_;
+    // #2146: see set_instruction_execute_ports. Default-constructed = every seam unwired.
+    instruction_execute::Ports instr_exec_ports_;
     // Posture cache shared across httplib worker threads (the POST handler lambda
     // is captured by value, so every worker shares this one object). Reads and
     // writes of the string fields MUST be serialised — an unsynchronised
@@ -1318,6 +1497,10 @@ private:
     // engine_principal_store_'s contract above.
     PluginConfigStore* plugin_config_store_{nullptr};
     config::Backing runtime_config_{};
+    ExecutionMutationPorts execution_mutation_ports_for_test_{}; // see set_execution_mutation_ports_for_test
+    EmitEventFn emit_event_fn_;                                  // see set_emit_event_fn
+    DefinitionReferrersFn definition_referrers_fn_;              // see set_definition_referrers_fn
+    DefinitionPackAdvisoryFn definition_pack_advisory_fn_;       // see set_definition_pack_advisory_fn
     UploadGrantStore* upload_grant_store_{nullptr};
     UploadGrantListReadFn upload_grant_list_read_fn_;
     // #3290 Phase 2 — see set_fleet_read_fn above.
@@ -1341,6 +1524,17 @@ private:
     // #2146 Batch B1 — see set_guardian_push_fn above.
     GuardianPushFn guardian_push_fn_;
     std::shared_ptr<software_sync::Runner> software_sync_runner_;
+    // SAM-21 - see set_software_lookup_reads / set_software_sync_status_fns above.
+    std::optional<software_list::LookupReads> software_lookup_reads_;
+    software_sync::StatusReadFn software_sync_status_fn_;
+    software_sync::UnfilteredFn software_sync_unfiltered_fn_;
+    // SAM-35 - see set_software_read_ctx / set_collection_settings_deps above.
+    std::optional<software_read_api::Ctx> software_read_ctx_;
+    software_collection_settings_api::Stores collection_settings_stores_;
+    PermFn collection_settings_probe_perm_fn_;
+    // SAM-29 - see set_software_lifecycle_store / set_product_registry_store above.
+    SoftwareLifecycleStore* software_lifecycle_store_{nullptr};
+    ProductRegistryStore* product_registry_store_{nullptr};
     // #2146 Batch B3 — see set_viz_deps above.
     FleetTopologyStore* fleet_topology_store_{nullptr};
     yuzu::server::OfflineRosterFn offline_roster_fn_;
@@ -1357,10 +1551,20 @@ private:
     std::shared_ptr<const ScheduleApi> schedule_api_;
     // ADR-0031 WS-A4 (eighth family) — see set_workflow_api above.
     std::shared_ptr<const WorkflowApi> workflow_api_;
+    ConcurrencyDispatchFn workflow_concurrency_dispatch_fn_; // see set_workflow_concurrency_dispatch_fn
+    WorkflowRunFn workflow_run_fn_;                          // see set_workflow_run_fn
+    WorkflowIdempotencyLookupFn workflow_idempotency_lookup_fn_; // see set_workflow_idempotency_lookup_fn
+    std::function<bool()> draining_fn_;                      // see set_draining_fn
+    ScopedGateFn scoped_gate_fn_;                            // see set_scoped_gate_fn
+    std::function<std::optional<std::string>(std::string_view)> workflow_digest_fn_; // see set_workflow_digest_fn
+    std::optional<std::chrono::milliseconds> workflow_reauthorize_retry_delay_; // see set_workflow_reauthorize_retry_delay
+    StreamRevalidateFn workflow_revalidate_fn_;              // see set_workflow_revalidate_fn
     // ADR-0031 WS-A4 (ninth family) — see set_guardian_api above.
     std::shared_ptr<const GuardianApi> guardian_api_;
     // ADR-0031 WS-A4 (tenth family) - see set_crypto_api above.
     std::shared_ptr<const CryptoApi> crypto_api_;
+    // ADR-0070 R1 - see set_revocation_source_service above.
+    ::yuzu::server::revocation_source::RevocationSourceService* revocation_source_service_{nullptr};
     // /crypto widgets - see set_crypto_access_fn above.
     CryptoAccessFn crypto_access_fn_;
 };

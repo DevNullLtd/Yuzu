@@ -1,0 +1,100 @@
+## Yuzu - TWO server replicas behind a gateway cluster (HA WS-13 slice 13.6 probe, #7082).
+## A LAB MEASUREMENT OVERLAY, NOT A DEPLOYMENT.
+##
+## A second server replica is NOT supported until the HA safe-to-scale gate lifts
+## (docs/ha-delivery-matrix.md, docs/adr/2002-high-availability-architecture.md). This overlay exists
+## to measure one thing: whether an agent attached to a gateway node that is up but cut off from its
+## servers can still be dispatched to through either replica. Do not copy it into a deployment, and
+## do not read a pass as evidence that two replicas are safe.
+##
+## It is MUTUALLY EXCLUSIVE with the 13.0 spike rig (same fixed addresses, 10.77.12.0/22): the runner refuses
+## to start while either rig's resources exist. Use it ONLY through scripts/ha/ha-gateway-two-replica-probe.sh, which layers it on the spike rig:
+##   docker compose -f docker-compose.ha-gateway-failover.yml -f docker-compose.ha-gateway-two-replica.yml
+## and sets the environment this file needs (SPIKE_GW_SYSCONFIG, SPIKE_HAPROXY_CFG, ...).
+##
+## What it changes against the spike rig:
+##  * server-2 (10.77.12.5): a second replica on the SAME Postgres and the SAME certs/CA/KEK volume
+##    (a per-replica CA fails closed: the second replica cannot resolve the first's KEK), its own
+##    data dir and REST port, the same management address as the first (the VIP, never one node).
+##  * the gateways dial ONE upstream endpoint, gw-srv.ha.test:50055, an L4 VIP over both replicas
+##    (haproxy-two-replica.cfg), with the shipped pool_size 1: each gateway has one holder replica.
+##  * the server certificate gains the SAN gw-srv.ha.test (fixed on the first boot of a FRESH certs
+##    volume, like every SAN in the spike rig).
+##
+## Not release-pinned (locally built yuzu-spike-* images), so it is deliberately NOT in
+## scripts/check-compose-versions.sh FILES, like the spike rig it extends.
+
+x-server-command: &server-command
+  - "--listen=0.0.0.0:50051"
+  - "--gateway-upstream=0.0.0.0:50055"
+  - "--gateway-mode"
+  - "--gateway-command-addr=${SPIKE_MGMT_ADDR:-gw-mgmt.ha.test:50063}"
+  - "--web-address=0.0.0.0"
+  - "--https-port=8443"
+  # SANs are fixed on the FIRST boot of a fresh certs volume; this is the spike's list plus gw-srv.
+  - "--cert-san=dns:server"
+  - "--cert-san=dns:gateway"
+  - "--cert-san=dns:gw-dns.ha.test"
+  - "--cert-san=dns:gw-vip.ha.test"
+  - "--cert-san=dns:gw-mgmt.ha.test"
+  - "--cert-san=dns:gw-srv.ha.test"
+  - "--cert-san=dns:gateway-1"
+  - "--cert-san=dns:gateway-2"
+  - "--cert-san=dns:gateway-3"
+  - "--cert-group=yuzu-pki"
+  - "--config=/etc/yuzu/yuzu-server.cfg"
+  - "--data-dir=/var/lib/yuzu"
+
+x-gateway-sysconfig: &gateway-sysconfig
+  # the reference sys.config with the upstream endpoint host changed to gw-srv.ha.test (the script
+  # generates it from deploy/docker/reference-gateway-sys.config; nothing else differs)
+  volumes:
+    - ${SPIKE_GW_SYSCONFIG:?set by the script}:/opt/yuzu_gw/releases/0.2.0/sys.config:ro
+
+services:
+  server:
+    command: *server-command
+
+  server-2:
+    extends:
+      file: docker-compose.ha-gateway-failover.yml
+      service: server
+    command: *server-command
+    depends_on:
+      postgres: { condition: service_healthy }
+      server: { condition: service_healthy }
+    ports: !override
+      - "127.0.0.1:${SPIKE_REST_PORT_2:-0}:8443"
+    volumes:
+      - ${SPIKE_SERVER_CFG:?set by the script}:/etc/yuzu/yuzu-server.cfg:ro
+      - certs:/etc/yuzu/certs
+      - server2-data:/var/lib/yuzu
+    networks:
+      spike:
+        ipv4_address: 10.77.12.5
+        aliases: !override [server-2]
+
+  gateway-1:
+    <<: *gateway-sysconfig
+    depends_on:
+      server-2: { condition: service_healthy }
+  gateway-2:
+    <<: *gateway-sysconfig
+    depends_on:
+      server-2: { condition: service_healthy }
+  gateway-3:
+    <<: *gateway-sysconfig
+    depends_on:
+      server-2: { condition: service_healthy }
+
+  haproxy:
+    # the overlay needs the config that carries the upstream VIP frontend: refuse the spike's own haproxy.cfg
+    volumes:
+      - ./ha-gateway-failover/${SPIKE_HAPROXY_CFG:?set by the script (haproxy-two-replica.cfg)}:/usr/local/etc/haproxy/haproxy.cfg:ro
+    # the server and the gateways resolve names through Docker's DNS, so the upstream VIP name is an alias
+    networks:
+      spike:
+        aliases: [gw-srv.ha.test]
+
+volumes:
+  server2-data:

@@ -29,6 +29,8 @@
 #include "command_capability.hpp" // PR6.0b: CommandCapability / ClassificationError — ClassifyFn's return type
 #include "forensics_visibility.hpp" // ForensicsVisibilityFn (#4990)
 #include "dispatch_caller.hpp" // PLAN-006: DispatchCaller — the principal threaded to dispatch_fn
+#include "echo_source_action_rules.hpp" // EchoActionCooldown: the repeat bound on Echo purge/re-enable
+#include "scoped_gate_outcome.hpp"      // ScopedPermFn's return type: the gate's refusal class
 
 namespace yuzu::server {
 
@@ -39,6 +41,7 @@ class TagStore;
 class InstructionStore;
 class HttpRouteSink; // http_route_sink.hpp — the in-process-testable seam (#438)
 struct FacetFilter;
+struct StoredResponse; // response_store.hpp
 struct ForensicsServed; // forensics_read_audit.hpp - #4990
 struct EchoRetentionPausedScan; // echo_tree_routes.hpp — #4027 REST+MCP twin shape
 
@@ -47,13 +50,37 @@ class AgentRegistry;
 class EventBus;
 } // namespace detail
 
+/// The ONE htmx sync scope every console results request shares (View select, per-column
+/// controls, Search, sortable headers, Prev/Next, the Create Group button).
+///
+/// WHY `replace`: in the bundled htmx 2.0.4 `abort` DROPS a request issued while another is in
+/// flight (`d==="abort"){if(u.xhr){...return e}`), so `closest form:abort` / `this:abort` lose the
+/// operator's SECOND keystroke or click. `replace` is newest-wins: the in-flight request is
+/// aborted and the new one issued. The sync element is the filter bar, so a header or pager
+/// request (whose own element is not the form) still competes with a form request.
+inline constexpr std::string_view kResultsSyncScope = "#filter-bar:replace";
+
+/// `HX-Trigger` member that aborts whatever results request is in flight on the filter bar.
+/// A new dispatch (or a help answer) replaces the results; a late response for the previous
+/// command must not land on top. The target is the sync element, which holds the xhr (the OLD
+/// #filter-bar). It is emitted LAST in the header because htmx keeps a key's `target` for the keys
+/// after it: an earlier `target:#filter-bar` would retarget the showToast that follows it too.
+inline constexpr std::string_view kResultsAbortTrigger =
+    R"("htmx:abort":{"target":"#filter-bar"})";
+
 class DashboardRoutes {
 public:
     using AuthFn = std::function<std::optional<auth::Session>(
         const httplib::Request&, httplib::Response&)>;
     using PermFn = std::function<bool(const httplib::Request&, httplib::Response&,
                                       const std::string&, const std::string&)>;
-    using AuditFn = std::function<void(const httplib::Request&, const std::string&,
+    /// Writes one audit row; returns the persist outcome (true == stored, or audit-off).
+    /// #3619: `bool`, never `void` -- a void sink cannot tell a stored row from a lost one.
+    /// Handlers never call it (or `persist_audit_fn_`) directly: each row goes through
+    /// `audit_attempted`, `audit_or_flag`, or the shared `emit_forensics_read_audit` (#4990), all
+    /// of which pass the sink to the `rest_audit.hpp` kernel (pinned by
+    /// tests/test_dashboard_audit_checked_lexical.py).
+    using AuditFn = std::function<bool(const httplib::Request&, const std::string&,
                                        const std::string&, const std::string&,
                                        const std::string&, const std::string&)>;
 
@@ -152,11 +179,15 @@ public:
         csrf_trusted_origins_ = std::move(origins);
     }
 
-    /// ADR-0033 section 9 ("no audit row, no mutation") for the expression-targeted Send
-    /// (`scope_expression` on POST /api/dashboard/execute): the SAME audit sink as `AuditFn`
-    /// but returning the persist outcome, so the route can write an `attempted` row BEFORE
-    /// dispatch and refuse (503) when it is not stored. Unset = the expression path fails
-    /// CLOSED (503), never "dispatch without evidence". Set before `register_routes`.
+    /// ADR-0033 section 9 ("no audit row, no mutation"): the SAME audit sink as `AuditFn`. Two
+    /// uses. (1) The `attempted` row a mutation writes BEFORE it acts (`audit_attempted`): every
+    /// console send on POST /api/dashboard/execute, POST /api/dashboard/group-from-results, and
+    /// the Echo re-enable and purge fragments (#3619; the expression-targeted send was first).
+    /// Unset here, those mutations fail CLOSED (503), never "act without evidence". (2) The
+    /// #4990 `response.forensics.read` row on /fragments/results (`emit_forensics_read_audit`),
+    /// a read that is set-and-proceed: unset, that row is skipped as audit-off. Set before
+    /// `register_routes`: handlers read the member on every request, so a later set would race
+    /// the request threads.
     using PersistAuditFn = std::function<bool(const httplib::Request&, const std::string&,
                                               const std::string&, const std::string&,
                                               const std::string&, const std::string&)>;
@@ -180,6 +211,25 @@ public:
                                            const std::string& securable_type,
                                            const std::string& operation)>;
     void set_fleet_read_fn(FleetReadFn fn) { fleet_read_fn_ = std::move(fn); }
+
+    /// #2540 - the per-device scoped-permission chokepoint, backing the Echo purge and re-enable
+    /// fragment POSTs so they authorize exactly like the REST purge twin: one probe of the
+    /// handler's own (securable, operation) pair on the posted device, asked again after the
+    /// `attempted` audit row. It is those handlers' SOLE authorization gate (never stacked with
+    /// `perm_fn_`). Same signature as `RestApiV1::ScopedGateFn`; server.cpp wires the SAME
+    /// `scoped_gate_fn` lambda into both. It returns the gate's refusal class and the handlers
+    /// admit ONLY on `== ScopedGateOutcome::Admitted`: a denial collapses to the 404 body, while
+    /// an authorization that could not be evaluated (the gate answered 503, or a read it depends
+    /// on failed) answers 503. It writes its own refusal and `auth.scoped_permission_required`
+    /// audit row into the Response it is handed, so the handlers feed it a throwaway. FAIL CLOSED
+    /// when unset: both POSTs answer 503 and dispatch nothing. Same setter idiom as
+    /// `set_fleet_read_fn`: set before `register_routes`.
+    using ScopedPermFn =
+        std::function<ScopedGateOutcome(const httplib::Request&, httplib::Response&,
+                                        const std::string& securable_type,
+                                        const std::string& operation,
+                                        const std::string& agent_id)>;
+    void set_scoped_perm_fn(ScopedPermFn fn) { scoped_perm_fn_ = std::move(fn); }
 
     /// #4990 - the Forensics plugin set the stored-response read tier excludes
     /// (`ServerImpl::forensics_plugin_set_`, borrowed: it outlives this object). Same setter idiom
@@ -262,11 +312,10 @@ public:
     /// When `true` (the REST/MCP twins), `extra_scope` (= `gate.scope`, the
     /// ADR-0017-authorized set) is the SOLE filter — `visible_set` is skipped
     /// entirely, matching the two device pickers' identical fix
-    /// (`EchoTreeRoutes::all_devices_fn_`). Default `false` preserves the HTML
-    /// fragment caller's existing membership-only behavior unchanged (it has
-    /// no `fleet_read_fn_` gate to defer to yet — out of scope this round,
-    /// same recorded exception as the two un-migrated device-picker
-    /// fragments).
+    /// (`EchoTreeRoutes::all_devices_fn_`). Default `false` keeps the
+    /// membership-only behavior for a caller with no gate scope to defer to;
+    /// the HTML frame (#2540) now gates on `fleet_read_fn_` and passes
+    /// `true` like its REST twin.
     EchoRetentionPausedScan
     gather_echo_retention_paused(const std::string& username,
                                 const authz::VisibleSet& extra_scope = std::nullopt,
@@ -281,11 +330,44 @@ private:
     /// refused.
     bool refuse_cross_site_write(const httplib::Request& req, httplib::Response& res) const;
 
+    /// #5700 Search-term admission. A Search term substring-matches stored output, so the Create
+    /// Group preview and POST that carry one run the same `Response:Read` admission the results
+    /// table does (`fleet_read_fn_`, there too the sole gate for that pair), after their
+    /// `ManagementGroup:Write` gate: the count and the membership otherwise tell a caller who may
+    /// not read responses which agents' output holds a string. Writes the refusal (the gate's own
+    /// A4 body, or 503 when `fleet_read_fn_` is unwired -- fail closed) and returns false. A
+    /// confined caller is admitted; their set is still cut to their visible scope by
+    /// `keep_visible`. Filters-only requests do not call it (their path is unchanged).
+    bool admit_search_read(const httplib::Request& req, httplib::Response& res) const;
+
+    /// #3619 / ADR-0033 section 9, "no audit row, no mutation": writes the `attempted` row
+    /// through `persist_audit_fn_` BEFORE a mutation (a console send, a group materialisation,
+    /// an Echo re-enable or purge). Call it after every refusal, so a rejected request burns no
+    /// row. When the row is not stored -- the store refused it, the sink threw, or the sink is
+    /// unwired (fail CLOSED) -- answers 503 with `Sec-Audit-Failed: true`, @p refusal_html as
+    /// the body and, when @p toast is non-null, an HX-Trigger toast (for hx-swap="none" forms,
+    /// which never show a body), and returns false: the caller returns without mutating.
+    [[nodiscard]] bool audit_attempted(const httplib::Request& req, httplib::Response& res,
+                                       const std::string& action, const std::string& target_type,
+                                       const std::string& target_id, const std::string& detail_text,
+                                       const std::string& refusal_html,
+                                       const char* toast = nullptr) const;
+
+    /// #3619: every other row (outcome, refusal, scope narrowing, read-class send). Writes it
+    /// through `audit_fn_` and, when it is not stored, marks the response
+    /// `Sec-Audit-Failed: true`. Never changes the status or body: the request's own answer
+    /// stands (set-and-proceed, the dashboard HTML posture in rest_audit.hpp).
+    void audit_or_flag(const httplib::Request& req, httplib::Response& res,
+                       const std::string& action, const std::string& result,
+                       const std::string& target_type, const std::string& target_id,
+                       const std::string& detail_text) const;
+
     std::vector<std::string> csrf_trusted_origins_;
     PersistAuditFn persist_audit_fn_;
     AuthFn auth_fn_;
     PermFn perm_fn_;
     FleetReadFn fleet_read_fn_;
+    ScopedPermFn scoped_perm_fn_; // #2540 - see set_scoped_perm_fn
     AuditFn audit_fn_;
     ResponseStore* response_store_{nullptr};
     const ForensicsPluginSet* forensics_plugins_{nullptr}; // #4990 - see set_forensics_plugin_set
@@ -341,8 +423,39 @@ private:
     std::vector<std::string> resolve_render_columns(const std::string& plugin,
                                                      const std::string& definition_id) const;
 
+    /// Phase-1 read shared by @ref render_results and @ref agents_matching_text: the stored
+    /// responses behind the column filters (all of them when @p filters is empty).
+    struct MatchingResponses {
+        std::vector<StoredResponse> responses;
+        bool store_degraded{false};  ///< a read failed: not "no results"
+        bool result_truncated{false}; ///< the row/byte cap cut the read: counts are partial
+    };
+    MatchingResponses load_matching_responses(const std::string& command_id,
+                                              const ResponseTierFilter& tier,
+                                              const std::vector<FacetFilter>& filters) const;
+
+    /// Distinct agent ids (first-seen order) with at least one line matching both the column
+    /// @p filters and the free-text @p text_query, using exactly the predicate the results table
+    /// renders. nullopt = the store is degraded. `truncated` is set when the read behind the set
+    /// was cut by the row/byte cap, i.e. the set is partial.
+    struct TextMatch {
+        std::vector<std::string> ids;
+        bool truncated{false};
+    };
+    std::optional<TextMatch>
+    agents_matching_text(const std::string& command_id, const ResponseTierFilter& tier,
+                         const std::string& plugin, const std::vector<FacetFilter>& filters,
+                         const std::string& text_query) const;
+
     /// Render filtered/sorted/paginated result rows + OOB thead, pagination,
-    /// summary. When @p definition_id is non-empty AND the definition has a
+    /// summary. Every sort/pager link carries only the identity of the view (command, plugin,
+    /// sort, dir, page, per_page, definition) and re-reads the LIVE filter bar through
+    /// `hx-include="#filter-bar"`, so a changed filter is never reverted by a stale baked URL.
+    /// `#result-pagination` carries `data-sort` / `data-dir` / `data-page` / `data-per-page` for
+    /// the client-side summary refresh. The "N agents" count
+    /// is DISTINCT agents (a stored row is one frame, so one agent can own several), and when
+    /// @p text_query is set it counts only agents with a matching line; the Create Group button is
+    /// offered for a text query alone. When @p definition_id is non-empty AND the definition has a
     /// `spec.visualization`, an OOB chart deck fragment is appended to
     /// re-populate `#chart-deck-host` (issue #587).
     ///
@@ -373,9 +486,14 @@ private:
                                const std::string& template_id = {},
                                const std::vector<std::string>& visible_columns = {},
                                const authz::VisibleSet& scope = std::nullopt,
-                               ForensicsServed* served = nullptr);
+                               ForensicsServed* served = nullptr,
+                               bool rows_omitted = false);
 
-    /// Render filter controls for a plugin schema. When @p definition_id is
+    /// Render filter controls for a plugin schema. Every control carries
+    /// @ref kResultsSyncScope; the form itself is `hx-sync="this:drop"` so the SSE-driven summary
+    /// refresh (issued from the form) is discarded, never queued, while a request is in flight.
+    /// When the definition has a template with an `equals` filter, a per-request
+    /// "View without saved filters" checkbox (`view_filters=off`) is rendered. When @p definition_id is
     /// non-empty it's emitted as a hidden form input so subsequent
     /// `hx-include="#filter-bar"` requests propagate it through to
     /// `/fragments/results` (which uses it to keep the chart deck live).
@@ -394,10 +512,16 @@ private:
     /// number — the store read that produces it can degrade, and "0 agents
     /// will be added" is a materially different, wrong claim from "the count
     /// could not be determined".
+    ///
+    /// @p text_query is the results page's Search term: it is part of the group definition
+    /// and travels as a hidden `q`. @p partial = the read behind the count was cut by the read
+    /// cap, so the count is not the group: the form says so and the submit is disabled.
     std::string render_create_group_form(const std::string& command_id,
                                           const std::string& plugin,
                                           const std::vector<FacetFilter>& filters,
-                                          std::optional<int64_t> agent_count);
+                                          std::optional<int64_t> agent_count,
+                                          const std::string& text_query = {},
+                                          bool partial = false);
 
     /// Render scope list with groups section.
     std::string render_scope_list(const std::string& selected, const std::string& username);
@@ -409,8 +533,14 @@ private:
     /// output for `<source>_enabled=false` rows, and renders an HTML table
     /// body fragment. The username + visibility filter close the
     /// Gate 2 cross-operator data-leak finding.
+    ///
+    /// `gate_scope` is the `fleet_read_fn_` gate's authoritative scope (#2540), the SOLE row
+    /// filter exactly as on the REST twin; the default (nullopt, unfiltered) is for the unit
+    /// seam only.
     std::string render_echo_retention_paused(const std::string& username, bool can_execute,
-                                            bool can_delete) const;
+                                            bool can_delete,
+                                            const authz::VisibleSet& gate_scope = std::nullopt,
+                                            bool scope_is_authoritative = false) const;
 
     /// Parse f_* filter params from request into FacetFilter vector.
     std::vector<FacetFilter> parse_filters(const httplib::Request& req,
@@ -436,6 +566,10 @@ private:
     mutable std::mutex echo_scan_mu_;
     std::unordered_map<std::string, EchoScanState> echo_scans_by_user_;
     static constexpr std::size_t kEchoScanStateCap = 256;
+
+    // The repeat bound on the Echo purge and re-enable POSTs (one dispatch per action, device and
+    // source per 30 s); per server process, see its class comment.
+    echo_source::EchoActionCooldown echo_action_cooldown_;
 
     // Unit-test seam (#562): render_echo_retention_paused and its inputs
     // (response_store_, mgmt_group_store_, echo_scans_by_user_) are private, and

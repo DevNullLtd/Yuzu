@@ -3,7 +3,7 @@
  * (installed_apps_parsers.hpp, Wave 4 PR4.3a de-shell migration).
  *
  * The bounded-runner acquisition is the impure shell; the parsing of
- * dpkg-query/rpm/pacman/system_profiler/brew/pkgutil output is header-pure
+ * dpkg-query/rpm/pacman/system_profiler/pkgutil output is header-pure
  * and pinned here on every host (the firewall_parsers.hpp pattern).
  *
  * Fixture provenance, stated per TEST_CASE:
@@ -16,6 +16,7 @@
  *     same discipline as test_firewall_parsers.cpp's ufw fixtures.
  */
 
+#include "installed_apps_old_path_oracle.hpp" // parse_dpkg_list / parse_rpm_list (test-only since SAM-45)
 #include "installed_apps_parsers.hpp"
 
 #include <catch2/catch_test_macros.hpp>
@@ -338,25 +339,6 @@ TEST_CASE("system_profiler apps: a non-ASCII Location is preserved", "[installed
     CHECK(apps[0].location == "/Applications/\xC3\x9C" "bersicht.app");
 }
 
-// ── macOS: brew list --versions ─────────────────────────────────────────
-
-TEST_CASE("brew list: name/version split, missing version tolerated — documented-format reconstruction",
-          "[installed_apps]") {
-    constexpr std::string_view out = "wget 1.21.4\ngit 2.43.0\nnode\n";
-    auto apps = parse_brew_list(out);
-    REQUIRE(apps.size() == 3);
-    CHECK(apps[0].name == "wget");
-    CHECK(apps[0].version == "1.21.4");
-    CHECK(apps[1].name == "git");
-    CHECK(apps[1].version == "2.43.0");
-    CHECK(apps[2].name == "node");
-    CHECK(apps[2].version.empty());
-}
-
-TEST_CASE("brew list: empty output yields zero apps", "[installed_apps]") {
-    CHECK(parse_brew_list("").empty());
-}
-
 // ── macOS: pkgutil (#2273 enrichment) ───────────────────────────────────
 
 TEST_CASE("pkgutil pkgs: real capture — id list, blank lines dropped", "[installed_apps]") {
@@ -418,7 +400,7 @@ TEST_CASE("format_app_row: absent InstallLocation renders '-', never fabricated"
     // bundle_id absent alone (Windows/Linux shape with a location, or a macOS
     // bundle that carries no CFBundleIdentifier).
     CHECK(format_app_row({"Tool", "1.0", "Acme", "20200101", "C:\\Program Files\\Tool", ""}) ==
-          "app|Tool|1.0|Acme|20200101|C:/Program Files/Tool|-");
+          "app|Tool|1.0|Acme|20200101|C:\\Program Files\\Tool|-");
     // location present, bundle id absent.
     CHECK(format_app_row({"Tool", "1.0", "Acme", "20200101", "", "com.acme.tool"}) ==
           "app|Tool|1.0|Acme|20200101|-|com.acme.tool");
@@ -462,13 +444,13 @@ TEST_CASE("format_app_row: a trailing backslash in install_location cannot swall
     // A Windows InstallLocation ends in a backslash (9 of 241 rows in the pre-fix
     // Windows capture). Raw, that backslash plus the following delimiter reads as an
     // escaped pipe: the backslash is deleted and the row loses a field.
-    // safe_output_field folds the backslash to '/', so the row keeps seven fields
+    // row_field folds the TRAILING backslash to '/', so the row keeps seven fields
     // under an escape-aware split.
     const auto row = format_app_row({.name = "7-Zip",
                                      .version = "26.02",
                                      .publisher = "Igor Pavlov",
                                      .install_location = "C:\\Program Files\\7-Zip\\"});
-    CHECK(row == "app|7-Zip|26.02|Igor Pavlov|-|C:/Program Files/7-Zip/|-");
+    CHECK(row == "app|7-Zip|26.02|Igor Pavlov|-|C:\\Program Files\\7-Zip/|-");
     CHECK(split_fields_escape_aware(row).size() == 7);
 
     // A literal '|' in the two ADR-0028 columns is escaped, not a delimiter.
@@ -481,7 +463,7 @@ TEST_CASE("format_app_row: a trailing backslash in install_location cannot swall
     // bundle_id passes through the same escape (dropping safe_output_field on the last
     // column alone must fail too).
     const auto bid = format_app_row({.name = "X", .bundle_id = "a|b\\c"});
-    CHECK(bid == "app|X|-|-|-|-|a\\|b/c");
+    CHECK(bid == "app|X|-|-|-|-|a\\|b\\c");
     CHECK(split_fields_escape_aware(bid).size() == 7);
 
     // install_date is no longer the row's last field, so a trailing backslash in it
@@ -507,7 +489,7 @@ TEST_CASE("format_app_row: hostile bytes in ANY field cannot forge or split a ro
     // the folded value. Mutation: dropping list_field on `name` (raw std::string
     // append) fails the first sub-case.
     const std::string hostile = "a|b\\c\r\nd";
-    const std::string folded = "a|b/c  d";
+    const std::string folded = "a|b\\c  d";
     const AppRowFields f{"N", "V", "P", "D", "L", "B"};
     for (std::size_t i = 0; i < 6; ++i) {
         AppRowFields g = f;
@@ -574,8 +556,8 @@ TEST_CASE("format_app_row: a pipe-filled field is bounded before it is escaped",
         const auto row = format_app_row({.name = "X", .version = hostile});
         const auto fields = split_fields_escape_aware(row);
         REQUIRE(fields.size() == 7);
-        // A decoded token never holds a backslash: none survives folding, so a
-        // trailing lone one would be a cut escape.
+        // The input holds no backslash, so none may appear: a trailing lone one
+        // would be a cut escape.
         for (const auto& token : fields)
             CHECK(token.find('\\') == std::string::npos);
         CHECK(fields[2].size() == kMaxListFieldBytes);
@@ -697,6 +679,18 @@ TEST_CASE("classify_reg_status: absent only when the root allows it; all else no
     CHECK(classify_reg_status(kErrorMoreData, true) == HiveRead::failed);
 }
 
+TEST_CASE("walk_degrades: only a failed read of a root that degrades the walk does",
+          "[installed_apps]") {
+    // The own-HKCU root (degrades_walk = false) logs a failure and never degrades; a machine-scope
+    // root degrades on a failure and on nothing else.
+    for (const HiveRead r : {HiveRead::ok, HiveRead::absent}) {
+        CHECK_FALSE(walk_degrades(r, true));
+        CHECK_FALSE(walk_degrades(r, false));
+    }
+    CHECK(walk_degrades(HiveRead::failed, true));
+    CHECK_FALSE(walk_degrades(HiveRead::failed, false));
+}
+
 namespace {
 // Recording stand-in for yuzu::CommandContext: the degraded-acquisition helpers
 // are templated on the context so this pins the contract with no plugin load.
@@ -750,7 +744,12 @@ TEST_CASE("emit_inventory: degraded is rc 1 with no rows and the typed status",
     RecCtx good;
     CHECK(emit_inventory(good, false, recs, fmt) == 0);
     CHECK(good.lines == std::vector<std::string>{"inv|AppA", "inv|AppB"}); // nameless dropped
-    CHECK(good.status_calls == 0);
+    // A clean pass declares itself complete (OK / FULL): the daily sync reads the typed completeness,
+    // and an undeclared answer would be UNKNOWN, never FULL.
+    CHECK(good.status_calls == 1);
+    CHECK(good.status == YUZU_RESULT_STATUS_OK);
+    CHECK(good.completeness == YUZU_RESULT_COMPLETENESS_FULL);
+    CHECK(good.provenance.empty());
 
     RecCtx bad;
     CHECK(emit_inventory(bad, true, recs, fmt) == 1);

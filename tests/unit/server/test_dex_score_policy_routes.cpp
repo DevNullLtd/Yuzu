@@ -6,8 +6,10 @@
  * function's own cases are in test_dex_score_policy_writer.cpp. No store, no sleeps, no I/O.
  */
 #include "dex_score_policy_writer.hpp"
+#include "openapi_spec_access.hpp"
 #include "rest_api_v1.hpp"
 
+#include "openapi_body_check.hpp"
 #include "test_route_sink.hpp"
 
 #include <catch2/catch_test_macros.hpp>
@@ -16,6 +18,7 @@
 #include <chrono>
 #include <memory>
 #include <optional>
+#include <set>
 #include <string>
 #include <utility>
 #include <vector>
@@ -201,6 +204,7 @@ TEST_CASE("score-policy routes: GET returns the policy in force with its ETag an
         CHECK_FALSE(j["data"].contains("fault"));
         CHECK(res->get_header_value("ETag") == "\"default\"");
         CHECK(j["data"]["document"]["version"] == 1);
+        CHECK_FALSE(j["data"]["document"].contains("model"));
     }
     SECTION("a stored policy") {
         h.stored = doc_with_excellent(95.0);
@@ -367,6 +371,87 @@ TEST_CASE("score-policy routes: PUT happy path answers 200 with the new revision
     CHECK(h.stored == body);
 }
 
+namespace {
+// Non-canonical on purpose: the answer must show the canonical, defaults-filled document.
+constexpr const char* kModelBody =
+    R"({"version":2,"model":{"per_device_event_cap":7,"regression_start_ratio":1.5},)"
+    R"("overrides":[{"image":"Foo.EXE","model":{"per_device_event_cap":2}}]})";
+
+void check_model_document(const json& d) {
+    REQUIRE(d.contains("version"));
+    REQUIRE(d.contains("model"));
+    REQUIRE(d.contains("overrides"));
+    CHECK(d["version"] == 2);
+    CHECK(d["model"]["per_device_event_cap"] == 7);
+    CHECK(d["model"]["regression_start_ratio"] == 1.5);
+    CHECK(d["model"]["regression_full_ratio"] == 3.0);  // default filled in
+    CHECK(d["model"]["interval_confidence"] == 0.95);   // default filled in
+    CHECK(d["model"].size() == 4);
+    REQUIRE(d["overrides"].size() == 1);
+    CHECK(d["overrides"][0]["image"] == "foo.exe");
+    CHECK(d["overrides"][0]["model"] == json{{"per_device_event_cap", 2}});
+}
+} // namespace
+
+TEST_CASE("score-policy routes: model parameters round-trip PUT then GET with their values and "
+          "defaults",
+          "[server][routes][dex][score_policy]") {
+    Harness h;
+    SECTION("real write then GET") {
+        const auto put = h.send("PUT", kPath, kModelBody, Harness::if_match("default"));
+        REQUIRE(put->status == 200);
+        const auto pj = json::parse(put->body);
+        check_model_document(pj["data"]["document"]);
+        REQUIRE(h.stored.has_value());
+        const auto expected = dex_score_policy_validate_text(kModelBody);
+        REQUIRE(expected.has_value());
+        CHECK(*h.stored == dex_score_policy_canonical(*expected));
+        CHECK(pj["data"]["revision"] == dex_score_policy_revision(*h.stored));
+
+        const auto get = h.send("GET", kPath);
+        REQUIRE(get->status == 200);
+        const auto gj = json::parse(get->body);
+        CHECK(gj["data"]["document"] == pj["data"]["document"]);
+        CHECK(gj["data"]["revision"] == pj["data"]["revision"]);
+        CHECK(get->get_header_value("ETag") == put->get_header_value("ETag"));
+
+        // A PUT of what GET returned is a fixed point: same text, same revision.
+        const auto again = h.send("PUT", kPath, gj["data"]["document"].dump(),
+                                  Harness::if_match(gj["data"]["revision"].get<std::string>()));
+        REQUIRE(again->status == 200);
+        CHECK(json::parse(again->body)["data"]["revision"] == gj["data"]["revision"]);
+        CHECK(*h.stored == dex_score_policy_canonical(*expected));
+    }
+    SECTION("dry run reports the model and stores nothing") {
+        const auto res = h.send("PUT", std::string(kPath) + "?dry_run=true", kModelBody,
+                                Harness::if_match("default"));
+        REQUIRE(res->status == 200);
+        const auto j = json::parse(res->body);
+        CHECK(j["data"]["dry_run"] == true);
+        check_model_document(j["data"]["document"]);
+        CHECK_FALSE(h.stored.has_value());
+        CHECK(h.cas_calls == 0);
+        REQUIRE(h.rows.size() == 1);
+        CHECK(h.rows[0].action == "dex.score_policy.validate");
+        // The audit row records exactly the canonical text a real write would store.
+        const auto expected = dex_score_policy_validate_text(kModelBody);
+        REQUIRE(expected.has_value());
+        CHECK(json::parse(h.rows[0].detail)["document"] ==
+              json::parse(dex_score_policy_canonical(*expected)));
+    }
+    SECTION("a model in a version 1 document is refused") {
+        const auto res = h.send("PUT", kPath, R"({"model":{"per_device_event_cap":7}})",
+                                Harness::if_match("default"));
+        CHECK(res->status == 400);
+        CHECK(json::parse(res->body)["error"]["message"] ==
+              "unparseable at model: requires version 2");
+        REQUIRE(h.rows.size() == 1);
+        CHECK(h.rows[0].result == "denied");
+        CHECK(json::parse(h.rows[0].detail)["field"] == "model");
+        CHECK(h.cas_calls == 0);
+    }
+}
+
 TEST_CASE("score-policy routes: a dry run's ETag is the current revision and not the would-be one",
           "[server][routes][dex][score_policy]") {
     Harness h;
@@ -462,9 +547,113 @@ TEST_CASE("score-policy routes: an ambiguous outcome is a 503 that names the sto
     CHECK(j["error"]["retry_after_ms"] == 2000);
     CHECK(j["error"]["remediation"] ==
           "GET /api/v1/dex/score-policy and compare its revision: if it is the If-Match "
-          "revision you sent, the write did not apply; if it is any other revision, review the "
-          "policy before changing it again");
+          "revision you sent, the policy is as it was before your request; if it is any other "
+          "revision, review the policy before changing it again");
     const std::string msg = j["error"]["message"];
     CHECK(msg.find(dex_score_policy_revision(doc_with_excellent(70.0))) != std::string::npos);
     CHECK(msg.find("not changed") == std::string::npos);
+}
+
+// #6500 item 7: the real bodies of GET, PUT, a dry-run PUT and DELETE, taken from the real
+// handlers, checked at VALUE level against the served DexScorePolicyData schema: every member is
+// declared with the matching JSON type, every required member is present and nothing undeclared
+// appears, recursing through the document (tiers, weights, model, overrides[]). No Postgres: the
+// writer deps are the fake store above, so this case always runs.
+TEST_CASE("score-policy routes: every 200 body conforms to the served DexScorePolicyData schema "
+          "at value level",
+          "[server][routes][dex][score_policy][openapi][value]") {
+    namespace oa = yuzu::test::openapi;
+    const json spec = json::parse(openapi_spec_json());
+    const json schema = oa::ok_response_schema(spec, "/dex/score-policy", "get");
+    REQUIRE(schema.is_object());
+    // GET, PUT and DELETE name one and the same component.
+    CHECK(oa::ok_response_schema(spec, "/dex/score-policy", "put") == schema);
+    CHECK(oa::ok_response_schema(spec, "/dex/score-policy", "delete") == schema);
+
+    Harness h;
+    std::set<std::string> seen;
+    std::set<std::string> sources;
+    std::vector<json> bodies;
+    const auto conforms = [&](const char* what, const std::unique_ptr<httplib::Response>& res) {
+        INFO("answer: " << what);
+        REQUIRE(res->status == 200);
+        const json body = json::parse(res->body);
+        const auto violations = oa::body_violations(spec, schema, body);
+        INFO(json(violations).dump(2));
+        // REQUIRE, not CHECK: the lines below index members the schema requires, and a const
+        // operator[] on a missing member asserts (undefined behaviour under NDEBUG) instead of
+        // failing. Optional members are read with .at(), which throws and fails the test.
+        REQUIRE(violations.empty());
+        // meta is declared as a bare object; its one member is pinned here.
+        CHECK(body["meta"] == json{{"api_version", "v1"}});
+        const auto paths = oa::seen_member_paths(body);
+        seen.insert(paths.begin(), paths.end());
+        bodies.push_back(body);
+        sources.insert(body["data"]["source"].get<std::string>());
+        return body;
+    };
+
+    // A document that names every optional part of the stored shape, including a fully
+    // populated override, so each nested schema is walked by a real body.
+    const std::string full_doc =
+        R"({"version":2,)"
+        R"("tiers":{"edges":{"excellent":95,"good":80,"fair":60},)"
+        R"("names":{"excellent":"Great","good":"Fine","fair":"Meh","poor":"Bad"}},)"
+        R"("weights":{"breadth":1,"crashes":2,"hangs":3,"regression":4},)"
+        R"("model":{"per_device_event_cap":7,"regression_start_ratio":1.5,)"
+        R"("regression_full_ratio":4,"interval_confidence":0.9},)"
+        R"("overrides":[{"image":"Foo.EXE",)"
+        R"("tiers":{"edges":{"excellent":99,"good":85,"fair":70},)"
+        R"("names":{"excellent":"Top","good":"Ok","fair":"Low","poor":"Awful"}},)"
+        R"("weights":{"breadth":2,"crashes":5,"hangs":6,"regression":7},)"
+        R"("model":{"per_device_event_cap":2,"regression_start_ratio":1.5,"regression_full_ratio":5}}]})";
+
+    // GET with nothing stored: source default, no fault.
+    conforms("GET, nothing stored", h.send("GET", kPath));
+
+    // GET over a stored text the validator refuses: the defaults with the fault member.
+    h.stored = R"({"version":3})";
+    const auto faulted = conforms("GET, refused stored text", h.send("GET", kPath));
+    REQUIRE(faulted["data"].contains("fault"));
+    h.stored.reset();
+
+    // PUT, real: previous_revision present, document walks every nested part.
+    const auto put = conforms("PUT", h.send("PUT", kPath, full_doc, Harness::if_match("default")));
+    REQUIRE(put["data"].contains("previous_revision"));
+    CHECK(put.at("data").at("document").at("overrides").at(0).contains("tiers"));
+    CHECK(put.at("data").at("document").at("overrides").at(0).contains("weights"));
+    CHECK(put.at("data").at("document").at("overrides").at(0).contains("model"));
+
+    // GET of what was written: custom source.
+    const std::string rev = put["data"]["revision"].get<std::string>();
+    conforms("GET, custom policy", h.send("GET", kPath));
+
+    // PUT dry run: dry_run member present and boolean.
+    const auto dry = conforms("PUT dry run",
+                              h.send("PUT", std::string(kPath) + "?dry_run=true", full_doc,
+                                     Harness::if_match(rev)));
+    CHECK(dry.at("data").at("dry_run") == true);
+
+    // DELETE of the stored policy, then of nothing (idempotent).
+    conforms("DELETE, stored policy", h.send("DELETE", kPath, {}, Harness::if_match(rev)));
+    conforms("DELETE, nothing stored", h.send("DELETE", kPath, {}, Harness::if_match("default")));
+
+    // Coverage: the bodies above carried every member the schema declares and both enum values
+    // of `source`, so no declared member went unchecked by this case.
+    const auto declared = oa::declared_member_paths(spec, schema);
+    std::set<std::string> missing;
+    for (const auto& d : declared)
+        if (!seen.contains(d))
+            missing.insert(d);
+    INFO("declared but never carried by a real body: " << json(missing).dump());
+    CHECK(missing.empty());
+    CHECK(sources == std::set<std::string>{"custom", "default"});
+
+    // The other direction: a member every real body carries must be declared required, so a
+    // `required` entry dropped from the schema text is caught (a conforming body cannot show it).
+    for (const char* level : {"$", "$.data"}) {
+        INFO("object level: " << level);
+        CHECK(oa::always_present_not_required(spec, schema, bodies, level) ==
+              std::set<std::string>{});
+    }
 }

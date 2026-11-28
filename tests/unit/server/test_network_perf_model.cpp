@@ -264,7 +264,7 @@ TEST_CASE("overview render: cards, co-occurrence, honesty", "[network][ui]") {
     // (a sibling DEX tab link is present) with the Network tab marked active,
     // rather than a standalone network sub-nav.
     CHECK(html.find("/fragments/dex/catalogue") != std::string::npos); // DEX sub-nav rendered
-    CHECK(html.find("class=\"on\" hx-get=\"/fragments/network/overview") !=
+    CHECK(html.find("class=\"on\" aria-current=\"page\" hx-get=\"/fragments/network/overview") !=
           std::string::npos); // Network tab is the active one
     CHECK(html.find("Round-trip time") != std::string::npos);
     CHECK(html.find("TCP_INFO") != std::string::npos);                // Linux/Windows honesty note

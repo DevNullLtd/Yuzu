@@ -46,6 +46,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
@@ -55,6 +56,13 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+
+#ifndef _WIN32
+#include <fcntl.h>
+#include <stdlib.h>
+#include <termios.h>
+#include <unistd.h>
+#endif
 
 namespace fs = std::filesystem;
 using yuzu::server::auth::AuthManager;
@@ -229,6 +237,29 @@ TEST_CASE("verify_password returns the verified role AND the stored hash it anch
     CHECK(over.error() == VerifyFailure::kBadCredential);
 }
 
+TEST_CASE("verify_password: an unknown user costs a PBKDF2, like a wrong password (F38)",
+          "[pg][auth][password][timing]") {
+    yuzu::test::AuthDbPg db;
+    AuthManager mgr;
+    mgr.set_auth_db(db.get());
+    seed_local(*db, "tim", kOld, Role::admin);
+    using clock = std::chrono::steady_clock;
+    auto time_of = [&](const std::string& user) {
+        auto best = std::chrono::nanoseconds::max();
+        for (int i = 0; i < 3; ++i) { // min of 3 resists a scheduling blip
+            const auto t0 = clock::now();
+            (void)mgr.verify_password(user, "not-the-password");
+            best = std::min(best, std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                      clock::now() - t0));
+        }
+        return best;
+    };
+    const auto known = time_of("tim");
+    const auto unknown = time_of("nobody-here");
+    // Before the fix the unknown path returned in microseconds (a DB read only).
+    CHECK(unknown * 2 > known);
+}
+
 TEST_CASE("verify_password: an AuthDB read failure is kStoreUnavailable, never a bad credential",
           "[pg][auth][password]") {
     // Before Gate 7 this collapsed to nullopt, which /login answered as a
@@ -253,7 +284,7 @@ TEST_CASE("commit_password_change (self): anchor compared under the row lock; ol
     AuthManager mgr;
     f.wire(mgr);
     REQUIRE(mgr.upsert_user("alice", kOld, Role::user));
-    auto s1 = mgr.create_local_session("alice", Role::user, false, anchor_of(mgr, "alice", kOld));
+    auto s1 = mgr.create_local_session("alice", Role::user, anchor_of(mgr, "alice", kOld));
     REQUIRE_FALSE(s1.empty());
 
     const auto r = mgr.commit_password_change(
@@ -463,7 +494,7 @@ TEST_CASE("commit_password_change: a REAL audit statement fault rolls the whole 
     f.wire(mgr);
     seed_local(*f.db, "ivy", kOld, Role::user);
     const auto before = f.db->get_user("ivy")->hash_hex;
-    auto s = mgr.create_local_session("ivy", Role::user, false, anchor_of(mgr, "ivy", kOld));
+    auto s = mgr.create_local_session("ivy", Role::user, anchor_of(mgr, "ivy", kOld));
     REQUIRE_FALSE(s.empty());
     f.exec("ALTER TABLE audit_store.audit_events RENAME TO audit_events_gone");
 
@@ -489,7 +520,7 @@ TEST_CASE("commit_password_change (admin): a fault on ONLY the auth.lockout.clea
     f.wire(mgr);
     seed_local(*f.db, "lockd", kOld, Role::user);
     const auto before = f.db->get_user("lockd")->hash_hex;
-    auto s = mgr.create_local_session("lockd", Role::user, false, anchor_of(mgr, "lockd", kOld));
+    auto s = mgr.create_local_session("lockd", Role::user, anchor_of(mgr, "lockd", kOld));
     REQUIRE_FALSE(s.empty());
     for (int i = 0; i < 3; ++i)
         REQUIRE(f.db->record_failed_login("lockd", 3, 3600).has_value());
@@ -577,18 +608,18 @@ TEST_CASE("create_local_session denies a mint whose verified hash is no longer s
     const auto anchor = anchor_of(mgr, "mira", kOld);
 
     // The anchor is current: the mint lands.
-    auto ok = mgr.create_local_session("mira", Role::user, false, anchor);
+    auto ok = mgr.create_local_session("mira", Role::user, anchor);
     REQUIRE_FALSE(ok.empty());
     CHECK(mgr.validate_session(ok).has_value());
 
     // An empty anchor never disables the check — it denies (fail closed).
-    CHECK(mgr.create_local_session("mira", Role::user, false, "").empty());
+    CHECK(mgr.create_local_session("mira", Role::user, "").empty());
 
     // A reset after the verify: the OLD anchor can no longer mint, and the
     // denied mint leaves no live session behind.
     REQUIRE(mgr.commit_password_change(mkreq(Kind::kAdminReset, "mira", kNew)).result ==
             Result::kOk);
-    CHECK(mgr.create_local_session("mira", Role::user, false, anchor).empty());
+    CHECK(mgr.create_local_session("mira", Role::user, anchor).empty());
     CHECK_FALSE(mgr.validate_session(ok).has_value());
     CHECK(f.sessions_of("mira") == 0);
 }
@@ -646,7 +677,7 @@ TEST_CASE("post-mint recheck WAITS on an uncommitted credential write and then d
     std::string token = "unset";
     // jthread: joined on every exit path (a failed REQUIRE below never leaves a
     // joinable std::thread to std::terminate; at worst B waits out lock_timeout).
-    std::jthread b([&] { token = mgr.create_local_session("mona", Role::user, false, anchor); });
+    std::jthread b([&] { token = mgr.create_local_session("mona", Role::user, anchor); });
     // Give B ample time to persist its session and reach the row-locked
     // re-read (where it blocks). At HEAD's plain read it would already have
     // returned a live token by now.
@@ -876,6 +907,49 @@ private:
     std::streambuf* old_in_ = nullptr;
     std::streambuf* old_out_ = nullptr;
 };
+#ifndef _WIN32
+// Makes fd 0 a pty slave (or /dev/null) for the scope; restores the original fd 0 after.
+class PtyAsStdin {
+public:
+    explicit PtyAsStdin(bool use_pty = true) {
+        saved_ = ::dup(0);
+        if (use_pty) {
+            // POSIX pty (portable to macOS, unlike <pty.h>'s openpty).
+            master_ = ::posix_openpt(O_RDWR | O_NOCTTY);
+            if (master_ >= 0 && ::grantpt(master_) == 0 && ::unlockpt(master_) == 0) {
+                const char* name = ::ptsname(master_);
+                if (name)
+                    slave_ = ::open(name, O_RDWR | O_NOCTTY);
+            }
+            ok_ = slave_ >= 0 && ::dup2(slave_, 0) >= 0;
+        } else {
+            slave_ = ::open("/dev/null", O_RDONLY);
+            ok_ = slave_ >= 0 && ::dup2(slave_, 0) >= 0;
+        }
+    }
+    ~PtyAsStdin() {
+        if (saved_ >= 0) {
+            ::dup2(saved_, 0);
+            ::close(saved_);
+        }
+        if (slave_ >= 0)
+            ::close(slave_);
+        if (master_ >= 0)
+            ::close(master_);
+    }
+    PtyAsStdin(const PtyAsStdin&) = delete;
+    PtyAsStdin& operator=(const PtyAsStdin&) = delete;
+    [[nodiscard]] bool ok() const { return ok_; }
+    [[nodiscard]] bool echo_on() const {
+        struct termios t{};
+        return ::tcgetattr(0, &t) == 0 && (t.c_lflag & ECHO) != 0;
+    }
+
+private:
+    int saved_ = -1, master_ = -1, slave_ = -1;
+    bool ok_ = false;
+};
+#endif
 } // namespace
 
 TEST_CASE("#5343: first_run_setup creates exactly one administrator and no second account",
@@ -892,10 +966,19 @@ TEST_CASE("#5343: first_run_setup creates exactly one administrator and no secon
     std::string out;
     bool ok = false;
     {
+#ifndef _WIN32
+        // F44: the prompt now refuses unless fd 0 is a terminal whose echo it can clear, so
+        // give it a pty slave as fd 0 (the text still comes from the swapped std::cin).
+        PtyAsStdin pty;
+        REQUIRE(pty.ok());
+#endif
         StdioSwap io{"admin\nfirst-run-pw-12345\nfirst-run-pw-12345\n"
                      "\nsecond-run-pw-12345\nsecond-run-pw-12345\n"};
         ok = AuthManager::first_run_setup(cfg);
         out = io.output();
+#ifndef _WIN32
+        CHECK(pty.echo_on()); // restored by the RAII guard
+#endif
     }
     CHECK(ok);
     CHECK(out.find("User account") == std::string::npos);
@@ -909,3 +992,21 @@ TEST_CASE("#5343: first_run_setup creates exactly one administrator and no secon
     CHECK(mgr.get_user_role("admin") == Role::admin);
     CHECK_FALSE(mgr.get_user_role("user").has_value());
 }
+
+#ifndef _WIN32
+TEST_CASE("F44: first_run_setup refuses to prompt for a password when stdin is not a terminal",
+          "[auth][password][F44]") {
+    yuzu::test::TempDir dir{"yuzu_test_firstrun_notty_"};
+    fs::create_directories(dir.path);
+    const auto cfg = dir.path / "yuzu-server.cfg";
+    PtyAsStdin devnull{/*use_pty=*/false};
+    REQUIRE(devnull.ok());
+    bool ok = true;
+    {
+        StdioSwap io{"admin\nfirst-run-pw-12345\nfirst-run-pw-12345\n"};
+        ok = AuthManager::first_run_setup(cfg);
+    }
+    CHECK_FALSE(ok);
+    CHECK_FALSE(fs::exists(cfg));
+}
+#endif

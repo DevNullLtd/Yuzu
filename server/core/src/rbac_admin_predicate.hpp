@@ -1,7 +1,9 @@
 #pragma once
 
+#include <string>
 #include <string_view>
 
+#include "rbac_admin_hint.hpp"
 #include "rbac_store.hpp"
 
 #include <yuzu/server/auth.hpp>
@@ -50,6 +52,26 @@
 /// `GuaranteedState:Push` (which any pusher holds) must not suffice. Neither call site adds an
 /// exception to any rule in this header; the REST route calls `deny_mcp_token_session` before
 /// the predicate, as A1 does.
+///
+/// SCOPE EXTENSION (#6034, the Users and roles page hint): `rbac_admin_hint` (below) is the
+/// ONE advisory composition of this predicate (on the caller's `RbacAdminSurface`), then
+/// `RbacStore::check_caller_authorized_under_current_regime`. The A2 assign and unassign routes
+/// call those same two functions in that order; the A1 enforcement route (`PUT
+/// /api/v1/rbac/enforcement`) calls the predicate and applies the regime rule INSIDE
+/// `set_enforcement`, on a real transition only, so its equality with the hint rests on the
+/// per-persona matrix in `test_rbac_admin_hint.cpp`, not on a shared call. A change to the gate
+/// sequence of any of the three routes needs a matching row in that matrix. It exists so
+/// `/access/users` draws the Assign button and the enforcement switch from the authority the
+/// server will apply rather than from the session's base account role. HINT ONLY, never a
+/// gate: it adds no admission logic of its own, writes no audit row and no response, and every
+/// action it hints at keeps its own unchanged gate. It has TWO production callers: the Access
+/// wiring lambda in `server.cpp` (`rbac_admin_hint_fn`), which passes `kRest` because the
+/// controls call the REST routes, and `read_rbac_enforcement` in `rbac_enforcement_read.hpp`
+/// (#6033), which forwards the surface of the transport it serves (`kRest` for `GET
+/// /api/v1/rbac/enforcement`, `kMcp` for `get_rbac_enforcement`). The read consumes the answer
+/// and changes no admission input of either function: it calls the hint once on the caller's
+/// own session and returns a label. A new caller needs the same proof the rest of this header
+/// asks for: it must not change the admission input set of either function.
 ///
 /// THE RULE: a caller passes iff they hold a DURABLE `Administrator`
 /// authority right now, re-read fresh from the store rather than trusted
@@ -246,6 +268,54 @@ enum class RbacAdminGate {
     return user->role == auth::Role::admin ? RbacAdminGate::kAdmin : RbacAdminGate::kDenied;
 }
 
+/// Advisory tri-state for "may this session even try the RBAC administration routes right now".
+/// The fold, in one place and nowhere else:
+///   - `is_rbac_administrator(session, .., surface)`: `kUnavailable` -> `kUnconfirmed`,
+///     `kDenied` -> `kMayNot` (the regime check is then not consulted, as in the routes);
+///   - on `kAdmin`, `rbac_store->check_caller_authorized_under_current_regime(username)`:
+///     `kAuthorized` -> `kMay`, `kNotAuthorized` -> `kMayNot`, `kUnavailable` -> `kUnconfirmed`.
+/// The regime check is part of the fold because the routes apply it after the predicate (the
+/// assign routes as a separate call, the enforcement route inside `set_enforcement`): it
+/// refuses a caller the predicate admitted when the grant has no active `auth.users` row (an
+/// SSO-only principal) or the local cache lags the durable regime. A predicate-only hint would
+/// draw a control the route then refuses.
+///
+/// HINT ONLY (see the scope paragraph above): the surface has NO default argument, exactly like
+/// the predicate, and there is deliberately no branch here beyond the fold, so the hint has no
+/// logic of its own that could drift. That does not bind the routes: a change to any of the
+/// three routes' gate sequence needs a matching row in `test_rbac_admin_hint.cpp`. Neither
+/// function it calls writes an audit row or a response; this one does not either. A null or
+/// closed `rbac_store` is `kUnconfirmed`, except for the structural exclusions (engine,
+/// service-scoped, and an MCP-tier token on REST), which are `kMayNot` before any store is read.
+[[nodiscard]] inline RbacAdminHint rbac_admin_hint(const auth::Session& session, AuthDB* auth_db,
+                                                    const RbacStore* rbac_store,
+                                                    RbacAdminSurface surface) {
+    switch (is_rbac_administrator(session, auth_db, rbac_store, surface)) {
+    case RbacAdminGate::kAdmin: {
+        // kAdmin is reachable only with a non-null store (the predicate returns kUnavailable
+        // without one), but the null check stays so this never dereferences on a future edit.
+        if (!rbac_store)
+            return RbacAdminHint::kUnconfirmed;
+        switch (rbac_store->check_caller_authorized_under_current_regime(session.username)) {
+        case RbacRegimeAuthority::kAuthorized:
+            return RbacAdminHint::kMay;
+        case RbacRegimeAuthority::kNotAuthorized:
+            return RbacAdminHint::kMayNot;
+        case RbacRegimeAuthority::kUnavailable:
+            return RbacAdminHint::kUnconfirmed;
+        }
+        break;
+    }
+    case RbacAdminGate::kDenied:
+        return RbacAdminHint::kMayNot;
+    case RbacAdminGate::kUnavailable:
+        return RbacAdminHint::kUnconfirmed;
+    }
+    // An enumerator this fold does not know is "could not confirm", never an admit: the
+    // predicate's answer was not understood, so nothing may be drawn live from it.
+    return RbacAdminHint::kUnconfirmed;
+}
+
 /// True when `target_principal` names the CURRENTLY authenticated caller's
 /// own stable principal (`session.username`) — the self-target-destruction
 /// comparison used at `settings_routes.cpp`'s self-delete
@@ -346,6 +416,39 @@ inline constexpr std::string_view kRbacAdminGateUnavailableAuditReason =
 /// checks degraded. EXTEND this, never fork a second copy.
 inline constexpr std::string_view kRbacRegimeAuthorityUnavailableAuditReason =
     "RBAC regime-authority check could not confirm authority — store degraded";
+
+/// Removing a user's `Administrator` grant ends that user's JIT elevation inside the
+/// unassign transaction (`RbacStore::unassign_role_detailed`). The REST route and its MCP twin
+/// report it the same two ways, from these shared helpers so the wording cannot drift: a
+/// ` elevations_cleared=N` suffix on the `rbac.role.unassigned` success row, and ONE dedicated
+/// `role.elevation.revoked` row (the verb the self-service `POST /api/v1/elevate/revoke` already
+/// writes; `reason=administrator_unassign` tells the two apart). Both only when N > 0. EXTEND
+/// these, never fork a second copy.
+///
+/// N counts session rows that held a nonzero elevation window, so a window that had already
+/// expired but was not yet reaped is counted: N is not a count of windows still live.
+/// Grammar notes for a consumer of these rows: the suffix is joined with a single space, not the
+/// `"; "` that separates `<role>` from `removed=<bool>`, so the detail reads
+/// `<role>; removed=true elevations_cleared=N` and `removed=` must be matched as a token, never
+/// compared to the whole text after it. The verb `role.elevation.revoked` has two writers: the
+/// self-service step-down (principal the user, `detail=was_elevated=<bool>`, or
+/// `was_elevated=unknown` after a degraded session lookup) and this one
+/// (principal the operator who removed the grant, `target_id` the user,
+/// `reason=administrator_unassign`). Revoking elevation eligibility also ends elevations but
+/// writes only `user.elevation_eligibility.set` (with its own ` elevations_cleared=N` suffix) and
+/// no `role.elevation.revoked` row. A retry after a lost COMMIT acknowledgement finds the grant
+/// already gone, reports `removed=false`, and writes neither addition.
+inline constexpr std::string_view kElevationRevokedAuditAction = "role.elevation.revoked";
+[[nodiscard]] inline std::string unassign_elevations_cleared_suffix(int cleared) {
+    return cleared > 0 ? " elevations_cleared=" + std::to_string(cleared) : std::string{};
+}
+/// `audit_role` is caller-controlled text on the MCP surface and MUST already have been through
+/// `audit_token` (CWE-117); the count is ours.
+[[nodiscard]] inline std::string unassign_elevation_revoked_detail(int cleared,
+                                                                   std::string_view audit_role) {
+    return "reason=administrator_unassign cleared=" + std::to_string(cleared) +
+           " role=" + std::string(audit_role);
+}
 
 /// Shared control-flow chokepoint for the two non-admit `RbacAdminGate`
 /// outcomes. Returns `true` (having already invoked exactly one of

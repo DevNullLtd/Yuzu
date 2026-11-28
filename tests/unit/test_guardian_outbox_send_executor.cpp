@@ -32,35 +32,71 @@ OutboxEntry lifecycle_entry(const std::string& event_id) {
                                   /*enqueued_ns=*/1'700'000'000'000'000'000, "armed");
 }
 
-/// A send that blocks until release() is called, then returns `result`.
-struct StallingSend {
-    std::mutex mu;
-    std::condition_variable cv;
-    bool release_flag{false};
-    std::atomic<int> invocations{0};
-    SendResult result{SendResult::Sent};
+/// The fixture releases its gate on every exit. Detached callbacks own the gate
+/// state, so even a failed drain assertion cannot leave them borrowing a dead CV.
+class StallingSend {
+    struct State {
+        std::mutex mu;
+        std::condition_variable cv;
+        bool released{false};
+        std::atomic<int> invocations{0};
+    };
+    std::shared_ptr<State> state_ = std::make_shared<State>();
 
-    SendResult operator()(const OutboxEntry&) {
-        invocations.fetch_add(1);
-        std::unique_lock<std::mutex> lk{mu};
-        cv.wait(lk, [&] { return release_flag; });
-        return result;
+public:
+    StallingSend() = default;
+    StallingSend(const StallingSend&) = delete;
+    StallingSend& operator=(const StallingSend&) = delete;
+    ~StallingSend() { release(); }
+
+    auto callback() const {
+        return [state = state_](const OutboxEntry&) {
+            state->invocations.fetch_add(1);
+            std::unique_lock lk{state->mu};
+            state->cv.wait(lk, [&] { return state->released; });
+            return SendResult::Sent;
+        };
     }
+    int invocations() const { return state_->invocations.load(); }
     void release() {
         {
-            std::lock_guard<std::mutex> lk{mu};
-            release_flag = true;
+            std::lock_guard lk{state_->mu};
+            state_->released = true;
         }
-        cv.notify_all();
+        state_->cv.notify_all();
     }
 };
 
 } // namespace
 
+TEST_CASE("stalled-send fixture releases its owned gate during exception unwind",
+          "[spark][guardian][send_executor][fixture]") {
+    GuardianOutboxSendExecutor exec;
+    bool entered = false;
+    try {
+        StallingSend send;
+        CHECK_FALSE(exec.offer(lifecycle_entry("unwind"), send.callback(), 20ms).has_value());
+        REQUIRE(spin_until([&] { return send.invocations() == 1; }));
+        entered = true;
+        throw std::runtime_error("fixture unwind");
+    } catch (const std::runtime_error& error) {
+        CHECK(std::string{error.what()} == "fixture unwind");
+    }
+    REQUIRE(entered);
+    REQUIRE(spin_until([&] { return exec.active_worker_count() == 0; }));
+    // A real completed send remains consumable after the fixture owner is gone.
+    const auto result = exec.offer(
+        lifecycle_entry("unwind"), [](const OutboxEntry&) { return SendResult::Retain; }, 20ms);
+    REQUIRE(result.has_value());
+    CHECK(*result == SendResult::Sent);
+}
+
 TEST_CASE("offer() completes synchronously for a fast send", "[spark][guardian][send_executor]") {
     GuardianOutboxSendExecutor exec;
     auto entry = lifecycle_entry("e1");
-    auto instant = [](const OutboxEntry&) -> SendResult { return SendResult::Sent; };
+    auto instant = [](const OutboxEntry&) -> SendResult {
+        return SendResult::Sent;
+    };
     auto result = exec.offer(entry, instant, 200ms);
     REQUIRE(result.has_value());
     CHECK(*result == SendResult::Sent);
@@ -78,20 +114,20 @@ TEST_CASE("offer() returns nullopt while the send is still stalled, then the res
     StallingSend send;
     auto entry = lifecycle_entry("e1");
 
-    auto first = exec.offer(entry, std::ref(send), 20ms);
+    auto first = exec.offer(entry, send.callback(), 20ms);
     CHECK_FALSE(first.has_value()); // still running
-    CHECK(spin_until([&] { return send.invocations.load() >= 1; }));
+    CHECK(spin_until([&] { return send.invocations() >= 1; }));
 
     // Re-offering the SAME entry does not resubmit - single-flight.
-    auto second = exec.offer(entry, std::ref(send), 20ms);
+    auto second = exec.offer(entry, send.callback(), 20ms);
     CHECK_FALSE(second.has_value());
-    CHECK(send.invocations.load() == 1);
+    CHECK(send.invocations() == 1);
 
     send.release();
     // The next offer() for the SAME entry consumes the published result.
     std::optional<SendResult> consumed;
     REQUIRE(spin_until([&] {
-        consumed = exec.offer(entry, std::ref(send), 20ms);
+        consumed = exec.offer(entry, send.callback(), 20ms);
         return consumed.has_value();
     }));
     CHECK(*consumed == SendResult::Sent);
@@ -111,22 +147,22 @@ TEST_CASE("item 4 regression: a head change during a stall does not wedge the ex
     auto entry_a = lifecycle_entry("event-a");
     auto entry_b = lifecycle_entry("event-b");
 
-    auto first = exec.offer(entry_a, std::ref(send_a), 20ms);
+    auto first = exec.offer(entry_a, send_a.callback(), 20ms);
     CHECK_FALSE(first.has_value());
-    REQUIRE(spin_until([&] { return send_a.invocations.load() >= 1; })); // A is now stuck
+    REQUIRE(spin_until([&] { return send_a.invocations() >= 1; })); // A is now stuck
 
     // The head changed to B while A is still in flight. The orphaned A worker cannot be
     // touched (a second concurrent Write() on the same stream would be wrong); this must
     // Retain, not launch B's send yet, and must NOT invoke B's send function at all.
-    std::atomic<int> b_invocations{0};
-    auto send_b = [&](const OutboxEntry&) -> SendResult {
-        b_invocations.fetch_add(1);
+    auto b_invocations = std::make_shared<std::atomic<int>>(0);
+    auto send_b = [b_invocations](const OutboxEntry&) -> SendResult {
+        b_invocations->fetch_add(1);
         return SendResult::Sent;
     };
     auto while_stalled = exec.offer(entry_b, send_b, 20ms);
     REQUIRE(while_stalled.has_value()); // Retain, not "still running" - a mismatch is decided
     CHECK(*while_stalled == SendResult::Retain);
-    CHECK(b_invocations.load() == 0); // never touched the orphaned worker's stream
+    CHECK(b_invocations->load() == 0); // never touched the orphaned worker's stream
 
     // Unblock A. THE regression: once A's orphaned worker finishes, offer()ing B again must
     // reclaim the slot and actually launch B - not return Retain forever because "event-a"
@@ -139,7 +175,7 @@ TEST_CASE("item 4 regression: a head change during a stall does not wedge the ex
             return b_result.has_value() && *b_result == SendResult::Sent;
         },
         3s));
-    CHECK(b_invocations.load() == 1);
+    CHECK(b_invocations->load() == 1);
     REQUIRE(spin_until([&] { return exec.active_worker_count() == 0; }));
 }
 
@@ -157,7 +193,8 @@ TEST_CASE("a throwing send is re-thrown by the next offer() call, not swallowed 
     REQUIRE(spin_until([&] {
         try {
             auto r = exec.offer(entry, throwing, 20ms);
-            return r.has_value(); // got Sent/Retain with no throw: wrong, but let REQUIRE below catch it
+            return r.has_value(); // got Sent/Retain with no throw: wrong, but let REQUIRE below
+                                  // catch it
         } catch (const std::runtime_error& e) {
             threw = true;
             CHECK(std::string(e.what()) == "send boom");
@@ -187,23 +224,21 @@ TEST_CASE("#4223 regression: the worker relinquishes eptr before scope exit, so 
     // NOT sufficient here on every target toolchain), the worker's `eptr` is already
     // empty by the time it reaches the gate, so this passes identically under TSan or not.
     GuardianOutboxSendExecutor exec;
-    std::atomic<bool> release_gate{false};
-    exec.set_eptr_race_release_gate_for_test(&release_gate);
-    // Declared AFTER release_gate/exec so it destructs FIRST on any exit path,
-    // including a REQUIRE/CHECK unwind below (#4223 adversarial review, K1/C2-1):
-    // release_gate is a stack local the detached worker may still be spinning on
-    // (set_eptr_race_release_gate_for_test()'s own documented contract), so a fatal
-    // assertion must release + drain the worker before release_gate (or exec) can be
-    // destroyed - matches test_thread_pool.cpp's ScopeExit precedent for the same
-    // fatal-unwind-vs-parked-worker hazard. CHECK, not REQUIRE, inside it: this may
-    // run during unwind, where a second throw would terminate.
+    auto release_gate = std::make_shared<std::atomic<bool>>(false);
+    exec.set_eptr_race_release_gate_for_test(release_gate.get());
+    // The actual send closure owns the gate through the worker's epilogue,
+    // including if a bounded drain fails during assertion unwind. The raw seam
+    // may only be reset after the worker has relinquished its ticket.
     ScopeExit release_on_exit{[&] {
-        release_gate.store(true, std::memory_order_relaxed);
-        CHECK(spin_until([&] { return exec.active_worker_count() == 0; }));
-        exec.set_eptr_race_release_gate_for_test(nullptr);
+        release_gate->store(true, std::memory_order_relaxed);
+        const bool drained = spin_until([&] { return exec.active_worker_count() == 0; });
+        CHECK(drained);
+        if (drained)
+            exec.set_eptr_race_release_gate_for_test(nullptr);
     }};
     auto entry = lifecycle_entry("e1");
-    auto throwing = [](const OutboxEntry&) -> SendResult {
+    auto throwing = [release_gate](const OutboxEntry&) -> SendResult {
+        (void)release_gate; // ownership lasts beyond this callback, through the epilogue gate
         throw std::runtime_error("send boom #4223");
     };
     bool threw = false;
@@ -372,7 +407,8 @@ TEST_CASE("#3966 fold-in: a thrown bad_alloc at the EARLIEST admission point (be
     // the guarded region a throw lands) - this exists for direct coverage of the
     // earlier point, not because a defect was found there.
     GuardianOutboxSendExecutor exec;
-    exec.set_launch_fault_for_test(GuardianOutboxSendExecutor::LaunchFaultForTest::ThrowBeforeCommit);
+    exec.set_launch_fault_for_test(
+        GuardianOutboxSendExecutor::LaunchFaultForTest::ThrowBeforeCommit);
     auto entry = lifecycle_entry("e1");
     std::atomic<int> invocations{0};
     auto instant = [&](const OutboxEntry&) -> SendResult {
@@ -410,13 +446,14 @@ TEST_CASE("#3953 item 3: has_in_flight_send() reads true for a mismatched orphan
     auto entry_a = lifecycle_entry("event-a");
     auto entry_b = lifecycle_entry("event-b");
 
-    auto first = exec.offer(entry_a, std::ref(send_a), 20ms);
+    auto first = exec.offer(entry_a, send_a.callback(), 20ms);
     CHECK_FALSE(first.has_value());
-    REQUIRE(spin_until([&] { return send_a.invocations.load() >= 1; }));
+    REQUIRE(spin_until([&] { return send_a.invocations() >= 1; }));
     CHECK(exec.has_in_flight_send()); // same-entry timeout case
 
     // The head changed to B while A is still in flight - the mismatch/orphan branch.
-    auto while_stalled = exec.offer(entry_b, [](const OutboxEntry&) { return SendResult::Sent; }, 20ms);
+    auto while_stalled =
+        exec.offer(entry_b, [](const OutboxEntry&) { return SendResult::Sent; }, 20ms);
     REQUIRE(while_stalled.has_value());
     CHECK(*while_stalled == SendResult::Retain);
     CHECK(exec.has_in_flight_send()); // mismatched-orphan-still-running case, too
@@ -427,7 +464,8 @@ TEST_CASE("#3953 item 3: has_in_flight_send() reads true for a mismatched orphan
     std::optional<SendResult> b_result;
     REQUIRE(spin_until(
         [&] {
-            b_result = exec.offer(entry_b, [](const OutboxEntry&) { return SendResult::Sent; }, 20ms);
+            b_result =
+                exec.offer(entry_b, [](const OutboxEntry&) { return SendResult::Sent; }, 20ms);
             return b_result.has_value() && *b_result == SendResult::Sent;
         },
         3s));
@@ -444,17 +482,11 @@ TEST_CASE("#3953 item 1: a reclaimed orphan's thrown exception is counted, not j
           "[spark][guardian][send_executor][chaos]") {
     GuardianOutboxSendExecutor exec;
     StallingSend send_a;
-    send_a.result = SendResult::Sent; // unused: A throws instead, see below
     auto entry_a = lifecycle_entry("event-a");
     auto entry_b = lifecycle_entry("event-b");
 
-    // A's send throws once released, instead of returning a SendResult.
-    std::atomic<bool> a_release{false};
-    std::mutex a_mu;
-    std::condition_variable a_cv;
-    auto throwing_a = [&](const OutboxEntry&) -> SendResult {
-        std::unique_lock<std::mutex> lk{a_mu};
-        a_cv.wait(lk, [&] { return a_release.load(); });
+    auto throwing_a = [send = send_a.callback()](const OutboxEntry& entry) -> SendResult {
+        (void)send(entry);
         throw std::runtime_error("orphan boom");
     };
 
@@ -462,16 +494,13 @@ TEST_CASE("#3953 item 1: a reclaimed orphan's thrown exception is counted, not j
     CHECK_FALSE(first.has_value());
 
     // Head changes to B while A is still running - the mismatch/orphan branch.
-    auto while_stalled = exec.offer(entry_b, [](const OutboxEntry&) { return SendResult::Sent; }, 20ms);
+    auto while_stalled =
+        exec.offer(entry_b, [](const OutboxEntry&) { return SendResult::Sent; }, 20ms);
     REQUIRE(while_stalled.has_value());
     CHECK(*while_stalled == SendResult::Retain);
     CHECK(exec.orphan_exception_count() == 0); // not yet reclaimed
 
-    {
-        std::lock_guard<std::mutex> lk{a_mu};
-        a_release = true;
-    }
-    a_cv.notify_all();
+    send_a.release();
 
     // Once A's orphaned worker finishes (with a throw this time), reclaiming it must
     // count the discard - the throw is real evidence of a problem, and silently losing
@@ -480,7 +509,8 @@ TEST_CASE("#3953 item 1: a reclaimed orphan's thrown exception is counted, not j
     std::optional<SendResult> b_result;
     REQUIRE(spin_until(
         [&] {
-            b_result = exec.offer(entry_b, [](const OutboxEntry&) { return SendResult::Sent; }, 20ms);
+            b_result =
+                exec.offer(entry_b, [](const OutboxEntry&) { return SendResult::Sent; }, 20ms);
             return b_result.has_value() && *b_result == SendResult::Sent;
         },
         3s));
@@ -500,26 +530,25 @@ TEST_CASE("#3953 item 2: a same-entry send stalled past the threshold is counted
     StallingSend send;
     auto entry = lifecycle_entry("e1");
 
-    auto first = exec.offer(entry, std::ref(send), 20ms);
+    auto first = exec.offer(entry, send.callback(), 20ms);
     CHECK_FALSE(first.has_value());
     CHECK(exec.send_stall_count() == 0); // not stalled yet - under the threshold
 
     // Repeated 20ms offers on the SAME entry until the threshold is crossed.
-    // NON-fatal (CHECK, not REQUIRE): send.release() below MUST run regardless, or the
-    // detached worker - still blocked in send.cv.wait() - outlives this stack frame's
-    // synchronization primitives once the test function returns.
+    // Keep checking the independent observations. Fixture destruction also releases
+    // the owned gate if a later assertion or unexpected exception leaves early.
     CHECK(spin_until([&] {
-        exec.offer(entry, std::ref(send), 20ms);
+        exec.offer(entry, send.callback(), 20ms);
         return exec.send_stall_count() == 1;
     }));
     // Stays 1 across further nullopts - counted once, not once per re-check.
-    exec.offer(entry, std::ref(send), 20ms);
+    exec.offer(entry, send.callback(), 20ms);
     CHECK(exec.send_stall_count() == 1);
 
     send.release();
     std::optional<SendResult> result;
     CHECK(spin_until([&] {
-        result = exec.offer(entry, std::ref(send), 20ms);
+        result = exec.offer(entry, send.callback(), 20ms);
         return result.has_value();
     }));
     if (result.has_value())
@@ -574,7 +603,7 @@ TEST_CASE("#3953 item 2: a mismatched orphan stalled past the threshold is count
     auto entry_a = lifecycle_entry("event-a");
     auto entry_b = lifecycle_entry("event-b");
 
-    auto first = exec.offer(entry_a, std::ref(send_a), 20ms);
+    auto first = exec.offer(entry_a, send_a.callback(), 20ms);
     CHECK_FALSE(first.has_value());
 
     // Poll the mismatch branch (offering B) until A - still running, past the
@@ -590,7 +619,8 @@ TEST_CASE("#3953 item 2: a mismatched orphan stalled past the threshold is count
     std::optional<SendResult> b_result;
     REQUIRE(spin_until(
         [&] {
-            b_result = exec.offer(entry_b, [](const OutboxEntry&) { return SendResult::Sent; }, 20ms);
+            b_result =
+                exec.offer(entry_b, [](const OutboxEntry&) { return SendResult::Sent; }, 20ms);
             return b_result.has_value() && *b_result == SendResult::Sent;
         },
         3s));
@@ -620,9 +650,9 @@ TEST_CASE("#3953 item 2 follow-up: an orphan that crosses the stall threshold on
     auto entry_a = lifecycle_entry("event-a");
     auto entry_b = lifecycle_entry("event-b");
 
-    auto first = exec.offer(entry_a, std::ref(send_a), 20ms);
+    auto first = exec.offer(entry_a, send_a.callback(), 20ms);
     CHECK_FALSE(first.has_value());
-    REQUIRE(spin_until([&] { return send_a.invocations.load() >= 1; }));
+    REQUIRE(spin_until([&] { return send_a.invocations() >= 1; }));
 
     // Cross the 50ms threshold with NO interim offer() call on any entry - the
     // mismatch branch's own check_stall_locked() must never fire for this orphan.
@@ -634,7 +664,8 @@ TEST_CASE("#3953 item 2 follow-up: an orphan that crosses the stall threshold on
 
     // The FIRST offer() call for a different entry now reaches the reclaim branch
     // directly - A is a mismatched orphan that is already done.
-    auto reclaimed = exec.offer(entry_b, [](const OutboxEntry&) { return SendResult::Sent; }, 200ms);
+    auto reclaimed =
+        exec.offer(entry_b, [](const OutboxEntry&) { return SendResult::Sent; }, 200ms);
     REQUIRE(reclaimed.has_value());
     CHECK(*reclaimed == SendResult::Sent);
     CHECK(exec.send_stall_count() == 1);
@@ -647,33 +678,33 @@ TEST_CASE("stop() prevents a new launch but does not disturb one already in flig
     StallingSend send;
     auto entry = lifecycle_entry("e1");
 
-    auto first = exec.offer(entry, std::ref(send), 20ms);
+    auto first = exec.offer(entry, send.callback(), 20ms);
     CHECK_FALSE(first.has_value());
-    REQUIRE(spin_until([&] { return send.invocations.load() >= 1; }));
+    REQUIRE(spin_until([&] { return send.invocations() >= 1; }));
 
     exec.stop();
     // Still waits out the ALREADY-launched worker rather than abandoning it.
-    auto still_waiting = exec.offer(entry, std::ref(send), 20ms);
+    auto still_waiting = exec.offer(entry, send.callback(), 20ms);
     CHECK_FALSE(still_waiting.has_value());
 
     send.release();
     std::optional<SendResult> result;
     REQUIRE(spin_until([&] {
-        result = exec.offer(entry, std::ref(send), 20ms);
+        result = exec.offer(entry, send.callback(), 20ms);
         return result.has_value();
     }));
     CHECK(*result == SendResult::Sent);
 
     // A DIFFERENT entry, offered after stop(), is never launched.
-    std::atomic<int> b_invocations{0};
-    auto send_b = [&](const OutboxEntry&) -> SendResult {
-        b_invocations.fetch_add(1);
+    auto b_invocations = std::make_shared<std::atomic<int>>(0);
+    auto send_b = [b_invocations](const OutboxEntry&) -> SendResult {
+        b_invocations->fetch_add(1);
         return SendResult::Sent;
     };
     auto after_stop = exec.offer(lifecycle_entry("e2"), send_b, 20ms);
     REQUIRE(after_stop.has_value());
     CHECK(*after_stop == SendResult::Retain);
-    CHECK(b_invocations.load() == 0);
+    CHECK(b_invocations->load() == 0);
 }
 
 // ---------------------------------------------------------------------------------------
@@ -708,7 +739,7 @@ TEST_CASE("#3980 in_flight_snapshot(): idle, running, monotone remaining_to_stal
     CHECK(idle.remaining_to_stall == 0ms);
 
     auto entry = stamped_entry("e1", 7);
-    CHECK_FALSE(exec.offer(entry, std::ref(send), 20ms).has_value());
+    CHECK_FALSE(exec.offer(entry, send.callback(), 20ms).has_value());
     const auto first = exec.in_flight_snapshot();
     CHECK(first.in_flight);
     CHECK(first.running);
@@ -756,7 +787,7 @@ TEST_CASE("#3972 in_flight_snapshot(): an unstamped entry (seq 0) reports seq 0"
         CHECK(spin_until([&] { return exec.active_worker_count() == 0; }, 3s));
     }};
     auto entry = lifecycle_entry("e1"); // seq defaults to 0
-    CHECK_FALSE(exec.offer(entry, std::ref(send), 20ms).has_value());
+    CHECK_FALSE(exec.offer(entry, send.callback(), 20ms).has_value());
     const auto s = exec.in_flight_snapshot();
     CHECK(s.in_flight);
     CHECK(s.running);
@@ -773,7 +804,7 @@ TEST_CASE("#3980 probe_orphan(): counts a stall with NO offer() ever called agai
     }};
     auto entry = lifecycle_entry("e1");
 
-    CHECK_FALSE(exec.offer(entry, std::ref(send), 20ms).has_value());
+    CHECK_FALSE(exec.offer(entry, send.callback(), 20ms).has_value());
     CHECK(exec.offer_calls_for_test() == 1);
     CHECK(exec.send_stall_count() == 0); // under the threshold
 
@@ -819,7 +850,7 @@ TEST_CASE("#3980 probe_orphan(): reclaims a done orphan only for an empty lane; 
     CHECK_FALSE(idle.newly_stalled);
     CHECK_FALSE(idle.snapshot.in_flight);
 
-    CHECK_FALSE(exec.offer(entry, std::ref(send), 20ms).has_value());
+    CHECK_FALSE(exec.offer(entry, send.callback(), 20ms).has_value());
     send.release();
     REQUIRE(spin_until([&] { return !exec.in_flight_snapshot().running; }));
 
@@ -829,7 +860,7 @@ TEST_CASE("#3980 probe_orphan(): reclaims a done orphan only for an empty lane; 
     CHECK_FALSE(non_empty.reclaimed);
     CHECK(non_empty.snapshot.in_flight);
     CHECK(exec.has_in_flight_send());
-    const auto consumed = exec.offer(entry, std::ref(send), 20ms);
+    const auto consumed = exec.offer(entry, send.callback(), 20ms);
     REQUIRE(consumed.has_value());
     CHECK(*consumed == SendResult::Sent);
     CHECK_FALSE(exec.has_in_flight_send());
@@ -849,14 +880,14 @@ TEST_CASE("#3980 probe_orphan(): an orphan on an emptied lane is reclaimed with 
     }};
     // Throws once released, so the reclaim branch's orphan-exception count is exercised
     // through the probe too (one copy of the reclaim logic).
-    auto throwing = [&](const OutboxEntry& e) -> SendResult {
+    auto throwing = [send = send.callback()](const OutboxEntry& e) -> SendResult {
         (void)send(e);
         throw std::runtime_error("orphan boom");
     };
     auto entry_a = lifecycle_entry("event-a");
 
     CHECK_FALSE(exec.offer(entry_a, throwing, 20ms).has_value());
-    REQUIRE(spin_until([&] { return send.invocations.load() >= 1; }));
+    REQUIRE(spin_until([&] { return send.invocations() >= 1; }));
     // Cross the threshold with the send still running, but do NOT count it yet: the
     // snapshot is read-only, so the stall is still unobserved when the send finishes.
     REQUIRE(spin_until([&] { return exec.in_flight_snapshot().remaining_to_stall == 0ms; }));
@@ -874,8 +905,8 @@ TEST_CASE("#3980 probe_orphan(): an orphan on an emptied lane is reclaimed with 
 
     // The slot is free: a fresh entry launches and completes.
     REQUIRE(spin_until([&] { return exec.active_worker_count() == 0; }, 3s));
-    auto fresh = exec.offer(lifecycle_entry("event-b"),
-                            [](const OutboxEntry&) { return SendResult::Sent; }, 200ms);
+    auto fresh = exec.offer(
+        lifecycle_entry("event-b"), [](const OutboxEntry&) { return SendResult::Sent; }, 200ms);
     REQUIRE(fresh.has_value());
     CHECK(*fresh == SendResult::Sent);
     CHECK(exec.send_stall_count() == 1); // not re-counted
@@ -885,23 +916,28 @@ TEST_CASE("#3980 probe_orphan(): a reclaim never touches worker_count - a done-b
           "alive worker still reads as alive (routed clause 4 / F3)",
           "[spark][guardian][send_executor][chaos][tsan]") {
     GuardianOutboxSendExecutor exec;
-    std::atomic<bool> release_gate{false};
-    exec.set_eptr_race_release_gate_for_test(&release_gate);
-    // Same unwind discipline as the #4223 case above: release + drain before release_gate
-    // or exec can be destroyed.
+    auto release_gate = std::make_shared<std::atomic<bool>>(false);
+    exec.set_eptr_race_release_gate_for_test(release_gate.get());
+    // As in #4223, shared callback ownership outlasts a failed bounded drain.
     ScopeExit release_on_exit{[&] {
-        release_gate.store(true, std::memory_order_relaxed);
-        CHECK(spin_until([&] { return exec.active_worker_count() == 0; }, 3s));
-        exec.set_eptr_race_release_gate_for_test(nullptr);
+        release_gate->store(true, std::memory_order_relaxed);
+        const bool drained = spin_until([&] { return exec.active_worker_count() == 0; }, 3s);
+        CHECK(drained);
+        if (drained)
+            exec.set_eptr_race_release_gate_for_test(nullptr);
     }};
     StallingSend send;
     ScopeExit release_send{[&] { send.release(); }}; // destructs BEFORE release_on_exit
+    auto gated_send = [release_gate, send = send.callback()](const OutboxEntry& entry) {
+        (void)release_gate; // keep the epilogue's borrowed pointer alive until worker exit
+        return send(entry);
+    };
     auto entry = lifecycle_entry("e1");
 
     // The send is CV-parked, so this offer() is deterministically a timeout (nullopt); on
     // release the worker publishes done=true and then parks on the gate while its ticket
     // is still held. Probe BEFORE any consuming offer() so the result is still in the slot.
-    CHECK_FALSE(exec.offer(entry, std::ref(send), 20ms).has_value());
+    CHECK_FALSE(exec.offer(entry, gated_send, 20ms).has_value());
     send.release();
     REQUIRE(spin_until([&] {
         const auto s = exec.in_flight_snapshot();
@@ -916,7 +952,7 @@ TEST_CASE("#3980 probe_orphan(): a reclaim never touches worker_count - a done-b
     // The slot is reclaimed but the worker is not: no join, no cancel, no decrement.
     CHECK(exec.active_worker_count() == 1);
 
-    release_gate.store(true, std::memory_order_relaxed);
+    release_gate->store(true, std::memory_order_relaxed);
     CHECK(spin_until([&] { return exec.active_worker_count() == 0; }, 3s));
 }
 
@@ -961,19 +997,19 @@ TEST_CASE("#3972 offer(): the gate never affects the same in-flight entry's wait
     }};
     auto entry = lifecycle_entry("e1");
 
-    CHECK_FALSE(exec.offer(entry, std::ref(send), 20ms).has_value()); // launched, running
+    CHECK_FALSE(exec.offer(entry, send.callback(), 20ms).has_value()); // launched, running
     GuardianOutboxSendExecutor::OfferTrace waiting;
-    CHECK_FALSE(exec.offer(entry, std::ref(send), 20ms, /*launch_permitted=*/false, &waiting)
+    CHECK_FALSE(exec.offer(entry, send.callback(), 20ms, /*launch_permitted=*/false, &waiting)
                     .has_value()); // still waits (nullopt), not a Retain-by-denial
     CHECK_FALSE(waiting.launch_denied);
     CHECK_FALSE(waiting.launched);
-    CHECK(send.invocations.load() == 1);
+    CHECK(send.invocations() == 1);
 
     send.release();
     GuardianOutboxSendExecutor::OfferTrace consuming;
     std::optional<SendResult> consumed;
     REQUIRE(spin_until([&] {
-        consumed = exec.offer(entry, std::ref(send), 20ms, false, &consuming);
+        consumed = exec.offer(entry, send.callback(), 20ms, false, &consuming);
         return consumed.has_value();
     }));
     CHECK(*consumed == SendResult::Sent);
@@ -990,14 +1026,14 @@ TEST_CASE("#3972 offer(): the gate never affects a done orphan's reclaim; only t
         CHECK(spin_until([&] { return exec.active_worker_count() == 0; }, 3s));
     }};
     auto entry_a = lifecycle_entry("event-a");
-    std::atomic<int> b_invocations{0};
-    auto send_b = [&](const OutboxEntry&) -> SendResult {
-        b_invocations.fetch_add(1);
+    auto b_invocations = std::make_shared<std::atomic<int>>(0);
+    auto send_b = [b_invocations](const OutboxEntry&) -> SendResult {
+        b_invocations->fetch_add(1);
         return SendResult::Sent;
     };
     auto entry_b = lifecycle_entry("event-b");
 
-    CHECK_FALSE(exec.offer(entry_a, std::ref(send_a), 20ms).has_value());
+    CHECK_FALSE(exec.offer(entry_a, send_a.callback(), 20ms).has_value());
     send_a.release();
     REQUIRE(spin_until([&] { return !exec.in_flight_snapshot().running; }));
 
@@ -1006,7 +1042,7 @@ TEST_CASE("#3972 offer(): the gate never affects a done orphan's reclaim; only t
     REQUIRE(r.has_value());
     CHECK(*r == SendResult::Retain);
     CHECK(trace.launch_denied); // the reclaim ran, then the NEW launch was denied
-    CHECK(b_invocations.load() == 0);
+    CHECK(b_invocations->load() == 0);
     CHECK_FALSE(exec.has_in_flight_send()); // orphan reclaimed despite the gate
 
     GuardianOutboxSendExecutor::OfferTrace allowed;
@@ -1014,7 +1050,7 @@ TEST_CASE("#3972 offer(): the gate never affects a done orphan's reclaim; only t
     REQUIRE(r2.has_value());
     CHECK(*r2 == SendResult::Sent);
     CHECK_FALSE(allowed.launch_denied);
-    CHECK(b_invocations.load() == 1);
+    CHECK(b_invocations->load() == 1);
 }
 
 TEST_CASE("#3980 offer_calls_for_test() counts every offer() entry, including denied and "
@@ -1022,7 +1058,9 @@ TEST_CASE("#3980 offer_calls_for_test() counts every offer() entry, including de
           "[spark][guardian][send_executor]") {
     GuardianOutboxSendExecutor exec;
     CHECK(exec.offer_calls_for_test() == 0);
-    auto instant = [](const OutboxEntry&) -> SendResult { return SendResult::Sent; };
+    auto instant = [](const OutboxEntry&) -> SendResult {
+        return SendResult::Sent;
+    };
     (void)exec.offer(lifecycle_entry("e1"), instant, 200ms, /*launch_permitted=*/false);
     CHECK(exec.offer_calls_for_test() == 1);
     (void)exec.offer(lifecycle_entry("e1"), instant, 200ms);
@@ -1073,8 +1111,8 @@ TEST_CASE("R5: a throwing send under the detached-worker marker is re-thrown to 
         }
         return rethrown;
     }));
-    CHECK(role_inside_send.load() == 1);                // the throw happened under the marker
-    CHECK_FALSE(on_guardian_detached_worker_thread());  // and never leaked onto the caller
+    CHECK(role_inside_send.load() == 1);               // the throw happened under the marker
+    CHECK_FALSE(on_guardian_detached_worker_thread()); // and never leaked onto the caller
     REQUIRE(spin_until([&] { return exec.active_worker_count() == 0; }));
 
     // The marker is a one-shot thread-local on a fresh detached thread per launch, so a later
@@ -1153,15 +1191,16 @@ TEST_CASE("destroying the executor while its detached worker is still parked is 
     {
         auto sentinel = std::make_shared<int>(0);
         worker_closure = sentinel;
-        const GuardianOutboxSendExecutor::SendFn parked = [gate, sentinel = std::move(sentinel)](
-                                                              const OutboxEntry&) -> SendResult {
+        const GuardianOutboxSendExecutor::SendFn parked =
+            [gate, sentinel = std::move(sentinel)](const OutboxEntry&) -> SendResult {
             gate->invocations.fetch_add(1);
             std::unique_lock<std::mutex> lk{gate->mu};
             gate->cv.wait(lk, [&] { return gate->open; });
             return SendResult::Sent;
         };
         CHECK_FALSE(exec->offer(lifecycle_entry("e1"), parked, 20ms).has_value());
-    } // `parked` is gone: the worker's send capture holds the only remaining reference to the sentinel
+    } // `parked` is gone: the worker's send capture holds the only remaining reference to the
+      // sentinel
     REQUIRE(spin_until([&] { return gate->invocations.load() == 1; }));
     CHECK_FALSE(worker_closure.expired());
     CHECK(exec->active_worker_count() == 1);

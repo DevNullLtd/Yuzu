@@ -49,6 +49,9 @@
 /// (fenced-leader/outbox model already scoped there) — not something this
 /// migration solves.
 
+#include "rbac_text.hpp"
+#include "utf8_sanitize.hpp"
+
 #include <cstdint>
 #include <cstddef>
 #include <filesystem>
@@ -188,9 +191,21 @@ public:
                                                        const std::string& arch,
                                                        const std::string& version, int rollout_pct);
 
-    void remove_package(const std::string& platform, const std::string& arch,
-                        const std::string& version);
+    /// Delete a package row. Returns true when the DELETE statement completed
+    /// (including when no row matched); false when the store was closed, no
+    /// connection was available in time, or the statement failed. A caller that
+    /// audits the removal or unlinks the package files must act on this result.
+    [[nodiscard]] bool remove_package(const std::string& platform, const std::string& arch,
+                                      const std::string& version);
     std::vector<UpdatePackage> list_packages() const;
+
+    /// The listing with the failure kept visible: `std::nullopt` when the store was
+    /// closed, no connection was available in time, or the query failed; a present
+    /// (possibly empty) vector only when the read succeeded. Use this where an
+    /// empty answer would change what is done next (the delete route decides which
+    /// files to unlink from it); `list_packages` stays the fail-soft form for the
+    /// display paths.
+    [[nodiscard]] std::optional<std::vector<UpdatePackage>> list_packages_checked() const;
     std::optional<UpdatePackage> latest_for(const std::string& platform,
                                             const std::string& arch) const;
 
@@ -217,6 +232,16 @@ private:
     yuzu::MetricsRegistry* metrics_{nullptr};
 };
 
+/// Is `s` well-formed UTF-8, as PostgreSQL's UTF8 encoding defines it (no
+/// overlong forms, no surrogates, nothing above U+10FFFF)? A text value that is not
+/// cannot be stored in a TEXT column, so the package fields (platform, arch,
+/// filename) are checked with this before anything is written. Same rule as
+/// `sanitize_utf8_strict`, which this delegates to: a string is valid exactly when
+/// scrubbing it changes nothing.
+[[nodiscard]] inline bool is_valid_utf8(std::string_view s) {
+    return sanitize_utf8_strict(s) == s;
+}
+
 /// Is `name` safe to use as an OTA package filename? (#3863)
 ///
 /// Every OTA artifact path is built as `update_dir_ / filename` — the binary, its
@@ -235,13 +260,17 @@ private:
 /// "just one more" separator or encoding to be handled. Callers reject; nothing
 /// rewrites the operator's name behind their back.
 ///
-/// Rejects: empty; `.` and `..`; anything containing `/`, `\\`, or `:`. The
+/// Rejects: empty; `.` and `..`; anything containing a NUL byte, another control
+/// byte (0x01-0x1F) or DEL; anything that is not valid UTF-8; anything containing
+/// `/`, `\\`, or `:`. The
 /// backslash and colon are rejected on every platform, not just Windows — the
 /// server may run on Windows, where both are path-significant (`:` also selects
 /// an NTFS alternate data stream), and a rule that varies by build host is a rule
 /// nobody can reason about.
 [[nodiscard]] inline bool is_safe_package_filename(std::string_view name) {
     if (name.empty() || name == "." || name == "..")
+        return false;
+    if (!rbac_text_is_clean(name) || !is_valid_utf8(name))
         return false;
     return name.find_first_of("/\\:") == std::string_view::npos;
 }

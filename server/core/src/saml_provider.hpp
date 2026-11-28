@@ -206,6 +206,21 @@ public:
     /// the PEM bytes.
     const std::string& signing_init_error() const;
 
+    /// True when SamlConfig::idp_cert_pem could NOT be loaded as a
+    /// signature-verification key by the very loader validate_response() uses
+    /// (the shared `load_idp_key` in saml_provider.cpp — xmlsec's
+    /// xmlSecOpenSSLAppKeyLoadMemory, PEM certificate format). Probed once at
+    /// construction (#4160) so server.cpp can disable SAML at boot instead of
+    /// leaving a provider that looks enabled while every assertion fails. This
+    /// is deliberately a SEPARATE flag and is NOT folded into is_enabled():
+    /// is_enabled() is a config-presence test that many tests satisfy with a
+    /// placeholder certificate string. Always false on Windows.
+    bool idp_cert_configured_but_broken() const;
+
+    /// Human-readable reason idp_cert_configured_but_broken() is true. Empty
+    /// otherwise. Never contains the certificate bytes.
+    const std::string& idp_cert_init_error() const;
+
 private:
     void cleanup_expired_states_locked(); ///< Must be called with mu_ held.
 
@@ -231,6 +246,12 @@ private:
     std::shared_ptr<EVP_PKEY> sp_signing_key_;
     bool        signing_init_failed_{false};
     std::string signing_init_error_;
+
+    /// Set by the constructor's IdP-certificate probe (#4160). See
+    /// idp_cert_configured_but_broken(). The certificate itself is public and
+    /// stays in config_ (validate_response re-reads it per assertion).
+    bool        idp_cert_init_failed_{false};
+    std::string idp_cert_init_error_;
 };
 
 } // namespace yuzu::server::saml

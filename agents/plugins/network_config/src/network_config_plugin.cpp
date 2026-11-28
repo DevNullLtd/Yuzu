@@ -97,11 +97,13 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
+#include <win_dns_cache_table.hpp> // DnsCacheTableOwner (F64: frees the DnsGetCacheDataTable list)
 #include <win_str.hpp>  // shared yuzu::win wide<->UTF-8 helpers (#1681)
 #include <iphlpapi.h>
 #include <netioapi.h> // GetIpNetTable2 / MIB_IPNET_ROW2 / ConvertInterfaceLuidToAlias (arp)
 #include <winhttp.h>
 #include <vector>
+#include <yuzu/agent/win_adapter_list.hpp> // read_adapters (bounded, in agent-core)
 #pragma comment(lib, "iphlpapi.lib")
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "winhttp.lib")
@@ -355,29 +357,24 @@ std::vector<std::string> extract_server_addresses(CFDictionaryRef dict) {
 #endif // __APPLE__
 
 #ifdef _WIN32
-// Format a MAC address from a byte array
-std::string format_mac(const BYTE* addr, DWORD len) {
-    if (len < 6)
-        return "-";
-    return std::format("{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}", addr[0], addr[1], addr[2],
-                       addr[3], addr[4], addr[5]);
-}
-
 // wide->UTF-8 conversion now via the shared win_str.hpp (#1681); from_wide is
 // behaviour-identical to the old NUL-terminated wide_to_utf8 for valid input.
 using yuzu::win::from_wide;
 
-// Convert a SOCKADDR to a string
-std::string sockaddr_to_string(LPSOCKADDR sa) {
-    char buf[128]{};
-    if (sa->sa_family == AF_INET) {
-        auto* v4 = reinterpret_cast<sockaddr_in*>(sa);
-        inet_ntop(AF_INET, &v4->sin_addr, buf, sizeof(buf));
-    } else if (sa->sa_family == AF_INET6) {
-        auto* v6 = reinterpret_cast<sockaddr_in6*>(sa);
-        inet_ntop(AF_INET6, &v6->sin6_addr, buf, sizeof(buf));
-    }
-    return buf;
+static_assert(yuzu::network_config::kIfTypeSoftwareLoopback == IF_TYPE_SOFTWARE_LOOPBACK);
+static_assert(yuzu::network_config::kIfTypeTunnel == IF_TYPE_TUNNEL);
+static_assert(yuzu::network_config::kIfOperStatusUp == static_cast<std::uint32_t>(IfOperStatusUp));
+
+// One bounded adapter-list read in agent-core, written through the pure row builder of the action.
+int write_adapter_list_rows(yuzu::CommandContext& ctx,
+                            yuzu::network_config::WindowsRows (*build)(
+                                const yuzu::agent::win::AdapterList&)) {
+    const auto list = yuzu::agent::win::read_adapters(yuzu::agent::win::kAdapterListDeadline);
+    yuzu::agent::forward_bounded_failure(ctx, list.status, "network_config:adapter_list");
+    const auto out = build(list);
+    for (const auto& row : out.rows)
+        ctx.write_output(row);
+    return out.rc;
 }
 #endif
 
@@ -734,36 +731,9 @@ RouteDumpResult fetch_default_route_dump() {
 // ── adapters action ───────────────────────────────────────────────────────
 
 int do_adapters(yuzu::CommandContext& ctx) {
+    int rc = 0;
 #ifdef _WIN32
-    ULONG buf_size = 0;
-    GetAdaptersAddresses(AF_UNSPEC, GAA_FLAG_INCLUDE_PREFIX, nullptr, nullptr, &buf_size);
-    if (buf_size == 0) {
-        ctx.write_output("adapter|No adapters found|-|0|unknown");
-        return 0;
-    }
-
-    std::vector<BYTE> buffer(buf_size);
-    auto* adapters = reinterpret_cast<PIP_ADAPTER_ADDRESSES>(buffer.data());
-    if (GetAdaptersAddresses(AF_UNSPEC, GAA_FLAG_INCLUDE_PREFIX, nullptr, adapters, &buf_size) !=
-        NO_ERROR) {
-        ctx.write_output("adapter|Error enumerating adapters|-|0|unknown");
-        return 1;
-    }
-
-    for (auto* a = adapters; a; a = a->Next) {
-        // Skip loopback and tunnel adapters
-        if (a->IfType == IF_TYPE_SOFTWARE_LOOPBACK)
-            continue;
-        if (a->IfType == IF_TYPE_TUNNEL)
-            continue;
-
-        auto name = from_wide(a->FriendlyName);
-        auto mac = format_mac(a->PhysicalAddress, a->PhysicalAddressLength);
-        auto speed_mbps = a->TransmitLinkSpeed / 1'000'000;
-        const char* status = (a->OperStatus == IfOperStatusUp) ? "up" : "down";
-
-        ctx.write_output(std::format("adapter|{}|{}|{}|{}", name, mac, speed_mbps, status));
-    }
+    rc = write_adapter_list_rows(ctx, yuzu::network_config::windows_adapter_rows);
 
 #elif defined(__linux__)
     auto links = fetch_link_dump();
@@ -864,52 +834,15 @@ int do_adapters(yuzu::CommandContext& ctx) {
                                      up_by_name[name] ? "up" : "down"));
     }
 #endif
-    return 0;
+    return rc;
 }
 
 // ── ip_addresses action ───────────────────────────────────────────────────
 
 int do_ip_addresses(yuzu::CommandContext& ctx) {
+    int rc = 0;
 #ifdef _WIN32
-    ULONG buf_size = 0;
-    GetAdaptersAddresses(AF_UNSPEC, GAA_FLAG_INCLUDE_GATEWAYS, nullptr, nullptr, &buf_size);
-    if (buf_size == 0)
-        return 0;
-
-    std::vector<BYTE> buffer(buf_size);
-    auto* adapters = reinterpret_cast<PIP_ADAPTER_ADDRESSES>(buffer.data());
-    if (GetAdaptersAddresses(AF_UNSPEC, GAA_FLAG_INCLUDE_GATEWAYS, nullptr, adapters, &buf_size) !=
-        NO_ERROR) {
-        return 1;
-    }
-
-    for (auto* a = adapters; a; a = a->Next) {
-        if (a->IfType == IF_TYPE_SOFTWARE_LOOPBACK)
-            continue;
-        if (a->IfType == IF_TYPE_TUNNEL)
-            continue;
-
-        auto adapter_name = from_wide(a->FriendlyName);
-
-        // Collect first gateway
-        std::string gateway = "-";
-        for (auto* gw = a->FirstGatewayAddress; gw; gw = gw->Next) {
-            auto addr = sockaddr_to_string(gw->Address.lpSockaddr);
-            if (!addr.empty()) {
-                gateway = addr;
-                break;
-            }
-        }
-
-        // List unicast addresses
-        for (auto* ua = a->FirstUnicastAddress; ua; ua = ua->Next) {
-            auto addr = sockaddr_to_string(ua->Address.lpSockaddr);
-            if (addr.empty())
-                continue;
-            ctx.write_output(
-                std::format("ip|{}|{}|{}|{}", adapter_name, addr, ua->OnLinkPrefixLength, gateway));
-        }
-    }
+    rc = write_adapter_list_rows(ctx, yuzu::network_config::windows_ip_rows);
 
 #elif defined(__linux__)
     auto links = fetch_link_dump();
@@ -1049,42 +982,15 @@ int do_ip_addresses(yuzu::CommandContext& ctx) {
         }
     }
 #endif
-    return 0;
+    return rc;
 }
 
 // ── dns_servers action ────────────────────────────────────────────────────
 
 int do_dns_servers(yuzu::CommandContext& ctx) {
+    int rc = 0;
 #ifdef _WIN32
-    ULONG buf_size = 0;
-    GetAdaptersAddresses(AF_UNSPEC, GAA_FLAG_INCLUDE_PREFIX, nullptr, nullptr, &buf_size);
-    if (buf_size == 0)
-        return 0;
-
-    std::vector<BYTE> buffer(buf_size);
-    auto* adapters = reinterpret_cast<PIP_ADAPTER_ADDRESSES>(buffer.data());
-    if (GetAdaptersAddresses(AF_UNSPEC, GAA_FLAG_INCLUDE_PREFIX, nullptr, adapters, &buf_size) !=
-        NO_ERROR) {
-        return 1;
-    }
-
-    for (auto* a = adapters; a; a = a->Next) {
-        if (a->IfType == IF_TYPE_SOFTWARE_LOOPBACK)
-            continue;
-        if (a->IfType == IF_TYPE_TUNNEL)
-            continue;
-
-        auto adapter_name = from_wide(a->FriendlyName);
-
-        for (auto* dns = a->FirstDnsServerAddress; dns; dns = dns->Next) {
-            auto addr = sockaddr_to_string(dns->Address.lpSockaddr);
-            if (addr.empty())
-                continue;
-            auto family = dns->Address.lpSockaddr->sa_family;
-            const char* type = (family == AF_INET6) ? "IPv6" : "IPv4";
-            ctx.write_output(std::format("dns|{}|{}|{}", adapter_name, addr, type));
-        }
-    }
+    rc = write_adapter_list_rows(ctx, yuzu::network_config::windows_dns_rows);
 
 #elif defined(__linux__)
     std::ifstream resolv("/etc/resolv.conf");
@@ -1172,7 +1078,7 @@ int do_dns_servers(yuzu::CommandContext& ctx) {
                           "network_config:no_systemconfiguration");
 #endif
 #endif
-    return 0;
+    return rc;
 }
 
 // ── proxy action ──────────────────────────────────────────────────────────
@@ -1184,17 +1090,18 @@ int do_proxy(yuzu::CommandContext& ctx) {
         if (proxy_cfg.lpszAutoConfigUrl) {
             ctx.write_output(std::format("proxy_type|pac"));
             ctx.write_output(
-                std::format("proxy_address|{}", from_wide(proxy_cfg.lpszAutoConfigUrl)));
+                yuzu::network_config::format_proxy_address_row(from_wide(proxy_cfg.lpszAutoConfigUrl)));
             GlobalFree(proxy_cfg.lpszAutoConfigUrl);
         }
         if (proxy_cfg.lpszProxy) {
             auto proxy = from_wide(proxy_cfg.lpszProxy);
             ctx.write_output(std::format("proxy_type|http"));
-            ctx.write_output(std::format("proxy_address|{}", proxy));
+            ctx.write_output(yuzu::network_config::format_proxy_address_row(
+                                     proxy, yuzu::network_config::ProxyShape::list));
             GlobalFree(proxy_cfg.lpszProxy);
         }
         if (proxy_cfg.lpszProxyBypass) {
-            ctx.write_output(std::format("bypass|{}", from_wide(proxy_cfg.lpszProxyBypass)));
+            ctx.write_output(yuzu::network_config::format_bypass_row(from_wide(proxy_cfg.lpszProxyBypass)));
             GlobalFree(proxy_cfg.lpszProxyBypass);
         }
         if (!proxy_cfg.lpszAutoConfigUrl && !proxy_cfg.lpszProxy) {
@@ -1216,10 +1123,10 @@ int do_proxy(yuzu::CommandContext& ctx) {
         if (val && *val) {
             if (std::string_view(var).find("no_proxy") != std::string_view::npos ||
                 std::string_view(var).find("NO_PROXY") != std::string_view::npos) {
-                ctx.write_output(std::format("bypass|{}", val));
+                ctx.write_output(yuzu::network_config::format_bypass_row(val));
             } else {
                 ctx.write_output(std::format("proxy_type|{}", var));
-                ctx.write_output(std::format("proxy_address|{}", val));
+                ctx.write_output(yuzu::network_config::format_proxy_address_row(val));
             }
             found = true;
         }
@@ -1329,7 +1236,7 @@ int do_proxy(yuzu::CommandContext& ctx) {
         const auto choice = yuzu::network_config::select_proxy(candidates);
         if (choice.found) {
             ctx.write_output(std::format("proxy_type|{}", choice.type));
-            ctx.write_output(std::format("proxy_address|{}", choice.address));
+            ctx.write_output(yuzu::network_config::format_proxy_address_row(choice.address));
             emitted = true;
         }
 
@@ -1352,7 +1259,7 @@ int do_proxy(yuzu::CommandContext& ctx) {
             // is the acquisition half.
             const std::string joined = yuzu::network_config::join_bypass_list(entries);
             if (!joined.empty())
-                ctx.write_output(std::format("bypass|{}", joined));
+                ctx.write_output(yuzu::network_config::format_bypass_row(joined));
         }
     } else {
         // SCDynamicStoreCopyProxies failed. Falling through to the
@@ -1764,66 +1671,67 @@ private:
     static int do_dns_cache(yuzu::CommandContext& ctx) {
 #ifdef _WIN32
         // Dynamically load DnsGetCacheDataTable from dnsapi.dll
-        using DNS_CACHE_ENTRY = struct _DNS_CACHE_ENTRY {
-            struct _DNS_CACHE_ENTRY* pNext;
-            PWSTR pszName;
-            WORD wType;
-            WORD wDataLength;
-            DWORD dwFlags;
-        };
-        using DnsGetCacheDataTableFn = BOOL(WINAPI*)(DNS_CACHE_ENTRY*);
+        using DnsGetCacheDataTableFn = BOOL(WINAPI*)(yuzu::shared::DnsCacheNode**);
 
-        auto hDnsApi = LoadLibraryA("dnsapi.dll");
+        auto hDnsApi = LoadLibraryExW(L"dnsapi.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
         if (!hDnsApi) {
             ctx.write_output("dns_cache|not_available|dnsapi.dll not found");
             return 0;
         }
 
         auto pFunc = reinterpret_cast<DnsGetCacheDataTableFn>(
-            GetProcAddress(hDnsApi, "DnsGetCacheDataTable"));
+            reinterpret_cast<void*>(GetProcAddress(hDnsApi, "DnsGetCacheDataTable")));
         if (!pFunc) {
             FreeLibrary(hDnsApi);
             ctx.write_output("dns_cache|not_available|DnsGetCacheDataTable not found");
             return 0;
         }
 
-        DNS_CACHE_ENTRY root{};
-        if (pFunc(&root)) {
-            int count = 0;
-            for (auto* entry = root.pNext; entry; entry = entry->pNext) {
-                if (entry->pszName) {
-                    auto name = from_wide(entry->pszName);
-                    // wType: 1=A, 28=AAAA, 5=CNAME, etc.
-                    const char* type = "unknown";
-                    switch (entry->wType) {
-                    case 1:
-                        type = "A";
-                        break;
-                    case 28:
-                        type = "AAAA";
-                        break;
-                    case 5:
-                        type = "CNAME";
-                        break;
-                    case 12:
-                        type = "PTR";
-                        break;
-                    case 15:
-                        type = "MX";
-                        break;
-                    case 33:
-                        type = "SRV";
-                        break;
+        {
+            // The list is caller-owned (F64): the owner frees every node + name on scope exit,
+            // including when write_output/from_wide throws. It must be destroyed BEFORE
+            // FreeLibrary below, which it is (inner scope).
+            yuzu::shared::DnsCacheTableOwner table(hDnsApi);
+            if (pFunc(table.out())) {
+                int count = 0;
+                std::size_t nodes = 0;
+                for (auto* entry = table.head(); entry; entry = entry->pNext) {
+                    if (++nodes > yuzu::shared::kDnsCacheNodeWalkCap)
+                        break; // corrupted/cyclic list: bound the walk
+                    if (entry->pszName) {
+                        auto name = from_wide(entry->pszName);
+                        // wType: 1=A, 28=AAAA, 5=CNAME, etc.
+                        const char* type = "unknown";
+                        switch (entry->wType) {
+                        case 1:
+                            type = "A";
+                            break;
+                        case 28:
+                            type = "AAAA";
+                            break;
+                        case 5:
+                            type = "CNAME";
+                            break;
+                        case 12:
+                            type = "PTR";
+                            break;
+                        case 15:
+                            type = "MX";
+                            break;
+                        case 33:
+                            type = "SRV";
+                            break;
+                        }
+                        ctx.write_output(std::format("cache_entry|{}|{}|0|", name, type));
+                        ++count;
                     }
-                    ctx.write_output(std::format("cache_entry|{}|{}|0|", name, type));
-                    ++count;
                 }
+                if (count == 0) {
+                    ctx.write_output("dns_cache|empty");
+                }
+            } else {
+                ctx.write_output("dns_cache|not_available|query failed");
             }
-            if (count == 0) {
-                ctx.write_output("dns_cache|empty");
-            }
-        } else {
-            ctx.write_output("dns_cache|not_available|query failed");
         }
         FreeLibrary(hDnsApi);
 

@@ -1,5 +1,7 @@
 #include "gateway_service_impl.hpp"
 
+#include "agent_reregistration_apply.hpp"
+
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -373,8 +375,10 @@ GatewayUpstreamServiceImpl::GatewayUpstreamServiceImpl(AgentRegistry& registry, 
             "row (the unique session index refused the fallback insert); the placement is "
             "unpublished and the same alert covers it. "
             "op=\"notify_stream_status\" outcome \"connected_unverified\" is a CONNECTED refused "
-            "because the directory read degraded and this replica holds no matching local "
-            "session (the agent recovers by reconnecting). HA WS-5 lookups: "
+            "because the directory read degraded, regardless of any session this replica holds "
+            "locally (a gateway that includes #5695 resends it and it is accepted once the "
+            "directory reads; an older gateway leaves the agent undispatchable until it "
+            "reconnects). HA WS-5 lookups: "
             "op=\"session_lookup\" outcome=\"ambiguous_session\" means one presented "
             "session_id matched more than one directory row (never trusted; expected zero), "
             "and outcome=\"unknown_session\" under op=\"renew_leases\" or "
@@ -453,7 +457,7 @@ GatewayUpstreamServiceImpl::GatewayUpstreamServiceImpl(AgentRegistry& registry, 
                           {{"op", "proxy_register"}, {"outcome", "malformed_session_id"}});
         metrics_->counter("yuzu_server_gateway_route_desync_total",
                           {{"op", "proxy_register"}, {"outcome", "session_held_by_other_agent"}});
-        // HA WS-5: CONNECTED refused on a degraded read with no matching local session.
+        // HA WS-5: CONNECTED refused on every degraded directory read (a locally held session does not change this).
         metrics_->counter("yuzu_server_gateway_route_desync_total",
                           {{"op", "notify_stream_status"}, {"outcome", "connected_unverified"}});
         // #1197: BatchHeartbeat's over-length unknown session_id, same shape
@@ -467,6 +471,9 @@ GatewayUpstreamServiceImpl::GatewayUpstreamServiceImpl(AgentRegistry& registry, 
         // fires only after a hand-dropped index; every match is still returned).
         metrics_->counter("yuzu_server_gateway_route_desync_total",
                           {{"op", "session_lookup"}, {"outcome", "ambiguous_session"}});
+        // #6339: the local session map and the directory row name different agents.
+        metrics_->counter("yuzu_server_gateway_route_desync_total",
+                          {{"op", "session_lookup"}, {"outcome", "agent_mismatch"}});
         metrics_->counter("yuzu_server_gateway_route_desync_total",
                           {{"op", "proxy_inventory"}, {"outcome", "unknown_session"}});
     }
@@ -526,15 +533,17 @@ GatewayUpstreamServiceImpl::resolve_sessions(const std::vector<std::string>& ses
             by_session[*rr.route.session_id].push_back(&rr);
 
     std::size_t ambiguous = 0;
+    std::size_t agent_mismatch = 0;
     std::unordered_set<std::string> lost_race_ids;
-    std::unordered_set<std::string> local_ids;
+    // session_id -> the agent THIS replica's hint map names for it.
+    std::unordered_map<std::string, std::string> local_agent;
     {
         std::lock_guard lock(sessions_mu_);
         for (const auto& id : ids) {
             if (lost_race_sessions_.contains(id))
                 lost_race_ids.insert(id);
-            if (gateway_sessions_.contains(id))
-                local_ids.insert(id);
+            if (auto lit = gateway_sessions_.find(id); lit != gateway_sessions_.end())
+                local_agent.emplace(id, lit->second);
         }
     }
     for (const auto& id : ids) {
@@ -552,10 +561,33 @@ GatewayUpstreamServiceImpl::resolve_sessions(const std::vector<std::string>& ses
                 ++ambiguous;
             continue;
         }
-        out.resolved.emplace(id, it->second.front()->route.agent_id);
+        const auto& row_agent = it->second.front()->route.agent_id;
+        const auto lit = local_agent.find(id);
+        // #6339 (ADR-2002 7f): the local hint map must not name a DIFFERENT agent than the
+        // directory row for the same session id. Believing the row alone would attribute a
+        // heartbeat or inventory report to the row's agent while this replica holds the id for
+        // another, which is how an agent that presents a victim's session id gets the victim's
+        // heartbeat. Refuse it (not resolved, not acted on) and let it fall through to the
+        // callers' unknown handling, which lists it so the gateway replays ProxyRegister and the
+        // register path decides who holds the id.
+        if (lit != local_agent.end() && lit->second != row_agent) {
+            if (out.agent_mismatch.insert(id).second)
+                ++agent_mismatch;
+            continue;
+        }
+        out.resolved.emplace(id, row_agent);
         out.from_store.insert(id);
-        if (!local_ids.contains(id))
+        if (lit == local_agent.end())
             out.store_only.insert(id);
+    }
+    if (agent_mismatch > 0) {
+        if (warn_slot_due("session_agent_mismatch"))
+            spdlog::warn("[gateway] GatewayRouteStore session lookup: {} session id(s) name a "
+                         "different agent in this replica's session map than in the directory; "
+                         "refused and listed for replay (logged at most once per 5s)",
+                         agent_mismatch);
+        record_directory_desync(metrics_, "session_lookup", "agent_mismatch",
+                                static_cast<double>(agent_mismatch));
     }
     if (ambiguous > 0) {
         if (warn_slot_due("ambiguous_session")) {
@@ -684,6 +716,57 @@ grpc::Status GatewayUpstreamServiceImpl::ProxyRegister(grpc::ServerContext* cont
     // still add themselves. Per-gateway agent_id
     // scoping/attestation is #1292 (design: #5578, ADR-0066).
 
+    // WP01: an already-enrolled id whose live leaf is not proven re-enrols through the token block
+    // below, as a re-enrolment (single-use token required, older leaf superseded). See
+    // agent_reregistration_gate.hpp; this is the mirror of the direct Register path.
+    bool reenrol_via_token = false;
+    bool reenrolled_with_token = false;
+    // A gRPC status, NEVER accepted=false (a permanent rejection to the agent): the agent keeps
+    // retrying until it holds a good token.
+    const auto reenrol_token_refusal = [&](std::string_view reason) {
+        if (metrics_) {
+            metrics_
+                ->counter("yuzu_register_reenrol_token_refused_total",
+                          {{"reason", std::string(reason)}})
+                .increment();
+        }
+        spdlog::warn("[gateway] Register: re-enrolment token refused for agent {} ({})",
+                     safe_agent_id, reason);
+        return grpc::Status(grpc::StatusCode::UNAUTHENTICATED,
+                            std::string(yuzu::server::kReregistrationRefusalPublicMessage));
+    };
+
+    // Both fields are gateway-authoritative (overwritten unconditionally by the gateway),
+    // so they are read ONLY here; the direct Register ignores them. `attests` is true only when
+    // the gateway's listener can witness a client certificate; a plaintext
+    // listener and TLS without witness_client_cert all report false (no proof can exist).
+    const auto run_reregistration_gate = [&]() {
+        const bool attests = request->gateway_attests_peer_cert();
+        bool cert_proves = false;
+        if (attests && agent_identity_hooks_ && agent_identity_hooks_->attested_leaf_proves &&
+            reregistration_mode_ != yuzu::server::ReregistrationProofMode::Off) {
+            try {
+                cert_proves = agent_identity_hooks_->attested_leaf_proves(
+                    request->gateway_attested_peer_cert_pem(), info.agent_id());
+            } catch (...) {
+                cert_proves = false; // a throw is no proof
+            }
+        }
+        return yuzu::server::apply_reregistration_gate(
+            reregistration_mode_, agent_identity_hooks_.get(), "gateway_proxy", info.agent_id(),
+            safe_agent_id,
+            yuzu::server::ReregistrationEvidence{
+                .cert_proves_identity = cert_proves,
+                .token_presented = !request->enrollment_token().empty(),
+                .transport_can_prove = attests},
+            metrics_,
+            yuzu::server::make_reregistration_audit_sink(
+                audit_store_, "gateway_proxy", info.agent_id(), agent_source_ip,
+                [&](std::string& d) { append_origin_detail(d); /* #1064 */ },
+                /*on_write_failure=*/nullptr, metrics_),
+            agent_source_ip);
+    };
+
     // Fast path: agent already enrolled from a prior connection
     {
         // WS-6 6.2: five-state read — a store ERROR fails closed with UNAVAILABLE,
@@ -712,7 +795,26 @@ grpc::Status GatewayUpstreamServiceImpl::ProxyRegister(grpc::ServerContext* cont
         const auto& prior = *prior_result;
         if (prior && *prior == auth::PendingStatus::approved) {
             spdlog::info("[gateway] Agent {} re-registering (already enrolled)", safe_agent_id);
-            goto gw_enrolled;
+            // WP01: the approved row is not proof of WHO is calling (the agent listener is
+            // verify-none by design, so the gateway relayed an unauthenticated claim). The proof
+            // is the leaf the gateway WITNESSED in the agent's TLS handshake; see
+            // run_reregistration_gate below.
+            const auto verdict = run_reregistration_gate();
+            if (verdict.route == yuzu::server::ReregistrationVerdict::Route::Refuse)
+                return *verdict.refusal;
+            if (verdict.route == yuzu::server::ReregistrationVerdict::Route::TokenReenrol)
+                reenrol_via_token = true; // fall through to the token block
+            else
+                goto gw_enrolled;
+        }
+        // WP01 / UP-2: the gate keys on the LEAF STATE, not the pending row (see the direct path):
+        // an absent OR pending row runs it; a pending row with no leaf proceeds unchanged.
+        if (!prior || *prior == auth::PendingStatus::pending) {
+            const auto verdict = run_reregistration_gate();
+            if (verdict.route == yuzu::server::ReregistrationVerdict::Route::Refuse)
+                return *verdict.refusal;
+            if (verdict.route == yuzu::server::ReregistrationVerdict::Route::TokenReenrol)
+                reenrol_via_token = true;
         }
         // #1067: reject an admin-DENIED agent BEFORE consuming any enrollment
         // token — same token-depletion DoS as the direct-connect path (W1.4
@@ -774,6 +876,8 @@ grpc::Status GatewayUpstreamServiceImpl::ProxyRegister(grpc::ServerContext* cont
                                      {"source", "gateway_proxy"}};
                     analytics_store->emit(std::move(ae));
                 }
+                if (reenrol_via_token)
+                    return reenrol_token_refusal("invalid_input_length");
                 response->set_accepted(false);
                 response->set_reject_reason(
                     std::string(yuzu::server::kEnrollmentTokenRejectionPublicMessage));
@@ -798,7 +902,8 @@ grpc::Status GatewayUpstreamServiceImpl::ProxyRegister(grpc::ServerContext* cont
                           yuzu::server::sanitize_enrollment_text(info.platform().os()),
                           yuzu::server::sanitize_enrollment_text(info.platform().arch()),
                           yuzu::server::sanitize_enrollment_text(info.agent_version()),
-                          /*enforce_new_id_charset=*/true)
+                          /*enforce_new_id_charset=*/true,
+                          /*require_single_use=*/reenrol_via_token)
                     : std::expected<auth::ConsumeEnrollResult, StoreError>{
                           auth::ConsumeEnrollResult{
                               .kind = auth::ConsumeEnrollResult::Kind::token_rejected,
@@ -899,6 +1004,9 @@ grpc::Status GatewayUpstreamServiceImpl::ProxyRegister(grpc::ServerContext* cont
                     analytics_store->emit(std::move(ae));
                 }
 
+                if (reenrol_via_token)
+                    return reenrol_token_refusal(consumed->not_single_use ? std::string_view{"multi_use_token"}
+                                                                      : std::string_view{variant});
                 response->set_accepted(false);
                 response->set_reject_reason(
                     std::string(yuzu::server::kEnrollmentTokenRejectionPublicMessage));
@@ -909,6 +1017,13 @@ grpc::Status GatewayUpstreamServiceImpl::ProxyRegister(grpc::ServerContext* cont
             // transaction, so the success audit row below only describes a
             // completed enrollment.
             const auto& claim = consumed->claim;
+            if (reenrol_via_token) {
+                // WP01 / D5: only a SINGLE-USE token (max_uses == 1) is proof of an existing
+                // identity; a multi-use fleet token is shared by every holder.
+                if (claim.max_uses != 1)
+                    return reenrol_token_refusal("multi_use_token");
+                reenrolled_with_token = true;
+            }
             spdlog::info("[gateway] Agent {} auto-enrolled via enrollment token id={} ({}/{})",
                          safe_agent_id, claim.token_id, claim.use_count_after,
                          claim.max_uses == 0 ? -1 : claim.max_uses);
@@ -935,6 +1050,18 @@ grpc::Status GatewayUpstreamServiceImpl::ProxyRegister(grpc::ServerContext* cont
                 ev.source_ip = agent_source_ip; // #1064: agent origin, not gateway IP
                 ev.result = "success";
                 enroll_audit_ok = audit_store_->log(ev);
+                if (reenrolled_with_token) {
+                    AuditEvent re = ev;
+                    re.action = "agent.reenrolled_with_token";
+                    re.target_type = "Agent";
+                    re.target_id = info.agent_id();
+                    re.detail = "token_id=" + claim.token_id + " via=gateway_proxy";
+                    enroll_audit_ok = audit_store_->log(re) && enroll_audit_ok;
+                }
+            } else if (audit_store_) {
+                // A wired but closed store cannot record the enrolment (nor the re-enrolment row):
+                // that is the same dropped-evidence degradation as a failed write, never silence.
+                enroll_audit_ok = false;
             }
             // #1065 / #1063: a dropped SUCCESS audit row is the same
             // evidence-chain degradation as a dropped failure row — was
@@ -1306,11 +1433,7 @@ gw_enrolled:
         session_id =
             "gw-session-" + auth::AuthManager::bytes_to_hex(auth::AuthManager::random_bytes(16));
         if (gateway_route_store_) {
-            // Upgrade-window shim (removed with the other legacy-name shims): carry the agent's
-            // legacy plugin-name flag onto the directory row, so a replica without this session
-            // can still dispatch.
-            if (auto res = gateway_route_store_->register_fresh(info.agent_id(), session_id,
-                                                                installed->legacy_echo_wire_name);
+            if (auto res = gateway_route_store_->register_fresh(info.agent_id(), session_id);
                 !res) {
                 record_route_store_failure(metrics_, "register_fresh", res.error());
                 // Task B (4.2b): register_fresh is the ONE fail-CLOSED
@@ -1386,6 +1509,11 @@ gw_enrolled:
     // stops re-enrollment/re-issuance (checked above). The shared signer
     // (sign_agent_csr) carries the per-agent rate-limit + CSR-size cap, so both
     // paths share one issuance chokepoint and cannot drift.
+    std::string_view no_leaf_reason; // set only when NO new leaf is issued below
+    if (request->csr_pem().empty())
+        no_leaf_reason = yuzu::server::kReenrolNoLeafNoCsr;
+    else if (!agent_cert_signer_)
+        no_leaf_reason = yuzu::server::kReenrolNoLeafNoSigner;
     if (!request->csr_pem().empty() && agent_cert_signer_) {
         // #1273 B-2: the signer (sign_agent_csr) runs INSIDE this synchronous gRPC
         // handler and is now reachable over the one-way-TLS gateway edge. An
@@ -1397,9 +1525,11 @@ gw_enrolled:
             issued = agent_cert_signer_(request->csr_pem(), info.agent_id(),
                                         CertIssuanceSource::GatewayProxy);
         } catch (const std::exception& e) {
+            no_leaf_reason = yuzu::server::kReenrolNoLeafSignerThrew;
             spdlog::error("[gateway] ProxyRegister: signer threw for agent {}: {}", safe_agent_id,
                           e.what());
         } catch (...) {
+            no_leaf_reason = yuzu::server::kReenrolNoLeafSignerThrew;
             // Non-std throw (foreign exception across a plugin/.so boundary, etc.)
             // must not escape the sync handler either (gov #1273 Hermes).
             spdlog::error("[gateway] ProxyRegister: signer threw a non-std exception for agent {}",
@@ -1409,10 +1539,36 @@ gw_enrolled:
             response->set_issued_certificate(issued->first);
             response->set_issued_ca_chain(issued->second);
             spdlog::info("[gateway] Issued per-agent client cert for {}", safe_agent_id);
+            // WP01 / D4: see the direct path. After the new leaf exists, never before.
+            if (reenrolled_with_token && agent_identity_hooks_ &&
+                agent_identity_hooks_->supersede_older_leaves) {
+                try {
+                    if (!agent_identity_hooks_->supersede_older_leaves(info.agent_id(),
+                                                                       issued->first))
+                        spdlog::warn("agent {}: older leaves not superseded (see "
+                                     "ca.cert.supersede_failed)",
+                                     safe_agent_id);
+                } catch (...) {
+                    spdlog::error("[gateway] ProxyRegister: superseding older leaves threw for "
+                                  "agent {}",
+                                  safe_agent_id);
+                    if (metrics_)
+                        metrics_->counter("yuzu_server_ca_supersede_failed_total").increment();
+                }
+            }
         } else {
             spdlog::warn("[gateway] ProxyRegister: client-cert signing failed for agent {}",
                          safe_agent_id);
+            if (no_leaf_reason.empty())
+                no_leaf_reason = yuzu::server::kReenrolNoLeafSignerFailed;
         }
+    }
+    // WP01: a single-use token was consumed to re-enrol a live-leaf id but NO leaf was issued: the
+    // token is spent and the old leaf stays. Count it (alert YuzuAgentReenrolTokenNoLeaf).
+    if (reenrolled_with_token && !no_leaf_reason.empty()) {
+        yuzu::server::count_reenrol_token_no_leaf(metrics_, no_leaf_reason);
+        spdlog::warn("[gateway] agent {}: re-enrolment token consumed but no leaf issued ({})", safe_agent_id,
+                     no_leaf_reason);
     }
 
     // Store session_id on the AgentSession so session-aware cleanup works.
@@ -1510,6 +1666,12 @@ grpc::Status GatewayUpstreamServiceImpl::BatchHeartbeat(grpc::ServerContext* con
                 // Cannot tell (directory degraded) or refused (ambiguous):
                 // NOT unknown. Listing it would make the gateway re-register
                 // a healthy session — a fleet-wide storm on a Postgres blip.
+            } else if (resolution.agent_mismatch.contains(sid)) {
+                // #6339: refused, and listed so the gateway replays ProxyRegister, but NOT an
+                // unknown session (already counted as session_lookup/agent_mismatch), so it goes
+                // to the replay set and is left out of the renew_leases/unknown_session count.
+                if (sid.size() <= kMaxGatewaySessionIdLen)
+                    replay_ids.insert(sid);
             } else if (sid.size() > kMaxGatewaySessionIdLen) {
                 ++malformed_session_ids; // counted below; never echoed or logged in full
             } else {
@@ -1777,8 +1939,8 @@ grpc::Status GatewayUpstreamServiceImpl::ProxyInventory(grpc::ServerContext* con
     // handle the agent's ProxyRegister. `received=false` is the agent's retry
     // nack. A degraded read with a local hint still resolves (and ingests);
     // an unknown, ambiguous or unhinted-degraded id is nacked. Only `unknown`
-    // is counted as a desync here: ambiguous and degraded were already counted
-    // by resolve_sessions under their own labels.
+    // is counted as a desync here: ambiguous, agent-mismatch and degraded were already
+    // counted by resolve_sessions under their own labels.
     std::string agent_id;
     {
         const auto resolution = resolve_sessions({request->session_id()});
@@ -1792,6 +1954,11 @@ grpc::Status GatewayUpstreamServiceImpl::ProxyInventory(grpc::ServerContext* con
         } else if (resolution.ambiguous.contains(request->session_id())) {
             spdlog::warn("[gateway] ProxyInventory: session {} is ambiguous in the route "
                          "directory; refusing",
+                         onbehalf::sanitize_for_log(request->session_id(), 64));
+        } else if (resolution.agent_mismatch.contains(request->session_id())) {
+            // Counted as agent_mismatch by resolve_sessions; not an unknown session.
+            spdlog::warn("[gateway] ProxyInventory: session {} names a different agent here than "
+                         "in the route directory; refusing",
                          onbehalf::sanitize_for_log(request->session_id(), 64));
         } else {
             record_directory_desync(metrics_, "proxy_inventory", "unknown_session");
@@ -1987,14 +2154,31 @@ GatewayUpstreamServiceImpl::NotifyStreamStatus(grpc::ServerContext* context,
     // ADR-1005 enforceable seam — see grpc_on_behalf_enforce.hpp.
     if (auto s = onbehalf::enforce(context); !s.ok()) return s;
 
+    // The identifiers below are asserted by the gateway and are compared and stored as text.
+    // A value with an embedded NUL cannot be stored faithfully (the database sees only its
+    // prefix), so the whole notification is refused here, before any lookup, check, publish or
+    // write. Only the field name is logged: the value is externally supplied.
+    for (const auto& [field, value] :
+         {std::pair<std::string_view, const std::string*>{"agent_id", &request->agent_id()},
+          {"session_id", &request->session_id()},
+          {"cluster_id", &request->cluster_id()},
+          {"stream_home_id", &request->stream_home_id()}}) {
+        if (value->find('\0') != std::string::npos) {
+            spdlog::warn("[gateway] NotifyStreamStatus rejected: {} contains an embedded NUL",
+                         field);
+            return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT,
+                                "identifier contains an embedded NUL");
+        }
+    }
+
     const auto& agent_id = request->agent_id();
     const auto& session_id = request->session_id();
 
     // Verify session. The durable directory is the cross-replica truth. The local
     // map is a fallback for a missing/tombstoned row, a lost-race session (which
-    // never owns a row under its own id) and a degraded read; a CONNECTED never
-    // takes it over a row that names a DIFFERENT session, and on a degraded read
-    // a CONNECTED needs this replica's own registry to hold the session too.
+    // never owns a row under its own id); a CONNECTED never takes it over a row
+    // that names a DIFFERENT session, and on a DEGRADED read a CONNECTED is always
+    // refused (no local fallback, #5685 (ii)). The map is never consulted then.
     const bool is_connected = request->event() == gw::StreamStatusNotification::CONNECTED;
     bool session_in_directory = false;
     bool directory_names_other_session = false;
@@ -2003,29 +2187,25 @@ GatewayUpstreamServiceImpl::NotifyStreamStatus(grpc::ServerContext* context,
         if (!row) {
             record_route_store_failure(metrics_, "session_lookup", row.error());
             if (is_connected) {
-                bool local_hint = false;
-                {
-                    std::lock_guard lock(sessions_mu_);
-                    auto it = gateway_sessions_.find(session_id);
-                    local_hint = it != gateway_sessions_.end() && it->second == agent_id;
+                // HA WS-5 (#5685 (ii), ADR-2002 7f Update 2026-11-13): a CONNECTED on a
+                // degraded directory read is ALWAYS refused. This replica's own session
+                // map is not evidence of the current placement once a second replica can
+                // supersede the session, and nothing exists to tell a one-replica
+                // deployment from a two-replica one, so there is deliberately no
+                // local-hint branch here. The gateway keeps a refused CONNECTED and sends
+                // it again (#5695), so the cost is a delay, not a loss. Do not
+                // reintroduce an acceptance for "the session this replica holds".
+                if (warn_slot_due("connected_unverified")) {
+                    spdlog::warn(
+                        "[gateway] NotifyStreamStatus: CONNECTED for session {} (agent {}) "
+                        "refused — the directory read degraded; the gateway sends the notice "
+                        "again and it is accepted once the directory reads (logged at most "
+                        "once per 5s; see yuzu_server_gateway_route_desync_total)",
+                        onbehalf::sanitize_for_log(session_id, 64), ::yuzu::log_id_token(agent_id));
                 }
-                // Single replica: that local session was directory-verified at
-                // ProxyRegister, and set_gateway_route still rejects a superseded one.
-                if (!local_hint || !registry_.session_is(agent_id, session_id)) {
-                    if (warn_slot_due("connected_unverified")) {
-                        spdlog::warn(
-                            "[gateway] NotifyStreamStatus: CONNECTED for session {} (agent {}) "
-                            "refused — the directory read degraded and this replica holds no "
-                            "matching local session; the agent recovers by reconnecting (logged "
-                            "at most once per 5s; see yuzu_server_gateway_route_desync_total)",
-                            onbehalf::sanitize_for_log(session_id, 64),
-                            ::yuzu::log_id_token(agent_id));
-                    }
-                    record_directory_desync(metrics_, "notify_stream_status",
-                                            "connected_unverified");
-                    response->set_acknowledged(false);
-                    return grpc::Status::OK;
-                }
+                record_directory_desync(metrics_, "notify_stream_status", "connected_unverified");
+                response->set_acknowledged(false);
+                return grpc::Status::OK;
             }
         } else {
             const bool has_sid = row->has_value() && (*row)->session_id.has_value();
@@ -2252,6 +2432,24 @@ GatewayUpstreamServiceImpl::NotifyStreamStatus(grpc::ServerContext* context,
             response->set_acknowledged(false);
             return grpc::Status::OK;
         }
+        // HA WS-5 #5685 follow-up: the arrival mirror. This runs on whichever replica receives the
+        // CONNECTED (it need not own the session), and drops plugin lists other sessions of this
+        // agent published: hygiene, since a plugin-absence verdict is confirmed against the
+        // directory row and no longer depends on this write. It runs BEFORE
+        // announce_connected, so a CONNECTED the durable write then refuses has still
+        // cleared them (fail-open only: the agent reads as unknown). It is skipped for a session
+        // recorded as having LOST its register_fresh epoch race: the durable row belongs to a
+        // NEWER session, and this session's id would make `session_id <> $2` delete THAT
+        // session's published list.
+        bool lost_race_session = false;
+        {
+            std::lock_guard lock(sessions_mu_);
+            lost_race_session = lost_race_sessions_.contains(session_id);
+        }
+        if (!lost_race_session)
+            mirror_arrival_to_presence(
+                heartbeat_ingestion_ ? heartbeat_ingestion_->offline_endpoint_store() : nullptr,
+                agent_id, session_id);
         // HA WS-4 4.1: mirror the same CONNECTED fact into the durable,
         // cross-replica routing directory (gateway_route_store.hpp). As of
         // 4.2b Task C the directory IS read for dispatch (fallback-only, on a

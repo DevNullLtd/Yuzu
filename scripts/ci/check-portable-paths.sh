@@ -24,8 +24,12 @@
 #   scripts/ci/check-portable-paths.sh              # scan the real tree (git ls-files)
 #   scripts/ci/check-portable-paths.sh --selftest    # fixture self-test (no git needed)
 #
-# Exit status: 0 = clean (or selftest passed), 1 = an illegal path was found
-# (or selftest failed), 2 = usage error.
+# Exit status: 0 = clean (or selftest passed); 1 = at least one illegal path
+# was found, or the scan could not run (`git ls-files` failed: not a checkout,
+# safe.directory refusal, git missing -- reported as a named ::error::), or
+# the selftest failed; 2 = usage error, or no working python interpreter. An
+# uncaught Python exception (a traceback) also exits 1, so a red run with a
+# traceback is a bug in the lint, not a finding.
 
 set -euo pipefail
 
@@ -198,6 +202,18 @@ def run_selftest():
         print("SELFTEST FAILED: run_full_scan did not fail a list containing the colon path")
         return 1
 
+    # git ls-files failure must fail closed (exit 1) with a named ::error::,
+    # never an uncaught CalledProcessError traceback. A nonexistent -C target
+    # makes git fail deterministically without needing a non-repo directory.
+    import contextlib
+    import io
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = scan_tracked("/nonexistent/yuzu_test_no_such_checkout")
+    if rc != 1 or "::error::check-portable-paths: could not list tracked paths" not in buf.getvalue():
+        print(f"SELFTEST FAILED: git ls-files failure gave rc={rc}, output={buf.getvalue()!r}")
+        return 1
+
     print("check-portable-paths --selftest: all fixtures behaved as expected.")
     return 0
 
@@ -213,8 +229,25 @@ def real_tracked_paths(root):
     return [p for p in out.decode("utf-8", errors="surrogateescape").split("\0") if p]
 
 
+def scan_tracked(root):
+    """Real scan entry. A failure to enumerate tracked paths (not a checkout,
+    safe.directory refusal, git missing) fails CLOSED: exit 1 with a named
+    ::error::, not a Python traceback."""
+    try:
+        paths = real_tracked_paths(root)
+    except (subprocess.CalledProcessError, OSError) as exc:
+        detail = ""
+        if isinstance(exc, subprocess.CalledProcessError):
+            detail = (exc.stderr or b"").decode("utf-8", errors="replace").strip()
+        print(f"::error::check-portable-paths: could not list tracked paths "
+              f"(git ls-files failed: {exc.__class__.__name__}"
+              f"{': ' + detail if detail else ''}); the scan did not run.")
+        return 1
+    return run_full_scan(paths)
+
+
 if selftest_flag:
     sys.exit(run_selftest())
 else:
-    sys.exit(run_full_scan(real_tracked_paths(repo_root)))
+    sys.exit(scan_tracked(repo_root))
 PYEOF

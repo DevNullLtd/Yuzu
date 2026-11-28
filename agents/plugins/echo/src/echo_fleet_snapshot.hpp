@@ -36,7 +36,7 @@
  */
 
 #include "echo_collectors.hpp"
-#include "echo_db.hpp" // NetworkEvent (input shape from query_recent_tcp_connections)
+#include "echo_db.hpp" // NetworkEvent (the `recent` input shape)
 
 #include <yuzu/agent/process_enum.hpp>
 
@@ -91,9 +91,10 @@ std::string build_fleet_snapshot_json(
  * is computed as `max(0, now_ts - recent.ts)` so the renderer can fade
  * older tubes.
  *
- * Pure function — no I/O. The plugin orchestration produces `live` from
- * `enumerate_connections()` and `recent` from
- * `EchoDatabase::query_recent_tcp_connections(now - window)`.
+ * Pure function — no I/O. The plugin no longer calls it: the roll-up tiers keep no
+ * per-connection rows to look back through, so the snapshot is the live ESTABLISHED set alone and
+ * `fleet_snapshot_window_seconds` has no effect. The merge keeps its own tests
+ * (test_fleet_snapshot.cpp) for a caller that supplies `recent` rows.
  */
 std::vector<NetConnection>
 merge_live_and_recent_connections(const std::vector<NetConnection>& live,

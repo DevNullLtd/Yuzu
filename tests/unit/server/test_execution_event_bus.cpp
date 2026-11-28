@@ -16,8 +16,10 @@
  *     the test for listener concurrency is a smoke).
  */
 
+#include "event_bus.hpp" // detail::format_sse (F69)
 #include "execution_event_bus.hpp"
 #include "execution_event_scope.hpp"
+#include "result_parsing.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -607,4 +609,31 @@ TEST_CASE("execution event scope projection sanitizes completion but passes synt
         CHECK(classify_execution_event_for_scope(synthetic, scope) ==
               ExecutionEventVerdict::kPass);
     }
+}
+
+// F69: the SSE grammar ends a line at LF, CR or CRLF; format_sse must re-prefix at all three or a
+// lone CR in agent-supplied data forges a field line on the shared /events stream.
+TEST_CASE("format_sse: a bare CR or CRLF in data never starts a forged field line",
+          "[sse][format_sse]") {
+    using yuzu::server::detail::format_sse;
+    using yuzu::server::detail::SseEvent;
+    const auto framed = [](std::string data) {
+        SseEvent ev;
+        ev.event_type = "output";
+        ev.data = std::move(data);
+        return format_sse(ev);
+    };
+    CHECK(framed("a\revent: forged") == "event: output\ndata: a\ndata: event: forged\n\n");
+    CHECK(framed("a\r\nb") == "event: output\ndata: a\ndata: b\n\n");
+    CHECK(framed("a\nb") == "event: output\ndata: a\ndata: b\n\n");
+    CHECK(framed("a\r") == "event: output\ndata: a\n\n"); // trailing terminator: no extra line
+    CHECK(framed("") == "event: output\ndata: \n\n");
+    // No line of the frame may begin with anything but `event: `/`data: `/`id: `, and no CR survives.
+    const auto f = framed("x\rretry: 1\rid: 9\r\ndata");
+    CHECK(f.find('\r') == std::string::npos);
+}
+
+TEST_CASE("split_output_lines: no CR survives into a row cell (F69)", "[sse][format_sse]") {
+    const auto lines = yuzu::server::split_output_lines("a\rb\r\nc\r\n\r\nd");
+    CHECK(lines == std::vector<std::string>{"ab", "c", "d"});
 }

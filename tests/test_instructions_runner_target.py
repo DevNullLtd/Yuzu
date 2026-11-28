@@ -24,7 +24,7 @@ import instructions_runner as ir  # noqa: E402
 
 AGENT = "agent-under-test"
 HOSTNAME = "Box-1"
-ANSWERED = [{"output": "x", "status": 1, "error_detail": ""}]  # the wire row shape
+ANSWERED = [{"instruction_id": "c1", "agent_id": AGENT, "output": "x", "status": 1, "error_detail": ""}]  # the wire row shape
 
 
 def make_def(risk, plugin="p"):
@@ -44,7 +44,7 @@ class RecordingClient:
     def __init__(self, code=200, payload=None):
         self.calls = []
         self.code = code
-        self.payload = {"command_id": "c1"} if payload is None else payload
+        self.payload = {"command_id": "c1", "agents_reached": 1} if payload is None else payload
 
     def execute_instruction(self, def_id, params, agent_ids=None):
         self.calls.append((def_id, params, agent_ids))

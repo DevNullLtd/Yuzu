@@ -10,7 +10,9 @@
 #   ./scripts/e2e-security-test.sh --server-url http://host:9090
 #
 # Prerequisites:
-#   - Yuzu server running with at least one admin user configured
+#   - Yuzu server running with at least one admin user configured, started with
+#     --metrics-no-auth or --metrics-trust-loopback (the /metrics check below; the
+#     loopback exemption is opt-in)
 #   - curl available
 
 set -euo pipefail
@@ -239,9 +241,11 @@ fi
 status=$(http_status "GET" "/health")
 assert_eq "GET /health → 200" "200" "$status"
 
-# /metrics → 200 (from localhost)
+# /metrics → 200. A loopback peer is no longer exempt by default (a same-host proxy
+# makes remote callers look like 127.0.0.1), so this holds only for a server started with
+# --metrics-no-auth (every shipped UAT launcher) or the opt-in --metrics-trust-loopback.
 status=$(http_status "GET" "/metrics")
-assert_eq "GET /metrics → 200 (localhost)" "200" "$status"
+assert_eq "GET /metrics → 200 (server run with --metrics-no-auth or --metrics-trust-loopback)" "200" "$status"
 
 # #2057: /api/v1/openapi.json now gates Infrastructure:Read — no longer an
 # unauthenticated endpoint. Unauthenticated → 401; authenticated (a scratch
@@ -741,8 +745,12 @@ if [[ -n "$ADMIN_PASS" ]]; then
         -b "$COOKIE_JAR" -H "Sec-Fetch-Site: cross-site"
     ss_expect_refused "cookie-session guarded HEAD without fetch metadata, Origin or Referer is refused" no_origin_no_referer \
         -b "$COOKIE_JAR"
-    ss_expect_answered "cookie-session guarded HEAD with same-origin fetch metadata reaches the handler" \
+    # An admitted HEAD passes the same-site gate and is then refused by the response policy
+    # (405, Allow: GET) without running the handler, so it never reaches the 400 above.
+    SS_ADMIT_RE='^405$'
+    ss_expect_answered "cookie-session guarded HEAD with same-origin fetch metadata passes the same-site gate and is then refused with 405" \
         -b "$COOKIE_JAR" -H "Sec-Fetch-Site: same-origin"
+    SS_ADMIT_RE='^400$'
 
     # The v1 twin of a guarded read follows the same rule for cookie sessions.
     SS_METHOD="GET"

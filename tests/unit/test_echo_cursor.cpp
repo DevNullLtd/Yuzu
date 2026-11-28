@@ -15,6 +15,8 @@
 
 #include "echo_cursor.hpp"
 #include "echo_db.hpp"
+#include "echo_test_db.hpp"
+#include "echo_fold_schema.hpp"
 #include "echo_schema_registry.hpp"
 #include "test_helpers.hpp"
 
@@ -50,7 +52,7 @@ struct TestEchoDb {
 
 TestEchoDb make_test_db() {
     auto tmp = yuzu::test::unique_temp_path("yuzu_test_echo_cursor_");
-    auto result = EchoDatabase::open(tmp);
+    auto result = yuzu::test::open_echo_db(tmp);
     REQUIRE(result.has_value());
     return TestEchoDb{std::move(*result), tmp};
 }
@@ -306,15 +308,16 @@ TEST_CASE("EchoDatabase: insert_removable_events_and_cursor round-trips events +
     ev.record_key = "rm-1";
 
     REQUIRE(t.db.insert_removable_events_and_cursor({ev}, R"({"v":1})"));
-    auto res = t.db.execute_query("SELECT COUNT(*) FROM removable_live");
+    auto res = t.db.execute_query("SELECT COALESCE(SUM(event_count), 0) FROM removable_hourly");
     REQUIRE(res.has_value());
     CHECK(res->rows[0][0] == "1");
     CHECK(read_cursor(t.db, "removable") == std::string(R"({"v":1})"));
 }
 
-// ── Replay idempotence via UNIQUE record_key ────────────────────────────────
+// ── Replay idempotence via the digest-checked replay ring ───────────────────
 
-TEST_CASE("power_live: duplicate record_key is a no-op (row count unchanged), cursor still advances",
+TEST_CASE("power: a replayed record_key is a no-op (event count unchanged) and the "
+          "cursor still advances",
           "[echo][cursor]") {
     auto t = make_test_db();
     PowerEvent ev;
@@ -325,11 +328,11 @@ TEST_CASE("power_live: duplicate record_key is a no-op (row count unchanged), cu
 
     REQUIRE(t.db.insert_power_events_and_cursor({ev}, R"({"v":1})"));
     // Replay the SAME event (e.g. a cursor re-read from a slightly earlier
-    // position) -- record_key's UNIQUE index makes this a silent no-op, not
-    // a duplicate row (echo_cursor.hpp rule 3).
+    // position) -- the replay ring remembers its record_key and identity digest,
+    // so it folds nothing a second time (echo_cursor.hpp rule 3).
     REQUIRE(t.db.insert_power_events_and_cursor({ev}, R"({"v":2})"));
 
-    auto res = t.db.execute_query("SELECT COUNT(*) FROM power_live");
+    auto res = t.db.execute_query("SELECT COALESCE(SUM(event_count), 0) FROM power_hourly");
     REQUIRE(res.has_value());
     CHECK(res->rows[0][0] == "1");
     // The cursor itself is NOT gated by record_key idempotence -- it still
@@ -436,9 +439,12 @@ TEST_CASE("a mid-batch refusal rolls back the events that ALREADY inserted, not 
     // `good` inserted before the refusal. If the transaction did not roll back
     // it would still be here -- a forensic row from a batch the store told the
     // caller it had REJECTED.
-    auto rows = t.db.execute_query("SELECT COUNT(*) FROM power_live WHERE record_key = 'good-row'");
+    // Observed in the tiers: only the seed's event counts, and no 'wake' row exists.
+    auto rows = t.db.execute_query(
+        "SELECT COALESCE(SUM(event_count), 0), COALESCE(SUM(action = 'wake'), 0) FROM power_hourly");
     REQUIRE(rows.has_value());
-    CHECK(rows->rows[0][0] == "0");
+    CHECK(rows->rows[0][0] == "1");
+    CHECK(rows->rows[0][1] == "0");
 
     // ... and the cursor did not advance either.
     auto c = read_cursor(t.db, "power");
@@ -452,7 +458,7 @@ TEST_CASE("insert_power_events_and_cursor rolls back the cursor when the event i
     REQUIRE(t.db.insert_power_events_and_cursor({}, R"({"v":1})"));
 
     // Force the event-insert half of the transaction to fail deterministically.
-    REQUIRE(t.db.execute_sql("DROP TABLE power_live"));
+    REQUIRE(t.db.execute_sql("DROP TABLE power_hourly_r"));
 
     PowerEvent ev;
     ev.ts = 1;
@@ -472,7 +478,7 @@ TEST_CASE("insert_removable_events_and_cursor rolls back the cursor when the eve
           "[echo][cursor]") {
     auto t = make_test_db();
     REQUIRE(t.db.insert_removable_events_and_cursor({}, R"({"v":1})"));
-    REQUIRE(t.db.execute_sql("DROP TABLE removable_live"));
+    REQUIRE(t.db.execute_sql("DROP TABLE removable_hourly_r"));
 
     RemovableEvent ev;
     ev.ts = 1;
@@ -485,18 +491,24 @@ TEST_CASE("insert_removable_events_and_cursor rolls back the cursor when the eve
 
 // ── Generated DDL ─────────────────────────────────────────────────────────────
 
-TEST_CASE("Echo warehouse DDL: power_live and removable_live carry a record_key UNIQUE index",
+TEST_CASE("Echo DDL: power and removable replay idempotence lives in the ring and not a "
+          "UNIQUE index",
           "[echo][cursor][warehouse]") {
-    auto ddl = generate_warehouse_ddl();
-    CHECK(ddl.find("CREATE UNIQUE INDEX IF NOT EXISTS power_live_record_key_uq "
-                   "ON power_live(record_key);") != std::string::npos);
-    CHECK(ddl.find("CREATE UNIQUE INDEX IF NOT EXISTS removable_live_record_key_uq "
-                   "ON removable_live(record_key);") != std::string::npos);
+    // No raw table, so no record_key column or UNIQUE index in the warehouse DDL; the fold DDL
+    // creates the replay ring the cursor sources are deduplicated through, and both tiers' tables.
+    const auto warehouse = generate_warehouse_ddl();
+    CHECK(warehouse.find("power_live") == std::string::npos);
+    CHECK(warehouse.find("removable_live") == std::string::npos);
+    CHECK(warehouse.find("record_key") == std::string::npos);
+    const auto fold = generate_fold_ddl();
+    CHECK(fold.find("CREATE TABLE IF NOT EXISTS echo_fold_seen") != std::string::npos);
+    CHECK(fold.find("CREATE TABLE IF NOT EXISTS power_hourly_r") != std::string::npos);
+    CHECK(fold.find("CREATE TABLE IF NOT EXISTS removable_hourly_r") != std::string::npos);
 }
 
 // ── Frozen schema-registry rows ─────────────────────────────────────────────
 
-TEST_CASE("Echo schema registry: power and removable default to ENABLED, live-tier-only",
+TEST_CASE("Echo schema registry: power and removable default to ENABLED with roll-up tiers only",
           "[echo][cursor][registry]") {
     bool saw_power = false, saw_removable = false;
     for (const auto& src : capture_sources()) {
@@ -509,9 +521,9 @@ TEST_CASE("Echo schema registry: power and removable default to ENABLED, live-ti
 
         // Every source ships default-on.
         CHECK(src.default_enabled);
-        CHECK(src.unique_key_column == "record_key");
-        REQUIRE(src.granularities.size() == 1);
-        CHECK(src.granularities.front().suffix == "live");
+        REQUIRE(src.granularities.size() == 2); // hourly + daily; replay idempotence is the ring's job
+        CHECK(src.granularities.front().suffix == "hourly");
+        CHECK(src.granularities.back().suffix == "daily");
     }
     CHECK(saw_power);
     CHECK(saw_removable);
@@ -563,7 +575,7 @@ TEST_CASE("CursorSource contract: CursorLost emits a capture_gap and re-baseline
     auto result = src.collect(t.db, R"({"v":1,"pos":"stale-behind-a-wrapped-log"})");
     CHECK(result.outcome == CursorOutcome::CursorLost);
 
-    auto res = t.db.execute_query("SELECT action FROM power_live WHERE action = 'capture_gap'");
+    auto res = t.db.execute_query("SELECT action FROM power_hourly WHERE action = 'capture_gap'");
     REQUIRE(res.has_value());
     CHECK(res->rows.size() == 1);
     // Re-baselined at "now", never replay-from-zero -- the new cursor is
@@ -708,8 +720,59 @@ TEST_CASE("BoundedPendingQueue: the dropped count surfaces in the next capture_g
     gap.record_key = "gap-for-overflow";
     REQUIRE(t.db.insert_power_events_and_cursor({gap}, R"({"v":1})"));
 
-    auto res = t.db.execute_query("SELECT detail FROM power_live WHERE action = 'capture_gap'");
+    auto res = t.db.execute_query("SELECT last_detail FROM power_hourly WHERE action = 'capture_gap'");
     REQUIRE(res.has_value());
     REQUIRE(res->rows.size() == 1);
     CHECK(res->rows[0][0] == "dropped=3");
+}
+
+// ── CursorRetry: the cursor driver's backoff policy (contract rule 1) ─────────
+
+TEST_CASE("cursor retry: delays grow 1 2 4 8 then hold at 12 ticks", "[echo][cursor][retry]") {
+    constexpr std::int64_t kTick = 300;
+    constexpr std::int64_t t0 = 1'000'000;
+    CursorRetry r;
+    CHECK(r.due(t0)); // no failure on record
+
+    const std::int64_t expected_ticks[] = {1, 2, 4, 8, 12, 12, 12};
+    std::int64_t now = t0;
+    for (const auto k : expected_ticks) {
+        r.note_failure(now, kTick);
+        CHECK_FALSE(r.due(now));                          // not on the failing tick
+        CHECK_FALSE(r.due(now + (k - 1) * kTick));        // not one tick early
+        CHECK(r.due(now + k * kTick));                    // due after exactly k ticks
+        CHECK(r.due(now + k * kTick - kTick / 2));        // half a tick of jitter is tolerated
+        now += k * kTick;                                 // the retry fails again
+    }
+}
+
+TEST_CASE("cursor retry: one success clears the backoff", "[echo][cursor][retry]") {
+    CursorRetry r;
+    r.note_failure(100, 60);
+    r.note_failure(160, 60);
+    REQUIRE_FALSE(r.due(161));
+    r.note_success();
+    CHECK(r.due(161));
+    CHECK(r.failures == 0);
+    CHECK(r.first_failure_ts == 0); // the first failure time is forgotten
+    r.note_failure(200, 60); // the streak starts again at one tick, not three
+    CHECK(r.first_failure_ts == 200); // a fresh streak, not the old first failure
+    CHECK(r.due(260));
+}
+
+TEST_CASE("cursor retry: a clock stepped back before the first failure makes the source due",
+          "[echo][cursor][retry]") {
+    CursorRetry r;
+    r.note_failure(1'000'000, 300);
+    r.note_failure(1'000'300, 300);
+    CHECK_FALSE(r.due(1'000'301));
+    CHECK(r.due(999'999)); // the clock went back past the first failure
+}
+
+TEST_CASE("cursor retry: the tick period comes from the config string, defaulting to 300",
+          "[echo][cursor][retry]") {
+    CHECK(parse_tick_seconds("60") == 60);
+    CHECK(parse_tick_seconds("7200") == 7200);
+    for (const char* bad : {"", "abc", "0", "-5", "30s", " 60"})
+        CHECK(parse_tick_seconds(bad) == 300);
 }

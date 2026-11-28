@@ -27,10 +27,14 @@
  */
 
 #include "agent_registry.hpp"     // the REAL AgentHealthStore (detail namespace)
+#include "capability_fragments.hpp" // the SHIPPED composed catalogue (plugin_init_failed label bound)
+#include "dedup_fleet_tags.hpp"   // #3663: the SHIPPED dedup tag table (no parallel repro)
 #include "guardian_health_fleet_tags.hpp" // #5403: the SHIPPED age-table row (no parallel repro)
 #include "network_perf_rules.hpp" // SHIPPED net-fact validators (no parallel repro)
+#include "plugin_init_failed_labels.hpp" // SHIPPED catalogue bound + rejected-gauge names
 #include "spark_fleet_tags.hpp"   // SHIPPED spark helpers (no parallel repro)
 #include "echo_corruption_audit.hpp" // #1567 SHIPPED audit gate + tag keys
+#include "echo_storage_offline_tag.hpp" // #7290 SHIPPED storage-offline tag + parser
 
 #include <yuzu/metrics.hpp>
 
@@ -39,10 +43,12 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <functional>
 #include <iterator>
+#include <latch>
 #include <mutex>
 #include <optional>
 #include <stdexcept>
@@ -1623,6 +1629,126 @@ TEST_CASE("REAL AgentHealthStore: a torn arm-gauge pair (one key present, its "
     CHECK(unlabelled_series(out, "yuzu_fleet_guardian_arm_tag_rejected") == 0.0);
 }
 
+// ── Guardian baseline-persistence rollup (#5605) ───────────────────────────────────
+// Three SUM gauges (unpersisted / rebaselined_at_boot / persist_failures), each absent-not-zero,
+// plus _reporting (keyed on the unpersisted tag ONLY) and _tag_rejected, both published every
+// sweep including 0.
+
+TEST_CASE("REAL AgentHealthStore: guardian baseline tags sum into unlabelled fleet gauges and "
+          "_reporting counts only agents that carried the unpersisted tag",
+          "[guardian][baseline][fleet][rollup][real]") {
+    yuzu::server::detail::AgentHealthStore store;
+    yuzu::MetricsRegistry metrics;
+
+    auto beat = [&](const std::string& id,
+                    const std::vector<std::pair<std::string, std::string>>& kv) {
+        google::protobuf::Map<std::string, std::string> tags;
+        tags["yuzu.os"] = "linux";
+        for (const auto& [k, v] : kv)
+            tags[k] = v;
+        store.upsert(id, tags);
+    };
+
+    beat("s1", {{"yuzu.guardian_baseline_unpersisted", "2"}});
+    beat("s2", {{"yuzu.guardian_baseline_unpersisted", "3"},
+                {"yuzu.guardian_baseline_rebaselined_at_boot", "1"}});
+    // A legacy agent (prefer_spark off) emits only the cumulative counter: it feeds that gauge
+    // but must NOT count toward _reporting, the denominator of the unpersisted gauge.
+    beat("legacy", {{"yuzu.guardian_baseline_persist_failures", "4"}});
+
+    store.recompute_metrics(metrics, std::chrono::seconds{300});
+    const std::string out = metrics.serialize();
+
+    CHECK(unlabelled_series(out, "yuzu_fleet_guardian_baseline_unpersisted") == 5.0);
+    CHECK(unlabelled_series(out, "yuzu_fleet_guardian_baseline_rebaselined_at_boot") == 1.0);
+    CHECK(unlabelled_series(out, "yuzu_fleet_guardian_baseline_persist_failures") == 4.0);
+    CHECK(unlabelled_series(out, "yuzu_fleet_guardian_baseline_reporting") == 2.0); // not 3
+    CHECK(unlabelled_series(out, "yuzu_fleet_guardian_baseline_tag_rejected") == 0.0);
+    // No agent-controlled label anywhere in this family.
+    CHECK(out.find("yuzu_fleet_guardian_baseline_unpersisted{") == std::string::npos);
+}
+
+TEST_CASE("REAL AgentHealthStore: a malformed baseline tag is counted as rejected and excluded "
+          "from its sum",
+          "[guardian][baseline][fleet][rollup][real]") {
+    yuzu::server::detail::AgentHealthStore store;
+    yuzu::MetricsRegistry metrics;
+
+    google::protobuf::Map<std::string, std::string> honest;
+    honest["yuzu.os"] = "linux";
+    honest["yuzu.guardian_baseline_unpersisted"] = "4";
+    store.upsert("honest", honest);
+
+    google::protobuf::Map<std::string, std::string> rogue;
+    rogue["yuzu.os"] = "linux";
+    rogue["yuzu.guardian_baseline_unpersisted"] = "abc";
+    store.upsert("rogue", rogue);
+
+    google::protobuf::Map<std::string, std::string> huge;
+    huge["yuzu.os"] = "linux";
+    huge["yuzu.guardian_baseline_persist_failures"] = "1000000001"; // above the 1e9 ceiling
+    store.upsert("huge", huge);
+
+    store.recompute_metrics(metrics, std::chrono::seconds{300});
+    const std::string out = metrics.serialize();
+
+    // Rejected, not clamped: the honest agent's 4 survives; the rogue is not in _reporting.
+    CHECK(unlabelled_series(out, "yuzu_fleet_guardian_baseline_unpersisted") == 4.0);
+    CHECK(unlabelled_series(out, "yuzu_fleet_guardian_baseline_reporting") == 1.0);
+    CHECK(unlabelled_series(out, "yuzu_fleet_guardian_baseline_tag_rejected") == 2.0);
+    CHECK_FALSE(has_unlabelled_series(out, "yuzu_fleet_guardian_baseline_persist_failures"));
+}
+
+TEST_CASE("REAL AgentHealthStore: guardian baseline gauges go absent (not zero) when nobody "
+          "reports, and a stale reporter ages out; the meta gauges still publish 0",
+          "[guardian][baseline][fleet][rollup][real]") {
+    yuzu::server::detail::AgentHealthStore store;
+    yuzu::MetricsRegistry metrics;
+
+    google::protobuf::Map<std::string, std::string> tags;
+    tags["yuzu.os"] = "linux";
+    tags["yuzu.guardian_baseline_unpersisted"] = "6";
+    tags["yuzu.guardian_baseline_rebaselined_at_boot"] = "2";
+    tags["yuzu.guardian_baseline_persist_failures"] = "3";
+    store.upsert("a1", tags);
+
+    store.recompute_metrics(metrics, std::chrono::seconds{300});
+    auto out = metrics.serialize();
+    REQUIRE(unlabelled_series(out, "yuzu_fleet_guardian_baseline_unpersisted") == 6.0);
+    REQUIRE(unlabelled_series(out, "yuzu_fleet_guardian_baseline_reporting") == 1.0);
+
+    // The reporter is now beyond the staleness window: all three SUM gauges must vanish (the
+    // clear at the top of the sweep), never linger or turn into a fabricated 0.
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    store.recompute_metrics(metrics, std::chrono::seconds{0});
+    out = metrics.serialize();
+    CHECK_FALSE(has_unlabelled_series(out, "yuzu_fleet_guardian_baseline_unpersisted"));
+    CHECK_FALSE(has_unlabelled_series(out, "yuzu_fleet_guardian_baseline_rebaselined_at_boot"));
+    CHECK_FALSE(has_unlabelled_series(out, "yuzu_fleet_guardian_baseline_persist_failures"));
+    CHECK(unlabelled_series(out, "yuzu_fleet_guardian_baseline_reporting") == 0.0);
+    CHECK(unlabelled_series(out, "yuzu_fleet_guardian_baseline_tag_rejected") == 0.0);
+}
+
+TEST_CASE("REAL AgentHealthStore: an explicit baseline unpersisted 0 publishes as zero, not "
+          "absent",
+          "[guardian][baseline][fleet][rollup][real]") {
+    yuzu::server::detail::AgentHealthStore store;
+    yuzu::MetricsRegistry metrics;
+
+    google::protobuf::Map<std::string, std::string> tags;
+    tags["yuzu.os"] = "linux";
+    tags["yuzu.guardian_baseline_unpersisted"] = "0";
+    store.upsert("clean", tags);
+    store.recompute_metrics(metrics, std::chrono::seconds{300});
+
+    const std::string out = metrics.serialize();
+    CHECK(unlabelled_series(out, "yuzu_fleet_guardian_baseline_unpersisted") == 0.0);
+    CHECK(unlabelled_series(out, "yuzu_fleet_guardian_baseline_reporting") == 1.0);
+    // The sparse rows were not reported, so they stay absent.
+    CHECK_FALSE(has_unlabelled_series(out, "yuzu_fleet_guardian_baseline_rebaselined_at_boot"));
+    CHECK_FALSE(has_unlabelled_series(out, "yuzu_fleet_guardian_baseline_persist_failures"));
+}
+
 // ── Guardian M1 health-stream rollup (#2298 gate 3, item 6d) ──────────────────────
 // Same coverage set as the journal family above, scoped to the 3-counter table.
 
@@ -1900,10 +2026,83 @@ TEST_CASE("REAL AgentHealthStore: yuzu_fleet_echo_db_corruption_agents counts va
     CHECK(series_val(metrics.serialize(), "yuzu_fleet_echo_db_corruption_agents ") == 1.0);
 }
 
-// Echo rename, upgrade window: an agent that has not upgraded still publishes the pre-rename
-// `yuzu.plugin.tar.` tag keys. The store normalises them at ingest, so the fleet gauge and the
-// corruption sink see one spelling. The legacy keys below are the point of the cases.
-TEST_CASE("REAL AgentHealthStore: legacy yuzu.plugin.tar.* tags are read as yuzu.plugin.echo.*",
+// #7290: Echo loaded offline (a failed or space-starved v10 migration, retried by the agent). The
+// agent's heartbeat tag maps to a CLOSED label set; the strings below are pinned literally and
+// mirror agents/plugins/echo/src/echo_status_format.hpp's offline_reason_token().
+TEST_CASE("REAL AgentHealthStore: yuzu_fleet_echo_storage_offline counts agents by reason, 0 included",
+          "[health_store][echo][storage_offline][real]") {
+    AgentHealthStore store;
+    yuzu::MetricsRegistry metrics;
+    const char* const k = "yuzu.plugin.echo.storage_offline";
+    const auto gauge = [&](const char* reason) {
+        return series_val(metrics.serialize(),
+                          std::string{"yuzu_fleet_echo_storage_offline{reason=\""} + reason + "\"} ");
+    };
+    beat_tags(store, "a", {{k, "free_space"}});
+    beat_tags(store, "b", {{k, "migration_failed"}});
+    beat_tags(store, "c", {{k, "migration_failed"}});
+    beat_tags(store, "d", {{k, "open_failed"}});
+    beat_tags(store, "e", {});
+    beat_tags(store, "f", {{k, ""}});
+    beat_tags(store, "g", {{k, "rollback_wedged"}});
+    store.recompute_metrics(metrics, std::chrono::seconds{300});
+    CHECK(gauge("free_space") == 1.0);
+    CHECK(gauge("migration_failed") == 2.0);
+    CHECK(gauge("open_failed") == 1.0);
+    CHECK(gauge("rollback_wedged") == 1.0);
+    CHECK(gauge("unknown") == 0.0);
+
+    // An agent that recovers (its next heartbeat drops the tag) leaves the count.
+    beat_tags(store, "b", {});
+    store.recompute_metrics(metrics, std::chrono::seconds{300});
+    CHECK(gauge("migration_failed") == 1.0);
+
+    // Every snapshot pruned: all five series are still PUBLISHED, at 0 (server-owned counts).
+    store.recompute_metrics(metrics, std::chrono::seconds{0});
+    CHECK(gauge("free_space") == 0.0);
+    CHECK(gauge("migration_failed") == 0.0);
+    CHECK(gauge("open_failed") == 0.0);
+    CHECK(gauge("rollback_wedged") == 0.0);
+    CHECK(gauge("unknown") == 0.0);
+}
+
+TEST_CASE("REAL AgentHealthStore: an unrecognised storage-offline value counts under unknown, never as a new label",
+          "[health_store][echo][storage_offline][real]") {
+    AgentHealthStore store;
+    yuzu::MetricsRegistry metrics;
+    const char* const k = "yuzu.plugin.echo.storage_offline";
+    beat_tags(store, "a", {{k, "disk_on_fire"}});
+    beat_tags(store, "b", {{k, std::string(4096, 'x')}});
+    beat_tags(store, "c", {{k, "migration_failed\nINJECTED"}});
+    beat_tags(store, "d", {{k, "Free_Space"}}); // the match is exact and case sensitive
+    store.recompute_metrics(metrics, std::chrono::seconds{300});
+    const auto text = metrics.serialize();
+    CHECK(series_val(text, "yuzu_fleet_echo_storage_offline{reason=\"unknown\"} ") == 4.0);
+    CHECK(series_val(text, "yuzu_fleet_echo_storage_offline{reason=\"free_space\"} ") == 0.0);
+    CHECK(series_val(text, "yuzu_fleet_echo_storage_offline{reason=\"migration_failed\"} ") == 0.0);
+    CHECK(text.find("disk_on_fire") == std::string::npos);
+    CHECK(text.find("INJECTED") == std::string::npos);
+}
+
+TEST_CASE("parse_echo_storage_offline: the tag and the four tokens are pinned, anything else is unknown",
+          "[health_store][echo][storage_offline]") {
+    using namespace yuzu::server::detail;
+    CHECK(std::string_view{kEchoTagStorageOffline} == "yuzu.plugin.echo.storage_offline");
+    CHECK(parse_echo_storage_offline("free_space") == std::optional<std::size_t>{0});
+    CHECK(parse_echo_storage_offline("migration_failed") == std::optional<std::size_t>{1});
+    CHECK(parse_echo_storage_offline("open_failed") == std::optional<std::size_t>{2});
+    // rollback_wedged has its own index, not the last (unknown) one
+    CHECK(parse_echo_storage_offline("rollback_wedged") == std::optional<std::size_t>{3});
+    CHECK(parse_echo_storage_offline("") == std::nullopt);
+    CHECK(parse_echo_storage_offline("garbage") == std::optional<std::size_t>{4});
+    CHECK(kEchoStorageOfflineReasons.size() == 5);
+    CHECK(kEchoStorageOfflineReasons[3] == "rollback_wedged");
+    CHECK(kEchoStorageOfflineReasons[4] == "unknown");
+}
+
+// The corruption gate and the fleet gauge read the `yuzu.plugin.echo.` tag keys only: the retired
+// `yuzu.plugin.tar.` spelling is an unrelated key. The retired keys below are the point of the case.
+TEST_CASE("REAL AgentHealthStore: retired yuzu.plugin.tar.* tags are not read as yuzu.plugin.echo.*",
           "[health_store][echo][corruption][real][echo_rename]") {
     AgentHealthStore store;
     yuzu::MetricsRegistry metrics;
@@ -1917,24 +2116,24 @@ TEST_CASE("REAL AgentHealthStore: legacy yuzu.plugin.tar.* tags are read as yuzu
         calls.push_back({a, t, q});
     });
 
-    beat_tags(store, "old", {{"yuzu.plugin.tar.db_corruption_total", "2"},
-                             {"yuzu.plugin.tar.db_quarantine_last", "100:f1"}});
-    beat_tags(store, "new", {{"yuzu.plugin.echo.db_corruption_total", "1"},
-                             {"yuzu.plugin.echo.db_quarantine_last", "200:f2"}});
-    REQUIRE(calls.size() == 2);
-    CHECK(calls[0].agent == "old");
-    CHECK(calls[0].total == 2);
-    CHECK(calls[0].q == "100:f1");
+    beat_tags(store, "retired", {{"yuzu.plugin.tar.db_corruption_total", "2"},
+                                 {"yuzu.plugin.tar.db_quarantine_last", "100:f1"}});
+    beat_tags(store, "current", {{"yuzu.plugin.echo.db_corruption_total", "1"},
+                                 {"yuzu.plugin.echo.db_quarantine_last", "200:f2"}});
+    REQUIRE(calls.size() == 1);
+    CHECK(calls[0].agent == "current");
+    CHECK(calls[0].total == 1);
+    CHECK(calls[0].q == "200:f2");
 
     store.recompute_metrics(metrics, std::chrono::seconds{300});
-    CHECK(series_val(metrics.serialize(), "yuzu_fleet_echo_db_corruption_agents ") == 2.0);
+    CHECK(series_val(metrics.serialize(), "yuzu_fleet_echo_db_corruption_agents ") == 1.0);
 }
 
-TEST_CASE("REAL AgentHealthStore: unrelated tag keys are not normalised",
+TEST_CASE("REAL AgentHealthStore: unrelated tag keys are not read as Echo tags",
           "[health_store][echo][real][echo_rename]") {
     AgentHealthStore store;
     yuzu::MetricsRegistry metrics;
-    // A key merely containing the legacy prefix text, and another plugin's corruption tag, must
+    // A key merely containing the retired prefix text, and another plugin's corruption tag, must
     // not be mistaken for an Echo tag.
     beat_tags(store, "a", {{"yuzu.plugin.other.db_corruption_total", "5"},
                            {"x.yuzu.plugin.tar.db_corruption_total", "5"}});
@@ -1942,19 +2141,104 @@ TEST_CASE("REAL AgentHealthStore: unrelated tag keys are not normalised",
     CHECK(series_val(metrics.serialize(), "yuzu_fleet_echo_db_corruption_agents ") == 0.0);
 }
 
-TEST_CASE("REAL AgentHealthStore: yuzu_fleet_plugin_init_failed is per plugin, capped, absent-not-zero",
+// ── yuzu_fleet_plugin_init_failed: the `plugin` label is bounded to the server's catalogue ──
+//
+// The heartbeat tag is agent-supplied, so these tests wire the REAL composed catalogue
+// (YUZU_ALL_CAPABILITY_FRAGMENTS, the set server.cpp wires) and use its plugin names, never
+// invented ones: a name invented here would test the filter against a set no server holds.
+
+namespace {
+const std::vector<std::string>& catalogue_names() {
+    static const yuzu::server::CommandCapabilityRegistry registry{YUZU_ALL_CAPABILITY_FRAGMENTS};
+    static const auto names = yuzu::server::catalogue_plugin_names(registry);
+    return names;
+}
+
+/// Catalogue plugins that are neither `echo` nor `wmi` (the two the cases below count by name),
+/// in catalogue order, so a list of them cannot add to either count.
+std::vector<std::string> other_catalogue_names() {
+    std::vector<std::string> out;
+    for (const auto& n : catalogue_names())
+        if (n != "echo" && n != "wmi")
+            out.push_back(n);
+    return out;
+}
+
+std::string join_names(const std::vector<std::string>& names, std::size_t count) {
+    std::string out;
+    for (std::size_t i = 0; i < count; ++i)
+        out += (i ? "," : "") + names.at(i);
+    return out;
+}
+
+constexpr const char* kInitFailed = "yuzu_fleet_plugin_init_failed";
+
+std::string init_failed_series(const std::string& plugin) {
+    return std::string{kInitFailed} + "{plugin=\"" + plugin + "\"} ";
+}
+
+std::string rejected_series(const char* reason) {
+    return std::string{yuzu::server::kPluginInitFailedRejectedGauge} + "{reason=\"" + reason +
+           "\"} ";
+}
+
+bool has_series(const std::string& out, const std::string& series) {
+    return out.find("\n" + series) != std::string::npos;
+}
+
+std::size_t count_init_failed_series(const std::string& out) {
+    std::size_t n = 0;
+    const std::string needle = "\n" + std::string{kInitFailed} + "{";
+    for (auto p = out.find(needle); p != std::string::npos; p = out.find(needle, p + 1))
+        ++n;
+    return n;
+}
+} // namespace
+
+TEST_CASE("catalogue_plugin_names skips the __-prefixed protocol names",
+          "[health_store][echo][real]") {
+    const auto& names = catalogue_names();
+    CHECK(std::ranges::find(names, "__guard__") == names.end());
+    CHECK(std::ranges::find(names, "__sync__") == names.end());
+    CHECK(std::ranges::find(names, "echo") != names.end());
+    for (const auto& n : names)
+        CHECK_FALSE(n.starts_with("__"));
+}
+
+TEST_CASE("every catalogue row's plugin name is already lowercase",
+          "[health_store][echo][real]") {
+    // Dispatch folds plugin-name case, but the label match is an exact lookup against the
+    // lowercased catalogue set. That is sound only while every shipped name is lowercase: a
+    // future mixed-case plugin name would never get its own series, so fail loudly here.
+    static const yuzu::server::CommandCapabilityRegistry registry{YUZU_ALL_CAPABILITY_FRAGMENTS};
+    std::size_t rows = 0;
+    registry.for_each_row([&](const yuzu::server::CommandCapability& cap) {
+        ++rows;
+        INFO("plugin: " << std::string{cap.plugin});
+        CHECK(yuzu::server::ascii_lower(cap.plugin) == std::string{cap.plugin});
+        // The two words the family reserves: "unknown" is the sum label (a catalogue plugin of
+        // that name would be silently overwritten by it) and "other" was the retired overflow.
+        CHECK(cap.plugin != yuzu::server::kUnknownPluginLabel);
+        CHECK(cap.plugin != "other");
+    });
+    CHECK(rows > 0);
+}
+
+TEST_CASE("REAL AgentHealthStore: yuzu_fleet_plugin_init_failed is per plugin, bounded by the catalogue, absent-not-zero",
           "[health_store][echo][corruption][real]") {
+    REQUIRE(catalogue_names().size() > 70); // the fleet-wide case below uses 70 distinct names
+    const auto others = other_catalogue_names();
     AgentHealthStore store;
+    store.set_known_plugins(catalogue_names());
     yuzu::MetricsRegistry metrics;
-    std::string forty;
-    for (int i = 0; i < 40; ++i)
-        forty += (i ? ",t" : "t") + std::to_string(i);
+
     beat_tags(store, "a", {{"yuzu.plugins_failed", "echo,wmi"}});
     beat_tags(store, "b", {{"yuzu.plugins_failed", "echo"}});
     beat_tags(store, "c", {});
-    beat_tags(store, "d", {{"yuzu.plugins_failed", forty}});
-    // 40 empty tokens then a valid name: the 32-split cap bites first, no label.
-    beat_tags(store, "e", {{"yuzu.plugins_failed", std::string(40, ',') + "late"}});
+    // 40 real names: only the first 32 are read.
+    beat_tags(store, "d", {{"yuzu.plugins_failed", join_names(others, 40)}});
+    // 40 empty tokens then a real name: the 32-split cap bites first, no label.
+    beat_tags(store, "e", {{"yuzu.plugins_failed", std::string(40, ',') + others.back()}});
     // #1567 round-2: a repeated token from ONE agent counts once, not once per
     // repeat — plugins_failed_ is a set on an honest agent, so this only fires
     // for a malformed/compromised one. MUTATION-TESTED: dropping the
@@ -1963,36 +2247,260 @@ TEST_CASE("REAL AgentHealthStore: yuzu_fleet_plugin_init_failed is per plugin, c
     beat_tags(store, "f", {{"yuzu.plugins_failed", "echo,echo"}});
     store.recompute_metrics(metrics, std::chrono::seconds{300});
     auto out = metrics.serialize();
-    CHECK(out.find("plugin=\"late\"") == std::string::npos);
-    CHECK(series_val(out, "yuzu_fleet_plugin_init_failed{plugin=\"echo\"} ") == 3.0);
-    CHECK(series_val(out, "yuzu_fleet_plugin_init_failed{plugin=\"wmi\"} ") == 1.0);
-    // At most 32 tokens counted from the 40-token agent: t0..t31 present, t32 not.
-    CHECK(out.find("plugin=\"t31\"") != std::string::npos);
-    CHECK(out.find("plugin=\"t32\"") == std::string::npos);
+    CHECK(series_val(out, init_failed_series("echo")) == 3.0);
+    CHECK(series_val(out, init_failed_series("wmi")) == 1.0);
+    // At most 32 tokens counted from the 40-token agent: [31] present, [32] not.
+    CHECK(has_series(out, init_failed_series(others[31])));
+    CHECK_FALSE(has_series(out, init_failed_series(others[32])));
+    CHECK_FALSE(has_series(out, init_failed_series(others.back())));
+    // Both the 40-token agent and the all-commas agent were cut at the cap.
+    CHECK(series_val(out, rejected_series(yuzu::server::kRejectOverCap)) == 2.0);
 
-    // Fleet-wide label cap: 70 agents each failing a distinct plugin.
+    // Fleet-wide, with a catalogue wired: 70 agents each failing a distinct catalogue plugin are
+    // ALL labelled by name (the label set is bounded by the catalogue, so there is no cap an
+    // agent can fill to push a later real plugin into "unknown"), and nothing joins "other".
     AgentHealthStore many;
+    many.set_known_plugins(catalogue_names());
     yuzu::MetricsRegistry m2;
-    for (int i = 0; i < 70; ++i) {
-        const auto name = std::format("plug_{:02d}", i);
-        beat_tags(many, "agent" + std::to_string(i), {{"yuzu.plugins_failed", name}});
-    }
+    const auto& names = catalogue_names();
+    for (int i = 0; i < 70; ++i)
+        beat_tags(many, "agent" + std::to_string(i), {{"yuzu.plugins_failed", names[i]}});
     many.recompute_metrics(m2, std::chrono::seconds{300});
     auto out2 = m2.serialize();
-    size_t named = 0;
-    for (size_t p = out2.find("yuzu_fleet_plugin_init_failed{"); p != std::string::npos;
-         p = out2.find("yuzu_fleet_plugin_init_failed{", p + 1))
-        ++named;
-    CHECK(named == 65); // 64 named + plugin="other"
-    CHECK(series_val(out2, "yuzu_fleet_plugin_init_failed{plugin=\"other\"} ") == 6.0);
-    CHECK(out2.find("plugin=\"plug_63\"") != std::string::npos);
-    CHECK(out2.find("plugin=\"plug_64\"") == std::string::npos);
+    CHECK(count_init_failed_series(out2) == 70);
+    CHECK_FALSE(has_series(out2, init_failed_series("unknown")));
+    CHECK_FALSE(has_series(out2, init_failed_series("other")));
+    CHECK(has_series(out2, init_failed_series(names[63])));
+    CHECK(has_series(out2, init_failed_series(names[69]))); // past the old 64-label cap, still named
 
     // Absent-not-zero: once the reporters are gone the family is cleared.
     for (int i = 0; i < 70; ++i)
         many.remove("agent" + std::to_string(i));
     many.recompute_metrics(m2, std::chrono::seconds{300});
-    CHECK(m2.serialize().find("yuzu_fleet_plugin_init_failed{") == std::string::npos);
+    CHECK(count_init_failed_series(m2.serialize()) == 0);
+}
+
+TEST_CASE("REAL AgentHealthStore: agent-minted plugin names cannot displace a catalogue plugin",
+          "[health_store][echo][real]") {
+    AgentHealthStore store;
+    store.set_known_plugins(catalogue_names());
+    yuzu::MetricsRegistry metrics;
+
+    // Two enrolled agents each report 32 distinct names that sort before lowercase "echo": the
+    // shape that filled the old first-64-in-byte-order label cap and pushed a real echo failure
+    // into plugin="other". Rotating the names every sweep must not change the outcome.
+    for (int sweep = 0; sweep < 2; ++sweep) {
+        std::string fake_a;
+        std::string fake_b;
+        for (int i = 0; i < 32; ++i) {
+            fake_a += std::format("{}A{}{:02d}", i ? "," : "", sweep, i);
+            fake_b += std::format("{}B{}{:02d}", i ? "," : "", sweep, i);
+        }
+        beat_tags(store, "hostile-1", {{"yuzu.plugins_failed", fake_a}});
+        beat_tags(store, "hostile-2", {{"yuzu.plugins_failed", fake_b}});
+        beat_tags(store, "honest", {{"yuzu.plugins_failed", "echo"}});
+        store.recompute_metrics(metrics, std::chrono::seconds{300});
+        const auto out = metrics.serialize();
+
+        CHECK(series_val(out, init_failed_series("echo")) == 1.0);
+        CHECK(series_val(out, init_failed_series("unknown")) == 64.0);
+        CHECK(count_init_failed_series(out) == 2); // echo + unknown, no minted series
+        CHECK(out.find("plugin=\"A") == std::string::npos);
+        CHECK(out.find("plugin=\"B") == std::string::npos);
+        CHECK(series_val(out, rejected_series(yuzu::server::kRejectUnknownPlugin)) == 2.0);
+    }
+}
+
+TEST_CASE("REAL AgentHealthStore: a token named other or unknown cannot collide with a label",
+          "[health_store][echo][real]") {
+    AgentHealthStore store;
+    store.set_known_plugins(catalogue_names());
+    yuzu::MetricsRegistry metrics;
+
+    // Neither word is a catalogue plugin, so neither earns a series of its own: both are summed
+    // under "unknown" with the other unknown name, and "other" is never emitted. (Before the
+    // fix a real plugin called "other" was overwritten by the overflow sum.) Matching is exact:
+    // the catalogue set is lowercase, so a case variant of a real name is unknown too.
+    beat_tags(store, "a", {{"yuzu.plugins_failed", "other,unknown,echo"}});
+    beat_tags(store, "b", {{"yuzu.plugins_failed", "ECHO"}});
+    store.recompute_metrics(metrics, std::chrono::seconds{300});
+    const auto out = metrics.serialize();
+
+    CHECK(series_val(out, init_failed_series("echo")) == 1.0);
+    CHECK(series_val(out, init_failed_series("unknown")) == 3.0);
+    CHECK_FALSE(has_series(out, init_failed_series("other")));
+    CHECK_FALSE(has_series(out, init_failed_series("ECHO")));
+    CHECK(count_init_failed_series(out) == 2);
+    CHECK(series_val(out, rejected_series(yuzu::server::kRejectUnknownPlugin)) == 2.0);
+}
+
+TEST_CASE("REAL AgentHealthStore: plugin_init_failed_rejected is published every sweep, zero included",
+          "[health_store][echo][real]") {
+    AgentHealthStore store;
+    store.set_known_plugins(catalogue_names());
+    yuzu::MetricsRegistry metrics;
+    const auto reasons = {yuzu::server::kRejectUnknownPlugin, yuzu::server::kRejectMalformed,
+                          yuzu::server::kRejectOverCap};
+
+    // No agents at all: every reason is a real 0, not an absent series.
+    store.recompute_metrics(metrics, std::chrono::seconds{300});
+    for (const char* r : reasons)
+        CHECK(series_val(metrics.serialize(), rejected_series(r)) == 0.0);
+
+    // Clean reporting: still 0, and the failure family is present (the two are independent).
+    beat_tags(store, "clean", {{"yuzu.plugins_failed", "echo"}});
+    store.recompute_metrics(metrics, std::chrono::seconds{300});
+    for (const char* r : reasons)
+        CHECK(series_val(metrics.serialize(), rejected_series(r)) == 0.0);
+
+    // One agent per reason; an agent is counted once per reason however many tokens it sends.
+    beat_tags(store, "unk", {{"yuzu.plugins_failed", "nosuchplugin_1,nosuchplugin_2"}});
+    beat_tags(store, "bad", {{"yuzu.plugins_failed", "echo,has-dash," + std::string(65, 'x')}});
+    beat_tags(store, "cap", {{"yuzu.plugins_failed", std::string(32, ',') + "echo"}});
+    store.recompute_metrics(metrics, std::chrono::seconds{300});
+    auto out = metrics.serialize();
+    CHECK(series_val(out, rejected_series(yuzu::server::kRejectUnknownPlugin)) == 1.0);
+    CHECK(series_val(out, rejected_series(yuzu::server::kRejectMalformed)) == 1.0);
+    CHECK(series_val(out, rejected_series(yuzu::server::kRejectOverCap)) == 1.0);
+    // The two unknown names of "unk" are summed, not labelled.
+    CHECK(series_val(out, init_failed_series("unknown")) == 2.0);
+
+    // The reporters go away: back to 0, not stale and not absent.
+    for (const char* id : {"unk", "bad", "cap"})
+        store.remove(id);
+    store.recompute_metrics(metrics, std::chrono::seconds{300});
+    for (const char* r : reasons)
+        CHECK(series_val(metrics.serialize(), rejected_series(r)) == 0.0);
+}
+
+TEST_CASE("REAL AgentHealthStore: a 64-character token is accepted, a 65-character one is malformed",
+          "[health_store][echo][real]") {
+    AgentHealthStore store;
+    store.set_known_plugins(catalogue_names());
+    yuzu::MetricsRegistry metrics;
+    // Exactly 64 well-formed characters is a token: not malformed, and (not in the catalogue)
+    // counted once as unknown_plugin, summed under plugin="unknown".
+    beat_tags(store, "edge", {{"yuzu.plugins_failed", std::string(64, 'x')}});
+    store.recompute_metrics(metrics, std::chrono::seconds{300});
+    auto out = metrics.serialize();
+    CHECK(series_val(out, rejected_series(yuzu::server::kRejectMalformed)) == 0.0);
+    CHECK(series_val(out, rejected_series(yuzu::server::kRejectUnknownPlugin)) == 1.0);
+    CHECK(series_val(out, init_failed_series("unknown")) == 1.0);
+
+    beat_tags(store, "edge", {{"yuzu.plugins_failed", std::string(65, 'x')}});
+    store.recompute_metrics(metrics, std::chrono::seconds{300});
+    out = metrics.serialize();
+    CHECK(series_val(out, rejected_series(yuzu::server::kRejectMalformed)) == 1.0);
+    CHECK(series_val(out, rejected_series(yuzu::server::kRejectUnknownPlugin)) == 0.0);
+    CHECK_FALSE(has_series(out, init_failed_series("unknown")));
+}
+
+TEST_CASE("REAL AgentHealthStore: one agent with two rejection reasons is counted once per reason",
+          "[health_store][echo][real]") {
+    AgentHealthStore store;
+    store.set_known_plugins(catalogue_names());
+    yuzu::MetricsRegistry metrics;
+    // Two unknown names and two malformed ones from the SAME agent: each reason counts that
+    // agent once, not once per token; the unknown tokens still sum to 2 under plugin="unknown".
+    beat_tags(store, "both", {{"yuzu.plugins_failed", "nosuchplugin_1,bad-name,nosuchplugin_2,also bad,echo"}});
+    store.recompute_metrics(metrics, std::chrono::seconds{300});
+    const auto out = metrics.serialize();
+    CHECK(series_val(out, rejected_series(yuzu::server::kRejectUnknownPlugin)) == 1.0);
+    CHECK(series_val(out, rejected_series(yuzu::server::kRejectMalformed)) == 1.0);
+    CHECK(series_val(out, rejected_series(yuzu::server::kRejectOverCap)) == 0.0);
+    CHECK(series_val(out, init_failed_series("unknown")) == 2.0);
+    CHECK(series_val(out, init_failed_series("echo")) == 1.0);
+}
+
+TEST_CASE("REAL AgentHealthStore: the 32-slot boundary, a repeated unknown token, and the literal reason series",
+          "[health_store][echo][real]") {
+    AgentHealthStore store;
+    store.set_known_plugins(catalogue_names());
+    yuzu::MetricsRegistry metrics;
+    const auto others = other_catalogue_names();
+    REQUIRE(others.size() >= 33);
+
+    // Exactly 32 real tokens: all read, none over the cap.
+    beat_tags(store, "exact", {{"yuzu.plugins_failed", join_names(others, 32)}});
+    store.recompute_metrics(metrics, std::chrono::seconds{300});
+    auto out = metrics.serialize();
+    CHECK(count_init_failed_series(out) == 32);
+    CHECK(has_series(out, init_failed_series(others[31])));
+    CHECK(series_val(out, rejected_series(yuzu::server::kRejectOverCap)) == 0.0);
+
+    // 33 tokens: the 33rd is not read, and the agent is over the cap once.
+    beat_tags(store, "exact", {{"yuzu.plugins_failed", join_names(others, 33)}});
+    store.recompute_metrics(metrics, std::chrono::seconds{300});
+    out = metrics.serialize();
+    CHECK(count_init_failed_series(out) == 32);
+    CHECK_FALSE(has_series(out, init_failed_series(others[32])));
+    CHECK(series_val(out, rejected_series(yuzu::server::kRejectOverCap)) == 1.0);
+
+    // The same unknown token twice from ONE agent is deduped before the catalogue test: it adds
+    // one to plugin="unknown" and the agent is counted once.
+    store.remove("exact");
+    beat_tags(store, "dup", {{"yuzu.plugins_failed", "nosuchplugin,nosuchplugin"}});
+    store.recompute_metrics(metrics, std::chrono::seconds{300});
+    out = metrics.serialize();
+    CHECK(series_val(out, init_failed_series("unknown")) == 1.0);
+    CHECK(series_val(out, rejected_series(yuzu::server::kRejectUnknownPlugin)) == 1.0);
+
+    // The reason label values are the documented words, spelt out here so renaming or swapping
+    // a kReject* constant cannot stay green.
+    CHECK(has_series(out, "yuzu_fleet_plugin_init_failed_rejected{reason=\"unknown_plugin\"} 1"));
+    CHECK(has_series(out, "yuzu_fleet_plugin_init_failed_rejected{reason=\"malformed\"} 0"));
+    CHECK(has_series(out, "yuzu_fleet_plugin_init_failed_rejected{reason=\"over_cap\"} 0"));
+}
+
+TEST_CASE("REAL AgentHealthStore: an empty token carries no name and is not malformed",
+          "[health_store][echo][real]") {
+    AgentHealthStore store;
+    store.set_known_plugins(catalogue_names());
+    yuzu::MetricsRegistry metrics;
+    // An empty token between commas and a trailing comma are ignored: both real names are
+    // labelled and no reason counts the agent.
+    beat_tags(store, "a", {{"yuzu.plugins_failed", "echo,,wmi,"}});
+    store.recompute_metrics(metrics, std::chrono::seconds{300});
+    const auto out = metrics.serialize();
+    CHECK(series_val(out, init_failed_series("echo")) == 1.0);
+    CHECK(series_val(out, init_failed_series("wmi")) == 1.0);
+    CHECK(count_init_failed_series(out) == 2);
+    CHECK(series_val(out, rejected_series(yuzu::server::kRejectMalformed)) == 0.0);
+    CHECK(series_val(out, rejected_series(yuzu::server::kRejectUnknownPlugin)) == 0.0);
+    CHECK(series_val(out, rejected_series(yuzu::server::kRejectOverCap)) == 0.0);
+}
+
+TEST_CASE("REAL AgentHealthStore: plugin_init_failed stays absent-not-zero beside the rejected gauge",
+          "[health_store][echo][real]") {
+    AgentHealthStore store;
+    store.set_known_plugins(catalogue_names());
+    yuzu::MetricsRegistry metrics;
+    beat_tags(store, "a", {});
+    store.recompute_metrics(metrics, std::chrono::seconds{300});
+    auto out = metrics.serialize();
+    // No failure reported: no per-plugin series (and no "unknown" one), but the rejected gauge
+    // is a measured 0.
+    CHECK(count_init_failed_series(out) == 0);
+    CHECK(series_val(out, rejected_series(yuzu::server::kRejectUnknownPlugin)) == 0.0);
+
+    // Only unknown names reported: just the "unknown" series.
+    beat_tags(store, "a", {{"yuzu.plugins_failed", "nosuchplugin"}});
+    store.recompute_metrics(metrics, std::chrono::seconds{300});
+    out = metrics.serialize();
+    CHECK(count_init_failed_series(out) == 1);
+    CHECK(series_val(out, init_failed_series("unknown")) == 1.0);
+}
+
+TEST_CASE("REAL AgentHealthStore: a store with no catalogue wired fails closed, every name unknown",
+          "[health_store][echo][real]") {
+    AgentHealthStore store; // set_known_plugins never called
+    yuzu::MetricsRegistry metrics;
+    beat_tags(store, "a", {{"yuzu.plugins_failed", "not_in_any_catalogue"}});
+    store.recompute_metrics(metrics, std::chrono::seconds{300});
+    const auto out = metrics.serialize();
+    CHECK_FALSE(has_series(out, init_failed_series("not_in_any_catalogue")));
+    CHECK(series_val(out, init_failed_series("unknown")) == 1.0);
+    CHECK(series_val(out, rejected_series(yuzu::server::kRejectUnknownPlugin)) == 1.0);
 }
 
 TEST_CASE("REAL AgentHealthStore: corruption candidates are surfaced, not deduped",
@@ -2043,6 +2551,19 @@ TEST_CASE("REAL AgentHealthStore: corruption candidates are surfaced, not dedupe
     beat_tags(store, "a", {{tot, "2"}, {ql, "200:f2"}});
     CHECK(calls.size() == 4);
 }
+
+namespace {
+// The message of the std::exception `fn` throws, or "<none>" (Catch2's *_THROWS_WITH needs the
+// matchers header, which this file does not otherwise pull in).
+std::string what_of(const std::function<void()>& fn) {
+    try {
+        fn();
+    } catch (const std::exception& e) {
+        return e.what();
+    }
+    return "<none>";
+}
+} // namespace
 
 TEST_CASE("EchoCorruptionAuditGate: durable dedup against the audit store's newest row",
           "[health_store][echo][corruption][gate]") {
@@ -2111,12 +2632,12 @@ TEST_CASE("EchoCorruptionAuditGate: a failed audit write is retried, a durable o
     // Degraded store: no write, not marked.
     CHECK_FALSE(gate.should_log("a", "1:f"));
     clock += yuzu::server::detail::kEchoCorruptionAuditDegradedRetry;
-    // Healthy, no row -> log; the caller's log() fails -> mark_failed opens the
-    // degraded window: no lookup inside it, admitted again after it.
+    // Healthy, no row -> log; the caller's log() fails -> mark_failed. "a" failed on its last
+    // try too, so only "a" waits: no lookup for it inside its wait, admitted again after it.
     answer = std::optional<std::string>{};
     REQUIRE(gate.should_log("a", "1:f"));
     const int before_fail = lookups;
-    gate.mark_failed();
+    gate.mark_failed("a");
     CHECK_FALSE(gate.should_log("a", "1:f"));
     CHECK(lookups == before_fail);
     clock += yuzu::server::detail::kEchoCorruptionAuditDegradedRetry;
@@ -2128,7 +2649,8 @@ TEST_CASE("EchoCorruptionAuditGate: a failed audit write is retried, a durable o
     CHECK(lookups == before);
 }
 
-TEST_CASE("EchoCorruptionAuditGate: overlapping calls hold one in-flight slot gate-wide",
+TEST_CASE("EchoCorruptionAuditGate: a second call for the same agent while its lookup is in "
+          "flight is refused; a different agent is admitted (#5033)",
           "[health_store][echo][corruption][gate]") {
     using yuzu::server::detail::EchoCorruptionAuditGate;
     int lookups = 0;
@@ -2136,7 +2658,7 @@ TEST_CASE("EchoCorruptionAuditGate: overlapping calls hold one in-flight slot ga
     std::optional<std::optional<std::string>> answer = std::optional<std::string>{};
     EchoCorruptionAuditGate* gp = nullptr;
     bool reenter = true;
-    bool inner_same = true, inner_other = true;
+    bool inner_same = true, inner_other = false;
     EchoCorruptionAuditGate gate(
         [&](const std::string&) {
             ++lookups;
@@ -2150,25 +2672,26 @@ TEST_CASE("EchoCorruptionAuditGate: overlapping calls hold one in-flight slot ga
         [&] { return clock; });
     gp = &gate;
 
-    // Same-agent and other-agent calls from inside the lookup: no admit, no lookup.
+    // From inside a's lookup: the same agent is refused (no lookup), another agent is admitted.
     REQUIRE(gate.should_log("a", "1:f"));
     CHECK_FALSE(inner_same);
-    CHECK_FALSE(inner_other);
-    CHECK(lookups == 1);
-    CHECK_FALSE(gate.should_log("a", "1:f")); // slot still held until completion
-    CHECK(lookups == 1);
+    CHECK(inner_other);
+    CHECK(lookups == 2);
+    CHECK_FALSE(gate.should_log("a", "1:f")); // a's slot still held until completion
+    CHECK_FALSE(gate.should_log("b", "2:g")); // so is b's
+    CHECK(lookups == 2);
     gate.mark_logged("a", "1:f");
     CHECK_FALSE(gate.should_log("a", "1:f")); // the map answers now
-    CHECK(lookups == 1);
+    CHECK_FALSE(gate.should_log("b", "2:g")); // a's completion leaves b's slot held
+    CHECK(lookups == 2);
 
-    // mark_failed releases the slot (after the degraded window).
-    REQUIRE(gate.should_log("b", "2:g"));
-    gate.mark_failed();
+    // mark_failed releases the agent's slot (after the degraded window).
+    gate.mark_failed("b");
     clock += yuzu::server::detail::kEchoCorruptionAuditDegradedRetry;
     CHECK(gate.should_log("b", "2:g"));
     gate.mark_logged("b", "2:g");
 
-    // Degraded outer lookup under overlap: exactly one probe, re-admitted after the window.
+    // Degraded lookup for a third agent: exactly one probe, re-admitted after the window.
     answer = std::nullopt;
     reenter = true;
     const int before = lookups;
@@ -2182,8 +2705,184 @@ TEST_CASE("EchoCorruptionAuditGate: overlapping calls hold one in-flight slot ga
     gate.mark_logged("c", "3:h");
 }
 
+TEST_CASE("EchoCorruptionAuditGate: a degraded store is probed once per admitted agent; the first "
+          "failure re-opens the gate-wide window (#5033)",
+          "[health_store][echo][corruption][gate]") {
+    using yuzu::server::detail::EchoCorruptionAuditGate;
+    int lookups = 0;
+    int64_t clock = 1000;
+    EchoCorruptionAuditGate* gp = nullptr;
+    bool reenter = true;
+    bool inner_b = true, inner_c = true, inner_a = true;
+    int lookups_after_b = 0, lookups_after_a = 0;
+    EchoCorruptionAuditGate gate(
+        [&](const std::string&) {
+            ++lookups;
+            if (reenter) {
+                reenter = false;
+                inner_b = gp->should_log("b", "2:g"); // distinct agent: admitted, probes too
+                lookups_after_b = lookups;
+                inner_c = gp->should_log("c", "3:h"); // b's failure already re-opened the window
+                // Step past the window: a is still in flight, and b's degraded release must
+                // not have freed a's slot, so a is refused without a lookup.
+                clock += yuzu::server::detail::kEchoCorruptionAuditDegradedRetry;
+                inner_a = gp->should_log("a", "1:f");
+                lookups_after_a = lookups;
+            }
+            return std::optional<std::optional<std::string>>{}; // degraded store
+        },
+        [&] { return clock; });
+    gp = &gate;
+
+    // Both distinct agents enter latest_() inside one degraded interval (the stated bound is
+    // per admitted agent, not one probe gate-wide) ...
+    CHECK_FALSE(gate.should_log("a", "1:f"));
+    CHECK_FALSE(inner_b);
+    CHECK(lookups_after_b == 2);
+    // ... but the first nullopt re-opened the window, so a third agent is refused without a
+    // lookup, from inside a's still-in-flight probe and afterwards.
+    CHECK_FALSE(inner_c);
+    CHECK_FALSE(inner_a);
+    CHECK(lookups_after_a == 2);
+    CHECK(lookups == 2);
+    CHECK_FALSE(gate.should_log("c", "3:h"));
+    CHECK(lookups == 2);
+    // After the window the next probe runs again (and re-opens it on failure).
+    clock += yuzu::server::detail::kEchoCorruptionAuditDegradedRetry;
+    CHECK_FALSE(gate.should_log("c", "3:h"));
+    CHECK(lookups == 3);
+    CHECK_FALSE(gate.should_log("d", "4:i"));
+    CHECK(lookups == 3);
+}
+
+TEST_CASE("EchoCorruptionAuditGate::Reservation: logged() and failed() complete once; a second "
+          "completion is a no-op (#7476)",
+          "[health_store][echo][corruption][gate]") {
+    using yuzu::server::detail::EchoCorruptionAuditGate;
+    using yuzu::server::detail::kEchoCorruptionAuditDegradedRetry;
+    int64_t clock = 1000;
+    EchoCorruptionAuditGate gate(
+        [&](const std::string&) -> std::optional<std::optional<std::string>> {
+            return std::optional<std::string>{}; // no prior row
+        },
+        [&] { return clock; });
+    const std::string a = "a";
+    const std::string b = "b";
+
+    SECTION("logged() after failed(): the failure stands, nothing is remembered") {
+        REQUIRE(gate.should_log(a, "1:f"));
+        {
+            EchoCorruptionAuditGate::Reservation r(gate, a);
+            r.failed();
+            r.logged("1:f"); // no-op: must not record a row that was never written
+        }
+        clock += kEchoCorruptionAuditDegradedRetry;
+        CHECK(gate.should_log(a, "1:f")); // not remembered, so a retry is admitted
+    }
+    SECTION("failed() after logged(): no degraded window opens") {
+        REQUIRE(gate.should_log(a, "1:f"));
+        {
+            EchoCorruptionAuditGate::Reservation r(gate, a);
+            r.logged("1:f");
+            r.failed(); // no-op: must not open a window for a durable row
+        }
+        CHECK(gate.should_log(b, "2:g")); // admitted at once, same clock
+        CHECK_FALSE(gate.should_log(a, "1:f")); // and a stays durable
+    }
+    SECTION("a second logged() or failed() does not release a slot the agent re-took") {
+        REQUIRE(gate.should_log(a, "1:f"));
+        {
+            EchoCorruptionAuditGate::Reservation r(gate, a);
+            r.logged("1:f");
+            clock += yuzu::server::detail::kEchoCorruptionAuditMinRowInterval;
+            REQUIRE(gate.should_log(a, "2:g")); // a re-takes its slot for a new identity
+            r.logged("1:f");                    // stale token: no-op, a's new slot stays held
+            r.failed();
+        }
+        CHECK_FALSE(gate.should_log(a, "3:h")); // still held (not freed by the stale token)
+        gate.mark_logged(a, "2:g");
+    }
+}
+
+TEST_CASE("EchoCorruptionAuditGate::Reservation: a clock that throws inside logged() propagates, "
+          "opens no window and still releases the slot (#7476)",
+          "[health_store][echo][corruption][gate]") {
+    using yuzu::server::detail::EchoCorruptionAuditGate;
+    int64_t clock = 1000;
+    bool clock_throws = false;
+    EchoCorruptionAuditGate gate(
+        [&](const std::string&) -> std::optional<std::optional<std::string>> {
+            return std::optional<std::string>{};
+        },
+        [&]() -> int64_t {
+            if (clock_throws)
+                throw std::runtime_error("clock failed");
+            return clock;
+        });
+    const std::string a = "a";
+    REQUIRE(gate.should_log(a, "1:f"));
+    {
+        EchoCorruptionAuditGate::Reservation r(gate, a);
+        clock_throws = true;
+        CHECK_THROWS_AS(r.logged("1:f"), std::runtime_error);
+        // The throw already consumed the completion: the destructor must not call mark_failed
+        // (which would throw again from a destructor and terminate).
+    }
+    clock_throws = false;
+    CHECK(gate.should_log("b", "2:g")); // no degraded window
+    CHECK(gate.should_log(a, "1:f"));   // slot released, identity not remembered
+}
+
+TEST_CASE("EchoCorruptionAuditGate: the in-flight set refuses at kMaxInFlight, never evicts",
+          "[health_store][echo][corruption][gate]") {
+    using yuzu::server::detail::EchoCorruptionAuditGate;
+    int lookups = 0;
+    EchoCorruptionAuditGate gate(
+        [&](const std::string&) {
+            ++lookups;
+            return std::optional<std::optional<std::string>>{std::optional<std::string>{}};
+        },
+        [] { return int64_t{1000}; });
+    // #7474: the lookup and the write each hold a lease of the shared PG pool, so the gate
+    // admits at most four agents at once, not one per entry the map can hold.
+    constexpr int kBound = static_cast<int>(EchoCorruptionAuditGate::kMaxInFlight);
+    static_assert(kBound == 4);
+    for (int i = 0; i < kBound; ++i)
+        REQUIRE(gate.should_log("agent-" + std::to_string(i), "1:f"));
+    CHECK(lookups == kBound);
+    // At the bound a new agent is refused without a lookup; no held slot was evicted.
+    CHECK_FALSE(gate.should_log("extra", "1:f"));
+    CHECK_FALSE(gate.should_log("agent-0", "1:f"));
+    CHECK(lookups == kBound);
+    // Completing one frees exactly one slot.
+    gate.mark_logged("agent-0", "1:f");
+    CHECK(gate.should_log("extra", "1:f"));
+    CHECK(lookups == kBound + 1);
+    CHECK_FALSE(gate.should_log("extra-2", "1:f"));
+    CHECK(lookups == kBound + 1);
+}
+
+TEST_CASE("EchoCorruptionAuditGate: a mass quarantine of distinct agents is admitted four at a time",
+          "[health_store][echo][corruption][gate]") {
+    using yuzu::server::detail::EchoCorruptionAuditGate;
+    int lookups = 0;
+    EchoCorruptionAuditGate gate(
+        [&](const std::string&) {
+            ++lookups;
+            return std::optional<std::optional<std::string>>{std::optional<std::string>{}};
+        },
+        [] { return int64_t{1000}; });
+    // Sixteen agents arrive while each admitted write is still pending: only four get a lease.
+    int admitted = 0;
+    for (int i = 0; i < 16; ++i)
+        if (gate.should_log("agent-" + std::to_string(i), "1:f"))
+            ++admitted;
+    CHECK(admitted == static_cast<int>(EchoCorruptionAuditGate::kMaxInFlight));
+    CHECK(lookups == admitted);
+}
+
 TEST_CASE("EchoCorruptionAuditGate::Reservation: a throw between reservation and "
-          "completion releases the slot",
+          "completion releases only its own agent's slot",
           "[health_store][echo][corruption][gate]") {
     using yuzu::server::detail::EchoCorruptionAuditGate;
     int64_t clock = 1000;
@@ -2194,26 +2893,386 @@ TEST_CASE("EchoCorruptionAuditGate::Reservation: a throw between reservation and
         [&] { return clock; });
 
     REQUIRE(gate.should_log("a", "1:f"));
+    REQUIRE(gate.should_log("b", "2:g"));
     try {
-        EchoCorruptionAuditGate::Reservation r(gate);
+        const std::string agent = "a";
+        EchoCorruptionAuditGate::Reservation r(gate, agent);
         throw std::runtime_error("boom");
     } catch (...) {
     }
-    // The unwind completed the reservation as failed(): degraded window open,
-    // no lookup admitted for a different agent yet.
-    CHECK_FALSE(gate.should_log("b", "2:g"));
+    // The unwind completed the reservation as failed(): degraded window open, so a fresh
+    // agent is refused.
+    CHECK_FALSE(gate.should_log("c", "3:h"));
     clock += yuzu::server::detail::kEchoCorruptionAuditDegradedRetry;
-    CHECK(gate.should_log("b", "2:g")); // proves the slot was released, not stranded
+    CHECK_FALSE(gate.should_log("b", "2:g")); // b's slot is untouched by a's unwind
+    CHECK(gate.should_log("a", "1:f"));       // a's slot was released, not stranded
 
     {
-        EchoCorruptionAuditGate::Reservation r(gate);
-        r.logged("b", "2:g");
+        const std::string agent = "b";
+        EchoCorruptionAuditGate::Reservation r(gate, agent);
+        r.logged("2:g");
     }
     // A committed reservation opens no degraded window: admitted immediately.
     CHECK(gate.should_log("c", "3:h"));
 }
 
-TEST_CASE("EchoCorruptionAuditGate: per-agent map is bounded by fleet, never wiped",
+TEST_CASE("EchoCorruptionAuditGate: a throwing lookup releases only its own agent's slot and "
+          "opens the degraded window (#7475)",
+          "[health_store][echo][corruption][gate]") {
+    using yuzu::server::detail::EchoCorruptionAuditGate;
+    using yuzu::server::detail::kEchoCorruptionAuditDegradedRetry;
+    int64_t clock = 1000;
+    EchoCorruptionAuditGate* gp = nullptr;
+    bool throw_in_a = true;
+    bool inner_b = true;
+    EchoCorruptionAuditGate gate(
+        [&](const std::string& agent) -> std::optional<std::optional<std::string>> {
+            if (agent == "a" && throw_in_a) {
+                throw_in_a = false;
+                inner_b = gp->should_log("b", "2:g"); // b's slot is held: refused, no lookup
+                throw std::runtime_error("lookup failed");
+            }
+            return std::optional<std::string>{}; // no prior row
+        },
+        [&] { return clock; });
+    gp = &gate;
+
+    REQUIRE(gate.should_log("b", "2:g")); // b holds its slot across a's failing lookup
+    REQUIRE_THROWS_AS(gate.should_log("a", "1:f"), std::runtime_error);
+    CHECK_FALSE(inner_b);
+    CHECK_FALSE(gate.should_log("b", "2:g")); // refused by the window a's throw opened
+    // A throwing store opens the degraded window like a degraded answer, so it is not retried
+    // on every heartbeat: with the clock unchanged a is refused ...
+    CHECK_FALSE(gate.should_log("a", "1:f"));
+    clock += kEchoCorruptionAuditDegradedRetry;
+    // ... once the window ends only b's held slot can refuse b: a's throw released a's slot
+    // alone ...
+    CHECK_FALSE(gate.should_log("b", "2:g"));
+    // ... and a's slot was released, not stranded.
+    CHECK(gate.should_log("a", "1:f"));
+    gate.mark_logged("a", "1:f");
+    gate.mark_logged("b", "2:g");
+}
+
+TEST_CASE("EchoCorruptionAuditGate: the window is dated from the throw, not from admission (#7475)",
+          "[health_store][echo][corruption][gate]") {
+    using yuzu::server::detail::EchoCorruptionAuditGate;
+    using yuzu::server::detail::kEchoCorruptionAuditDegradedRetry;
+    int64_t clock = 1000;
+    EchoCorruptionAuditGate gate(
+        [&](const std::string&) -> std::optional<std::optional<std::string>> {
+            clock += 61; // the lookup blocks for longer than a whole window, then throws
+            throw std::runtime_error("lookup failed");
+        },
+        [&] { return clock; });
+    REQUIRE_THROWS_AS(gate.should_log("a", "1:f"), std::runtime_error);
+    REQUIRE(clock == 1061);
+    // A window dated from admission (1000) would already be over at 1061.
+    CHECK_FALSE(gate.should_log("b", "2:g"));
+    clock = 1061 + kEchoCorruptionAuditDegradedRetry - 1;
+    CHECK_FALSE(gate.should_log("b", "2:g"));
+}
+
+TEST_CASE("EchoCorruptionAuditGate: the degraded window only extends (#7475)",
+          "[health_store][echo][corruption][gate]") {
+    using yuzu::server::detail::EchoCorruptionAuditGate;
+    using yuzu::server::detail::kEchoCorruptionAuditDegradedRetry;
+    int lookups = 0;
+    int64_t clock = 1000;
+    EchoCorruptionAuditGate gate(
+        [&](const std::string&) -> std::optional<std::optional<std::string>> {
+            ++lookups;
+            return std::optional<std::string>{};
+        },
+        [&] { return clock; });
+    REQUIRE(gate.should_log("a", "1:f"));
+    REQUIRE(gate.should_log("b", "2:g"));
+    gate.mark_failed("a"); // window until 1000 + retry
+    clock = 900;           // a later failure stamped earlier (a stepped-back injected clock)
+    gate.mark_failed("b"); // would date the window to 900 + retry: it must not shorten it
+    const int before = lookups;
+    clock = 1000 + kEchoCorruptionAuditDegradedRetry - 1;
+    CHECK_FALSE(gate.should_log("c", "3:h"));
+    CHECK(lookups == before);
+    clock = 1000 + kEchoCorruptionAuditDegradedRetry;
+    CHECK(gate.should_log("c", "3:h"));
+}
+
+TEST_CASE("EchoCorruptionAuditGate: a clock that throws in the lookup's catch path still releases "
+          "the slot, opens the window from entry time, and the lookup's exception propagates "
+          "(#7475)",
+          "[health_store][echo][corruption][gate]") {
+    using yuzu::server::detail::EchoCorruptionAuditGate;
+    using yuzu::server::detail::kEchoCorruptionAuditDegradedRetry;
+    int64_t clock = 1000;
+    bool clock_throws = false;
+    bool first = true;
+    EchoCorruptionAuditGate gate(
+        [&](const std::string&) -> std::optional<std::optional<std::string>> {
+            if (first) {
+                first = false;
+                clock_throws = true; // the clock fails exactly when the failure handler reads it
+                throw std::runtime_error("lookup failed");
+            }
+            return std::optional<std::string>{}; // no prior row
+        },
+        [&]() -> int64_t {
+            if (clock_throws)
+                throw std::runtime_error("clock failed");
+            return clock;
+        });
+    CHECK(what_of([&] { (void)gate.should_log("a", "1:f"); }) == "lookup failed");
+    clock_throws = false;
+    CHECK_FALSE(gate.should_log("b", "2:g")); // window opened from the entry time (1000)
+    clock = 1000 + kEchoCorruptionAuditDegradedRetry;
+    CHECK(gate.should_log("a", "1:f")); // a's slot was released, not stranded
+    gate.mark_logged("a", "1:f");
+}
+
+namespace {
+// A gate with a scripted lookup and write per agent, an injected clock and a recording observer,
+// shared by the repeat-failure cases below. No threads, no sleeps.
+struct RepeatFailureGate {
+    enum class Answer { no_row, degraded, throws, durable };
+    int64_t clock = 1000;
+    int lookups = 0;
+    std::unordered_map<std::string, Answer> answer; // an agent not listed answers no_row
+    std::string write_fails_for;                    // the one agent whose audit write fails
+    std::vector<yuzu::server::detail::DegradedCause> seen;
+    yuzu::server::detail::EchoCorruptionAuditGate gate{
+        [this](const std::string& agent) -> std::optional<std::optional<std::string>> {
+            ++lookups;
+            switch (answer[agent]) {
+            case Answer::degraded:
+                return std::nullopt;
+            case Answer::throws:
+                throw std::runtime_error("lookup failed");
+            case Answer::durable:
+                return std::optional<std::string>{"1:f"};
+            case Answer::no_row:
+                break;
+            }
+            return std::optional<std::string>{};
+        },
+        [this] { return clock; },
+        [this](yuzu::server::detail::DegradedCause cause) { seen.push_back(cause); }};
+
+    // One heartbeat's audit step for `agent`: true iff a row was written (a throwing lookup is
+    // swallowed and counts as not written).
+    bool beat(const std::string& agent, const std::string& quarantine = "1:f") {
+        try {
+            return yuzu::server::detail::log_echo_corruption_once(
+                gate, agent, quarantine, [&] { return agent != write_fails_for; });
+        } catch (const std::runtime_error&) {
+            return false;
+        }
+    }
+};
+} // namespace
+
+TEST_CASE("EchoCorruptionAuditGate: one agent whose lookup or write keeps failing never holds the "
+          "gate shut for healthy agents",
+          "[health_store][echo][corruption][gate]") {
+    using yuzu::server::detail::DegradedCause;
+    using yuzu::server::detail::kEchoCorruptionAuditDegradedRetry;
+    RepeatFailureGate f;
+    const std::string bad = "bad";
+    DegradedCause cause = DegradedCause::lookup_degraded;
+    SECTION("the audit store answers degraded for it") {
+        f.answer[bad] = RepeatFailureGate::Answer::degraded;
+    }
+    SECTION("its lookup throws") {
+        f.answer[bad] = RepeatFailureGate::Answer::throws;
+        cause = DegradedCause::lookup_threw;
+    }
+    SECTION("its audit write fails") {
+        f.write_fails_for = bad;
+        cause = DegradedCause::write_failed;
+    }
+
+    // The first failure cannot be told from a store fault, so it pauses every agent once.
+    CHECK_FALSE(f.beat(bad));
+    CHECK_FALSE(f.beat("healthy-0"));
+    for (int round = 1; round <= 5; ++round) {
+        // Just inside its own wait the bad agent is refused with no lookup at all.
+        f.clock += kEchoCorruptionAuditDegradedRetry - 1;
+        int before = f.lookups;
+        CHECK_FALSE(f.beat(bad));
+        CHECK(f.lookups == before);
+        // The wait is over: it is tried again and fails again, and in the same second a new
+        // healthy agent is audited (its row is written, so a counter on the row moves).
+        f.clock += 1;
+        CHECK_FALSE(f.beat(bad));
+        CHECK(f.lookups == before + 1);
+        CHECK(f.beat("healthy-" + std::to_string(round)));
+    }
+    // Every failure was reported, a contained repeat included.
+    REQUIRE(f.seen.size() == 6);
+    for (const auto c : f.seen)
+        CHECK(c == cause);
+}
+
+TEST_CASE("EchoCorruptionAuditGate: agents that fail in turn each pause every agent once, after "
+          "which all of them are contained",
+          "[health_store][echo][corruption][gate]") {
+    using yuzu::server::detail::kEchoCorruptionAuditDegradedRetry;
+    RepeatFailureGate f;
+    f.answer["bad"] = RepeatFailureGate::Answer::degraded;
+    f.answer["other"] = RepeatFailureGate::Answer::degraded;
+
+    CHECK_FALSE(f.beat("bad")); // its first failure opens the window at 1000
+    f.clock += kEchoCorruptionAuditDegradedRetry;
+    CHECK_FALSE(f.beat("bad")); // it is remembered: contained, so a healthy agent is audited
+    CHECK(f.beat("healthy-1"));
+
+    // A first failure by another agent is a store signal as far as the gate can tell: the window
+    // opens once more, and that agent is remembered beside the first.
+    CHECK_FALSE(f.beat("other"));
+    CHECK_FALSE(f.beat("healthy-2"));
+
+    // From here neither re-opens the window, in whichever order they fail: each is tried once a
+    // retry period, and a healthy agent is audited in the same second as each failure.
+    for (int round = 0; round < 6; ++round) {
+        f.clock += kEchoCorruptionAuditDegradedRetry;
+        const std::string first = round % 2 ? "bad" : "other";
+        const std::string second = round % 2 ? "other" : "bad";
+        const int before = f.lookups;
+        CHECK_FALSE(f.beat(first));
+        CHECK(f.beat("healthy-a" + std::to_string(round)));
+        CHECK_FALSE(f.beat(second));
+        CHECK(f.beat("healthy-b" + std::to_string(round)));
+        CHECK(f.lookups == before + 4);
+        CHECK_FALSE(f.beat(first)); // inside its own wait: no lookup
+        CHECK_FALSE(f.beat(second));
+        CHECK(f.lookups == before + 4);
+    }
+}
+
+TEST_CASE("EchoCorruptionAuditGate: kMaxFailing failing agents are contained; one more re-opens "
+          "the window and the agent whose wait ends earliest is forgotten",
+          "[health_store][echo][corruption][gate]") {
+    using yuzu::server::detail::EchoCorruptionAuditGate;
+    using yuzu::server::detail::kEchoCorruptionAuditDegradedRetry;
+    constexpr int kCap = static_cast<int>(EchoCorruptionAuditGate::kMaxFailing);
+    RepeatFailureGate f;
+    const auto bad = [](int i) { return "bad-" + std::to_string(i); };
+    for (int i = 0; i <= kCap; ++i)
+        f.answer[bad(i)] = RepeatFailureGate::Answer::degraded;
+
+    // Each agent's first failure pauses every agent once.
+    for (int i = 0; i < kCap; ++i) {
+        CHECK_FALSE(f.beat(bad(i)));
+        CHECK_FALSE(f.beat("healthy-w" + std::to_string(i)));
+        f.clock += kEchoCorruptionAuditDegradedRetry + 1;
+    }
+    // All are remembered: a whole round of failures (1 s apart, so their waits end in order)
+    // opens no window, and a healthy agent is audited straight after.
+    for (int i = 0; i < kCap; ++i) {
+        CHECK_FALSE(f.beat(bad(i)));
+        f.clock += 1;
+    }
+    CHECK(f.beat("healthy-all"));
+
+    // One more failing agent than the table holds: its first failure opens the window, and the
+    // table forgets the agent whose wait ends earliest (bad-0).
+    f.clock += kEchoCorruptionAuditDegradedRetry;
+    CHECK_FALSE(f.beat(bad(kCap)));
+    CHECK_FALSE(f.beat("healthy-x"));
+    f.clock += kEchoCorruptionAuditDegradedRetry;
+    CHECK_FALSE(f.beat(bad(1))); // still remembered: contained
+    CHECK(f.beat("healthy-y"));
+    CHECK_FALSE(f.beat(bad(0))); // forgotten: a first failure again, so the window re-opens
+    CHECK_FALSE(f.beat("healthy-z"));
+}
+
+TEST_CASE("EchoCorruptionAuditGate: a success forgets only the agent that succeeded",
+          "[health_store][echo][corruption][gate]") {
+    using yuzu::server::detail::kEchoCorruptionAuditDegradedRetry;
+    using yuzu::server::detail::kEchoCorruptionAuditMinRowInterval;
+    RepeatFailureGate f;
+    f.answer["bad"] = RepeatFailureGate::Answer::degraded;
+    f.answer["other"] = RepeatFailureGate::Answer::degraded;
+    CHECK_FALSE(f.beat("bad"));
+    f.clock += kEchoCorruptionAuditDegradedRetry;
+    CHECK_FALSE(f.beat("other")); // both remembered now
+    f.clock += kEchoCorruptionAuditDegradedRetry;
+
+    f.answer["other"] = RepeatFailureGate::Answer::no_row;
+    CHECK(f.beat("other"));     // its row is written: forgotten
+    CHECK_FALSE(f.beat("bad")); // still remembered: contained
+    CHECK(f.beat("healthy-1"));
+
+    f.clock += kEchoCorruptionAuditMinRowInterval;
+    f.answer["other"] = RepeatFailureGate::Answer::degraded;
+    CHECK_FALSE(f.beat("other", "2:g")); // a first failure again: the window opens
+    CHECK_FALSE(f.beat("healthy-2"));
+    f.clock += kEchoCorruptionAuditDegradedRetry;
+    CHECK_FALSE(f.beat("bad")); // and "bad" was never forgotten
+    CHECK(f.beat("healthy-3"));
+}
+
+TEST_CASE("EchoCorruptionAuditGate: a success forgets a failing agent, so its next failure opens "
+          "the window again",
+          "[health_store][echo][corruption][gate]") {
+    using yuzu::server::detail::kEchoCorruptionAuditDegradedRetry;
+    using yuzu::server::detail::kEchoCorruptionAuditMinRowInterval;
+    RepeatFailureGate f;
+    const std::string bad = "bad";
+    f.answer[bad] = RepeatFailureGate::Answer::degraded;
+    CHECK_FALSE(f.beat(bad)); // opens the window, remembers "bad"
+    f.clock += kEchoCorruptionAuditDegradedRetry;
+
+    SECTION("after its row is written") {
+        f.answer[bad] = RepeatFailureGate::Answer::no_row;
+        CHECK(f.beat(bad)); // mark_logged forgets it
+        f.clock += kEchoCorruptionAuditMinRowInterval;
+        f.answer[bad] = RepeatFailureGate::Answer::degraded;
+        CHECK_FALSE(f.beat(bad, "2:g")); // a first failure again, not a repeat
+        CHECK_FALSE(f.beat("healthy-1"));
+    }
+    SECTION("after a durable lookup hit") {
+        f.answer[bad] = RepeatFailureGate::Answer::durable; // the audit store holds "1:f"
+        CHECK_FALSE(f.beat(bad));                           // remember_locked forgets it, no write
+        f.answer[bad] = RepeatFailureGate::Answer::degraded;
+        CHECK_FALSE(f.beat(bad, "2:g"));
+        CHECK_FALSE(f.beat("healthy-1"));
+    }
+}
+
+TEST_CASE("EchoCorruptionAuditGate: a repeating agent's own wait is dated from its failure and a "
+          "failure stamped earlier never shortens it",
+          "[health_store][echo][corruption][gate]") {
+    using yuzu::server::detail::kEchoCorruptionAuditDegradedRetry;
+    RepeatFailureGate f;
+    auto& gate = f.gate;
+    const std::string bad = "bad";
+
+    REQUIRE(gate.should_log(bad, "1:f"));
+    gate.mark_failed(bad); // first failure at 1000: the window opens and "bad" is remembered
+    f.clock = 1060;
+    REQUIRE(gate.should_log(bad, "1:f"));
+    f.clock = 1100; // the write took 40 s, then failed
+    gate.mark_failed(bad); // a repeat: its own wait runs to 1160, no gate-wide window
+    CHECK(gate.should_log("healthy", "1:f"));
+    gate.mark_logged("healthy", "1:f");
+    const int before = f.lookups;
+    f.clock = 1160 - 1;
+    CHECK_FALSE(gate.should_log(bad, "1:f")); // dated from the failure (1100), not admission (1060)
+    CHECK(f.lookups == before);
+    f.clock = 1160;
+    REQUIRE(gate.should_log(bad, "1:f"));
+
+    // A repeat failure stamped earlier (a stepped-back injected clock) keeps the later deadline.
+    f.clock = 1000;
+    gate.mark_failed(bad); // would date the wait to 1060
+    f.clock = 1160 - kEchoCorruptionAuditDegradedRetry + 1; // 1101: past 1060, before 1160
+    CHECK_FALSE(gate.should_log(bad, "1:f"));
+    f.clock = 1160;
+    CHECK(gate.should_log(bad, "1:f"));
+}
+
+TEST_CASE("EchoCorruptionAuditGate: per-agent map is bounded by fleet, never wiped; when every "
+          "entry is inside its window one is still evicted (#5034)",
           "[health_store][echo][corruption][gate]") {
     using yuzu::server::detail::EchoCorruptionAuditGate;
     int lookups = 0;
@@ -2224,8 +3283,10 @@ TEST_CASE("EchoCorruptionAuditGate: per-agent map is bounded by fleet, never wip
             return std::optional<std::optional<std::string>>{std::optional<std::string>{}};
         },
         [&] { return clock; });
-    // One past the 65,536 cap: exactly one entry is evicted, never a wholesale clear.
-    constexpr int kAgents = 65537;
+    // One past the 65,536 cap: exactly one entry is evicted, never a wholesale clear. Every
+    // entry here was just written (all inside the rate-limit window), so this is the fallback
+    // arm: no entry is evictable by age, one is still evicted and the map never exceeds the cap.
+    constexpr int kAgents = static_cast<int>(EchoCorruptionAuditGate::kMaxAgents) + 1;
     for (int i = 0; i < kAgents; ++i)
         gate.mark_logged("agent-" + std::to_string(i), "1:f");
     // The single evicted entry is admitted (order-independent). Release the
@@ -2239,12 +3300,141 @@ TEST_CASE("EchoCorruptionAuditGate: per-agent map is bounded by fleet, never wip
     for (int i = 0; i < kAgents; ++i) {
         if (gate.should_log("agent-" + std::to_string(i), "1:f")) {
             ++admitted;
-            gate.mark_failed();
+            gate.mark_failed("agent-" + std::to_string(i));
             clock += yuzu::server::detail::kEchoCorruptionAuditDegradedRetry;
         }
     }
     CHECK(admitted == 1);
     CHECK(lookups == 1);
+}
+
+TEST_CASE("EchoCorruptionAuditGate: the eviction search at the cap is a bounded prefix, however "
+          "many identities arrive (heartbeat path holds the gate mutex)",
+          "[health_store][echo][corruption][gate]") {
+    using yuzu::server::detail::EchoCorruptionAuditGate;
+    int64_t clock = 1000;
+    EchoCorruptionAuditGate gate(
+        [&](const std::string&) {
+            return std::optional<std::optional<std::string>>{std::optional<std::string>{}};
+        },
+        [&] { return clock; });
+    constexpr int kFill = static_cast<int>(EchoCorruptionAuditGate::kMaxAgents);
+    // The earlier guarantee that an agent still inside its rate-limit window is never the victim
+    // (#5034) is now best effort: only the first kVictimScan entries are searched, and which
+    // entries those are depends on the standard library's iteration order, so it is not asserted.
+    // Sustained all-fresh at the cap: every entry is inside its rate-limit window, so no
+    // eviction finds an elapsed victim; each one must stop at the prefix bound and fall back to
+    // the oldest examined entry. A whole-map scan per new identity (about 10 ms each at this
+    // size) would have examined 65,536 entries here.
+    for (int i = 0; i < kFill; ++i)
+        gate.mark_logged("fresh-" + std::to_string(i), "1:f");
+    CHECK(gate.max_victim_probe() == 0); // exactly at the cap, nothing evicted yet
+    constexpr int kFlood = 2000;
+    for (int i = 0; i < kFlood; ++i)
+        gate.mark_logged("flood-" + std::to_string(i), "1:f");
+    CHECK(gate.max_victim_probe() == EchoCorruptionAuditGate::kVictimScan);
+}
+
+TEST_CASE("EchoCorruptionAuditGate: agents writing at the cap do not evict each other's live "
+          "window",
+          "[health_store][echo][corruption][gate]") {
+    using yuzu::server::detail::EchoCorruptionAuditGate;
+    int64_t clock = 1000;
+    EchoCorruptionAuditGate gate(
+        [&](const std::string&) {
+            return std::optional<std::optional<std::string>>{std::optional<std::string>{}};
+        },
+        [&] { return clock; });
+    constexpr int kFill = static_cast<int>(EchoCorruptionAuditGate::kMaxAgents);
+    for (int i = 0; i < kFill; ++i)
+        gate.mark_logged("fresh-" + std::to_string(i), "1:f"); // every window opened at 1000
+    // New agents write one second later, so each is the NEWEST entry in the map. When the
+    // examined prefix has no elapsed window the victim must be the oldest entry, never the one
+    // just inserted: evicting the newest node let two agents erase each other's window, so each
+    // wrote a row on every call.
+    constexpr int kRounds = 8;
+    // Two new entries per round against a 32-entry examined prefix: old entries stay in view.
+    static_assert(2 * kRounds < static_cast<int>(EchoCorruptionAuditGate::kVictimScan));
+    for (int r = 1; r <= kRounds; ++r) {
+        clock = 1000 + r;
+        const std::string a = "a-" + std::to_string(r);
+        const std::string b = "b-" + std::to_string(r);
+        REQUIRE(gate.should_log(a, "1:f"));
+        gate.mark_logged(a, "1:f");
+        REQUIRE(gate.should_log(b, "1:f"));
+        gate.mark_logged(b, "1:f");
+    }
+    for (int r = 1; r <= kRounds; ++r) {
+        // Each new agent's window is still live: a rotated identity is refused, not admitted.
+        CHECK_FALSE(gate.should_log("a-" + std::to_string(r), "2:g"));
+        CHECK_FALSE(gate.should_log("b-" + std::to_string(r), "2:g"));
+    }
+}
+
+TEST_CASE("EchoCorruptionAuditGate: at the cap an agent with a live window survives a table of "
+          "elapsed and never-windowed entries",
+          "[health_store][echo][corruption][gate]") {
+    using yuzu::server::detail::EchoCorruptionAuditGate;
+    using yuzu::server::detail::kEchoCorruptionAuditMinRowInterval;
+    int64_t clock = 1000;
+    // Ids starting "dur-" are already durable (found by the lookup only: no row of ours, so no
+    // window at all); every other id has no audit row yet.
+    EchoCorruptionAuditGate gate(
+        [&](const std::string& id) {
+            return std::optional<std::optional<std::string>>{
+                id.starts_with("dur-") ? std::optional<std::string>{"1:f"}
+                                       : std::optional<std::string>{}};
+        },
+        [&] { return clock; });
+    constexpr int kFill = static_cast<int>(EchoCorruptionAuditGate::kMaxAgents);
+    for (int i = 0; i < kFill; ++i) {
+        if (i % 2 == 0) {
+            gate.mark_logged("old-" + std::to_string(i), "1:f"); // window opened at 1000
+        } else {
+            REQUIRE_FALSE(gate.should_log("dur-" + std::to_string(i), "1:f")); // no window
+        }
+    }
+    clock += kEchoCorruptionAuditMinRowInterval; // every old window has elapsed
+    // "limited" opens a live window at the cap. The examined prefix of each later insert holds at
+    // most 9 of the new entries, so it always holds an elapsed or never-windowed entry, and the
+    // search stops at the first of those: "limited" is never the victim.
+    REQUIRE(gate.should_log("limited", "1:f"));
+    gate.mark_logged("limited", "1:f");
+    for (int i = 0; i < 8; ++i)
+        gate.mark_logged("newcomer-" + std::to_string(i), "1:f");
+    CHECK_FALSE(gate.should_log("limited", "2:g")); // still inside its window: refused
+}
+
+TEST_CASE("EchoCorruptionAuditGate: agents written in the same second at the cap keep their window",
+          "[health_store][echo][corruption][gate]") {
+    using yuzu::server::detail::EchoCorruptionAuditGate;
+    int64_t clock = 1000;
+    EchoCorruptionAuditGate gate(
+        [&](const std::string&) {
+            return std::optional<std::optional<std::string>>{std::optional<std::string>{}};
+        },
+        [&] { return clock; });
+    constexpr int kFill = static_cast<int>(EchoCorruptionAuditGate::kMaxAgents);
+    for (int i = 0; i < kFill; ++i)
+        gate.mark_logged("fresh-" + std::to_string(i), "1:f");
+    // The clock does not move: whole-second stamps tie, and the first examined entry (often a
+    // just-inserted node) must not win a tie against an older-or-equal one.
+    // Enough pairs that a strict comparison (first examined wins ties) loses a window on
+    // libstdc++ as well as libc++; two new entries per round stay inside the examined prefix.
+    constexpr int kRounds = 15;
+    static_assert(2 * kRounds < static_cast<int>(EchoCorruptionAuditGate::kVictimScan));
+    for (int r = 0; r < kRounds; ++r) {
+        const std::string a = "pa-" + std::to_string(r);
+        const std::string b = "pb-" + std::to_string(r);
+        REQUIRE(gate.should_log(a, "1:f"));
+        gate.mark_logged(a, "1:f");
+        REQUIRE(gate.should_log(b, "1:f"));
+        gate.mark_logged(b, "1:f");
+    }
+    for (int r = 0; r < kRounds; ++r) {
+        CHECK_FALSE(gate.should_log("pa-" + std::to_string(r), "2:g"));
+        CHECK_FALSE(gate.should_log("pb-" + std::to_string(r), "2:g"));
+    }
 }
 
 TEST_CASE("EchoCorruptionAuditGate: a rotating identity is rate-limited per agent",
@@ -2276,6 +3466,234 @@ TEST_CASE("EchoCorruptionAuditGate: a rotating identity is rate-limited per agen
     CHECK(lookups == before + 2);
 }
 
+TEST_CASE("EchoCorruptionAuditGate: the degraded observer fires on every failure, outside the "
+          "lock, and a throwing observer is swallowed (#5066)",
+          "[health_store][echo][corruption][gate]") {
+    using namespace yuzu::server::detail;
+    int64_t clock = 1000;
+    enum class Mode { degraded, throws, ok } mode = Mode::degraded;
+    bool observer_throws = false;
+    std::vector<DegradedCause> seen;
+    EchoCorruptionAuditGate* gp = nullptr;
+    bool reentered = true;
+    EchoCorruptionAuditGate gate(
+        [&](const std::string&) -> std::optional<std::optional<std::string>> {
+            if (mode == Mode::degraded)
+                return std::nullopt;
+            if (mode == Mode::throws)
+                throw std::runtime_error("lookup failed");
+            return std::optional<std::string>{};
+        },
+        [&] { return clock; },
+        [&](DegradedCause cause) {
+            seen.push_back(cause);
+            // Re-entering the gate from the callback would self-deadlock if the observer ran
+            // under the gate's lock; the window is already open, so this answers false.
+            reentered = gp->should_log("reenter", "9:z");
+            if (observer_throws)
+                throw std::runtime_error("observer failed");
+        });
+    gp = &gate;
+
+    CHECK_FALSE(gate.should_log("a", "1:f"));
+    REQUIRE(seen.size() == 1);
+    CHECK(seen.back() == DegradedCause::lookup_degraded);
+    CHECK_FALSE(reentered);
+
+    clock += kEchoCorruptionAuditDegradedRetry;
+    mode = Mode::throws;
+    reentered = true;
+    CHECK_THROWS_AS(gate.should_log("b", "2:g"), std::runtime_error);
+    REQUIRE(seen.size() == 2);
+    CHECK(seen.back() == DegradedCause::lookup_threw);
+    CHECK_FALSE(reentered);
+
+    clock += kEchoCorruptionAuditDegradedRetry;
+    mode = Mode::ok;
+    REQUIRE(gate.should_log("c", "3:h"));
+    const std::string c = "c";
+    reentered = true;
+    {
+        EchoCorruptionAuditGate::Reservation r(gate, c);
+        r.failed();
+    }
+    REQUIRE(seen.size() == 3);
+    CHECK(seen.back() == DegradedCause::write_failed);
+    CHECK_FALSE(reentered);
+
+    // A committed write opens no window and reports nothing.
+    clock += kEchoCorruptionAuditDegradedRetry;
+    REQUIRE(gate.should_log("d", "4:i"));
+    gate.mark_logged("d", "4:i");
+    CHECK(seen.size() == 3);
+
+    // A throwing observer neither loses the lookup's own exception nor breaks completion.
+    observer_throws = true;
+    mode = Mode::throws;
+    clock += kEchoCorruptionAuditDegradedRetry;
+    CHECK(what_of([&] { (void)gate.should_log("e", "5:j"); }) == "lookup failed");
+    mode = Mode::ok;
+    clock += kEchoCorruptionAuditDegradedRetry;
+    REQUIRE(gate.should_log("f", "6:k"));
+    CHECK_NOTHROW(gate.mark_failed("f"));
+    CHECK(seen.size() == 5);
+
+    CHECK(std::string(echo_corruption_degraded_cause_token(DegradedCause::lookup_degraded)) ==
+          "lookup_degraded");
+    CHECK(std::string(echo_corruption_degraded_cause_token(DegradedCause::lookup_threw)) ==
+          "lookup_threw");
+    CHECK(std::string(echo_corruption_degraded_cause_token(DegradedCause::write_failed)) ==
+          "write_failed");
+}
+
+TEST_CASE("EchoCorruptionAuditGate: completing one agent's slot never frees another's (#7478)",
+          "[health_store][echo][corruption][gate]") {
+    using yuzu::server::detail::EchoCorruptionAuditGate;
+    using yuzu::server::detail::kEchoCorruptionAuditDegradedRetry;
+    int lookups = 0;
+    int64_t clock = 1000;
+    bool degraded = false;
+    EchoCorruptionAuditGate gate(
+        [&](const std::string&) -> std::optional<std::optional<std::string>> {
+            ++lookups;
+            if (degraded)
+                return std::nullopt;
+            return std::optional<std::string>{};
+        },
+        [&] { return clock; });
+
+    SECTION("mark_logged(a) leaves b's slot held") {
+        REQUIRE(gate.should_log("a", "1:f"));
+        REQUIRE(gate.should_log("b", "2:g"));
+        gate.mark_logged("a", "1:f");
+        const int before = lookups;
+        CHECK_FALSE(gate.should_log("b", "2:g")); // b still holds its slot: no lookup
+        CHECK(lookups == before);
+    }
+    SECTION("a's degraded lookup leaves b's slot held") {
+        REQUIRE(gate.should_log("b", "2:g"));
+        degraded = true;
+        CHECK_FALSE(gate.should_log("a", "1:f")); // a's lookup answers degraded, releasing a
+        degraded = false;
+        clock += kEchoCorruptionAuditDegradedRetry;
+        const int before = lookups;
+        CHECK_FALSE(gate.should_log("b", "2:g")); // window over; b is refused only by its slot
+        CHECK(lookups == before);
+        CHECK(gate.should_log("a", "1:f")); // a's own slot was released
+    }
+}
+
+TEST_CASE("EchoCorruptionAuditGate: concurrent ingest threads never exceed kMaxInFlight and "
+          "strand no slot (#7478)",
+          "[health_store][echo][corruption][gate]") {
+    using yuzu::server::detail::EchoCorruptionAuditGate;
+    using yuzu::server::detail::kEchoCorruptionAuditDegradedRetry;
+    constexpr int kThreads = 8;
+    constexpr int kPerThread = 200;
+    constexpr int kBound = static_cast<int>(EchoCorruptionAuditGate::kMaxInFlight);
+    // Each clock read advances past the degraded window, so a failure never blocks the next
+    // admission for long and every outcome below is exercised without any sleeping.
+    std::atomic<int64_t> clock{1000};
+    std::atomic<int> in_lookup{0}, peak_lookup{0}, admitted{0};
+    const auto raise = [](std::atomic<int>& peak, int v) {
+        int p = peak.load();
+        while (v > p && !peak.compare_exchange_weak(p, v)) {
+        }
+    };
+    EchoCorruptionAuditGate gate(
+        [&](const std::string&) -> std::optional<std::optional<std::string>> {
+            raise(peak_lookup, ++in_lookup);
+            std::this_thread::yield(); // widens the overlap; correctness never depends on it
+            --in_lookup;
+            return std::optional<std::string>{};
+        },
+        [&] { return clock.fetch_add(kEchoCorruptionAuditDegradedRetry); });
+
+    std::latch start(kThreads);
+    {
+        std::vector<std::jthread> threads;
+        for (int t = 0; t < kThreads; ++t) {
+            threads.emplace_back([&, t] {
+                start.arrive_and_wait();
+                for (int k = 0; k < kPerThread; ++k) {
+                    const std::string agent = "t" + std::to_string(t) + "-" + std::to_string(k);
+                    if (!gate.should_log(agent, "1:f"))
+                        continue;
+                    ++admitted;
+                    EchoCorruptionAuditGate::Reservation r(gate, agent);
+                    switch ((t + k) % 3) {
+                    case 0:
+                        r.logged("1:f");
+                        break;
+                    case 1:
+                        r.failed();
+                        break;
+                    default:
+                        break; // the destructor completes it as failed
+                    }
+                }
+            });
+        }
+    } // jthreads join here
+    CHECK(admitted.load() > 0);
+    CHECK(peak_lookup.load() <= kBound);
+
+    // No slot leaked: after the storm a full set of fresh agents is admitted, and one more is
+    // refused. A stranded slot would admit fewer.
+    clock.fetch_add(10 * kEchoCorruptionAuditDegradedRetry);
+    for (int i = 0; i < kBound; ++i)
+        REQUIRE(gate.should_log("fresh-" + std::to_string(i), "1:f"));
+    CHECK_FALSE(gate.should_log("fresh-extra", "1:f"));
+}
+
+TEST_CASE("log_echo_corruption_once: returns true once per identity, never for a durable or "
+          "failed write (#7486)",
+          "[health_store][echo][corruption][gate]") {
+    using namespace yuzu::server::detail;
+    std::optional<std::optional<std::string>> answer = std::optional<std::string>{}; // no row
+    int64_t clock = 1000;
+    EchoCorruptionAuditGate gate(
+        [&](const std::string&) { return answer; }, [&] { return clock; });
+    int writes = 0;
+    bool write_ok = true;
+    const auto write = [&] {
+        ++writes;
+        return write_ok;
+    };
+    const std::string a = "a";
+
+    // A new identity is written and counted once; the same identity again is not.
+    CHECK(log_echo_corruption_once(gate, a, "1:f", write));
+    CHECK_FALSE(log_echo_corruption_once(gate, a, "1:f", write));
+    CHECK(writes == 1);
+
+    // The lookup already holds the identity (failover, or an agent returning from offline):
+    // no write, no count.
+    answer = std::optional<std::string>{"2:g"};
+    CHECK_FALSE(log_echo_corruption_once(gate, "b", "2:g", write));
+    CHECK(writes == 1);
+
+    // A failed write is not counted; the retry after the degraded window is.
+    answer = std::optional<std::string>{};
+    write_ok = false;
+    CHECK_FALSE(log_echo_corruption_once(gate, "c", "3:h", write));
+    CHECK(writes == 2);
+    write_ok = true;
+    CHECK_FALSE(log_echo_corruption_once(gate, "c", "3:h", write)); // inside the window
+    CHECK(writes == 2);
+    clock += kEchoCorruptionAuditDegradedRetry;
+    CHECK(log_echo_corruption_once(gate, "c", "3:h", write));
+    CHECK(writes == 3);
+
+    // A throwing write completes the reservation as failed and propagates, uncounted.
+    clock += kEchoCorruptionAuditDegradedRetry;
+    CHECK_THROWS_AS(log_echo_corruption_once(gate, "d", "4:i",
+                                             []() -> bool { throw std::runtime_error("log"); }),
+                    std::runtime_error);
+    clock += kEchoCorruptionAuditDegradedRetry;
+    CHECK(log_echo_corruption_once(gate, "d", "4:i", write)); // slot was released
+}
+
 TEST_CASE("echo corruption audit detail: encode/decode round-trip and sink composition",
           "[health_store][echo][corruption][gate]") {
     using namespace yuzu::server::detail;
@@ -2299,16 +3717,13 @@ TEST_CASE("echo corruption audit detail: encode/decode round-trip and sink compo
     }, [&] { return clock; });
     AgentHealthStore store;
     store.set_corruption_sink([&](const std::string& a, int64_t t, const std::string& q) {
-        if (!gate.should_log(a, q))
-            return;
-        // Mirrors server.cpp's sink shape: a Reservation, not raw mark_logged/mark_failed.
-        EchoCorruptionAuditGate::Reservation res(gate);
-        if (log_ok) {
+        // The same helper server.cpp's sink calls: admit, write, complete the reservation.
+        (void)log_echo_corruption_once(gate, a, q, [&] {
+            if (!log_ok)
+                return false;
             rows.push_back(encode_echo_corruption_detail(t, q));
-            res.logged(a, q);
-        } else {
-            res.failed();
-        }
+            return true;
+        });
     });
     const auto beat = [&] {
         beat_tags(store, "a", {{kEchoTagCorruptionTotal, "1"}, {kEchoTagQuarantineLast, "5:f"}});
@@ -2832,4 +4247,435 @@ TEST_CASE("REAL AgentHealthStore: health tag wire-format edge values - sign / ra
             CHECK(unlabelled_series(out, "yuzu_fleet_guardian_health_tag_rejected") == 0.0);
         }
     }
+}
+
+// ── #3663: agent command-dedup store fleet telemetry (REAL store) ───────────────
+//
+// The dedup gauges COUNT AGENTS (not sum per-process counters) and are published every sweep,
+// 0 included; only the capacity MAX is absent-not-zero. See server/core/src/dedup_fleet_tags.hpp.
+
+namespace {
+std::string dedup_sweep(const std::vector<
+                        std::pair<std::string, std::vector<std::pair<std::string, std::string>>>>&
+                            agents) {
+    yuzu::server::detail::AgentHealthStore store;
+    yuzu::MetricsRegistry metrics;
+    for (const auto& [id, kv] : agents)
+        beat_tags(store, id, kv);
+    store.recompute_metrics(metrics, std::chrono::seconds{300});
+    return metrics.serialize();
+}
+} // namespace
+
+TEST_CASE("REAL AgentHealthStore: dedup_degraded is a live 0/1 flag; reporting and rejected "
+          "are the denominators",
+          "[health_store][dedup_fleet][real]") {
+    const auto out = dedup_sweep({
+        {"a", {{"yuzu.dedup_degraded", "1"}}},       // counted + reporting
+        {"b", {{"yuzu.dedup_degraded", "0"}}},       // reporting, not counted
+        {"c", {}},                                   // older agent: not reporting, not rejected
+        {"d", {{"yuzu.dedup_degraded", "2"}}},       // a flag that reads 2 is forged: rejected
+        {"e", {{"yuzu.dedup_degraded", "garbage"}}}, // rejected
+        {"f", {{"yuzu.dedup_degraded", ""}}},        // present-but-empty: rejected
+    });
+    CHECK(series_val(out, "yuzu_fleet_agents_dedup_store_degraded ") == 1.0);
+    CHECK(series_val(out, "yuzu_fleet_agents_dedup_reporting ") == 2.0);
+    CHECK(series_val(out, "yuzu_fleet_agents_dedup_tag_rejected ") == 3.0);
+}
+
+TEST_CASE("REAL AgentHealthStore: every dedup count gauge is published at 0 on an empty fleet",
+          "[health_store][dedup_fleet][real]") {
+    // Server-owned counts over the reporting population: a flat 0 is a measurement, and
+    // `reporting` = 0 is what says nobody is being measured. Only rows_max is absent.
+    const auto out = dedup_sweep({});
+    for (const auto& m : yuzu::server::detail::kDedupAgentCountMetrics)
+        CHECK(series_val(out, std::string(m.gauge) + " ") == 0.0);
+    CHECK(series_val(out, "yuzu_fleet_agents_dedup_reporting ") == 0.0);
+    CHECK(series_val(out, "yuzu_fleet_agents_dedup_tag_rejected ") == 0.0);
+    CHECK_FALSE(has_unlabelled_series(out, "yuzu_fleet_dedup_rows_max"));
+}
+
+TEST_CASE("REAL AgentHealthStore: dedup counter gauges count agents with a value > 0",
+          "[health_store][dedup_fleet][real]") {
+    for (const auto& m : yuzu::server::detail::kDedupAgentCountMetrics) {
+        if (m.kind != yuzu::server::detail::DedupCountKind::kPositiveCounter)
+            continue;
+        INFO("tag: " << m.tag);
+        const auto out = dedup_sweep({
+            {"a", {{m.tag, "5"}}},           // counted (and one agent only once, however large)
+            {"b", {{m.tag, "1"}}},           // counted
+            {"c", {{m.tag, "0"}}},           // valid reading, not counted
+            {"d", {}},                       // absent: not counted, not rejected
+            {"e", {{m.tag, "-1"}}},          // rejected
+            {"f", {{m.tag, "garbage"}}},     // rejected
+            {"g", {{m.tag, "1000000001"}}},  // above the plausibility ceiling: rejected, not clamped
+            {"h", {{m.tag, "12345678901"}}}, // over 10 chars: rejected
+            {"i", {{m.tag, "18446744073709551617"}}}, // 2^64+1: wraps to 1 without the cap
+        });
+        CHECK(series_val(out, std::string(m.gauge) + " ") == 2.0);
+        CHECK(series_val(out, "yuzu_fleet_agents_dedup_tag_rejected ") == 5.0);
+        // No cross-talk: every OTHER count gauge stays 0 when only this tag is set.
+        for (const auto& other : yuzu::server::detail::kDedupAgentCountMetrics)
+            if (std::string(other.gauge) != m.gauge)
+                CHECK(series_val(out, std::string(other.gauge) + " ") == 0.0);
+    }
+}
+
+TEST_CASE("REAL AgentHealthStore: an agent restart (counter back to 0) leaves the count",
+          "[health_store][dedup_fleet][real]") {
+    // The reason this is an agent COUNT rather than a fleet sum: the counters are per-process,
+    // so a restart that zeroes one must not look like a negative increment - it just stops
+    // being counted.
+    yuzu::server::detail::AgentHealthStore store;
+    yuzu::MetricsRegistry metrics;
+    beat_tags(store, "a", {{"yuzu.dedup_degraded", "0"}, {"yuzu.dedup_record_errors", "7"}});
+    store.recompute_metrics(metrics, std::chrono::seconds{300});
+    CHECK(series_val(metrics.serialize(), "yuzu_fleet_agents_dedup_record_erroring ") == 1.0);
+
+    beat_tags(store, "a", {{"yuzu.dedup_degraded", "0"}, {"yuzu.dedup_record_errors", "0"}});
+    store.recompute_metrics(metrics, std::chrono::seconds{300});
+    CHECK(series_val(metrics.serialize(), "yuzu_fleet_agents_dedup_record_erroring ") == 0.0);
+}
+
+TEST_CASE("REAL AgentHealthStore: dedup_rows_max is the fleet MAX and absent when unreported",
+          "[health_store][dedup_fleet][real]") {
+    const char* k = "yuzu.dedup_rows";
+    {
+        const auto out = dedup_sweep({
+            {"a", {{k, "100"}}},
+            {"b", {{k, "20512"}}},
+            {"c", {{k, "0"}}},        // a valid reading: an empty store is still a reading
+            {"d", {}},                // absent
+            {"e", {{k, "garbage"}}},  // rejected: must not win the MAX nor be clamped into it
+            {"f", {{k, "4000000000"}}}, // above the ceiling: rejected
+        });
+        CHECK(series_val(out, "yuzu_fleet_dedup_rows_max ") == 20512.0);
+        CHECK(series_val(out, "yuzu_fleet_agents_dedup_tag_rejected ") == 2.0);
+    }
+    {
+        // Only a zero reading: the gauge exists and is 0 - a measurement, not an absence.
+        const auto out = dedup_sweep({{"a", {{k, "0"}}}});
+        CHECK(series_val(out, "yuzu_fleet_dedup_rows_max ") == 0.0);
+    }
+    {
+        // Nobody reported a VALID value (one agent sent only garbage): ABSENT, never a
+        // fabricated 0, and the garbage is visible in the rejected meta-gauge instead.
+        const auto out = dedup_sweep({{"a", {{k, "garbage"}}}, {"b", {}}});
+        CHECK_FALSE(has_unlabelled_series(out, "yuzu_fleet_dedup_rows_max"));
+        CHECK(series_val(out, "yuzu_fleet_agents_dedup_tag_rejected ") == 1.0);
+    }
+}
+
+TEST_CASE("REAL AgentHealthStore: a stale dedup_rows_max series does not outlive its reporter",
+          "[health_store][dedup_fleet][real]") {
+    yuzu::server::detail::AgentHealthStore store;
+    yuzu::MetricsRegistry metrics;
+    beat_tags(store, "a", {{"yuzu.dedup_rows", "500"}});
+    store.recompute_metrics(metrics, std::chrono::seconds{300});
+    CHECK(series_val(metrics.serialize(), "yuzu_fleet_dedup_rows_max ") == 500.0);
+
+    // The same agent's next heartbeat no longer carries the tag (e.g. its count went unknown).
+    beat_tags(store, "a", {});
+    store.recompute_metrics(metrics, std::chrono::seconds{300});
+    CHECK_FALSE(has_unlabelled_series(metrics.serialize(), "yuzu_fleet_dedup_rows_max"));
+}
+
+TEST_CASE("REAL AgentHealthStore: one agent with several bad dedup tags is rejected once",
+          "[health_store][dedup_fleet][real]") {
+    const auto out = dedup_sweep({
+        {"a",
+         {{"yuzu.dedup_degraded", "7"},
+          {"yuzu.dedup_replays", "x"},
+          {"yuzu.dedup_rows", "-3"}}},
+    });
+    CHECK(series_val(out, "yuzu_fleet_agents_dedup_tag_rejected ") == 1.0);
+    CHECK(series_val(out, "yuzu_fleet_agents_dedup_reporting ") == 0.0); // its flag was rejected
+}
+
+TEST_CASE("REAL AgentHealthStore: a valid degraded flag with a rejected rows tag counts once each",
+          "[health_store][dedup_fleet][real]") {
+    // reporting = 1 (the flag is valid), rejected = 1 (the rows tag is not), and an absent rows
+    // series (nothing valid to take a MAX of).
+    const auto out = dedup_sweep({
+        {"a", {{"yuzu.dedup_degraded", "0"}, {"yuzu.dedup_rows", "garbage"}}},
+    });
+    CHECK(series_val(out, "yuzu_fleet_agents_dedup_reporting ") == 1.0);
+    CHECK(series_val(out, "yuzu_fleet_agents_dedup_tag_rejected ") == 1.0);
+    CHECK_FALSE(has_unlabelled_series(out, "yuzu_fleet_dedup_rows_max"));
+}
+
+TEST_CASE("REAL AgentHealthStore: a counter can count an agent whose flag was rejected",
+          "[health_store][dedup_fleet][real]") {
+    // Documented in the reporting HELP: the counts are NOT bounded by `reporting`. An agent whose
+    // degraded flag is forged (2) is not reporting, but its valid claim_errors still counts.
+    const auto out = dedup_sweep({
+        {"a", {{"yuzu.dedup_degraded", "2"}, {"yuzu.dedup_claim_errors", "5"}}},
+    });
+    CHECK(series_val(out, "yuzu_fleet_agents_dedup_reporting ") == 0.0);
+    CHECK(series_val(out, "yuzu_fleet_agents_dedup_claim_erroring ") == 1.0);
+    CHECK(series_val(out, "yuzu_fleet_agents_dedup_tag_rejected ") == 1.0);
+}
+
+// ── #2240: yuzu_fleet_guardian_backend{os,backend} ──────────────────────────────────────
+//
+// REAL AgentHealthStore, not TestAgentHealthStore (header rule, lines 4-23): the mirror has no
+// guardian_backend code, so only the shipped store can make these red when the publisher is
+// deleted. The gauge is a CATEGORICAL partition count: each recognised agent lands in exactly
+// one {os,backend} series. A missing tag is NotReported (never `legacy`), a non-empty value
+// outside the closed table is REJECTED (counted in _tag_rejected, in no bucket). Gauge and meta
+// gauge names are typed out here on purpose: the pin test
+// (test_guardian_backend_fleet_tags.cpp) binds them to the shipped header constants.
+
+namespace {
+
+struct BackendBeat {
+    std::string id;
+    std::string os; // empty => omit yuzu.os
+    std::optional<std::string> backend; // nullopt => omit the tag
+};
+
+std::string backend_sweep(const std::vector<BackendBeat>& beats,
+                          std::chrono::seconds staleness = std::chrono::seconds{300}) {
+    yuzu::server::detail::AgentHealthStore store;
+    yuzu::MetricsRegistry metrics;
+    for (const auto& b : beats) {
+        google::protobuf::Map<std::string, std::string> tags;
+        if (!b.os.empty())
+            tags["yuzu.os"] = b.os;
+        if (b.backend)
+            tags["yuzu.guardian_backend"] = *b.backend;
+        store.upsert(b.id, tags);
+    }
+    store.recompute_metrics(metrics, staleness);
+    return metrics.serialize();
+}
+
+std::string backend_series(const std::string& os, const std::string& backend) {
+    return "yuzu_fleet_guardian_backend{os=\"" + os + "\",backend=\"" + backend + "\"} ";
+}
+
+bool has_backend_sample(const std::string& out, const std::string& series) {
+    return out.find("\n" + series) != std::string::npos;
+}
+
+} // namespace
+
+TEST_CASE("REAL AgentHealthStore: guardian backend is a per-os partition count",
+          "[guardian][backend][rollup][real]") {
+    const auto out = backend_sweep({
+        {"l1", "linux", "legacy"},
+        {"l2", "linux", "legacy"},
+        {"l3", "linux", "spark"},
+        {"l4", "linux", "spark_failed"},
+        {"w1", "windows", "unwired"},
+        {"w2", "windows", "legacy"},
+    });
+    CHECK(series_val(out, backend_series("linux", "legacy")) == 2.0);
+    CHECK(series_val(out, backend_series("linux", "spark")) == 1.0);
+    CHECK(series_val(out, backend_series("linux", "spark_failed")) == 1.0);
+    CHECK(series_val(out, backend_series("windows", "unwired")) == 1.0);
+    CHECK(series_val(out, backend_series("windows", "legacy")) == 1.0);
+    // Partition: reporting is the sum of every series, one agent in exactly one bucket.
+    CHECK(series_val(out, "yuzu_fleet_guardian_backend_reporting ") == 6.0);
+    // Absent-not-zero: a (os,backend) pair nobody reports is never pre-seeded, and an OS with
+    // no reporting agent has no series at all.
+    CHECK_FALSE(has_backend_sample(out, backend_series("linux", "unwired")));
+    CHECK_FALSE(has_backend_sample(out, backend_series("windows", "spark")));
+    CHECK(out.find("yuzu_fleet_guardian_backend{os=\"darwin\"") == std::string::npos);
+}
+
+TEST_CASE("REAL AgentHealthStore: a missing guardian backend tag is NotReported, never legacy",
+          "[guardian][backend][rollup][real]") {
+    // Two agents that never send the tag (old agent, no Guardian, a faulted Group C beat, a
+    // stopping agent) and one honest legacy. Reading absence as `legacy` would make the
+    // pre-flip fleet look 100 percent reporting legacy when it is not.
+    const auto out = backend_sweep({
+        {"old-1", "linux", std::nullopt},
+        {"old-2", "linux", std::nullopt},
+        {"honest", "linux", "legacy"},
+    });
+    CHECK(series_val(out, backend_series("linux", "legacy")) == 1.0);
+    CHECK(series_val(out, "yuzu_fleet_guardian_backend_reporting ") == 1.0);
+    CHECK(series_val(out, "yuzu_fleet_guardian_backend_tag_rejected ") == 0.0);
+}
+
+TEST_CASE("REAL AgentHealthStore: a forged guardian backend value pages on no bucket",
+          "[guardian][backend][rollup][real]") {
+    // Strict, case-sensitive, closed-set parse: unknown, differently cased, padded, numeric,
+    // oversized and unterminated values contribute to NO bucket (never `legacy`, never
+    // `spark_failed`) and are counted once each in _tag_rejected. A present-empty value is
+    // NotReported, not rejected.
+    std::vector<BackendBeat> beats = {
+        {"honest", "linux", "spark_failed"},
+        {"empty", "linux", std::string{}},
+        {"f1", "linux", "Legacy"},
+        {"f2", "linux", "LEGACY"},
+        {"f3", "linux", " legacy"},
+        {"f4", "linux", "legacy "},
+        {"f5", "linux", "spark_failed\n"},
+        {"f6", "linux", "0"},
+        {"f7", "linux", "true"},
+        {"f8", "linux", "spark-failed"},
+        {"f9", "linux", "a-future-backend"},
+        {"f10", "linux", "legacy,spark"},
+        {"f11", "linux", std::string("legacy\0x", 8)},
+        {"huge", "linux", std::string(4u * 1024u * 1024u, 'x')},
+    };
+    const auto out = backend_sweep(beats);
+    CHECK(series_val(out, backend_series("linux", "spark_failed")) == 1.0);
+    CHECK_FALSE(has_backend_sample(out, backend_series("linux", "legacy")));
+    CHECK(series_val(out, "yuzu_fleet_guardian_backend_tag_rejected ") == 12.0);
+    CHECK(series_val(out, "yuzu_fleet_guardian_backend_reporting ") == 1.0);
+    // The forged payload never becomes a label value.
+    CHECK(out.find("a-future-backend") == std::string::npos);
+    CHECK(out.find("xxxxxxxx") == std::string::npos);
+}
+
+TEST_CASE("REAL AgentHealthStore: a stale agent leaves the guardian backend gauge",
+          "[guardian][backend][rollup][real]") {
+    yuzu::server::detail::AgentHealthStore store;
+    yuzu::MetricsRegistry metrics;
+    google::protobuf::Map<std::string, std::string> tags;
+    tags["yuzu.os"] = "linux";
+    tags["yuzu.guardian_backend"] = "legacy";
+    store.upsert("doomed", tags);
+
+    store.recompute_metrics(metrics, std::chrono::seconds{300});
+    REQUIRE(series_val(metrics.serialize(), backend_series("linux", "legacy")) == 1.0);
+
+    // Zero window: the prune runs before accumulation, so the aged-out agent is not counted.
+    store.recompute_metrics(metrics, std::chrono::seconds{0});
+    const auto out = metrics.serialize();
+    CHECK_FALSE(has_backend_sample(out, backend_series("linux", "legacy")));
+    CHECK(series_val(out, "yuzu_fleet_guardian_backend_reporting ") == 0.0);
+}
+
+TEST_CASE("REAL AgentHealthStore: a backend change moves the agent between series",
+          "[guardian][backend][rollup][real]") {
+    yuzu::server::detail::AgentHealthStore store;
+    yuzu::MetricsRegistry metrics;
+    auto beat = [&](const std::string& backend) {
+        google::protobuf::Map<std::string, std::string> tags;
+        tags["yuzu.os"] = "linux";
+        tags["yuzu.guardian_backend"] = backend;
+        store.upsert("flip", tags); // upsert REPLACES the whole tag map
+    };
+    beat("legacy");
+    store.recompute_metrics(metrics, std::chrono::seconds{300});
+    REQUIRE(series_val(metrics.serialize(), backend_series("linux", "legacy")) == 1.0);
+
+    beat("spark");
+    store.recompute_metrics(metrics, std::chrono::seconds{300});
+    const auto out = metrics.serialize();
+    CHECK(series_val(out, backend_series("linux", "spark")) == 1.0);
+    // The old series is cleared each sweep, not left at a stale 1.
+    CHECK_FALSE(has_backend_sample(out, backend_series("linux", "legacy")));
+    CHECK(series_val(out, "yuzu_fleet_guardian_backend_reporting ") == 1.0);
+}
+
+TEST_CASE("REAL AgentHealthStore: guardian backend os label is allowlisted",
+          "[guardian][backend][rollup][real]") {
+    const auto out = backend_sweep({
+        {"a", "freebsd", "legacy"},
+        {"b", "Windows", "legacy"},
+        {"c", "", "legacy"},
+        {"d", "pwn-uniquely-named-series", "legacy"},
+    });
+    CHECK(series_val(out, backend_series("other", "legacy")) == 3.0);
+    CHECK(series_val(out, backend_series("unknown", "legacy")) == 1.0);
+    CHECK(out.find("pwn-") == std::string::npos);
+    CHECK(out.find("freebsd") == std::string::npos);
+}
+
+TEST_CASE("REAL AgentHealthStore: guardian backend meta gauges publish at zero, family stays absent",
+          "[guardian][backend][rollup][real]") {
+    // Quiet fleet: nobody reports. The two unlabelled meta gauges are published every sweep
+    // (including 0, so their absence means the sweep did not run); the labelled family has no
+    // sample at all.
+    const auto out = backend_sweep({{"a", "linux", std::nullopt}});
+    CHECK(series_val(out, "yuzu_fleet_guardian_backend_reporting ") == 0.0);
+    CHECK(series_val(out, "yuzu_fleet_guardian_backend_tag_rejected ") == 0.0);
+    CHECK(out.find("\nyuzu_fleet_guardian_backend{") == std::string::npos);
+}
+
+// ── dex_observer_for (the Apps page's live observer split) ───────────────────
+
+namespace {
+void observer_beat(yuzu::server::detail::AgentHealthStore& store, const std::string& id,
+                   const std::optional<std::string>& armed) {
+    google::protobuf::Map<std::string, std::string> tags;
+    tags["yuzu.os"] = "linux";
+    if (armed)
+        tags[std::string(yuzu::server::detail::kDexObserverArmedTag)] = *armed;
+    store.upsert(id, tags);
+}
+} // namespace
+
+TEST_CASE("REAL AgentHealthStore dex_observer_for: tag 1 is Armed, 0 is Disarmed, everything else "
+          "is NoneReported",
+          "[dex][observer][real]") {
+    using yuzu::server::DexObserverState;
+    yuzu::server::detail::AgentHealthStore store;
+    observer_beat(store, "armed", "1");
+    observer_beat(store, "disarmed", "0");
+    observer_beat(store, "absent", std::nullopt);
+    observer_beat(store, "other", "yes");
+    observer_beat(store, "empty", "");
+    const std::vector<std::string> ids{"armed", "disarmed", "absent", "other", "empty", "unknown"};
+    const auto out = store.dex_observer_for(ids, std::chrono::seconds{300});
+    REQUIRE(out.size() == ids.size());
+    CHECK(out[0] == DexObserverState::Armed);
+    CHECK(out[1] == DexObserverState::Disarmed);
+    CHECK(out[2] == DexObserverState::NoneReported);
+    CHECK(out[3] == DexObserverState::NoneReported);
+    CHECK(out[4] == DexObserverState::NoneReported);
+    CHECK(out[5] == DexObserverState::NoneReported); // an id the store has never seen
+    // A negative window makes every snapshot stale, deterministically (no clock to wait on).
+    for (const auto s : store.dex_observer_for(ids, std::chrono::seconds{-1}))
+        CHECK(s == DexObserverState::NoneReported);
+}
+
+TEST_CASE("REAL AgentHealthStore dex_observer_for: aligned with the input, duplicates and all, and "
+          "one entry per id across more than one slice",
+          "[dex][observer][real]") {
+    using yuzu::server::DexObserverState;
+    using yuzu::server::detail::kGuardianBackendSlice;
+    yuzu::server::detail::AgentHealthStore store;
+    CHECK(store.dex_observer_for({}, std::chrono::seconds{300}).empty());
+    observer_beat(store, "a", "1");
+    observer_beat(store, "b", "0");
+    const std::vector<std::string> dup{"b", "a", "b", "missing", "a"};
+    const auto small = store.dex_observer_for(dup, std::chrono::seconds{300});
+    REQUIRE(small.size() == dup.size());
+    CHECK(small[0] == DexObserverState::Disarmed);
+    CHECK(small[1] == DexObserverState::Armed);
+    CHECK(small[2] == DexObserverState::Disarmed);
+    CHECK(small[3] == DexObserverState::NoneReported);
+    CHECK(small[4] == DexObserverState::Armed);
+
+    const std::size_t n = (2 * kGuardianBackendSlice) + 7;
+    std::vector<std::string> ids;
+    ids.reserve(n);
+    for (std::size_t i = 0; i < n; ++i) {
+        ids.push_back("sl-" + std::to_string(i));
+        if (i % 3 != 2)
+            observer_beat(store, ids.back(), i % 3 == 0 ? "1" : "0");
+    }
+    const auto big = store.dex_observer_for(ids, std::chrono::seconds{300});
+    REQUIRE(big.size() == n);
+    for (std::size_t i = 0; i < n; ++i)
+        CHECK(big[i] == (i % 3 == 0   ? DexObserverState::Armed
+                         : i % 3 == 1 ? DexObserverState::Disarmed
+                                      : DexObserverState::NoneReported));
+}
+
+TEST_CASE("REAL AgentHealthStore: the disarmed gauge reads the same tag constant",
+          "[dex][observer][real]") {
+    yuzu::server::detail::AgentHealthStore store;
+    yuzu::MetricsRegistry metrics;
+    observer_beat(store, "x", "0");
+    observer_beat(store, "y", "1");
+    observer_beat(store, "z", "0");
+    store.recompute_metrics(metrics, std::chrono::seconds{300});
+    CHECK(metrics.serialize().find("yuzu_fleet_agents_dex_observer_disarmed 2") != std::string::npos);
 }

@@ -2,15 +2,20 @@
  * test_web_utils.cpp — Unit tests for server web utility functions
  *
  * Covers: base64_decode, html_escape, url_decode, extract_form_value,
- *         form_value_supplied
+ *         form_value_supplied, plural_word / plural_count, html_escape_marked
  */
 
 #include "mcp_jsonrpc.hpp"
+#include "plural.hpp"
 #include "web_utils.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
+#include <cstdint>
+#include <filesystem>
+#include <format>
+#include <fstream>
 #include <string>
 #include <vector>
 
@@ -698,6 +703,21 @@ TEST_CASE("format_iso_utc: epoch 0 sentinel vs known UTC moment",
     REQUIRE(format_iso_utc(1777466096) == "2026-04-29T12:34:56Z");
 }
 
+TEST_CASE("format_iso_utc: a value past year 9999 or beyond the platform range is the sentinel",
+          "[web_utils][time]") {
+    REQUIRE(format_iso_utc(INT64_MAX) == "—");
+    REQUIRE(format_iso_utc(INT64_MIN) == "—");
+    REQUIRE(format_iso_utc(12345678901234567LL) == "—"); // 17 digits
+#ifdef _WIN32
+    // MSVC's gmtime_s fails past year 3000 (32535215999), so 3001-9999 is the sentinel there.
+    REQUIRE(format_iso_utc(32535215999LL) == "3000-12-31T23:59:59Z");
+    REQUIRE(format_iso_utc(253402300799LL) == "—");
+#else
+    REQUIRE(format_iso_utc(253402300799LL) == "9999-12-31T23:59:59Z");
+#endif
+    REQUIRE(format_iso_utc(253402300800LL) == "—");
+}
+
 TEST_CASE("format_iso_utc: format is fixed-width", "[web_utils][time]") {
     auto s = format_iso_utc(1735689600);
     REQUIRE(s.size() == 20); // "YYYY-MM-DDTHH:MM:SSZ"
@@ -923,6 +943,21 @@ TEST_CASE("audit_token: neutralises k=v structural delimiters + control bytes",
     CHECK(audit_token(std::string("a\r\nb")) == "a__b");
     CHECK(audit_token(std::string("a\x7F" "b")) == "a_b");
     CHECK(audit_token(std::string("a\tb")) == "a_b");
+}
+
+TEST_CASE("flatten_audit_text: one line, trailing whitespace dropped, nothing else changed",
+          "[web_utils][audit]") {
+    CHECK(flatten_audit_text("") == "");
+    CHECK(flatten_audit_text("plain text") == "plain text");
+    // A libpq message: trailing newline, often a second CONTEXT line.
+    CHECK(flatten_audit_text("revoke did not persist: ERROR: boom\n") ==
+          "revoke did not persist: ERROR: boom");
+    CHECK(flatten_audit_text("ERROR: boom\nCONTEXT: PL/pgSQL function f()\n") ==
+          "ERROR: boom CONTEXT: PL/pgSQL function f()");
+    CHECK(flatten_audit_text("a\r\nb\r\n") == "a  b");
+    CHECK(flatten_audit_text("trailing \t \n") == "trailing");
+    // Delimiters are left alone: this is not the caller-value neutraliser.
+    CHECK(flatten_audit_text("k=v, x") == "k=v, x");
 }
 
 // ── mcp_body_exceeds_cap (#2437) ────────────────────────────────────────────
@@ -1239,7 +1274,7 @@ TEST_CASE("agent_error_display bounds the FIRST record, not a byte window",
         "error|Echo storage is offline on this endpoint; the database was closed after a "
         "transaction could not be rolled back. Collection and retention are both stopped. The "
         "read-only query connection is unavailable too, so `echo sql` cannot read the historical "
-        "data either. Restart the agent to recover.\nstorage_state|offline";
+        "data either. Restart the agent to recover.\nstorage_state|offline|rollback_wedged";
 
     const auto shown = yuzu::server::agent_error_display(offline);
     CHECK(shown.starts_with("Echo storage is offline")); // prefix stripped
@@ -1382,4 +1417,212 @@ TEST_CASE("path_segment_ok: empty and dot-only ids are refused, everything else 
     CHECK(path_segment_ok("./bulk-approve?"));
     CHECK(path_segment_ok("550e8400-e29b-41d4-a716-446655440000"));
     CHECK(path_segment_ok(std::string(5000, 'x')));
+}
+
+// ── plural_word / plural_count (#7540) ──────────────────────────────────────
+
+TEST_CASE("plural_word: one only at exactly 1, zero and negative counts take the plural",
+          "[web_utils][plural]") {
+    CHECK(plural_word(1, "device", "devices") == "device");
+    CHECK(plural_word(0, "device", "devices") == "devices");
+    CHECK(plural_word(2, "device", "devices") == "devices");
+    CHECK(plural_word(-1, "device", "devices") == "devices");
+    CHECK(plural_word(1, " is", " are") == " is");
+    CHECK(plural_word(3, " is", " are") == " are");
+}
+
+TEST_CASE("plural_count: 'N word' for int, int64 and size_t", "[web_utils][plural]") {
+    CHECK(plural_count(1, "day", "days") == "1 day");
+    CHECK(plural_count(std::int64_t{41}, "permission", "permissions") == "41 permissions");
+    CHECK(plural_count(std::size_t{0}, "retry", "retries") == "0 retries");
+    CHECK(plural_count(std::size_t{1}, "retry", "retries") == "1 retry");
+}
+
+TEST_CASE("plural_word: the std::string result concatenates in leading, middle and trailing position",
+          "[web_utils][plural]") {
+    // The compile-level proof of the return type: a string_view result has no operator+ before C++26.
+    const std::string lead = plural_word(1, "one", "many") + " tail";
+    const std::string mid = "head " + plural_word(2, "one", "many") + " tail";
+    const std::string trail = "head " + plural_word(2, "one", "many");
+    CHECK(lead == "one tail");
+    CHECK(mid == "head many tail");
+    CHECK(trail == "head many");
+}
+
+// ── html_escape_marked (#7535) ──────────────────────────────────────────────
+
+TEST_CASE("html_escape_marked: each listed character prints as visible text",
+          "[web_utils][escape_marked]") {
+    CHECK(html_escape_marked("a\xD8\x9C" "b") == "a&lt;U+061C&gt;b");           // U+061C
+    CHECK(html_escape_marked("a\xE2\x80\xAE" "b") == "a&lt;U+202E&gt;b");      // U+202E
+    CHECK(html_escape_marked("a\xE2\x81\xA6" "b") == "a&lt;U+2066&gt;b");      // U+2066
+    CHECK(html_escape_marked("a\xE2\x80\x8B" "b") == "a&lt;U+200B&gt;b");      // U+200B
+    CHECK(html_escape_marked("a\xE2\x80\x8D" "b") == "a&lt;U+200D&gt;b");      // U+200D
+    CHECK(html_escape_marked("a\xEF\xBB\xBF" "b") == "a&lt;U+FEFF&gt;b");      // U+FEFF
+    CHECK(html_escape_marked("\xE2\x80\xA8") == "\xE2\x80\xA8");             // U+2028 is not listed
+    CHECK(html_escape_marked("\xE2\x81\xA0") == "&lt;U+2060&gt;");              // U+2060
+    CHECK(html_escape_marked("\xE2\x81\xA9") == "&lt;U+2069&gt;");              // U+2069
+}
+
+namespace {
+// UTF-8 for one code point (the two- and three-byte forms the marked list and its neighbours use).
+std::string utf8_of(std::uint32_t cp) {
+    std::string out;
+    if (cp < 0x800) {
+        out += static_cast<char>(0xC0 | (cp >> 6));
+        out += static_cast<char>(0x80 | (cp & 0x3F));
+    } else {
+        out += static_cast<char>(0xE0 | (cp >> 12));
+        out += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+        out += static_cast<char>(0x80 | (cp & 0x3F));
+    }
+    return out;
+}
+} // namespace
+
+TEST_CASE("html_escape_marked: every listed code point is marked and its neighbours are not",
+          "[web_utils][escape_marked]") {
+    // The list in web_utils.hpp (invisible_code_point_at), range by range: 21 code points.
+    std::vector<std::uint32_t> listed = {0x061C, 0xFEFF};
+    for (std::uint32_t cp = 0x200B; cp <= 0x200F; ++cp)
+        listed.push_back(cp);
+    for (std::uint32_t cp = 0x202A; cp <= 0x202E; ++cp)
+        listed.push_back(cp);
+    for (std::uint32_t cp = 0x2060; cp <= 0x2064; ++cp)
+        listed.push_back(cp);
+    for (std::uint32_t cp = 0x2066; cp <= 0x2069; ++cp)
+        listed.push_back(cp);
+    REQUIRE(listed.size() == 21);
+    for (const std::uint32_t cp : listed) {
+        const std::string raw = utf8_of(cp);
+        const std::string label = std::format("&lt;U+{:04X}&gt;", cp);
+        INFO("code point " << label);
+        const std::string out = html_escape_marked("a" + raw + "b");
+        CHECK(out == "a" + label + "b");
+        CHECK(out.find(raw) == std::string::npos);
+    }
+    // One below and one above each range's ends, and the ordinary spaces beside them: printed as
+    // they are (html_escape leaves them alone), never marked.
+    for (const std::uint32_t cp : {0x061Bu, 0x061Du, 0x200Au, 0x2010u, 0x2029u, 0x202Fu, 0x205Fu, 0x2065u,
+                                   0x206Au, 0x3000u, 0xFEFEu}) {
+        const std::string raw = utf8_of(cp);
+        INFO("neighbour U+" << std::format("{:04X}", cp));
+        CHECK(html_escape_marked("a" + raw + "b") == "a" + raw + "b");
+    }
+}
+
+TEST_CASE("html_escape_marked: ordinary text and ordinary spaces are byte-identical to html_escape",
+          "[web_utils][escape_marked]") {
+    const std::vector<std::string> same = {
+        "notepad.exe",
+        "caf\xC3\xA9",                           // accented Latin
+        "\xE6\x97\xA5\xE6\x9C\xAC\xE8\xAA\x9E",  // CJK
+        "a\xC2\xA0" "b",                         // U+00A0
+        "a\xE3\x80\x80" "b",                    // U+3000
+        "a\xE2\x80\x83" "b",                    // U+2003
+        "a\xE2\x80\xA8" "b",                    // U+2028
+        "a\xE2\x80\xA9" "b",                    // U+2029
+        "\xE2\x82\xAC",                         // a three-byte lead (U+20AC) that is not listed
+    };
+    for (const auto& s : same)
+        CHECK(html_escape_marked(s) == html_escape(s));
+}
+
+TEST_CASE("html_escape_marked: markup is still escaped and a marker cannot be forged into live markup",
+          "[web_utils][escape_marked]") {
+    CHECK(html_escape_marked("<b>\"x\"&'y'</b>") == html_escape("<b>\"x\"&'y'</b>"));
+    // Literal marker text is escaped like any other text; it never becomes a tag.
+    CHECK(html_escape_marked("<U+202E>") == "&lt;U+202E&gt;");
+    CHECK(html_escape_marked("a\xE2\x80\xAE<script>") == "a&lt;U+202E&gt;&lt;script&gt;");
+}
+
+TEST_CASE("html_escape_marked: truncated and malformed UTF-8 passes through without reading past the end",
+          "[web_utils][escape_marked]") {
+    for (const std::string& s : {std::string("\xD8"), std::string("\xE2"), std::string("\xE2\x80"),
+                                std::string("\xEF\xBB"), std::string("x\xE2\x81"),
+                                std::string("\xE2\x80\x8"), std::string("\xEF\xBB\xBE"),
+                                std::string("\xD8\x9D")})
+        CHECK(html_escape_marked(s) == html_escape(s));
+    // A marked character after a truncated lead is still found.
+    CHECK(html_escape_marked(std::string("\xE2\xE2\x80\xAE")) == "\xE2&lt;U+202E&gt;");
+}
+
+// ── metrics_loopback_peer_exempt (WP06 F57) ────────────────────────────────
+
+TEST_CASE("metrics_loopback_peer_exempt: only a direct loopback peer with no forwarding "
+          "evidence qualifies (the caller additionally requires the operator opt-in)",
+          "[web_utils][metrics]") {
+    CHECK(metrics_loopback_peer_exempt("127.0.0.1", false));
+    CHECK(metrics_loopback_peer_exempt("::1", false));
+    // A proxy-evidence header demotes a loopback peer to remote.
+    CHECK_FALSE(metrics_loopback_peer_exempt("127.0.0.1", true));
+    CHECK_FALSE(metrics_loopback_peer_exempt("::1", true));
+}
+
+TEST_CASE("metrics_loopback_peer_exempt: remote, empty and lookalike addresses fail closed",
+          "[web_utils][metrics]") {
+    CHECK_FALSE(metrics_loopback_peer_exempt("10.0.0.5", false));
+    CHECK_FALSE(metrics_loopback_peer_exempt("", false));
+    CHECK_FALSE(metrics_loopback_peer_exempt("127.0.0.1.evil", false));
+    CHECK_FALSE(metrics_loopback_peer_exempt("::ffff:127.0.0.1", false));
+    CHECK_FALSE(metrics_loopback_peer_exempt("127.0.0.2", false));
+}
+
+// ── unauthenticated_answer (#8732) ─────────────────────────────────────────
+// These cases prove the pure decision. That server.cpp's pre-routing handler calls it is pinned
+// lexically (`PINNED_RESOLVE_TO_GATE` in tests/test_same_site_wiring_lexical.py); no test drives a
+// live handler, so the default loopback refusal and the `--metrics-trust-loopback` and
+// `--metrics-no-auth` admissions are covered only by `metrics_loopback_peer_exempt`'s cases above.
+
+TEST_CASE("unauthenticated_answer: /metrics is a 401 JSON for a scraper, with or without an "
+          "htmx header",
+          "[web_utils][metrics]") {
+    CHECK(unauthenticated_answer("/metrics", false) == UnauthenticatedAnswer::Json401);
+    // The 401 JSON branch is ahead of the htmx branch.
+    CHECK(unauthenticated_answer("/metrics", true) == UnauthenticatedAnswer::Json401);
+}
+
+TEST_CASE("unauthenticated_answer: the other machine paths stay 401 JSON",
+          "[web_utils][metrics]") {
+    for (auto p : {"/api/v1/agents", "/api/", "/events", "/mcp/v1/", "/mcp/v1/sse"})
+        CHECK(unauthenticated_answer(p, false) == UnauthenticatedAnswer::Json401);
+}
+
+TEST_CASE("unauthenticated_answer: pages redirect, htmx panels get a 401 with HX-Redirect",
+          "[web_utils][metrics]") {
+    CHECK(unauthenticated_answer("/fleet", false) == UnauthenticatedAnswer::SignInRedirect);
+    CHECK(unauthenticated_answer("/fleet", true) == UnauthenticatedAnswer::HtmxRedirect401);
+}
+
+TEST_CASE("unauthenticated_answer: lookalike paths are not machine paths", "[web_utils][metrics]") {
+    // Matching is exact for /metrics and /events, and prefix-with-slash for /api/ and /mcp/.
+    CHECK(unauthenticated_answer("/metrics/x", false) == UnauthenticatedAnswer::SignInRedirect);
+    CHECK(unauthenticated_answer("/metricsx", false) == UnauthenticatedAnswer::SignInRedirect);
+    CHECK(unauthenticated_answer("/apix", false) == UnauthenticatedAnswer::SignInRedirect);
+    CHECK(unauthenticated_answer("/events/x", false) == UnauthenticatedAnswer::SignInRedirect);
+}
+
+TEST_CASE("kForwardingEvidenceHeaders names the common proxy headers", "[web_utils][metrics]") {
+    bool xff = false, fwd = false, real = false;
+    for (auto h : kForwardingEvidenceHeaders) {
+        xff |= h == "X-Forwarded-For";
+        fwd |= h == "Forwarded";
+        real |= h == "X-Real-IP";
+    }
+    CHECK(xff);
+    CHECK(fwd);
+    CHECK(real);
+}
+
+// WP06 F57 wiring: the default is OFF and the pre-routing handler consults the opt-in first.
+TEST_CASE("server.cpp: /metrics loopback exemption is gated on the opt-in flag",
+          "[web_utils][metrics]") {
+#ifndef YUZU_SERVER_SRC_DIR
+#error "YUZU_SERVER_SRC_DIR must be injected by tests/meson.build."
+#endif
+    std::ifstream in(std::filesystem::path(YUZU_SERVER_SRC_DIR) / "server.cpp");
+    REQUIRE(in.is_open());
+    std::string src{std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
+    CHECK(src.find("cfg_.metrics_trust_loopback &&") != std::string::npos);
+    CHECK(src.find("req.remote_addr == \"127.0.0.1\"") == std::string::npos);
 }

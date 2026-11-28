@@ -12,12 +12,21 @@
 > `secrets-at-rest-envelope-encryption`). This is the accepted record; it amends
 > the original proposal per the decisions in "Amendments" below.
 
-> **Amendment pending: ADR-3006 (plugin management, proposed 2026-10-06).** ADR-3006 sets
+> **Amendment pending delivery: ADR-3006 (plugin management, 2026-10-06; accepted, status
+> reconciled 2026-11-14).** ADR-3006 sets
 > the direction that, for new installations, the opt-in default in Amendment 1 ("opt-in, not
 > default-on") is replaced by on-by-default with customer-controlled switch-off, and that the
 > staged-then-push guardrail under "Operator surfaces" gives way to the server's enablement
-> state and its preview. Existing installations keep their current state. Nothing has changed
-> in the product yet: until the work that follows ADR-3006 lands, this ADR describes what ships.
+> state and its preview. **The default half shipped early, by a ruling recorded as an owner
+> ruling** (PR #6360, authored and merged by @Doomgoose, approved by @FortitudeEtc
+> (2026-10-23); its body records the ruling as an owner ruling without naming the owner):
+> `arp` and `dns`, like every Echo capture source, are on by default on every OS where supported, and agents
+> upgraded past schema v8 were moved to on once, **including a source an operator had switched
+> off before the upgrade** (the v8 migration flips every stored `false`, seeded or operator-written, for the
+> eight formerly opt-in sources, `echo_db.cpp`); a source an operator switches off afterwards stays off, unless the agent's `echo.db` is quarantined as corrupt or its data is reset, which switches every source back on (`echo_db.cpp`, #559). Amendment 1's opt-in default no longer describes what ships. ADR-3006 was kept
+> accepted with this exception recorded by @Tr3kkR (Nathan Dornbrook), 2026-11-14. The
+> enablement-state and preview half is still pending; until it lands, the staged-then-push
+> guardrail below is how a source is switched off.
 
 ## Context
 

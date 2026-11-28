@@ -694,6 +694,7 @@
       "content/definitions/printing.yaml"
     ],
     "plugin": [
+      "agents/plugins/printing/src/printing_identity.hpp",
       "agents/plugins/printing/src/printing_ipp.hpp",
       "agents/plugins/printing/src/printing_parsers.hpp",
       "agents/plugins/printing/src/printing_plugin.cpp"
@@ -701,6 +702,7 @@
     "privilege_row": true,
     "tests": [
       "tests/unit/server/test_printing_clear_queue_gate.cpp",
+      "tests/unit/test_printing_identity.cpp",
       "tests/unit/test_printing_local_dispatcher.cpp",
       "tests/unit/test_printing_parsers.cpp"
     ]

@@ -6,27 +6,22 @@
  * Build Tools 2022) on 2026-09-03: this TU compiles clean under real MSVC
  * (zero errors, zero warnings), the plugin's unit suite passes there
  * (145 assertions / 23 cases), and the snapshots leg was exercised against
- * three live VSS shadow copies. The volume-enumeration walk and the
+ * three live VSS shadow copies (its VSS walk has since moved to agent-core,
+ * which that run does not cover). The volume-enumeration walk and the
  * IDiskQuotaControl quota path are compiled and linked but have not been
  * asserted against a host with quotas configured, so their runtime
  * behaviour past "it runs" is still unproven.
  *
- * Two SDK surfaces are soft-guarded via `__has_include`, and neither guard's
- * failure is allowed to silently look like success:
+ * One SDK surface is soft-guarded via `__has_include` here, and the guard's
+ * failure is not allowed to silently look like success:
  *   - `<dskquota.h>` (quota state); a build lacking it reports every volume
- *     `unavailable` and degrades the result. Unlike VSS this needs no
- *     dedicated import library, so the fallback is genuinely REACHABLE -- but
- *     it is still not a SUPPORTED configuration: the dispatcher suite asserts
- *     that no leg ever reports its own guard excluded it, so such a build
- *     fails its tests by design (Gate 4, consistency-auditor CA-4).
- *   - `<vsbackup.h>` (VSS shadow-copy enumeration); the guarded fallback emits
- *     an honest `none` row. **In practice that fallback is unreachable**, and
- *     saying otherwise would overstate it (governance Gate 3,
- *     plugin-developer): meson requires `vssapi` unconditionally on Windows,
- *     and an SDK without `<vsbackup.h>` has no `vssapi.lib` either, so such a
- *     build fails at CONFIGURE time and never reaches this code. The guard is
- *     kept as defence in depth and to keep the TU self-describing, not because
- *     it is a supported configuration.
+ *     `unavailable` and degrades the result. It needs no dedicated import
+ *     library, so the fallback is genuinely REACHABLE -- but it is still not a
+ *     SUPPORTED configuration: the dispatcher suite asserts that no leg ever
+ *     reports its own guard excluded it, so such a build fails its tests by
+ *     design (Gate 4, consistency-auditor CA-4).
+ * The VSS shadow-copy walk, and its `<vsbackup.h>` guard, live in agent-core
+ * (yuzu/agent/win_vss_snapshots.hpp).
  *
  * Snapshots do NOT use `FSCTL_SRV_ENUMERATE_SNAPSHOTS`, which an earlier
  * revision of this file did. That control is not declared by ANY header in
@@ -36,7 +31,7 @@
  * had compiled the real path out and the leg was a permanent fallback row.
  * It is also the wrong question: it is an SMB *server*-side control listing
  * the previous versions a share exposes to clients, not the shadow copies a
- * volume holds. See the mechanism banner above emit_snapshot_rows_vss.
+ * volume holds. See the snapshots section below.
  *
  * Every OS call here is read-only: no write/format/delete right is ever
  * requested on a volume handle, quota control instance, or drive.
@@ -57,18 +52,6 @@
 
 #include "filesystem_posture_legs.hpp"
 
-// VSS must be included BEFORE the initguid.h block below. initguid.h switches
-// DEFINE_GUID from "declare" to "allocate storage", and that switch applies to
-// every header processed AFTER it -- letting it reach the VSS headers would
-// define GUIDs that vssapi.lib already exports and risk LNK2005. Including VSS
-// first keeps its GUIDs as plain declarations resolved from the import library.
-#if __has_include(<vsbackup.h>)
-#define YUZU_FSPOSTURE_HAVE_VSS 1
-#include <vss.h>
-#include <vswriter.h> // both are prerequisites of vsbackup.h, in this order
-#include <vsbackup.h>
-#endif
-
 // initguid.h must precede dskquota.h in exactly this TU: it makes dskquota.h
 // DEFINE (not merely declare) CLSID_DiskQuotaControl / IID_IDiskQuotaControl
 // as local storage, so this TU needs no uuid.lib dependency.
@@ -78,11 +61,9 @@
 #include <dskquota.h>
 #endif
 
-#include <cstddef>
 #include <format>
 #include <optional>
 #include <string>
-#include <string_view>
 #include <vector>
 
 namespace yuzu::filesystem_posture {
@@ -488,354 +469,6 @@ void emit_quota_rows_dskquota(yuzu::CommandContext& ctx, const std::vector<std::
 
 #endif // YUZU_FSPOSTURE_HAVE_DSKQUOTA
 
-// ── snapshots ────────────────────────────────────────────────────────────
-//
-// MECHANISM: VSS/COM (IVssBackupComponents::Query), replacing
-// FSCTL_SRV_ENUMERATE_SNAPSHOTS. The file banner records why the FSCTL was
-// both unavailable on the current SDK and the wrong question.
-//
-// VERIFIED on the-rig 2026-09-03 against three live shadow copies (Windows
-// SDK 10.0.26100.0). Query returns every snapshot machine-wide in one call
-// and each carries its own originating volume, so this leg -- unlike
-// emit_mounts/emit_quotas -- does not enumerate volumes first.
-//
-// PRIVILEGE. Measured on that host, and ONLY these three were measured:
-//   NT AUTHORITY\SYSTEM           CreateVssBackupComponents -> S_OK, 3 found
-//   NT AUTHORITY\LOCAL SERVICE    -> E_ACCESSDENIED (0x80070005)
-//   NT AUTHORITY\NETWORK SERVICE  -> E_ACCESSDENIED (0x80070005)
-//
-// The Windows agent service runs as LocalSystem today (#1442), so this leg
-// works as shipped. Should #1442 move it to NT SERVICE\YuzuAgent, the call is
-// EXPECTED to return E_ACCESSDENIED -- expected, not measured: that account
-// was not among the three tested, and docs/agent-privilege-model.md shows it
-// being granted Administrators out of band for other actions, which would
-// change the answer. Either way a denial is reported as an explicit
-// PERMISSION_DENIED degradation below and must never read as an empty,
-// healthy snapshot set.
-//
-// KNOWN OPERATIONAL HAZARD -- NO DEADLINE ON THESE CALLS.
-// CreateVssBackupComponents/InitializeForBackup/SetContext/Query/Next are
-// synchronous cross-process COM, executed on a bounded agent dispatch-pool
-// worker, with no timeout. A wedged VSS service or a hung third-party writer
-// parks that worker permanently; a repeating scheduled `snapshots` instruction
-// parks one per fire, and once the pool and its queue are exhausted the agent
-// REJECTs EVERY command, not just this one -- the pool is shared with
-// quarantine/containment dispatch, so this is an availability coupling with a
-// security operation, not merely a slow read.
-//
-// Raised independently at governance Gate 4 (unhappy-path UP-1) and Gate 6
-// (sre S-3). Shipped deliberately, ALEX RULING: documented rather than bounded
-// here, because (a) every other plugin's OS calls are equally unbounded --
-// agents/plugins/ has no bounded_call site outside `discovery` -- so bounding
-// this one leg would be an inconsistent point fix, and (b) the obvious
-// mechanism is unsafe for COM: bounded_wait.hpp bounds the WAIT by abandoning
-// a DETACHED thread, and this plugin can be dlclosed out from under it. A
-// tree-wide bounding strategy is tracked as a follow-up issue; do not "fix"
-// this locally without reading that issue first.
-//
-// NO CoInitializeSecurity call anywhere in this leg: it is a process-global,
-// once-only setting and a plugin must never impose one on its host agent.
-// Verified as SYSTEM that CreateVssBackupComponents/Query both succeed under
-// a bare CoInitializeEx(MTA) -- exactly what yuzu::shared::win::ComInit does.
-// Note ComInit also accepts RPC_E_CHANGED_MODE (another plugin already put
-// this pool thread in an STA); MSDN directs VSS requesters to an MTA, so VSS
-// would then run in an STA. No in-tree plugin initialises STA (grep:
-// zero COINIT_APARTMENTTHREADED), so this is latent, and any resulting
-// failure lands in the generic "failed: 0x…" branch rather than being
-// misreported as a privilege problem.
-
-#if defined(YUZU_FSPOSTURE_HAVE_VSS)
-
-/// RAII owner for the heap strings VSS allocates into a VSS_SNAPSHOT_PROP.
-/// Next() fills a fresh property block on every iteration, so this must free
-/// on every exit from the turn on which it is CONSTRUCTED. It is constructed
-/// immediately after a successful fetch and BEFORE every other decision, so
-/// the failed-status `break`, the cap `break`, the normal end of the walk, and
-/// any check added later are all covered by construction. The one `continue`
-/// -- the non-snapshot skip -- runs on a turn where no owner was constructed
-/// at all; see the trade-off note at that branch.
-///
-/// Two earlier revisions of this comment were wrong in opposite directions,
-/// which is why the ordering is spelled out rather than asserted: one claimed
-/// it freed on "every loop turn, including the early-continue paths" (the skip
-/// path contradicts that -- Gate 2, docs-writer), and the code then briefly
-/// checked the cap BEFORE constructing the owner, making the cap `break` leak
-/// (Gate 3, cpp-safety and cpp-expert, independently).
-/// Unwrapped manual cleanup in new C++ is a governance policy floor, not a
-/// style preference.
-class ScopedSnapshotProp {
-public:
-    explicit ScopedSnapshotProp(VSS_SNAPSHOT_PROP& p) : p_(&p) {}
-    ~ScopedSnapshotProp() {
-        if (p_) ::VssFreeSnapshotProperties(p_);
-    }
-    ScopedSnapshotProp(const ScopedSnapshotProp&) = delete;
-    ScopedSnapshotProp& operator=(const ScopedSnapshotProp&) = delete;
-
-private:
-    VSS_SNAPSHOT_PROP* p_;
-};
-
-std::string guid_to_string(const GUID& g) {
-    wchar_t buf[64] = {};
-    if (::StringFromGUID2(g, buf, static_cast<int>(std::size(buf))) == 0) return "-";
-    return yuzu::win::from_wide(buf);
-}
-
-/// Renders a VSS step failure for both the row `detail` and the
-/// mark_result_partial provenance. E_ACCESSDENIED is named explicitly: it is
-/// the one failure here an operator can actually act on, and it is what
-/// #1442 will turn this leg into fleet-wide.
-std::string vss_failure_detail(std::string_view step, HRESULT hr) {
-    if (hr == E_ACCESSDENIED) {
-        // "commonly indicates", not "lacks": E_ACCESSDENIED from a COM call
-        // can also arise from COM security negotiation or the VSS service's
-        // own ACL. Administrative rights are the overwhelmingly likely cause
-        // and the one an operator can act on, but asserting a single cause
-        // from a generic HRESULT would be stating more than the code knows.
-        return std::format("{} denied (0x{:08X}): VSS snapshot enumeration requires "
-                           "administrative rights; this commonly indicates the agent service "
-                           "account lacks them",
-                           step, static_cast<unsigned long>(hr));
-    }
-    return std::format("{} failed: 0x{:08X}", step, static_cast<unsigned long>(hr));
-}
-
-void emit_snapshot_rows_vss(yuzu::CommandContext& ctx) {
-    // Every early return below writes BOTH a `none` row and a degraded mark:
-    // a failure must stay distinguishable from a genuinely empty snapshot
-    // set, which is the same peer-H6 rule the retired FSCTL path carried.
-    //
-    // A privilege denial gets PERMISSION_DENIED rather than CONSTRAINED, so a
-    // status-keyed consumer can tell "not allowed to read this" from any other
-    // degradation. The descriptor and four operator docs state that a denied
-    // read reports permission_denied; routing it here is what makes that
-    // sentence true rather than aspirational (governance Gate 2).
-    const auto fail = [&ctx](std::string_view step, HRESULT hr) {
-        const std::string detail = vss_failure_detail(step, hr);
-        write_snapshot_row(ctx, "-", "-", "none", detail);
-        if (hr == E_ACCESSDENIED)
-            mark_result_denied(ctx, "windows:vss", detail);
-        else
-            mark_result_partial(ctx, "windows:vss", detail);
-    };
-
-    yuzu::shared::win::ComInit com;
-    if (!com.ok()) {
-        constexpr const char* kDetail = "COM initialisation failed";
-        write_snapshot_row(ctx, "-", "-", "none", kDetail);
-        mark_result_partial(ctx, "windows:vss", kDetail);
-        return;
-    }
-
-    yuzu::shared::win::ComPtr<IVssBackupComponents> backup;
-    HRESULT hr = ::CreateVssBackupComponents(backup.put());
-    if (FAILED(hr) || !backup) {
-        fail("CreateVssBackupComponents", hr);
-        return;
-    }
-
-    hr = backup->InitializeForBackup();
-    if (FAILED(hr)) {
-        fail("InitializeForBackup", hr);
-        return;
-    }
-
-    // VSS_CTX_ALL so both persistent backup snapshots and the
-    // client-accessible ones behind "Previous Versions" / System Restore are
-    // enumerated; the default context reports only a subset. A failure here
-    // is NOT fatal -- the query still runs at the default context -- but it
-    // narrows what can be seen, so it is recorded rather than swallowed.
-    const bool context_narrowed = FAILED(backup->SetContext(VSS_CTX_ALL));
-
-    yuzu::shared::win::ComPtr<IVssEnumObject> snapshots;
-    hr = backup->Query(GUID_NULL, VSS_OBJECT_NONE, VSS_OBJECT_SNAPSHOT, snapshots.put());
-    if (FAILED(hr) || !snapshots) {
-        fail("Query", hr);
-        return;
-    }
-
-    // Bound the walk. Next() is driven by a storage provider this process
-    // does not control, so the loop carries its own ceiling for the same
-    // reason the macOS leg caps fs_snapshot_list; the cap matches that leg's
-    // so the two platforms' truncation semantics stay comparable.
-    constexpr std::size_t kMaxSnapshots = 1024;
-
-    std::size_t emitted = 0;
-    // The cap is counted in LOOP TURNS, not emitted rows. Counting rows would
-    // let the non-snapshot `continue` below bypass the counter entirely, so a
-    // provider that yields non-snapshot objects indefinitely would spin
-    // forever AND leak on every turn -- defeating the exact rationale the cap
-    // is here for, since Next() is driven by code this process does not
-    // control. Governance Gate 2 (security-guardian) caught this; the two
-    // decisions were individually fine and wrong in combination.
-    std::size_t iterations = 0;
-    bool truncated = false;
-    bool enum_failed = false;
-    HRESULT enum_hr = S_OK;
-    bool skipped_wrong_type = false;
-
-    for (;;) {
-        VSS_OBJECT_PROP prop{};
-        ULONG fetched = 0;
-        const HRESULT next_hr = snapshots->Next(1, &prop, &fetched);
-
-        // `fetched`, NOT the HRESULT, decides whether the provider wrote
-        // anything into `prop`. Three cases, and they are NOT interchangeable
-        // (Gate 4, unhappy-path UP-2 -- an earlier revision collapsed the
-        // second into the first, so an over-fetch reported a healthy EMPTY
-        // host on a machine that had snapshots, and leaked the block):
-        //
-        //   fetched == 0  -> normal end of the walk (S_FALSE). Nothing owned.
-        //   fetched  > 1  -> the enumerator ignored our celt of 1. We cannot
-        //                    own or free what we cannot address, so this is an
-        //                    enumeration FAILURE, never an end-of-walk.
-        //   fetched == 1  -> the contract we asked for; fall through and own.
-        if (fetched == 0) {
-            if (FAILED(next_hr)) {
-                enum_failed = true;
-                enum_hr = next_hr;
-            }
-            break;
-        }
-        if (fetched != 1) {
-            enum_failed = true;
-            enum_hr = SUCCEEDED(next_hr) ? E_UNEXPECTED : next_hr;
-            break;
-        }
-
-        // OWNERSHIP IS TAKEN HERE, before ANY other decision, and that
-        // ordering is the whole point -- governance Gate 3 (cpp-safety and
-        // cpp-expert, independently) found that an earlier revision checked
-        // the walk ceiling BEFORE constructing the owner, so the truncation
-        // `break` discarded a fully-populated property block that nothing ever
-        // freed. Every check below is therefore safe to add: the owner is
-        // already alive on every path out of this turn.
-        //
-        // std::optional is what makes the ownership CONDITIONAL without a
-        // second owner type: ScopedSnapshotProp is non-copyable and
-        // non-movable, and emplace() constructs it in place.
-        const bool is_snapshot = (prop.Type == VSS_OBJECT_SNAPSHOT);
-        std::optional<ScopedSnapshotProp> owner;
-        if (is_snapshot)
-            owner.emplace(prop.Obj.Snap);
-
-        // A populated entry delivered alongside a failed status: own it (above)
-        // and then stop.
-        if (FAILED(next_hr)) {
-            enum_failed = true;
-            enum_hr = next_hr;
-            break;
-        }
-
-        // Bound the WALK, counted in loop turns rather than emitted rows, so
-        // the skip below cannot bypass the ceiling.
-        if (++iterations > kMaxSnapshots) {
-            truncated = true;
-            break;
-        }
-
-        // Only a snapshot-typed property owns snapshot strings, so such an
-        // entry is skipped and no owner was constructed for it above.
-        //
-        // DELIBERATE TRADE-OFF, adjudicated at governance Gate 2 by
-        // security-guardian (NOT self-granted -- the policy floor on non-RAII
-        // cleanup requires an adjudicator who is not the author):
-        //
-        // this path frees nothing, so a non-snapshot entry leaks whatever
-        // strings its own union arm holds. Accepted because (a) the Query
-        // above asks for VSS_OBJECT_SNAPSHOT only, so the branch is
-        // unreachable in practice; (b) the alternative -- calling
-        // VssFreeSnapshotProperties on a union arm that is not a
-        // VSS_SNAPSHOT_PROP -- is undefined behaviour on data this process did
-        // not shape; and (c) the leak is BOUNDED by the kMaxSnapshots walk
-        // ceiling checked above, which is counted in loop turns precisely so
-        // this branch cannot spin. The branch is not silent either: it
-        // degrades the result below.
-        //
-        // A strictly better third option exists and is deferred, not rejected:
-        // switch on prop.Type and release VSS_PROVIDER_PROP's own strings with
-        // CoTaskMemFree (VSS publishes no VssFreeProviderProperties). Left out
-        // of this change because it is ~6 lines of untestable code on a branch
-        // no query can reach; filed as a follow-up.
-        if (!is_snapshot) {
-            skipped_wrong_type = true;
-            continue;
-        }
-
-        const VSS_SNAPSHOT_PROP& snap = prop.Obj.Snap;
-
-        // m_pwszOriginalVolumeName is a volume GUID path in exactly the form
-        // primary_mount_point() expects, so a snapshot maps to the same
-        // mount-point vocabulary the mounts action reports.
-        const std::wstring original =
-            snap.m_pwszOriginalVolumeName ? snap.m_pwszOriginalVolumeName : L"";
-        const std::string mount_point =
-            original.empty() ? std::string("-")
-                             : yuzu::win::from_wide(primary_mount_point(original).c_str());
-        const std::string name = guid_to_string(snap.m_SnapshotId);
-        const std::string device = snap.m_pwszSnapshotDeviceObject
-                                       ? yuzu::win::from_wide(snap.m_pwszSnapshotDeviceObject)
-                                       : std::string("-");
-
-        write_snapshot_row(ctx, mount_point, name, "vss", device);
-        ++emitted; // rows only -- the walk ceiling is `iterations`, checked above
-    }
-
-    if (enum_failed) {
-        const std::string detail = vss_failure_detail("IVssEnumObject::Next", enum_hr);
-        // Rows already emitted are real; only a walk that produced nothing
-        // needs the `none` sentinel to carry the failure.
-        if (emitted == 0) write_snapshot_row(ctx, "-", "-", "none", detail);
-        // Mirror the `fail` lambda's routing. Raised independently by
-        // cpp-safety and plugin-developer at Gate 3: without this branch a
-        // denial arriving MID-walk logged "requires administrative rights"
-        // while the typed status said CONSTRAINED -- the exact prose/status
-        // divergence the PERMISSION_DENIED work existed to close, surviving in
-        // the one site the first fix did not reach.
-        if (enum_hr == E_ACCESSDENIED)
-            mark_result_denied(ctx, "windows:vss", detail);
-        else
-            mark_result_partial(ctx, "windows:vss", detail);
-        return;
-    }
-    // Only claim an empty machine when the walk was COMPLETE AND UNNARROWED.
-    // Gate 3 (cpp-safety F3) gated this on `truncated`; Gate 4
-    // (consistency-auditor CA-3) found the other two narrowing paths reach
-    // here too -- a failed SetContext enumerates a narrower context, and a
-    // skipped non-snapshot object means the walk did not see everything. Any
-    // of the three makes "no shadow copies present" a claim the code cannot
-    // support, so each gets its own honest sentinel instead.
-    if (emitted == 0) {
-        if (!truncated && !context_narrowed && !skipped_wrong_type) {
-            write_snapshot_row(ctx, "-", "-", "none", "no shadow copies present on any volume");
-        } else {
-            write_snapshot_row(ctx, "-", "-", "none",
-                               "no shadow copies observed, but the enumeration was incomplete "
-                               "-- see the degraded status for why");
-        }
-    }
-    // mark_result_partial ASSIGNS -- last writer wins for the reported
-    // provenance -- so these run least-material first, leaving the most
-    // material cause (an incomplete list) as the one an operator sees.
-    if (skipped_wrong_type) {
-        mark_result_partial(ctx, "windows:vss",
-                            "the provider returned a non-snapshot object; it was skipped");
-    }
-    if (context_narrowed) {
-        mark_result_partial(
-            ctx, "windows:vss",
-            "SetContext(VSS_CTX_ALL) failed; only the default snapshot context was enumerated");
-    }
-    if (truncated) {
-        mark_result_partial(
-            ctx, "windows:vss",
-            std::format("snapshot list truncated at the {}-entry cap", kMaxSnapshots));
-    }
-}
-
-#endif // YUZU_FSPOSTURE_HAVE_VSS
-
 } // namespace
 
 // ── entry points ─────────────────────────────────────────────────────────
@@ -901,6 +534,36 @@ int emit_quotas(yuzu::CommandContext& ctx) {
     return 0;
 }
 
+// ── snapshots ────────────────────────────────────────────────────────────
+//
+// MECHANISM: VSS/COM (IVssBackupComponents::Query), replacing
+// FSCTL_SRV_ENUMERATE_SNAPSHOTS. The file banner records why the FSCTL was
+// both unavailable on the current SDK and the wrong question.
+//
+// VERIFIED on the-rig 2026-09-03 against three live shadow copies (Windows
+// SDK 10.0.26100.0). Query returns every snapshot machine-wide in one call
+// and each carries its own originating volume, so this leg -- unlike
+// emit_mounts/emit_quotas -- does not enumerate volumes first.
+//
+// PRIVILEGE. Measured on that host, and ONLY these three were measured:
+//   NT AUTHORITY\SYSTEM           CreateVssBackupComponents -> S_OK, 3 found
+//   NT AUTHORITY\LOCAL SERVICE    -> E_ACCESSDENIED (0x80070005)
+//   NT AUTHORITY\NETWORK SERVICE  -> E_ACCESSDENIED (0x80070005)
+//
+// The Windows agent service runs as LocalSystem today (#1442), so this leg
+// works as shipped. Should #1442 move it to NT SERVICE\YuzuAgent, the call is
+// EXPECTED to return E_ACCESSDENIED -- expected, not measured: that account
+// was not among the three tested, and docs/agent-privilege-model.md shows it
+// being granted Administrators out of band for other actions, which would
+// change the answer. Either way a denial is reported as an explicit
+// PERMISSION_DENIED degradation below and must never read as an empty,
+// healthy snapshot set.
+//
+// BOUNDED READ. The COM walk runs in agent-core on its own worker thread,
+// waited on for at most kVssDeadline: see yuzu/agent/win_vss_snapshots.hpp.
+// This leg only resolves mount points and writes the rows and marks that
+// plan_vss_rows decides.
+
 int emit_snapshots(yuzu::CommandContext& ctx) {
     // UP-4: the VSS leg resolves each snapshot's originating volume through
     // primary_mount_point, so it needs the same hard-error suppression.
@@ -911,12 +574,24 @@ int emit_snapshots(yuzu::CommandContext& ctx) {
     // so a volume walk here would add a second failure mode without adding
     // any coverage -- a volume with no snapshots contributes nothing either
     // way, and a snapshot whose volume the walk missed would be dropped.
-#if defined(YUZU_FSPOSTURE_HAVE_VSS)
-    emit_snapshot_rows_vss(ctx);
-#else
-    write_snapshot_row(ctx, "-", "-", "none", "built without the VSS SDK headers");
-    mark_result_partial(ctx, "windows:vss", "SDK header vsbackup.h not present at build time");
-#endif
+    const auto read = yuzu::agent::win::read_vss_snapshots(yuzu::agent::win::kVssDeadline);
+    // The originating volume is a volume GUID path in exactly the form
+    // primary_mount_point() expects, so a snapshot maps to the same
+    // mount-point vocabulary the mounts action reports.
+    const VssRowPlan plan = plan_vss_rows(read, [](const std::string& volume) {
+        return yuzu::win::from_wide(primary_mount_point(yuzu::win::to_wide(volume)).c_str());
+    });
+    for (const auto& row : plan.rows)
+        write_snapshot_row(ctx, row.mount_point, row.name, row.kind, row.detail);
+    for (const auto& mark : plan.marks) {
+        std::string provenance{"windows:vss"};
+        if (!mark.cause.empty())
+            provenance.append(":").append(mark.cause);
+        if (mark.denied)
+            mark_result_denied(ctx, provenance, mark.detail);
+        else
+            mark_result_partial(ctx, provenance, mark.detail);
+    }
     return 0;
 }
 

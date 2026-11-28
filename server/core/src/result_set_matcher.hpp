@@ -2,9 +2,14 @@
 
 #include <nlohmann/json_fwd.hpp>
 
+#include <cstddef>
+#include <cstdint>
+#include <memory>
 #include <optional>
+#include <set>
 #include <string>
 #include <string_view>
+#include <type_traits>
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Result-set membership matcher (scope walking — design §3.2 / §6).
@@ -43,8 +48,10 @@
 // the line is split on every unescaped pipe instead; without the flag a key/value plugin's rows
 // are key + remainder and never match a wider declaration. The index is the declared column
 // position, not the dashboard cell position (for a key/value plugin the dashboard still shows key
-// + remainder under the declared headers). Wrong-typed keys match nobody; a caller may not supply
-// any of the three server-authored keys.
+// + remainder under the declared headers). A fourth key, "partial_when_constrained":true, is stored
+// when the definition's result schema sets `partialWhenConstrained: true`; it never changes who
+// matches (see constrained_answer_is_unresolved). Wrong-typed keys match nobody; a caller may not
+// supply any of the four server-authored keys.
 //
 // `op` ∈ {eq, in, contains, exists}. A non-SUCCESS response NEVER qualifies,
 // regardless of matcher — a plugin that errored is not evidence of a hit.
@@ -61,6 +68,84 @@ inline constexpr int kStatusSuccess = 1;
 /// membership in a result set whose pending row carries `matcher_json`.
 bool response_matches(std::string_view matcher_json, int status, std::string_view output);
 
+/// True when `matcher_json` is a column matcher (a string `column`, no `kind`) and `output` is an
+/// echo `__schema__`-headed answer whose header does not name that column: the agent answered
+/// from a table that lacks the column (a stored matcher over a column the roll-up does not
+/// keep), which the membership computation counts as a failed agent rather than a silent
+/// non-member. False for every other matcher, for an answer with no `__schema__` line, and for a
+/// header that names the column over zero data rows (a legitimate empty answer).
+bool answer_lacks_matcher_column(std::string_view matcher_json, std::string_view output);
+
+/// The typed plugin result status meaning the plugin did only part of what it was asked. Mirrors
+/// `CommandResponse::PLUGIN_RESULT_CONSTRAINED` (= 4) in agent.proto.
+inline constexpr int kPluginResultConstrained = 4;
+
+/// True when `matcher_json` carries the server-authored `"partial_when_constrained": true` (stored
+/// by `bind_declared_columns` for a definition whose result schema sets `partialWhenConstrained`)
+/// and the answer's stored `plugin_result_status` is CONSTRAINED: the plugin examined only part of
+/// what it was asked to, so an answer with no matching row is not evidence of absence, and the
+/// membership computation counts the agent as failed rather than a clean non-member. False for
+/// every other matcher and status: a definition without the key (find_by_hash, every other plugin,
+/// a stored search_dir 0.4.0) and a row with no typed status (an older agent) are unaffected.
+bool constrained_answer_is_unresolved(std::string_view matcher_json, int plugin_result_status);
+
+/// A stored matcher parsed once. The members read builds one per pending set and asks it about
+/// every stored row, so the matcher text is parsed once per read and not once per row. Each
+/// member answers what the function of the same name above answers for the same text (those
+/// are this class built and asked once); text that does not parse is the default matcher.
+class ParsedMatcher {
+public:
+    explicit ParsedMatcher(std::string_view matcher_json);
+    ParsedMatcher(const ParsedMatcher&) = delete;
+    ParsedMatcher& operator=(const ParsedMatcher&) = delete;
+    ~ParsedMatcher();
+
+    [[nodiscard]] bool response_matches(int status, std::string_view output) const;
+    [[nodiscard]] bool answer_lacks_matcher_column(std::string_view output) const;
+    [[nodiscard]] bool constrained_answer_is_unresolved(int plugin_result_status) const;
+
+private:
+    std::unique_ptr<const nlohmann::json> matcher_;
+    /// The string entries of `value_set`, put in one ordered set when the matcher is parsed, so an
+    /// `in` test is one lookup of the cell. Ordered, not hashed: the entries and the cells come
+    /// from outside the server and the standard string hash is fixed and unseeded, so keys chosen
+    /// there could all hash alike and turn each lookup into a walk of every entry; an ordered
+    /// set's lookup does not degrade with the keys it holds. Views into `*matcher_`.
+    std::set<std::string_view> in_set_;
+};
+// A copied `in_set_` would point into the source's `*matcher_`, and a moved-from object would
+// have no `*matcher_` for its members to read: the class offers neither, and this keeps it so.
+static_assert(!std::is_copy_constructible_v<ParsedMatcher> &&
+                  !std::is_move_constructible_v<ParsedMatcher> &&
+                  !std::is_copy_assignable_v<ParsedMatcher> &&
+                  !std::is_move_assignable_v<ParsedMatcher>,
+              "ParsedMatcher holds views into its own *matcher_: not copyable, not movable");
+
+/// The largest caller matcher admission accepts: 64 KiB as compact JSON, the bound the same routes
+/// put on one `params` value. It bounds the cost of evaluating a large matcher. The server-authored
+/// keys are stored after the check and are not counted, so a stored matcher can be longer by them.
+inline constexpr std::size_t kMatcherMaxBytes = 65536;
+/// The 400 / -32602 message for a matcher over that bound (REST and MCP share it).
+inline constexpr std::string_view kMatcherTooLargeMessage =
+    "matcher exceeds 65536 bytes as compact JSON";
+static_assert(kMatcherMaxBytes == 65536,
+              "the message, the MCP schema description and the OpenAPI path item state the bound");
+
+/// The largest `column`, `op` and `value` a caller matcher may carry, in bytes: the three the MCP
+/// tool's input schema states (`mcp_input_bounds.hpp` takes its constants from these). They bound
+/// the size of a matcher field a caller supplies. A `value_set` entry has no bound of its own; it
+/// counts toward `kMatcherMaxBytes`.
+inline constexpr std::size_t kMatcherColumnMaxBytes = 128;
+inline constexpr std::size_t kMatcherOpMaxBytes = 32;
+inline constexpr std::size_t kMatcherValueMaxBytes = 512;
+/// The message for a field over its bound: MCP sends it as is, REST behind its
+/// `RESULT_SET_BAD_REQUEST: ` prefix.
+inline constexpr std::string_view kMatcherFieldTooLargeMessage =
+    "a matcher field exceeds its bound (column<=128, op<=32, value<=512 bytes)";
+static_assert(kMatcherColumnMaxBytes == 128 && kMatcherOpMaxBytes == 32 &&
+                  kMatcherValueMaxBytes == 512,
+              "the message and the OpenAPI path item state the three bounds");
+
 /// Admission check for a caller-supplied matcher (#4644): nullopt when acceptable, else the 400
 /// message. A present `kind` must be a string; on a kind-less matcher a present `column`, `op`
 /// or `value` must be a string and a present `value_set` an array. Only `echo_rows_ge` has a numeric field: its `n`
@@ -68,13 +153,17 @@ bool response_matches(std::string_view matcher_json, int status, std::string_vie
 /// CLOSED on a malformed `n` or `kind` already stored (including n < 1), so a bad value can never
 /// throw out of the maintenance tick nor admit every responder. A matcher that is present but not
 /// a JSON object is accepted here as the unrecognised-shape default (the serialized text may be
-/// anything): a route holding the parsed value calls `validate_matcher_object` instead.
+/// anything): a route holding the parsed value calls `validate_matcher_object` instead, and only
+/// that form applies the three field bounds. Text over `kMatcherMaxBytes` is refused first, on its
+/// length, before it is parsed.
 std::optional<std::string> validate_matcher(std::string_view matcher_json);
 
 /// The admission check for a PRESENT caller `matcher` value (#4644): nullopt when acceptable,
 /// else the 400 / -32602 message. A value that is not a JSON object is refused ("matcher must be
-/// a JSON object"; it used to be dropped, which meant every responder qualified), then the
-/// object goes through `validate_matcher`. REST and MCP both call this ONE function, so a third
+/// a JSON object"; it used to be dropped, which meant every responder qualified), then one whose
+/// string `column`, `op` or `value` is over its bound (`kMatcherFieldTooLargeMessage`: the object's
+/// own three keys, whatever its `kind`), then the object goes through `validate_matcher`. REST and
+/// MCP both call this ONE function, so both apply the same bounds in the same order, and a third
 /// producer cannot admit accept-all by calling only the text check. An ABSENT matcher is the
 /// caller's own default and is not passed here.
 std::optional<std::string> validate_matcher_object(const nlohmann::json& matcher);
@@ -84,11 +173,43 @@ std::optional<std::string> validate_matcher_object(const nlohmann::json& matcher
 /// `ResponseTemplatesEngine::synthesise_default` -- the dashboard's own source). When
 /// `matcher.column` is among them, stores `declared_columns` and `plugin` in `matcher` (and
 /// `row_discriminator` when the definition's first column declares `discriminator: true`) so
-/// `response_matches` can resolve the column positionally in plain pipe rows. No-op otherwise.
-/// REST and MCP both call this ONE function. `validate_matcher` refuses all three keys from a
-/// caller.
+/// `response_matches` can resolve the column positionally in plain pipe rows, and
+/// `partial_when_constrained` when the result schema sets `partialWhenConstrained: true`. No-op
+/// otherwise. REST and MCP both call this ONE function. `validate_matcher` refuses all four keys
+/// from a caller.
 void bind_declared_columns(nlohmann::json& matcher, const std::string& result_schema_json,
                            const std::string& plugin);
+
+/// True when the stored echo SQL still reads a raw capture table: one of the sixteen real
+/// `<source>_live` table names, or its `$<Source>_Live` spelling (the `$` is not a word character,
+/// so both tokenise to the same lower-cased name), as a whole identifier outside comments
+/// (case-insensitive), or as the whole content of a `'...'` token wherever it stands (SQLite
+/// reads `FROM 'process_live'`, `main.'process_live'` and `x IN 'process_live'` as the table;
+/// the rule is position-free, so `WHERE name = 'process_live'` is refused too, while a longer
+/// literal such as `'see process_live'` is not). Quoted identifiers (`"..."`, `` `...` ``,
+/// `[...]`) are read as SQLite tokenises them: their content is checked like code, and a `'`,
+/// `--` or `/*` inside one never hides the code after it. Roll-up is the only mode, so such a query
+/// answers with no rows (the shims) rather than an error, and re-evaluating it would silently
+/// build an empty set. `usage_live` and an unknown `$Foo_Live` are not matched: the agent
+/// answers those with an error, which the failure signal counts. Three false positives are
+/// accepted (the predicate fails closed): a name inside a double-quoted string literal
+/// (`SELECT "$Process_Live"`), a single-quoted literal that is exactly a raw table name, and
+/// a CTE that shadows a shim name. Pure; used by the REST and
+/// MCP re-evaluation and create paths (RESULT_SET_REEVAL_STALE_SOURCE).
+bool references_raw_capture_table(std::string_view sql);
+
+/// The same predicate for an instruction_result set, applied to the SQL it will actually run:
+/// `params.sql` when the stored params carry a string, else the `sql` parameter's schema default
+/// in the definition's `parameter_schema` JSON (the canned queries keep their SQL there). False
+/// when neither yields text.
+bool instruction_reads_raw_capture_table(const nlohmann::json& params,
+                                         std::string_view parameter_schema);
+
+/// The 400 / -32602 message for a refused stale-source set (REST and MCP share it).
+inline constexpr std::string_view kStaleSourceMessage =
+    "RESULT_SET_REEVAL_STALE_SOURCE: the query reads a raw capture table (a $<Source>_Live "
+    "name or a <source>_live table). Echo keeps hourly, daily and monthly roll-ups only, so "
+    "it would match no devices. Query the hourly roll-up instead, for example $Process_Hourly";
 
 /// Count the rows in an echo `echo.sql` response `output`. The echo plugin emits
 /// a `__schema__|col|col` header line, one `|`-joined line per row, then a
@@ -96,5 +217,35 @@ void bind_declared_columns(nlohmann::json& matcher, const std::string& result_sc
 /// trailer when present; otherwise counts data lines. An `error|...` output
 /// (the echo failure shape) returns 0. Exposed for direct testing.
 int echo_row_count(std::string_view output);
+
+/// Targeted agents recorded as unanswered when a pending set is filled. Terminal (every targeted
+/// agent responded, and none of those answers was lost) is 0. Otherwise the count is
+/// `targeted - responded` plus `dropped` (agents the tracker counted as responded whose terminal
+/// response the response store did not persist: their answer is not in the stored rows), floored
+/// at 1: with no tracker data, or none targeted, completeness cannot be proven, so the set reads
+/// "not known complete" rather than complete. Never 0 while `dropped > 0`.
+[[nodiscard]] inline int64_t unanswered_agent_count(int64_t targeted, int64_t responded,
+                                                    bool tracker_present, int64_t dropped = 0) {
+    const int64_t lost = dropped > 0 ? dropped : 0;
+    if (tracker_present && targeted > 0 && responded >= targeted && lost == 0)
+        return 0;
+    const int64_t gap = tracker_present && targeted > responded ? targeted - responded : 0;
+    const int64_t total = gap + lost;
+    return total > 1 ? total : 1;
+}
+
+/// The dropped-answer count the fill uses for a set that is due (terminal or timed out), from the
+/// tracker's count (`nullopt` when it could not be read) and the set's age in seconds. A readable
+/// count is used as is. An unreadable one skips the set for this tick (`nullopt`) until the set is
+/// older than `give_up_after_s`; past that the set is filled with a count of 1, so it reads
+/// incomplete rather than staying pending until its expiry.
+[[nodiscard]] constexpr std::optional<int64_t>
+fill_count_decision(std::optional<int64_t> count, int64_t age_s, int64_t give_up_after_s) noexcept {
+    if (count)
+        return *count;
+    if (age_s > give_up_after_s)
+        return int64_t{1};
+    return std::nullopt;
+}
 
 } // namespace yuzu::server::rs_matcher

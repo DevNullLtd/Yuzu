@@ -48,25 +48,28 @@ What it cannot tell you: who is over quota (no per-user data anywhere), how larg
 ```mermaid
 sequenceDiagram
   participant D as Dispatch pool worker
+  participant W as agent-core VSS worker
   participant C as COM and VSS
   participant S as Volume Shadow Copy service
-  D->>C: initialise COM (MTA)
-  D->>C: CreateVssBackupComponents
-  C-->>D: E_ACCESSDENIED unless Administrator or SYSTEM
-  D->>C: InitializeForBackup
-  D->>C: SetContext VSS_CTX_ALL
-  D->>C: Query for snapshot objects
-  C->>S: cross-process call, no timeout
+  D->>W: read the snapshots, wait at most 15 s
+  W->>C: initialise COM (MTA)
+  W->>C: CreateVssBackupComponents
+  C-->>W: E_ACCESSDENIED unless Administrator or SYSTEM
+  W->>C: InitializeForBackup
+  W->>C: SetContext VSS_CTX_ALL
+  W->>C: Query for snapshot objects
+  C->>S: cross-process call
   loop up to 1024 turns
-    D->>C: Next one object
-    C->>S: cross-process call, no timeout
-    S-->>D: snapshot id, volume, device path
+    W->>C: Next one object
+    C->>S: cross-process call
+    S-->>W: snapshot id, volume, device path
   end
-  Note over D,S: a wedged service or backup provider holds this worker indefinitely
+  W-->>D: snapshot records, only if within 15 s
+  Note over D,S: after 15 s the read is unanswered while the agent-core worker stays blocked until the service answers
   D-->>D: rows, or one none row plus a degraded status
 ```
 
-The Windows `snapshots` action makes a chain of synchronous cross-process COM calls on one shared agent worker. Each call has no deadline, so a hung Volume Shadow Copy service or third-party backup provider keeps that worker occupied, and a repeating schedule can occupy more of them. The walk itself is capped at 1,024 turns, and any failure is reported distinctly from a genuinely empty set.
+The Windows `snapshots` action reads through agent-core, which makes the chain of synchronous cross-process COM calls on its own worker thread and waits at most 15 s for the whole read. An unanswered read reports one `none` row (`VSS enumeration did not answer: <cause>`) and `CONSTRAINED` with provenance `windows:vss:<cause>`: `windows:vss:deadline_exceeded`, `windows:vss:call_in_progress` or `windows:vss:abandoned_call_pending`. The action returns 0. The calls cannot be cancelled: after the limit the worker thread stays blocked in agent-core until the service answers. One read runs at a time, so a hung Volume Shadow Copy service or third-party backup provider holds that one thread and no further read starts until it returns. The walk itself is capped at 1,024 turns, and any failure is reported distinctly from a genuinely empty set.
 
 ## OS capability
 
@@ -153,7 +156,7 @@ Surfaced as `plugin_result_status` on the command response. `mark_result_partial
 | Status | Completeness | Provenance (examples) | When |
 |---|---|---|---|
 | `UNDECLARED` (agent-derived `OK`) | — | — | clean read on every action; both captured Unix samples for all three actions, and the Windows `snapshots` sample |
-| `CONSTRAINED` | partial | `linux:mountinfo`, `linux:mountinfo:malformed`, `macos:getmntinfo`, `macos:getattrlist`, `macos:fs_snapshot_list`, `windows:volume_enum`, `windows:dskquota`, `windows:vss` | an OS call failed, a malformed/truncated mountinfo, an unrecognized quota state, or a VSS step (`SetContext`, a non-snapshot object) narrowed but did not stop the walk |
+| `CONSTRAINED` | partial | `linux:mountinfo`, `linux:mountinfo:malformed`, `macos:getmntinfo`, `macos:getattrlist`, `macos:fs_snapshot_list`, `windows:volume_enum`, `windows:dskquota`, `windows:vss`, `windows:vss:deadline_exceeded`, `windows:vss:call_in_progress`, `windows:vss:abandoned_call_pending` | an OS call failed, a malformed/truncated mountinfo, an unrecognized quota state, a VSS step (`SetContext`, a non-snapshot object) narrowed but did not stop the walk, or the VSS read did not answer within its 15 s limit (the three `windows:vss:<cause>` values) |
 | `CONSTRAINED` | partial | `linux:mountinfo:unreadable`, `linux:mountinfo:entry_cap`, `linux:mountinfo:quotas`, `linux:mountinfo:entry_cap:quotas`, `linux:mountinfo:malformed:quotas`, `linux:mountinfo:snapshots`, `linux:mountinfo:entry_cap:snapshots`, `linux:mountinfo:malformed:snapshots`, `linux:statvfs` | Linux, per action: the `/proc/self/mountinfo` read for `mounts` (`:unreadable`/`:entry_cap`) or for `quotas`/`snapshots` (action-suffixed `:quotas`/`:snapshots` variants) failed outright, hit its entry-count cap, or contained a malformed line; or a per-mount `statvfs(3)` call failed (`linux:statvfs`, `mounts` only) |
 | `PERMISSION_DENIED` | partial | `linux:quotactl` (every probed device `EPERM`/`EACCES`), `macos:getattrlist`, `macos:fs_snapshot_list` (`EACCES`/`EPERM` on a volume root), `windows:dskquota` (`E_ACCESSDENIED`), `windows:vss` (`E_ACCESSDENIED`) | a privilege denial specifically, reported distinctly from every other degradation so a status-keyed consumer can tell "not allowed to read this" from a generic failure |
 
@@ -263,8 +266,8 @@ snapshot|-|-|none|no btrfs or device-mapper mount found
 
 1. **Quotas and Linux snapshots report less than their names suggest.** Quota reporting is volume-level on every OS and never per-identity; on APFS that is structural: the macOS leg reads the volume quota with `getattrlist` and never calls `quotactl`, and the source comment says `quotactl` returns `ENOTSUP` on every APFS mount while succeeding on HFS+ (an OS behaviour the plugin does not itself exercise), and on Linux only the user-quota format is probed. Linux `snapshots` reports capability, not inventory: it cannot list unmounted btrfs snapshots (needs `CAP_SYS_ADMIN` through `BTRFS_IOC_TREE_SEARCH`) or tell an LVM snapshot volume from a dm-crypt, multipath or integrity target (needs a `DM_TABLE_STATUS` ioctl), and this plugin issues neither.
 2. **A typical Windows host returns `CONSTRAINED` for `quotas`, and the captured `mounts` run was too.** Every NTFS volume with no drive letter (recovery and similar partitions) gets an `unavailable` quota row, which marks the run `windows:dskquota`; in the captured `mounts` run every row carried a size and filesystem type yet the run was `windows:volume_enum`, because the code treats an empty mount-path list as a failed lookup. Read the per-row state rather than the run status alone.
-3. **Windows VSS enumeration has no deadline.** `CreateVssBackupComponents`, `Query` and `Next` are synchronous COM calls with no timeout, run on a bounded agent dispatch-pool worker shared with quarantine and containment dispatch. A wedged VSS service or a hung third-party backup provider parks that worker, so prefer on-demand `snapshots` over a frequent schedule on hosts running third-party backup software.
-4. **Linux `mounts` omits capacity for network filesystems.** `nfs`, `nfs3`, `nfs4`, `cifs`, `smb3`, `smbfs`, `afs`, `ceph`, `glusterfs`, `9p`, `virtiofs`, `lustre`, `beegfs`, `gfs2`, `ocfs2`, `gpfs`, `panfs`, `vboxsf`, `vmhgfs`, `prl_fs`, `autofs`, and network-backed `fuse.*` mounts (`sshfs`, `s3fs`, `davfs`, `rclone`, `cephfs`, `ceph-fuse`, `glusterfs`, `nfs`, `smb`, `vmhgfs-fuse`, `prl_fsd`; the list is `agents/shared/network_fstype.hpp`) are still listed, but their capacity columns read `-`, because a `statvfs` against an unreachable server blocks the dispatch worker indefinitely.
+3. **Windows VSS enumeration is limited to 15 s, and a blocked call is not cancelled.** `CreateVssBackupComponents`, `Query` and `Next` are synchronous COM calls with no timeout of their own, so agent-core runs them on its own worker thread and the action waits at most 15 s. An unanswered read returns one `none` row (`VSS enumeration did not answer: <cause>`) and `CONSTRAINED` with partial completeness, provenance `windows:vss:deadline_exceeded`, `windows:vss:call_in_progress` or `windows:vss:abandoned_call_pending`; snapshots the walk had already seen are not reported. The worker thread stays blocked in agent-core until the Volume Shadow Copy service answers, and until then every further read reports `abandoned_call_pending` without calling VSS again.
+4. **Linux `mounts` omits capacity for network filesystems.** `nfs`, `nfs3`, `nfs4`, `cifs`, `smb3`, `smbfs`, `afs`, `ceph`, `glusterfs`, `9p`, `virtiofs`, `lustre`, `beegfs`, `gfs2`, `ocfs2`, `gpfs`, `panfs`, `vboxsf`, `vmhgfs`, `prl_fs`, `autofs`, `smb2`, `ncpfs`, `coda`, and network-backed `fuse.*` mounts (`sshfs`, `s3fs`, `davfs`, `rclone`, `cephfs`, `ceph-fuse`, `glusterfs`, `nfs`, `smb`, `vmhgfs-fuse`, `prl_fsd`, `gcsfuse`, `goofys`, `blobfuse`, `blobfuse2`, `ossfs`, `obsfs`, `cosfs`, `juicefs`, `mfsmount`, `moosefs`, `lizardfs`, `seaweedfs`, `weed`, `curlftpfs`, `httpfs2`, `s3ql`, `onedrive`, `google-drive-ocamlfuse`, `davfs2`, `fuse-nfs`; the list is `agents/shared/network_fstype.hpp`, a deny-list by name: an unlisted FUSE subtype and an overlay over a network mount are not detected) are still listed, but their capacity columns read `-`, because a `statvfs` against an unreachable server blocks the dispatch worker indefinitely.
 5. **`FSCTL_SRV_ENUMERATE_SNAPSHOTS` was rejected as the Windows snapshots mechanism; do not reintroduce it.** No header in SDK 10.0.26100.0 declares it (a direct probe fails `C2065: undeclared identifier`), and an earlier build had silently compiled the real path out behind a guard. It is also the wrong question: an SMB server-side control that lists previous versions a share exposes, not the shadow copies a volume holds.
 
 ## Source and tests

@@ -1012,7 +1012,7 @@ TEST_CASE("password routes: a session minted with the OLD credential during the 
         if (fired.exchange(true))
             return;
         racer = std::jthread(
-            [&] { minted = h.auth_mgr.create_local_session("vic", Role::user, false, old_anchor); });
+            [&] { minted = h.auth_mgr.create_local_session("vic", Role::user, old_anchor); });
         std::this_thread::sleep_for(std::chrono::milliseconds(300));
     });
     auto res = h.reset("vic", kNew);
@@ -1151,7 +1151,7 @@ TEST_CASE("password routes: a Settings MFA verify queued behind a reset is Crede
     REQUIRE(init.has_value());
     const auto code = totp_now(init->secret_base32);
 
-    std::optional<std::expected<std::vector<std::string>, AuthDBError>> during;
+    std::optional<std::expected<AuthDB::MfaEnrolment, AuthDBError>> during;
     std::atomic<bool> fired{false};
     bool waiter_seen = false;
     std::jthread racer; // joined on every exit path
@@ -1282,9 +1282,11 @@ TEST_CASE("password routes: under sso-only a DISARMED break-glass session cannot
     h.wire();
     h.seed("bg", kOld, Role::admin);
     REQUIRE(h.db->arm_break_glass("bg", 600).has_value());
+    h.auth_routes->reset_break_glass_arm_cache_for_test(); // the gate caches the arm state (1 s)
     h.session_user = "bg"; // signed in while armed
     h.session_role = Role::admin;
     REQUIRE(h.db->disarm_break_glass("bg").has_value());
+    h.auth_routes->reset_break_glass_arm_cache_for_test();
 
     const auto pbkdf2_before = h.pbkdf2_runs();
     for (int i = 0; i < 20; ++i) {
@@ -1303,6 +1305,7 @@ TEST_CASE("password routes: under sso-only a DISARMED break-glass session cannot
 
     // Re-armed: the route behaves normally again.
     REQUIRE(h.db->arm_break_glass("bg", 600).has_value());
+    h.auth_routes->reset_break_glass_arm_cache_for_test(); // the gate caches the arm state (1 s)
     auto wrong = h.change("still-not-it-123", kNew);
     REQUIRE(wrong);
     CHECK(wrong->status == 403);
@@ -1847,7 +1850,7 @@ TEST_CASE("password routes: a same-account recovery-code sign-in during an audit
     auto codes =
         h.db->mfa_verify_enrollment("vic", totp_now(init->secret_base32, -1), std::nullopt);
     REQUIRE(codes.has_value());
-    REQUIRE_FALSE(codes->empty());
+    REQUIRE_FALSE(codes->recovery_codes.empty());
     const auto h0 = h.stored_hash("vic");
     const auto prior = h.auth_mgr.create_local_session_for_test("vic", Role::user, true);
     REQUIRE_FALSE(prior.empty());
@@ -1873,9 +1876,9 @@ TEST_CASE("password routes: a same-account recovery-code sign-in during an audit
     {
         std::jthread tv([&] { resV = h.reset("vic", kNew); }); // joined on every exit path
         owner_waiting = yuzu::test::wait_for_pg_lock_waiter(h.db.dsn(), "%INSERT INTO audit_store%");
-        step2 = h.sink.Post("/login/mfa",
-                            "mfa_pending_token=" + pending + "&code=" + codes->front(),
-                            "application/x-www-form-urlencoded");
+        step2 = h.sink.Post(
+            "/login/mfa", "mfa_pending_token=" + pending + "&code=" + codes->recovery_codes.front(),
+            "application/x-www-form-urlencoded");
         tv.join();
     }
     CHECK(run("ROLLBACK"));
@@ -1911,4 +1914,57 @@ TEST_CASE("password routes: the literal /me route wins over the {name} regex",
     REQUIRE(res);
     CHECK(res->status == 400); // the SELF handler's body validation, not the admin gate
     CHECK(h.password_works("olga", kOld));
+}
+
+// WP03 (T14): the self-service password change runs the same arm gate as /login. An arm state
+// that cannot be read is NOT an admission there: the route answers 403 sso_only_local_disabled
+// with no hash and no lockout strike, exactly as for a break-glass account that is not armed.
+TEST_CASE("password routes: under sso-only an unreadable break-glass arm state is refused, never evaluated",
+          "[pg][rest][password][lockout][wp03]") {
+    PasswordRoutesHarness h(/*lockout_threshold=*/3);
+    h.cfg.auth_mode = "sso-only";
+    h.cfg.break_glass_user = "bg";
+    h.wire();
+    h.seed("bg", kOld, Role::admin);
+    std::atomic<int> mode{0}; // 0 armed, 2 the read fails
+    h.auth_routes->set_arm_clock_for_test(1'000'000);
+    h.auth_routes->set_break_glass_status_hook_for_test([&mode] {
+        yuzu::server::BreakGlassArmRead r;
+        r.ok = mode.load() == 0;
+        r.armed = r.ok;
+        r.armed_until = "arm-1";
+        r.remaining_ms = 600'000;
+        return r;
+    });
+    h.auth_routes->reset_break_glass_arm_cache_for_test();
+    h.session_user = "bg"; // signed in while armed
+    h.session_role = Role::admin;
+
+    // Armed and readable: the route evaluates the current password (a wrong one is wrong_current).
+    auto armed_wrong = h.change("not-the-password-1", kNew);
+    REQUIRE(armed_wrong);
+    CHECK(armed_wrong->status == 403);
+    REQUIRE(h.has_audit("user.password_change", "denied", "wrong_current"));
+
+    // The cached armed answer ages out and the next read fails: the arm state is unreadable.
+    h.auth_routes->advance_arm_clock_for_test(1100);
+    mode = 2;
+    const auto pbkdf2_before = h.pbkdf2_runs();
+    auto res = h.change(kOld, kNew); // the CORRECT current password
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    // The gate's own refusal, not a step-up refusal or a wrong-password one.
+    CHECK(h.has_audit("user.password_change", "denied", "sso_only_local_disabled"));
+    CHECK(h.pbkdf2_runs() == pbkdf2_before); // nothing was hashed
+    // No lockout assertion here on purpose: the break-glass account is lockout-exempt on this
+    // route under sso-only, so its failed count stays 0 whether or not an attempt reached the
+    // verifier (the wrong_current attempt above did, and left it at 0). The hash count and the
+    // audit row are what show the verifier was not reached.
+    CHECK(h.password_works("bg", kOld)); // the password did not change
+
+    // Control: readable and armed again, the same request succeeds.
+    mode = 0;
+    auto ok = h.change(kOld, kNew);
+    REQUIRE(ok);
+    CHECK(ok->status == 200);
 }

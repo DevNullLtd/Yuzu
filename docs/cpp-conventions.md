@@ -31,6 +31,7 @@ The `cpp-expert` and `cpp-safety` agents load this document on any C++ source ch
 - The C API in `sdk/include/yuzu/plugin.h` must stay stable. No C++ types cross the boundary — only `const char*`, fixed-size arrays, and C enums.
 - C++ ergonomics live in `plugin.hpp` (CRTP + `YUZU_PLUGIN_EXPORT` macro). Don't break the C boundary when extending the C++ wrapper.
 - `YUZU_PLUGIN_ABI_VERSION` increments on any layout change with a migration plan (architect agent gates this).
+- A blocking OS call with no timeout of its own is bounded by an exported agent-core function, never by a detached thread in plugin code (the plugin can be unloaded under it). How to do it: [ADR-3008](adr/3008-bounded-os-calls-in-agent-core.md). `tests/test_bounded_os_call_lexical.py` enforces the plugin side.
 
 ### Reserved plugin names
 
@@ -83,7 +84,7 @@ The repo's shared owners live in `agents/core/include/yuzu/agent/` — reach for
 | `ScopedCFRef<T>` | a CoreFoundation `+1` reference (macOS) | `scoped_cfref.hpp` |
 | `ScopedIOObject` | an IOKit `io_object_t` / Mach send right (macOS) | `scoped_ioobject.hpp` |
 
-All three are move-only and release exactly once. The `reset()` contract differs by resource, and the difference is deliberate. For the two REFCOUNTED owners (`ScopedCFRef`, `ScopedIOObject`) the argument is an **owned `+1`** consumed **even when it shares identity with the current value**, because a same-identity `+1` is a distinct release obligation — an equality early-return leaks it, and `reset(get())` is caller misuse, not a no-op. `ScopedFd` keeps an `fd == fd_` early-return and is right to: a descriptor is a value, not a refcount, so two live owning claims on one number cannot coexist, and dropping the guard would close the fd and then retain the closed number. Objective-C++/ARC specifics are in `docs/native-objcpp-conventions.md`.
+All three are move-only and release exactly once. The `reset()` contract differs by resource, and the difference is deliberate. For the two REFCOUNTED owners (`ScopedCFRef`, `ScopedIOObject`) the argument is an **owned `+1`** consumed **even when it shares identity with the current value**, because a same-identity `+1` is a distinct release obligation — an equality early-return leaks it, and `reset(get())` is caller misuse, not a no-op. `ScopedFd` keeps an `fd == fd_` early-return and is right to: a descriptor is a value, not a refcount, so two live owning claims on one number cannot coexist, and dropping the guard would close the fd and then retain the closed number. The two refcounted implementations are separate, so the CF test cannot catch an IOKit-only regression; do not "harmonise" the three `reset()` contracts. Objective-C++/ARC specifics are in `docs/native-objcpp-conventions.md`.
 
 Resource owner types must be non-copyable when copying would double-release. Prefer move-only wrappers with explicit transfer semantics; any use of `release()` must immediately hand the resource to another named owner.
 
@@ -112,10 +113,11 @@ Use for assets we author in this repo (page HTML shells, small bespoke JS module
 
 Use for vendored assets (Three.js r168, ECharts, IBM Plex typeface) and for first-party assets that outgrew Pattern A (`static/yuzu-viz.js`, `static/yuzu-viz-host.js`, `static/yuzu.css`). htmx is the exception: it is vendored but hand-split into raw-string literals in the tracked `static_js_bundle.cpp`, not codegen'd.
 
-- Source file lives in `server/core/vendor/` (vendored text), `server/core/vendor/<asset>/` (vendored binary), or `server/core/static/` (first-party). One exception: `static/cytoscape.min.js` is vendored third-party code that lives in `static/` (not `vendor/`) and has no `cytoscape-NOTICE.txt` yet.
+- Source file lives in `server/core/vendor/` (vendored text), `server/core/vendor/<asset>/` (vendored binary), or `server/core/static/` (first-party). One exception: `static/cytoscape.min.js` is vendored third-party code that lives in `static/` (not `vendor/`), with its `cytoscape-NOTICE.txt` beside it.
 - `meson.build` declares a `custom_target` that invokes `server/core/scripts/embed_js.py` (text) or `embed_binary.py` (binary). The script chunks input bytes into raw-string fragments and concatenates them at static-init time so MSVC's per-literal 16,380-byte limit cannot be hit.
 - Generated symbol is `kFooJs` for input symbol `FooJs` (the script prepends `k`).
-- Pair every vendored asset (not first-party ones) with a `<asset>-NOTICE.txt` carrying licence + upstream URL + SPDX identifier + SHA-256 (recompute via `shasum -a 256 …`); the test suite pins the byte count, the NOTICE pins the hash, and a vendor refresh updates both in lock-step.
+- Pair every vendored asset (not first-party ones) with a `<asset>-NOTICE.txt` carrying licence + upstream URL + SPDX identifier + SHA-256 (recompute via `shasum -a 256 …`); the test suite pins the byte count, the NOTICE (or, for htmx, the manifest) pins the hash, and a vendor refresh updates both in lock-step.
+- Every vendored file (htmx's literals in `static_js_bundle.cpp` included) also has an entry in `server/core/vendored-components.json` (version and how it was established, licence, purl, SHA-256, size), which puts it on the release SBOMs of every artifact holding `yuzu-server`. `tests/test_vendored_components.py` fails on a file under `vendor/` or `static/` that is unlisted or whose hash differs, and on a NOTICE whose hash or SPDX identifier disagrees with it; a first-party file in `static/` is recognised by its `yuzu-*.js` / `yuzu.css` name.
 - Generated `.cpp` lands in `meson.build`'s `meson.current_build_dir()` and is added to the static library's source list as the custom-target object — do not commit the generated TU.
 
 ### Naming

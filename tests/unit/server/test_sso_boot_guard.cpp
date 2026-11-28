@@ -15,6 +15,8 @@
 
 #include <yuzu/server/server.hpp>
 
+#include <yuzu/metrics.hpp>
+
 #include <catch2/catch_test_macros.hpp>
 
 #include <string>
@@ -176,3 +178,150 @@ TEST_CASE("sso_only_boot_guard_ok: sso-only + complete SAML — fails on Windows
 }
 
 #endif
+
+// ── Runtime-wiring half (#4160) ─────────────────────────────────────────────
+//
+// sso_only_runtime_providers_ok runs inside ServerImpl AFTER the providers are
+// wired, taking the OUTCOME (up/down) rather than reading disk or network. Its
+// callers feed it `provider && provider->is_enabled()`, so these cases pin the
+// decision table directly. NOT covered here: the ServerImpl constructor wiring
+// itself (which provider pointer feeds which flag, startup_failed_ being set) —
+// ServerImpl is not unit-constructible (it needs Postgres); that wiring is
+// guarded by the lexical tripwire tests/test_sso_runtime_wiring_lexical.py (a
+// best-effort source-text check) plus a live boot, which is a manual step, not a
+// test in this tree. The IdP-certificate probe that makes
+// `saml_up` truthful is unit-tested in test_saml_provider.cpp ([4160]).
+
+TEST_CASE("sso_only_runtime_providers_ok: standard mode is always ok", "[sso][bootguard][runtime]") {
+    Config cfg;
+    cfg.auth_mode = "standard";
+    CHECK(sso_only_runtime_providers_ok(cfg, false, false).has_value());
+}
+
+TEST_CASE("sso_only_runtime_providers_ok: sso-only with a provider up is ok",
+          "[sso][bootguard][runtime]") {
+    CHECK(sso_only_runtime_providers_ok(oidc_ready(), true, false).has_value());
+    CHECK(sso_only_runtime_providers_ok(saml_ready(), false, true).has_value());
+}
+
+TEST_CASE("sso_only_runtime_providers_ok: sole OIDC provider disabled at wiring — refuses",
+          "[sso][bootguard][runtime]") {
+    auto r = sso_only_runtime_providers_ok(oidc_ready(), false, false);
+    REQUIRE_FALSE(r.has_value());
+    // Only the provider the operator configured is named in the "but X was disabled"
+    // clause (the cause examples further on mention SAML unconditionally).
+    CHECK(r.error().find("but OIDC was disabled at startup") != std::string::npos);
+    CHECK(r.error().find("but SAML") == std::string::npos);
+}
+
+#ifndef _WIN32
+TEST_CASE("sso_only_runtime_providers_ok: sole SAML provider disabled at wiring — refuses",
+          "[sso][bootguard][runtime]") {
+    // e.g. an unreadable / oversized / unloadable IdP certificate leaves saml_provider_ null.
+    // Symmetric with the OIDC case above: neither provider gets a weaker guarantee.
+    auto r = sso_only_runtime_providers_ok(saml_ready(), false, false);
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error().find("but SAML was disabled at startup") != std::string::npos);
+    CHECK(r.error().find("but OIDC") == std::string::npos);
+}
+
+TEST_CASE("sso_only_runtime_providers_ok: dual config, one broken — boots; both broken — refuses",
+          "[sso][bootguard][runtime]") {
+    Config cfg = saml_ready();
+    cfg.oidc_issuer = "https://login.example.com/tenant/v2.0";
+    cfg.oidc_client_id = "client-abc-123";
+    // One working provider is enough: a broken secondary is a log + gauge, not a refusal.
+    CHECK(sso_only_runtime_providers_ok(cfg, true, false).has_value());
+    CHECK(sso_only_runtime_providers_ok(cfg, false, true).has_value());
+    // Both down: refuse and name both.
+    auto r = sso_only_runtime_providers_ok(cfg, false, false);
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error().find("but OIDC and SAML were disabled at startup") != std::string::npos);
+}
+#endif
+
+TEST_CASE("sso_only_runtime_providers_ok: break-glass does not satisfy the check",
+          "[sso][bootguard][runtime]") {
+    // Break-glass is the recovery for an IdP outage AFTER a successful start, not
+    // an SSO provider. Configuring it must change NOTHING: same verdict and the
+    // same message as without it (the text mentions break-glass unconditionally,
+    // so asserting the word would prove nothing — compare the two results).
+    Config without = oidc_ready();
+    Config with = oidc_ready();
+    with.break_glass_user = "emergency-admin";
+    auto a = sso_only_runtime_providers_ok(without, false, false);
+    auto b = sso_only_runtime_providers_ok(with, false, false);
+    REQUIRE_FALSE(a.has_value());
+    REQUIRE_FALSE(b.has_value());
+    CHECK(a.error() == b.error());
+    // ...and a working provider still passes with break-glass set (it is not a blocker either).
+    CHECK(sso_only_runtime_providers_ok(with, true, false).has_value());
+}
+
+TEST_CASE("sso_only_runtime_providers_ok: no configured provider at all — generic wording",
+          "[sso][bootguard][runtime]") {
+    // Unreachable in production (main.cpp's presence guard refuses first) but the
+    // helper must still refuse and say something coherent when called directly.
+    Config cfg;
+    cfg.auth_mode = "sso-only";
+    auto r = sso_only_runtime_providers_ok(cfg, false, false);
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error().find("the configured SSO provider") != std::string::npos);
+}
+
+TEST_CASE("sso_only_runtime_providers_ok: the refusal states the cause and the safe recovery",
+          "[sso][bootguard][runtime]") {
+    auto r = sso_only_runtime_providers_ok(oidc_ready(), false, false);
+    REQUIRE_FALSE(r.has_value());
+    // Points at the log for the cause and warns what the escape hatch re-enables.
+    CHECK(r.error().find("logged just before this line") != std::string::npos);
+    CHECK(r.error().find("local-password login enabled again") != std::string::npos);
+}
+
+// ── Gauge publisher (#4160) ─────────────────────────────────────────────────
+// The same function the ServerImpl constructor and the Settings OIDC save call,
+// asserted against a standalone registry (the acceptance criterion's "and the
+// gauge"). configured=1 with enabled=0 is the "configured but disabled at
+// runtime" signal.
+
+namespace {
+// A line of the Prometheus exposition: "<name> <value>".
+bool has_sample(const std::string& body, const std::string& name, const char* value) {
+    return body.find("\n" + name + " " + value + "\n") != std::string::npos ||
+           body.rfind(name + " " + value + "\n", 0) == 0;
+}
+}  // namespace
+
+TEST_CASE("publish_*_provider_gauges: configured and enabled are independent 0/1 gauges",
+          "[sso][bootguard][metrics]") {
+    yuzu::MetricsRegistry m;
+    publish_oidc_provider_gauges(m, /*configured=*/true, /*enabled=*/false);
+    publish_saml_provider_gauges(m, /*configured=*/false, /*enabled=*/false);
+    std::string body = m.serialize();
+    // "configured but disabled at runtime" — the alertable state:
+    CHECK(has_sample(body, "yuzu_auth_oidc_provider_configured", "1"));
+    CHECK(has_sample(body, "yuzu_auth_oidc_provider_enabled", "0"));
+    // "not configured":
+    CHECK(has_sample(body, "yuzu_auth_saml_provider_configured", "0"));
+    CHECK(has_sample(body, "yuzu_auth_saml_provider_enabled", "0"));
+
+    // Republishing (the Settings save path) overwrites rather than duplicating.
+    publish_oidc_provider_gauges(m, true, true);
+    body = m.serialize();
+    CHECK(has_sample(body, "yuzu_auth_oidc_provider_enabled", "1"));
+    CHECK_FALSE(has_sample(body, "yuzu_auth_oidc_provider_enabled", "0"));
+
+    // SAML with the two flags set the OTHER way round, and OIDC unconfigured-but-enabled,
+    // so a swapped or constant-valued publisher cannot hide behind (false,false).
+    yuzu::MetricsRegistry m2;
+    publish_saml_provider_gauges(m2, /*configured=*/true, /*enabled=*/false);
+    publish_oidc_provider_gauges(m2, /*configured=*/false, /*enabled=*/true);
+    body = m2.serialize();
+    CHECK(has_sample(body, "yuzu_auth_saml_provider_configured", "1"));
+    CHECK(has_sample(body, "yuzu_auth_saml_provider_enabled", "0"));
+    CHECK(has_sample(body, "yuzu_auth_oidc_provider_configured", "0"));
+    CHECK(has_sample(body, "yuzu_auth_oidc_provider_enabled", "1"));
+    publish_saml_provider_gauges(m2, true, true);
+    body = m2.serialize();
+    CHECK(has_sample(body, "yuzu_auth_saml_provider_enabled", "1"));
+}

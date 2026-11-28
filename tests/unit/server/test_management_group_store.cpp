@@ -19,10 +19,13 @@
 
 #include "management_group_store.hpp"
 
+#include "mgmt_group_error.hpp"
+
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
 
 #include "../test_helpers.hpp"
+#include "test_mgmt_group_pg_helper.hpp" // plant_group_role_row (test-only raw group-role insert)
 
 #include <yuzu/metrics.hpp>
 
@@ -33,6 +36,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -145,6 +149,44 @@ TEST_CASE("ManagementGroupStore: duplicate name rejected", "[pg][management_grou
 
     auto r2 = store.create_group(g);
     REQUIRE(!r2.has_value());
+    // The caller's conflict, named as such: not one of the store-fault messages.
+    CHECK(r2.error() == "a group with that name already exists");
+    CHECK_FALSE(mgmt_group_error_is_store_fault(r2.error()));
+}
+
+TEST_CASE("ManagementGroupStore: renaming onto an existing name is a name conflict, not a fault",
+          "[pg][management_group][crud]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mgmt_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ManagementGroupStore store{pool};
+
+    ManagementGroup a;
+    a.name = "First";
+    a.membership_type = "static";
+    REQUIRE(store.create_group(a).has_value());
+    ManagementGroup b;
+    b.name = "Second";
+    b.membership_type = "static";
+    auto bid = store.create_group(b);
+    REQUIRE(bid.has_value());
+
+    auto fetched = store.get_group(*bid);
+    REQUIRE(fetched.has_value());
+    fetched->name = "First";
+    auto r = store.update_group(*fetched);
+    REQUIRE(!r.has_value());
+    CHECK(r.error() == "a group with that name already exists");
+    CHECK_FALSE(mgmt_group_error_is_store_fault(r.error()));
+
+    // A different unique-constraint hit (the generated id) is still a store fault: a retry mints
+    // a new id, so it is the one case where retrying is right.
+    ManagementGroup c;
+    c.id = *bid;
+    c.name = "Third";
+    c.membership_type = "static";
+    auto dup_id = store.create_group(c);
+    REQUIRE(!dup_id.has_value());
+    CHECK(mgmt_group_error_is_store_fault(dup_id.error()));
 }
 
 TEST_CASE("ManagementGroupStore: update group", "[pg][management_group][crud]") {
@@ -294,6 +336,239 @@ TEST_CASE("ManagementGroupStore: static membership", "[pg][management_group][mem
     CHECK(members2.size() == 1);
 }
 
+// Decommission memberships: the returning-id question, in two phases. Register's only membership
+// write is add_member(root), so an agent that registers again with the same id keeps every group it
+// was in UNLESS a decommission removed its memberships in between (the tenth cascade store), in
+// which case it is back in the ROOT group only. This test models that Register write directly
+// against the store; the Register-side half (an approved id takes the fast path, no token) is
+// driven through the real service in test_agent_service_impl.cpp.
+TEST_CASE("ManagementGroupStore: a re-registered agent id keeps its memberships until decommission, then rejoins root only",
+          "[pg][management_group][members][decommission]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mgmt_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ManagementGroupStore store{pool};
+
+    // The root group is created by ServerImpl at boot (server.cpp: "Ensure root 'All Devices' group
+    // exists"), not by the store migration, so a bare store has none and add_member(root) would
+    // violate the group foreign key. Bootstrap it the way the server does.
+    {
+        ManagementGroup root;
+        root.id = ManagementGroupStore::kRootGroupId;
+        root.name = "All Devices";
+        root.membership_type = "dynamic";
+        root.scope_expression = "*";
+        root.created_by = "system";
+        REQUIRE(store.create_group(root).has_value());
+    }
+    auto make = [&](const char* name, const char* type) {
+        ManagementGroup g;
+        g.name = name;
+        g.membership_type = type;
+        auto id = store.create_group(g);
+        REQUIRE(id.has_value());
+        return *id;
+    };
+    const auto s1 = make("Static one", "static");
+    const auto s2 = make("Static two", "static");
+    const auto dyn = make("Dynamic one", "dynamic");
+
+    // a1: root (as Register adds it), two static groups, one dynamic group. a2: bystander.
+    REQUIRE(store.add_member(ManagementGroupStore::kRootGroupId, "a1").has_value());
+    REQUIRE(store.add_member(s1, "a1").has_value());
+    REQUIRE(store.add_member(s2, "a1").has_value());
+    store.refresh_dynamic_membership(dyn, {"a1"});
+    REQUIRE(store.add_member(s1, "a2").has_value());
+    REQUIRE(store.add_member(s2, "a2").has_value());
+
+    auto sorted_groups = [&](const std::string& agent) {
+        auto g = store.get_agent_groups(agent);
+        REQUIRE(g.has_value());
+        std::vector<std::string> v = *g;
+        std::sort(v.begin(), v.end());
+        return v;
+    };
+    std::vector<std::string> want_a1{ManagementGroupStore::kRootGroupId, s1, s2, dyn};
+    std::sort(want_a1.begin(), want_a1.end());
+    REQUIRE(sorted_groups("a1") == want_a1);
+
+    // Re-registration, modelled exactly as production does it: the root-group add, result discarded.
+    // Nothing else on that path writes membership.
+    (void)store.add_member(ManagementGroupStore::kRootGroupId, "a1");
+
+    // The agent never left a group, so its old scope is intact: exact set, not "non-empty".
+    CHECK(sorted_groups("a1") == want_a1);
+    std::vector<std::string> want_a2{s1, s2};
+    std::sort(want_a2.begin(), want_a2.end());
+    CHECK(sorted_groups("a2") == want_a2);
+
+    // After decommission the id is in no group; the modelled re-registration puts it back in the
+    // ROOT group only. Non-root scope does not come back by itself.
+    REQUIRE(store.delete_agent("a1"));
+    (void)store.add_member(ManagementGroupStore::kRootGroupId, "a1");
+    CHECK(sorted_groups("a1") == std::vector<std::string>{ManagementGroupStore::kRootGroupId});
+    CHECK(sorted_groups("a2") == want_a2);
+}
+
+// #6352: ManagementGroupStore::delete_agent, the tenth decommission cascade store.
+namespace {
+struct DeleteAgentFixture {
+    std::string root;
+    std::string s1, s2, dyn;
+};
+
+// The root group is created by ServerImpl at boot, not by the store migration; bootstrap it the way
+// server.cpp does. a1 sits in root, two static groups and one dynamic group; a2 (the bystander) in
+// root and s1.
+DeleteAgentFixture seed_delete_agent(ManagementGroupStore& store) {
+    ManagementGroup root;
+    root.id = ManagementGroupStore::kRootGroupId;
+    root.name = "All Devices";
+    root.membership_type = "dynamic";
+    root.scope_expression = "*";
+    root.created_by = "system";
+    REQUIRE(store.create_group(root).has_value());
+    auto make = [&](const char* name, const char* type) {
+        ManagementGroup g;
+        g.name = name;
+        g.membership_type = type;
+        auto id = store.create_group(g);
+        REQUIRE(id.has_value());
+        return *id;
+    };
+    DeleteAgentFixture f;
+    f.root = ManagementGroupStore::kRootGroupId;
+    f.s1 = make("S1", "static");
+    f.s2 = make("S2", "static");
+    f.dyn = make("Dyn", "dynamic");
+    REQUIRE(store.add_member(f.root, "a1").has_value());
+    REQUIRE(store.add_member(f.s1, "a1").has_value());
+    REQUIRE(store.add_member(f.s2, "a1").has_value());
+    store.refresh_dynamic_membership(f.dyn, {"a1"});
+    REQUIRE(store.add_member(f.root, "a2").has_value());
+    REQUIRE(store.add_member(f.s1, "a2").has_value());
+    return f;
+}
+
+std::vector<std::string> sorted_ids(std::vector<std::string> v) {
+    std::sort(v.begin(), v.end());
+    return v;
+}
+} // namespace
+
+TEST_CASE("ManagementGroupStore::delete_agent removes the agent from every group and no other",
+          "[pg][management_group][members][decommission]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mgmt_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ManagementGroupStore store{pool};
+    const auto f = seed_delete_agent(store);
+    REQUIRE(sorted_ids(store.get_agent_groups("a1").value()) ==
+            sorted_ids({f.root, f.s1, f.s2, f.dyn}));
+
+    std::vector<std::string> removed;
+    std::size_t removed_count = 99;
+    CHECK(store.delete_agent("a1", &removed, &removed_count));
+    // The evidence: exactly the groups the agent was removed from (static, dynamic and root), and
+    // the count the cascade uses to tell a complete id list from a lost one.
+    CHECK(sorted_ids(removed) == sorted_ids({f.root, f.s1, f.s2, f.dyn}));
+    CHECK(removed_count == removed.size());
+
+    // A value, not nullopt (no degrade): the agent is in NO group, static, dynamic and root alike.
+    auto after = store.get_agent_groups("a1");
+    REQUIRE(after.has_value());
+    CHECK(after->empty());
+    for (const auto& gid : {f.root, f.s1, f.s2, f.dyn})
+        for (const auto& m : store.get_members(gid))
+            CHECK(m.agent_id != "a1");
+
+    // The bystander's exact set and each group's remaining member list are intact.
+    CHECK(sorted_ids(store.get_agent_groups("a2").value()) == sorted_ids({f.root, f.s1}));
+    CHECK(store.get_members(f.s1).size() == 1);
+    CHECK(store.get_members(f.root).size() == 1);
+    // The groups themselves are untouched.
+    CHECK(store.get_group(f.s1).has_value());
+    CHECK(store.get_group(f.dyn).has_value());
+}
+
+TEST_CASE("ManagementGroupStore::delete_agent is idempotent and an unknown id is a successful no-op",
+          "[pg][management_group][members][decommission]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mgmt_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ManagementGroupStore store{pool};
+    const auto f = seed_delete_agent(store);
+
+    CHECK(store.delete_agent("never-seen")); // true, zero rows
+    CHECK(sorted_ids(store.get_agent_groups("a1").value()) ==
+          sorted_ids({f.root, f.s1, f.s2, f.dyn})); // nothing else touched
+    CHECK(sorted_ids(store.get_agent_groups("a2").value()) == sorted_ids({f.root, f.s1}));
+
+    CHECK(store.delete_agent("a1"));
+    CHECK(store.delete_agent("a1")); // second call on a deleted id: still true
+    CHECK(store.get_agent_groups("a1").value().empty());
+}
+
+TEST_CASE("ManagementGroupStore::delete_agent refuses an empty or NUL-bearing id and deletes nothing",
+          "[pg][management_group][members][decommission]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mgmt_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ManagementGroupStore store{pool};
+    const auto f = seed_delete_agent(store);
+
+    std::vector<std::string> removed{"stale"};
+    CHECK_FALSE(store.delete_agent("", &removed));
+    CHECK(removed.empty()); // cleared on a refusal, never left holding stale ids
+    CHECK_FALSE(store.delete_agent(""));
+    // An embedded NUL must not truncate onto another agent's id ("a1\0x" would otherwise read as "a1").
+    CHECK_FALSE(store.delete_agent(std::string_view("a1\0x", 4)));
+    CHECK(sorted_ids(store.get_agent_groups("a1").value()) ==
+          sorted_ids({f.root, f.s1, f.s2, f.dyn}));
+}
+
+// Point-in-time pin : delete_agent is not a tombstone. add_member and
+// refresh_dynamic_membership are INSERT ... ON CONFLICT DO NOTHING with no agent-existence check, so
+// the id can be put back in a group after the delete returned, for example by an operator add or by
+// a dynamic group created later. The deterministic, non-racing form of the documented residual.
+TEST_CASE("ManagementGroupStore::delete_agent is point-in-time: a later add puts the id back",
+          "[pg][management_group][members][decommission]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mgmt_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ManagementGroupStore store{pool};
+    const auto f = seed_delete_agent(store);
+
+    REQUIRE(store.delete_agent("a1"));
+    REQUIRE(store.get_agent_groups("a1").value().empty());
+
+    REQUIRE(store.add_member(f.s2, "a1").has_value());
+    store.refresh_dynamic_membership(f.dyn, {"a1"});
+    CHECK(sorted_ids(store.get_agent_groups("a1").value()) == sorted_ids({f.s2, f.dyn}));
+}
+
+// A lease that cannot be had is a refusal, never a false erasure: the only pooled
+// connection is held, so a bounded acquire on the saturated pool gives up (the pool fails a bounded
+// acquire fast, well inside kWriteTimeout) and delete_agent returns false, and the rows survive.
+TEST_CASE("ManagementGroupStore::delete_agent returns false when no connection is available",
+          "[pg][management_group][members][decommission]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mgmt_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 1}};
+    ManagementGroupStore store{pool};
+    REQUIRE(store.is_open());
+    const auto f = seed_delete_agent(store);
+
+    auto held = pool.try_acquire_for(std::chrono::seconds(2));
+    REQUIRE(held);
+    CHECK_FALSE(store.delete_agent("a1"));
+    held = {}; // release the only connection
+    CHECK(sorted_ids(store.get_agent_groups("a1").value()) ==
+          sorted_ids({f.root, f.s1, f.s2, f.dyn}));
+}
+
+TEST_CASE("ManagementGroupStore::delete_agent returns false on a store that is not open",
+          "[management_group][degrade][decommission]") {
+    PgPool pool{{.conninfo = "yuzu_invalid_keyword=1", .size = 1}};
+    ManagementGroupStore store{pool};
+    REQUIRE(!store.is_open());
+    CHECK_FALSE(store.delete_agent("a1"));
+}
+
 TEST_CASE("ManagementGroupStore: dynamic membership refresh", "[pg][management_group][members]") {
     YUZU_REQUIRE_PG_DB_TPL(db, mgmt_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
@@ -364,6 +639,97 @@ TEST_CASE("ManagementGroupStore: engine principals cannot hold scoped role assig
     a.role_name = "Viewer";
     auto r = store.assign_role(a);
     REQUIRE(!r.has_value());
+}
+
+// PR-1a: the store refuses a group-scoped ITServiceOwner grant. EXACT byte match (no case
+// folding, no trimming); a variant is an ordinary custom role. Rows already stored stay readable
+// and removable.
+TEST_CASE("ManagementGroupStore: assign_role refuses a group-scoped ITServiceOwner grant",
+          "[pg][management_group][roles]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mgmt_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ManagementGroupStore store{pool};
+
+    ManagementGroup g;
+    g.name = "ItsoGroup";
+    g.membership_type = "static";
+    auto group_id = store.create_group(g);
+    REQUIRE(group_id.has_value());
+
+    auto make = [&](const std::string& ptype, const std::string& pid, const std::string& role) {
+        GroupRoleAssignment a;
+        a.group_id = *group_id;
+        a.principal_type = ptype;
+        a.principal_id = pid;
+        a.role_name = role;
+        return a;
+    };
+    const std::string kFixed = "this role cannot be assigned at management-group scope";
+
+    SECTION("a user principal is refused with the fixed, non-fault message") {
+        auto r = store.assign_role(make("user", "alice", "ITServiceOwner"));
+        REQUIRE(!r.has_value());
+        CHECK(r.error() == kFixed);
+        CHECK_FALSE(mgmt_group_error_is_store_fault(r.error()));
+        CHECK(store.get_group_roles(*group_id).empty());
+    }
+
+    SECTION("a group principal is refused") {
+        auto r = store.assign_role(make("group", "ops-team", "ITServiceOwner"));
+        REQUIRE(!r.has_value());
+        CHECK(r.error() == kFixed);
+        CHECK(store.get_group_roles(*group_id).empty());
+    }
+
+    SECTION("the engine refusal still wins over the deny-list (check order)") {
+        auto r = store.assign_role(make("engine", "engine:nvd", "ITServiceOwner"));
+        REQUIRE(!r.has_value());
+        CHECK(r.error().find("cannot hold scoped") != std::string::npos);
+        CHECK(r.error() != kFixed);
+        CHECK(store.get_group_roles(*group_id).empty());
+    }
+
+    SECTION("other roles are accepted, built-in and custom") {
+        REQUIRE(store.assign_role(make("user", "alice", "Operator")).has_value());
+        REQUIRE(store.assign_role(make("user", "alice", "Viewer")).has_value());
+        REQUIRE(store.assign_role(make("user", "alice", "ForensicsScoped")).has_value());
+        CHECK(store.get_group_roles(*group_id).size() == 3);
+    }
+
+    SECTION("variants of the name are ordinary custom roles (exact byte match)") {
+        const std::string nul_form("ITServiceOwner\0", 15);
+        REQUIRE(nul_form.size() == 15);
+        const std::vector<std::string> variants = {"itserviceowner", "ITServiceOwner ", nul_form};
+        for (const auto& v : variants) {
+            INFO("variant size " << v.size());
+            REQUIRE(store.assign_role(make("user", "bob", v)).has_value());
+        }
+        auto roles = store.get_group_roles(*group_id);
+        REQUIRE(roles.size() == 3);
+        std::vector<std::string> stored;
+        for (const auto& r : roles)
+            stored.push_back(r.role_name);
+        CHECK(std::find(stored.begin(), stored.end(), "itserviceowner") != stored.end());
+        CHECK(std::find(stored.begin(), stored.end(), "ITServiceOwner ") != stored.end());
+        // sanitize_pg_text substitutes the NUL with U+FFFD (never deletes), so the stored name
+        // is a different string from the refused one.
+        CHECK(std::find(stored.begin(), stored.end(), std::string("ITServiceOwner\xEF\xBF\xBD")) !=
+              stored.end());
+        CHECK(std::find(stored.begin(), stored.end(), "ITServiceOwner") == stored.end());
+    }
+
+    SECTION("an already-stored row is still read and still removable") {
+        const auto planted = make("user", "carol", "ITServiceOwner");
+        yuzu::test::plant_group_role_row(db.dsn(), planted);
+        auto roles = store.get_group_roles(*group_id);
+        REQUIRE(roles.size() == 1);
+        CHECK(roles[0].role_name == "ITServiceOwner");
+        // The refusal does not touch it; the same assign is still refused.
+        CHECK_FALSE(store.assign_role(planted).has_value());
+        auto d = store.unassign_role(*group_id, "user", "carol", "ITServiceOwner");
+        REQUIRE(d.has_value());
+        CHECK(store.get_group_roles(*group_id).empty());
+    }
 }
 
 TEST_CASE("ManagementGroupStore: get_assignments_for_principal unions user and group arms",
@@ -468,7 +834,7 @@ TEST_CASE("ManagementGroupStore: get_visible_agents honors RBAC-disabled posture
         a.group_id = *gid_a;
         a.principal_type = "user";
         a.principal_id = "admin";
-        a.role_name = "ITServiceOwner";
+        a.role_name = "Operator";
         REQUIRE(store.assign_role(a).has_value());
         auto visible = store.get_visible_agents("admin");
         REQUIRE(visible.has_value());
@@ -844,6 +1210,150 @@ TEST_CASE("ManagementGroupStore: cascade delete removes members and roles",
 
     auto roles = store.get_group_roles(*group_id);
     CHECK(roles.empty());
+}
+
+// #7074 (C1): validate_new_group exposes the pre-insert refusals of create_group so a caller can refuse
+// BEFORE writing an audit row. create_group runs the same function, so each refusal text is identical.
+TEST_CASE("ManagementGroupStore: validate_new_group refusals match create_group text, write nothing",
+          "[pg][management_group][crud][mgmt-audit-first]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mgmt_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ManagementGroupStore store{pool};
+    REQUIRE(store.is_open());
+
+    const auto baseline = store.list_groups_checked();
+    REQUIRE(baseline.has_value());
+
+    // Each case: the input, and the exact text create_group has always returned for it.
+    ManagementGroup empty_name;
+    empty_name.membership_type = "static";
+
+    ManagementGroup self_parent;
+    self_parent.id = "abcdef012345";
+    self_parent.parent_id = self_parent.id;
+    self_parent.name = "SelfParent";
+    self_parent.membership_type = "static";
+
+    ManagementGroup missing_parent;
+    missing_parent.name = "OrphanChild";
+    missing_parent.parent_id = "does-not-exist";
+    missing_parent.membership_type = "static";
+
+    // A chain of six groups (the deepest has five ancestors): a child below it exceeds the cap.
+    std::string prev_id;
+    for (int i = 0; i < 6; ++i) {
+        ManagementGroup g;
+        g.name = "Chain " + std::to_string(i);
+        g.membership_type = "static";
+        g.parent_id = prev_id;
+        auto r = store.create_group(g);
+        REQUIRE(r.has_value());
+        prev_id = *r;
+    }
+    ManagementGroup too_deep;
+    too_deep.name = "Chain 6";
+    too_deep.parent_id = prev_id;
+    too_deep.membership_type = "static";
+
+    const auto after_chain = store.list_groups_checked();
+    REQUIRE(after_chain.has_value());
+    REQUIRE(after_chain->size() == baseline->size() + 6);
+
+    struct Case {
+        const ManagementGroup* group;
+        const char* text;
+    };
+    const Case cases[] = {
+        {&empty_name, "group name cannot be empty"},
+        {&self_parent, "group cannot be its own parent"},
+        {&missing_parent, "parent group not found"},
+        {&too_deep, "maximum hierarchy depth (5) exceeded"},
+    };
+    for (const auto& c : cases) {
+        INFO("expected refusal: " << c.text);
+        auto v = store.validate_new_group(*c.group);
+        REQUIRE(!v.has_value());
+        CHECK(v.error() == c.text);
+
+        // create_group re-runs the same checks and returns the identical text.
+        auto created = store.create_group(*c.group);
+        REQUIRE(!created.has_value());
+        CHECK(created.error() == c.text);
+    }
+
+    // Neither call wrote a row.
+    const auto after = store.list_groups_checked();
+    REQUIRE(after.has_value());
+    CHECK(after->size() == after_chain->size());
+}
+
+TEST_CASE("ManagementGroupStore: validate_new_group accepts valid input without writing",
+          "[pg][management_group][crud][mgmt-audit-first]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mgmt_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ManagementGroupStore store{pool};
+    REQUIRE(store.is_open());
+
+    ManagementGroup parent;
+    parent.name = "ValidateParent";
+    parent.membership_type = "static";
+    auto parent_id = store.create_group(parent);
+    REQUIRE(parent_id.has_value());
+
+    const auto baseline = store.list_groups_checked();
+    REQUIRE(baseline.has_value());
+
+    ManagementGroup root;
+    root.name = "ValidateRoot";
+    root.membership_type = "static";
+    ManagementGroup child;
+    child.name = "ValidateChild";
+    child.parent_id = *parent_id;
+    child.membership_type = "static";
+
+    CHECK(store.validate_new_group(root).has_value());
+    CHECK(store.validate_new_group(child).has_value());
+    // A name conflict is a write-time outcome, not a pre-insert check: validation does not see it.
+    ManagementGroup dup;
+    dup.name = "ValidateParent";
+    dup.membership_type = "static";
+    CHECK(store.validate_new_group(dup).has_value());
+
+    const auto after = store.list_groups_checked();
+    REQUIRE(after.has_value());
+    CHECK(after->size() == baseline->size());
+    CHECK(!store.find_group_by_name("ValidateRoot").has_value());
+    CHECK(!store.find_group_by_name("ValidateChild").has_value());
+
+    // create_group still creates on the same inputs, and still reports the conflict itself.
+    auto root_id = store.create_group(root);
+    REQUIRE(root_id.has_value());
+    auto child_id = store.create_group(child);
+    REQUIRE(child_id.has_value());
+    auto child_row = store.get_group(*child_id);
+    REQUIRE(child_row.has_value());
+    CHECK(child_row->parent_id == *parent_id);
+    auto dup_result = store.create_group(dup);
+    REQUIRE(!dup_result.has_value());
+    CHECK(dup_result.error() == "a group with that name already exists");
+}
+
+// No database: the not-open refusal comes first and is the same text from both entry points.
+TEST_CASE("ManagementGroupStore: validate_new_group and create_group refuse a closed store alike",
+          "[management_group][degrade][mgmt-audit-first]") {
+    PgPool pool{{.conninfo = "yuzu_invalid_keyword=1", .size = 1}};
+    ManagementGroupStore store{pool};
+    REQUIRE(!store.is_open());
+
+    ManagementGroup g;
+    g.name = "ClosedStore";
+    g.membership_type = "static";
+    auto v = store.validate_new_group(g);
+    REQUIRE(!v.has_value());
+    CHECK(v.error() == "database not open");
+    auto c = store.create_group(g);
+    REQUIRE(!c.has_value());
+    CHECK(c.error() == "database not open");
 }
 
 // Degrade-distinguishable fail-closed path (ADR-0042). Deliberately NOT [pg]:

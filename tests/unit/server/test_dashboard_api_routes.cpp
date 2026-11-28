@@ -404,6 +404,26 @@ TEST_CASE("dashboard_api_routes: /api/export/json-to-csv transforms a JSON array
     CHECK(r->body == "name\r\nwidget\r\ngadget\r\n");
 }
 
+// A few KB of JSON can name thousands of columns; the route must answer 413 (not 400,
+// not a multi-hundred-MB body) when the CSV would pass 16 MiB.
+TEST_CASE("dashboard_api_routes: /api/export/json-to-csv answers 413 when the CSV output would exceed "
+          "its limit",
+          "[server][routes][dashboard_api_routes][export]") {
+    Harness h;
+    h.wire();
+    std::string wide = "[{";
+    for (int i = 0; i < 5000; ++i)
+        wide += std::string(i ? "," : "") + "\"k" + std::to_string(i) + "\":1";
+    wide += "}";
+    for (int i = 0; i < 20000; ++i)
+        wide += ",{}";
+    wide += "]";
+    auto r = h.sink.Post("/api/export/json-to-csv", wide);
+    REQUIRE(r);
+    CHECK(r->status == 413);
+    CHECK(r->body.find("16 MiB") != std::string::npos);
+}
+
 TEST_CASE("dashboard_api_routes: /api/export/json-to-csv rejects a non-array JSON body with 400",
           "[server][routes][dashboard_api_routes]") {
     Harness h;

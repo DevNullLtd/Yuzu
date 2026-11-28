@@ -1,24 +1,33 @@
 #include "device_inventory_store.hpp"
 
+#include "device_ci_kinds.hpp"
+#include "pg/pg_array.hpp"
 #include "pg/pg_exec.hpp"
 #include "pg/pg_migration_runner.hpp"
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
+#include "device_ci_section_digest.hpp"
+#include "sha256_hex.hpp"
 
+#include <yuzu/log_token.hpp>
 #include <yuzu/metrics.hpp>
 
 #include <libpq-fe.h>
-#include <openssl/evp.h>
 #include <spdlog/spdlog.h>
 
+#include <algorithm>
+#include <array>
 #include <atomic>
 #include <charconv>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <expected>
+#include <iterator>
 #include <optional>
+#include <ranges>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -26,7 +35,7 @@ namespace yuzu::server {
 
 namespace {
 
-constexpr const char* kStoreName = "device_inventory_store";
+constexpr const char* kStoreName = kDeviceInventoryStoreSchema;
 
 // Bounded acquires (ADR-0012 lease discipline). Ingest runs on the gRPC thread
 // (direct ReportInventory / gateway ProxyInventory) so it gives up fast on a
@@ -34,7 +43,9 @@ constexpr const char* kStoreName = "device_inventory_store";
 // reads are user-facing dashboard requests and can wait a little longer.
 constexpr std::chrono::milliseconds kIngestAcquireTimeout{500};
 constexpr std::chrono::milliseconds kQueryAcquireTimeout{3000};
-// Hard cap on roster rows materialised regardless of the caller's `limit`, so the
+// Execution cap of the keyset SELECT (SET LOCAL statement_timeout); the pool default is 30 s.
+constexpr const char* kKeysetStatementTimeout = "5s";
+// Hard cap on rows one keyset read materialises regardless of the caller's `limit`, so the
 // store can never allocate an unbounded result set.
 constexpr int kListRowCap = 100000;
 
@@ -42,6 +53,14 @@ constexpr int kListRowCap = 100000;
 constexpr const char* kReasonStoreNotOpen = "store_not_open";
 constexpr const char* kReasonPoolTimeout = "pool_acquire_timeout";
 constexpr const char* kReasonQueryError = "query_error";
+// The keyed list read (`list_device_ci_for`) ran out of its overall budget between chunks (#7549): the
+// whole read is reported degraded rather than returned partial.
+constexpr const char* kReasonKeyedBudget = "keyed_read_budget";
+// A failed read of the v2 per-section statements (the section status SELECT or a per-kind row
+// SELECT) after - or, for the standalone `get_device_ci_sections`, instead of - the record read:
+// kept apart from `query_error` (the record read failed) because the two are answered differently
+// (REST 503 / MCP retryable error versus `ci: null`, HTTP 200) and fixed differently.
+constexpr const char* kReasonSectionsQueryError = "sections_query_error";
 // Sample the per-site degrade WARN (leading edge of an episode, then every Nth)
 // so a sustained PG outage during a roster poll cannot flood the log — the counter
 // is the continuous signal, the log a sampled breadcrumb. Values match the
@@ -54,6 +73,15 @@ std::int64_t now_secs() {
                std::chrono::system_clock::now().time_since_epoch())
         .count();
 }
+
+// The PostgreSQL clock in epoch seconds. ONE spelling for every authoring and reading site of
+// `changed_at` (the content upsert, `device_ci_watermark`), so the stamp and the watermark that
+// brackets it come from the same clock and the same rounding. clock_timestamp(), not now(): it
+// advances inside a transaction, so a long ingest transaction does not stamp an old instant.
+// "Same clock" holds for ONE primary: a failover to a node whose clock differs, or a clock step,
+// puts new stamps and an already-issued watermark on different timelines (a residual of the
+// margin, docs/security-reviews/hardware-ci-changed-since-2026-11.md).
+constexpr const char* kDbClockSecsExpr = "EXTRACT(EPOCH FROM clock_timestamp())::bigint";
 
 // Per-site degrade-WARN state (one static instance per call site).
 struct DegradeSampler {
@@ -98,20 +126,255 @@ std::string bigint_param(const std::string& s) {
     return std::to_string(v);
 }
 
-std::string sha256_hex(const std::string& in) {
-    unsigned char md[EVP_MAX_MD_SIZE];
-    unsigned int len = 0;
-    if (EVP_Digest(in.data(), in.size(), md, &len, EVP_sha256(), nullptr) != 1)
-        return {};
-    static const char* kHex = "0123456789abcdef";
-    std::string out;
-    out.reserve(static_cast<std::size_t>(len) * 2);
-    for (unsigned int i = 0; i < len; ++i) {
-        out.push_back(kHex[md[i] >> 4]);
-        out.push_back(kHex[md[i] & 0x0f]);
-    }
+// Split a kDeviceCiSections column list ("a,b,c") into names.
+std::vector<std::string> split_columns(std::string_view columns) {
+    std::vector<std::string> out;
+    for (const auto part : std::views::split(columns, ','))
+        out.emplace_back(part.begin(), part.end());
     return out;
 }
+
+// Migration v2 (additive, online-safe: constant defaults make the ALTER metadata-only,
+// ADR-0008): the v2 blob's identity scalars on device_ci (wire positions 22-32 of
+// device_ci_kinds.hpp), a per-section status table, and one child table per list kind
+// (typed TEXT columns). Children cascade from device_ci so delete_agent stays one statement.
+// Unqualified DDL - the runner sets search_path to the store schema.
+//
+// FROZEN (#7164): this is a checked-in literal, NOT generated from kDeviceCiSections. The
+// runner skips a migration whose version is already recorded, so a generated v2 changes what a
+// FRESH database gets and nothing about a deployed one. Never edit it: a new table-backed kind,
+// or a changed column list, ships its own migration (v4 or later) - see "Registry-backed tables"
+// in docs/postgres-store-playbook.md. What ties the registry to the schema is now (a) the
+// projection check in the constructor (a registry table or column the database lacks refuses
+// at boot) and (b) the schema test in test_device_inventory_store.cpp. The compile-time tie
+// between kDeviceCiScalarFields and the scalar DDL that the old generator carried is replaced
+// by those two. It is byte-identical (3311 bytes, sha256
+// 1e6e39f4f195e20b1d0253ab1fc7bc6d48401162e78371df3ebecaaabaf41f6c) to what the generator emitted
+// when it was frozen, so a database that already ran v2 on today's registry needs nothing.
+constexpr const char* kMigrationV2Sql =
+    "ALTER TABLE device_ci ADD COLUMN blob_version SMALLINT NOT NULL DEFAULT 1,"
+    " ADD COLUMN chassis_type TEXT NOT NULL DEFAULT '',"
+    " ADD COLUMN chassis_serial TEXT NOT NULL DEFAULT '',"
+    " ADD COLUMN chassis_asset_tag TEXT NOT NULL DEFAULT '',"
+    " ADD COLUMN chassis_source TEXT NOT NULL DEFAULT '',"
+    " ADD COLUMN board_vendor TEXT NOT NULL DEFAULT '',"
+    " ADD COLUMN board_product TEXT NOT NULL DEFAULT '',"
+    " ADD COLUMN board_serial TEXT NOT NULL DEFAULT '',"
+    " ADD COLUMN board_source TEXT NOT NULL DEFAULT '',"
+    " ADD COLUMN machine_id_hash TEXT NOT NULL DEFAULT '',"
+    " ADD COLUMN machine_id_algorithm TEXT NOT NULL DEFAULT '',"
+    " ADD COLUMN machine_id_source TEXT NOT NULL DEFAULT '';"
+    "CREATE TABLE device_ci_section (  agent_id TEXT NOT NULL REFERENCES device_ci (agent_id) ON DELETE CASCADE,"
+    "  kind     TEXT NOT NULL,  level    TEXT NOT NULL DEFAULT '',"
+    "  reason   TEXT NOT NULL DEFAULT '',  PRIMARY KEY (agent_id, kind));"
+    "CREATE TABLE device_ci_cpu (agent_id TEXT NOT NULL REFERENCES device_ci (agent_id) ON DELETE CASCADE,"
+    " ord INTEGER NOT NULL, idx TEXT NOT NULL DEFAULT '', model TEXT NOT NULL DEFAULT '',"
+    " cores TEXT NOT NULL DEFAULT '', threads TEXT NOT NULL DEFAULT '',"
+    " clock_mhz TEXT NOT NULL DEFAULT '', socket_designation TEXT NOT NULL DEFAULT '',"
+    " stepping TEXT NOT NULL DEFAULT '', PRIMARY KEY (agent_id, ord));"
+    "CREATE TABLE device_ci_dimm (agent_id TEXT NOT NULL REFERENCES device_ci (agent_id) ON DELETE CASCADE,"
+    " ord INTEGER NOT NULL, slot TEXT NOT NULL DEFAULT '',"
+    " size_mb TEXT NOT NULL DEFAULT '', type TEXT NOT NULL DEFAULT '',"
+    " speed_mhz TEXT NOT NULL DEFAULT '', manufacturer TEXT NOT NULL DEFAULT '',"
+    " part_number TEXT NOT NULL DEFAULT '', serial TEXT NOT NULL DEFAULT '',"
+    " PRIMARY KEY (agent_id, ord));"
+    "CREATE TABLE device_ci_disk (agent_id TEXT NOT NULL REFERENCES device_ci (agent_id) ON DELETE CASCADE,"
+    " ord INTEGER NOT NULL, idx TEXT NOT NULL DEFAULT '', model TEXT NOT NULL DEFAULT '',"
+    " size_gb TEXT NOT NULL DEFAULT '', media_type TEXT NOT NULL DEFAULT '',"
+    " interface TEXT NOT NULL DEFAULT '', PRIMARY KEY (agent_id, ord));"
+    "CREATE TABLE device_ci_swap (agent_id TEXT NOT NULL REFERENCES device_ci (agent_id) ON DELETE CASCADE,"
+    " ord INTEGER NOT NULL, device TEXT NOT NULL DEFAULT '',"
+    " total_mb TEXT NOT NULL DEFAULT '', source TEXT NOT NULL DEFAULT '',"
+    " PRIMARY KEY (agent_id, ord));"
+    "CREATE TABLE device_ci_volume (agent_id TEXT NOT NULL REFERENCES device_ci (agent_id) ON DELETE CASCADE,"
+    " ord INTEGER NOT NULL, volume TEXT NOT NULL DEFAULT '',"
+    " mount_points TEXT NOT NULL DEFAULT '', device TEXT NOT NULL DEFAULT '',"
+    " fstype TEXT NOT NULL DEFAULT '', total_bytes TEXT NOT NULL DEFAULT '',"
+    " detail TEXT NOT NULL DEFAULT '', PRIMARY KEY (agent_id, ord));"
+    "CREATE TABLE device_ci_partition (agent_id TEXT NOT NULL REFERENCES device_ci (agent_id) ON DELETE CASCADE,"
+    " ord INTEGER NOT NULL, disk TEXT NOT NULL DEFAULT '',"
+    " partition TEXT NOT NULL DEFAULT '', size_bytes TEXT NOT NULL DEFAULT '',"
+    " type TEXT NOT NULL DEFAULT '', mount_points TEXT NOT NULL DEFAULT '',"
+    " detail TEXT NOT NULL DEFAULT '', PRIMARY KEY (agent_id, ord));"
+    "CREATE TABLE device_ci_topology (agent_id TEXT NOT NULL REFERENCES device_ci (agent_id) ON DELETE CASCADE,"
+    " ord INTEGER NOT NULL, topo_kind TEXT NOT NULL DEFAULT '',"
+    " name TEXT NOT NULL DEFAULT '', uuid TEXT NOT NULL DEFAULT '',"
+    " members TEXT NOT NULL DEFAULT '', detail TEXT NOT NULL DEFAULT '',"
+    " PRIMARY KEY (agent_id, ord));";
+
+// Migration v3 (additive, online-safe, ADR-0008): the number of child rows stored for the
+// section (`row_count`) and the SHA-256 of their canonical serialization (`content_digest`),
+// both written in the same transaction as the rows. NULL = status-only kind (no child rows) or a
+// row written before v3 (unknown) - both read exactly as before (never verified). Nullable with
+// no default and no CHECK: the ALTERs are metadata-only and cannot fail on existing rows.
+// v3 is unreleased, so the digest column is folded into it rather than adding a v4. The ADDs are
+// IF NOT EXISTS so a re-run is harmless, BUT the runner will not run an applied version again: a
+// database that already recorded the earlier row_count-only v3 lacks content_digest. Since #7158
+// the runner's recorded-hash check refuses first when that database recorded the old text AFTER
+// public.yuzu_schema_migrations existed (the log line names the store and v3); a database that
+// applied the old v3 BEFORE the table existed was recorded as first seen with this build's text,
+// so the constructor's projection check refuses it instead, with a log line naming
+// device_ci_section. Either way server.cpp refuses to start the server. The reset for such a
+// dev/UAT database is in docs/user-manual/upgrading.md ("the server refuses to start on a device
+// inventory schema it cannot read"): UPDATE public.schema_meta SET version = 2 WHERE store =
+// 'device_inventory_store', then restart (the re-applied v3 overwrites its recorded hash).
+// Unqualified DDL - the runner sets search_path to the store schema.
+constexpr const char* kMigrationV3Sql =
+    "ALTER TABLE device_ci_section ADD COLUMN IF NOT EXISTS row_count INTEGER NULL, "
+    "ADD COLUMN IF NOT EXISTS content_digest TEXT NULL;";
+
+// v4: the index behind the bulk CI read's C-collated keyset (`list_device_ci_after`). That read
+// orders and compares `agent_id COLLATE "C"` (byte order). Its CORRECTNESS comes from that
+// spelling in the query: the primary key's index is built under the DATABASE collation, so a
+// libc/ICU upgrade under an existing volume (no REINDEX) leaves it stale, and a keyset walk
+// ordered by it can skip rows with no error (measured on a mechanical emulation of a collation
+// change: 11,945 of 50,030 ids at limit 1; see
+// docs/security-reviews/hardware-ci-bulk-read-collation-drift-2026-11-15.md). "C" is byte
+// comparison, which no library upgrade changes, so the query stays correct without this index. The
+// index makes an index scan available for each page (the planner decides): only an index on that
+// exact expression can serve the query, and without it every page is a scan plus a sort (about
+// 317 ms a page at 1M rows).
+// SUPERSEDED by v6, which builds `(agent_id COLLATE "C", changed_at)` and drops this index. This v4
+// text stays byte-for-byte as shipped (its hash is recorded in every database that ran it).
+// ADDITIVE and idempotent (IF NOT EXISTS; no existing object is touched). Not CONCURRENTLY: the
+// runner applies a migration in a transaction, where CONCURRENTLY is refused. A plain build takes
+// a SHARE lock on device_ci (writes wait, reads do not): about 0.5 s of blocked ingest per
+// million rows, once, at the first server start after the upgrade.
+// The pool's 30 s statement_timeout and 10 s lock_timeout would otherwise bound the build and the
+// lock wait, and a failed migration refuses to start the server on every restart. So, as in the
+// CaStore v5 and CommandOutboxStore v3 migrations, SET LOCAL (it ends with the migration's
+// transaction, so nothing leaks onto the pooled connection) lifts the statement timeout for the
+// build and allows a lock wait of 30 s (ca_store's value) behind a long ingest transaction.
+// The btree key list of the index, exactly as `pg_get_indexdef` prints it after `USING btree`
+// (verified on PostgreSQL 18.4, where the parenthesised expression and a plain collated column
+// print the same). These two constants and `agent_id_c_index_ddl` feed v4's FROZEN migration text (its
+// SHA-256 is recorded in every database that ran it and pinned in the tests) and v6's DROP, and
+// nothing else: the runtime check uses `kKeysetIndexKey` / `kChangedAtIndexKey` below. Changing the
+// spelling here changes v4's recorded hash, so a tidy-up of these constants needs a new migration.
+constexpr std::string_view kAgentIdCIndexKey = "(agent_id COLLATE \"C\")";
+constexpr const char* kAgentIdCIndexName = "device_ci_agent_id_c_idx";
+
+std::string agent_id_c_index_ddl(std::string_view table) {
+    std::string ddl = "CREATE INDEX IF NOT EXISTS ";
+    ddl += kAgentIdCIndexName;
+    ddl += " ON ";
+    ddl += table;
+    ddl += " (";
+    ddl += kAgentIdCIndexKey;
+    ddl += ")";
+    return ddl;
+}
+
+const std::string kMigrationV4Sql = "SET LOCAL lock_timeout = '30s'; "
+                                    "SET LOCAL statement_timeout = 0; " +
+                                    agent_id_c_index_ddl("device_ci") + ";";
+
+// v5: `changed_at`, the change marker behind the bulk read's `changed_since` delta filter. Epoch
+// SECONDS (the unit of first_seen/last_seen) of the last CONTENT change, authored by the PostgreSQL
+// clock inside the content upsert (kDbClockSecsExpr there); `last_seen` cannot serve because every
+// hash-skip daily sync bumps it. The DEFAULT is the migration's own `now()`: a STABLE, non-volatile
+// expression, which PostgreSQL 11+ evaluates once and records as the column's "missing value"
+// instead of rewriting the table, so the ADD COLUMN is metadata-only (measured on PostgreSQL 18.4,
+// docs/security-reviews/hardware-ci-changed-since-2026-11.md), and every existing row reads
+// "changed at the migration" - the conservative answer, since nothing says when it really changed.
+// clock_timestamp() (volatile) would force a rewrite, so it is NOT the default. The default stays on
+// the column: the content upsert always supplies the value, and a hand-inserted row still gets one.
+// Idempotent (IF NOT EXISTS on both). The index serves a sparse delta (`changed_at >= $n`); it is
+// built with v4's transaction-local settings for the same reason (a plain build takes a SHARE lock
+// and the pool's 30 s statement_timeout / 10 s lock_timeout would otherwise bound it, and a failed
+// migration refuses to start the server on every restart). Not CONCURRENTLY: the runner's
+// transaction refuses it.
+//
+// The type guard between the two statements: IF NOT EXISTS skips the ADD COLUMN for a column of
+// ANOTHER type or nullability that is already there (a hand-made or half-restored table), and the
+// migration would then be stamped as applied over a column every content upsert fails on (`CASE
+// types text and bigint cannot be matched`) and every delta 503s on. So the DO block RAISEs, which
+// aborts the migration's transaction: v5 is not stamped, the store refuses to open, and the log
+// names the column and what was found. `device_ci` resolves through the runner's transaction-local
+// search_path (the store schema first), exactly like the unqualified DDL around it.
+const std::string kMigrationV5Sql =
+    "SET LOCAL lock_timeout = '30s'; "
+    "SET LOCAL statement_timeout = 0; "
+    "ALTER TABLE device_ci ADD COLUMN IF NOT EXISTS changed_at BIGINT NOT NULL "
+    "DEFAULT (EXTRACT(EPOCH FROM now()))::bigint; "
+    "DO $v5guard$ DECLARE col_type text; col_not_null boolean; BEGIN "
+    "SELECT format_type(a.atttypid, a.atttypmod), a.attnotnull INTO col_type, col_not_null "
+    "FROM pg_attribute a WHERE a.attrelid = 'device_ci'::regclass AND a.attname = 'changed_at' "
+    "AND NOT a.attisdropped; "
+    "IF col_type IS DISTINCT FROM 'bigint' OR col_not_null IS DISTINCT FROM true THEN "
+    "RAISE EXCEPTION 'device_inventory_store.device_ci.changed_at must be bigint NOT NULL "
+    "(found type %, not null %)', coalesce(col_type, 'missing'), coalesce(col_not_null::text, 'missing'); "
+    "END IF; END $v5guard$; "
+    "CREATE INDEX IF NOT EXISTS device_ci_changed_at_idx ON device_ci (changed_at);";
+
+// v6: the keyset index the bulk read plans on from v6 on, `(agent_id COLLATE "C", changed_at)`,
+// REPLACING v4's `device_ci_agent_id_c_idx`. Why: with only v4's index, a delta of roughly 3% or more
+// of the table that is clustered in `agent_id` order made the planner scan the whole `agent_id` index
+// and test `changed_at` in the heap row by row, which is the slow case recorded as HWCI-DELTA-PLAN-FLIP
+// in docs/security-reviews/hardware-ci-changed-since-2026-11.md. With `changed_at` as the second key
+// column the planner tests it inside the index, so the same walk reads only the matching heap rows.
+// It still serves a plain keyset (the leading column is the v4 expression), so v4's index is a strict
+// prefix of it and redundant (its size and its write cost buy nothing), and it is dropped here in the
+// same transaction. The v5 `device_ci_changed_at_idx` stays: it keeps a sparse delta at a few
+// milliseconds.
+// LOCKING, deliberately: the FIRST statement takes ACCESS EXCLUSIVE on device_ci. A build that took
+// SHARE and then upgraded to ACCESS EXCLUSIVE at the drop could deadlock against any session that
+// had read the table and then wrote it (reproduced on PostgreSQL 18.4, and the migration can be the
+// victim); taking the strongest mode first removes the upgrade and leaves ONE lock wait, bounded by
+// the 30 s lock_timeout below (the sibling gateway_route_store migration does the same for the same
+// reason). The price is that reads of device_ci block for the build too (about 0.6 s per million rows
+// on an idle database, measured; longer under write load), which v5 already costs.
+// The statement order is DETERMINISTIC on purpose: DROP the composite if it exists, CREATE it, then
+// DROP v4's. A bare `CREATE INDEX IF NOT EXISTS` would be skipped over a same-named index that is
+// INVALID or differently defined (an operator's cancelled hand build after a lock-timeout failure of
+// this very migration), and the unconditional drop of v4's index would then remove the only usable
+// keyset index. The composite's name has never shipped, so dropping a pre-existing one costs one
+// rebuild and nothing else.
+// The two DROPs are SCHEMA-QUALIFIED: the runner's search_path is `"<store>", public`, so an
+// unqualified `DROP INDEX IF EXISTS` falls through to `public` and would drop a same-named index
+// there (verified). That is a deliberate local exception to the unqualified-DDL convention of the
+// other migrations (the CREATE and the LOCK resolve through the store schema, which comes first).
+// A SEPARATE migration, not an edit of v5: a recorded migration's text is frozen (the runner
+// refuses a drifted hash). Idempotent (a re-run drops and rebuilds), built under v4's transaction-local settings for the same reasons, and not
+// CONCURRENTLY (the runner's transaction refuses it).
+// THE CONSTANTS BELOW FEED v6's RECORDED HASH: changing the index name, the key spelling or
+// `index_ddl` changes v6's SHA-256 in every database that ran it (the tests pin it), so it needs a
+// new migration, not an edit. The check compares the key list `pg_get_indexdef` prints after
+// `USING btree` to `kKeysetIndexKey` / `kChangedAtIndexKey`, optionally followed by an operator's
+// ` WITH (...)` storage parameter (verified on PostgreSQL 18.4); a same-named index with another
+// column, an INCLUDE, a different expression or a predicate does not pass.
+constexpr std::string_view kKeysetIndexKey = "(agent_id COLLATE \"C\", changed_at)";
+constexpr const char* kKeysetIndexName = "device_ci_agent_id_c_changed_idx";
+// The v5 index, spelled as `pg_get_indexdef` prints it, for the runtime check only (the v5
+// migration keeps its own literal text, which is what its recorded hash covers).
+constexpr std::string_view kChangedAtIndexKey = "(changed_at)";
+constexpr const char* kChangedAtIndexName = "device_ci_changed_at_idx";
+
+std::string index_ddl(std::string_view name, std::string_view key, std::string_view table) {
+    std::string ddl = "CREATE INDEX IF NOT EXISTS ";
+    ddl += name;
+    ddl += " ON ";
+    ddl += table;
+    ddl += " ";
+    ddl += key;
+    return ddl;
+}
+
+const std::string kMigrationV6Sql = std::string("SET LOCAL lock_timeout = '30s'; "
+                                                "SET LOCAL statement_timeout = 0; "
+                                                "LOCK TABLE device_ci IN ACCESS EXCLUSIVE MODE; "
+                                                "DROP INDEX IF EXISTS device_inventory_store.") +
+                                    kKeysetIndexName + "; " +
+                                    index_ddl(kKeysetIndexName, kKeysetIndexKey, "device_ci") +
+                                    "; DROP INDEX IF EXISTS device_inventory_store." +
+                                    kAgentIdCIndexName + ";";
+
+// The indexes as the runtime check (and an operator by hand) creates them: schema-qualified, because
+// no search_path is set outside the migration runner.
+const std::string kKeysetIndexCreateSql =
+    index_ddl(kKeysetIndexName, kKeysetIndexKey, "device_inventory_store.device_ci");
+const std::string kChangedAtIndexCreateSql =
+    index_ddl(kChangedAtIndexName, kChangedAtIndexKey, "device_inventory_store.device_ci");
 
 const std::vector<pg::PgMigration>& migrations() {
     // Unqualified DDL: the runner sets `search_path` to the store schema for the
@@ -150,8 +413,14 @@ const std::vector<pg::PgMigration>& migrations() {
          "  arch          TEXT NOT NULL DEFAULT '',"
          "  first_seen    BIGINT NOT NULL,"
          "  last_seen     BIGINT NOT NULL);"
-         // Roster reads order by hostname; the index keeps the LIMIT scan ordered.
+         // Historical: built for an ordered roster read that no longer exists (the Hardware list
+         // joins CI by agent_id, #7549). No read relies on this index.
          "CREATE INDEX device_ci_hostname_idx ON device_ci (hostname);"},
+        {2, kMigrationV2Sql},
+        {3, kMigrationV3Sql},
+        {4, kMigrationV4Sql},
+        {5, kMigrationV5Sql},
+        {6, kMigrationV6Sql},
     };
     return kMigrations;
 }
@@ -161,9 +430,13 @@ constexpr const char* kSelectCols =
     "agent_id, manufacturer, model, serial, system_uuid, hostname, domain, ou, "
     "bios_vendor, bios_version, bios_date, cpu_model, cpu_cores, cpu_threads, ram_bytes, "
     "disks_summary, primary_mac, macs_summary, nic_count, os_name, os_version, os_build, "
-    "arch, first_seen, last_seen";
+    "arch, first_seen, last_seen, blob_version, chassis_type, chassis_serial, "
+    "chassis_asset_tag, chassis_source, board_vendor, board_product, board_serial, "
+    "board_source, machine_id_hash, machine_id_algorithm, machine_id_source, changed_at";
 
-void fill_record(PGresult* res, int row, DeviceCiRecord& out) {
+/// Returns the index of the first column after the ones it read, so a query that appends columns
+/// to `kSelectCols` can continue from there.
+int fill_record(PGresult* res, int row, DeviceCiRecord& out) {
     int c = 0;
     const auto col = [&]() { return PQgetvalue(res, row, c++); };
     out.agent_id = col();
@@ -191,11 +464,132 @@ void fill_record(PGresult* res, int row, DeviceCiRecord& out) {
     out.arch = col();
     out.first_seen = to_i64(col());
     out.last_seen = to_i64(col());
+    out.blob_version = static_cast<int>(to_i64(col()));
+    out.chassis_type = col();
+    out.chassis_serial = col();
+    out.chassis_asset_tag = col();
+    out.chassis_source = col();
+    out.board_vendor = col();
+    out.board_product = col();
+    out.board_serial = col();
+    out.board_source = col();
+    out.machine_id_hash = col();
+    out.machine_id_algorithm = col();
+    out.machine_id_source = col();
+    out.changed_at = to_i64(col());
+    return c;
+}
+
+/// What the runtime check needs to know about one index: its name, the key list `pg_get_indexdef`
+/// prints after `USING btree`, the operator's DDL, and what a miss costs (said in the WARN).
+/// CALL-SCOPED: `create_sql` is a reference to a namespace-scope constant, so build one only as an
+/// argument of `warn_if_index_unusable`; never store it.
+struct IndexCheck {
+    const char* name;
+    std::string_view key;
+    const std::string& create_sql;
+    const char* consequence;
+};
+
+/// After migrations: is the index really there, valid and defined as the read needs it?
+/// The recorded schema version being v6 is not proof (a restore, a hand `DROP INDEX`, or a same-named index of
+/// another definition that `IF NOT EXISTS` accepted). The read stays CORRECT without it (the
+/// `COLLATE "C"` spelling and the `changed_at` comparison in the query carry correctness), so a miss
+/// or a failed check is a WARN and the store still opens, but the plan degrades, which a loaded
+/// server feels as an exhausted pool, so the line says how to fix it. It logs and returns and does
+/// not change `open_`; a failed check logs and moves on.
+void warn_if_index_unusable(PGconn* conn, const IndexCheck& chk) {
+    pg::PgResult res = pg::exec_params(
+        conn,
+        "SELECT i.indisvalid, i.indisready, i.indpred IS NOT NULL, pg_get_indexdef(i.indexrelid) "
+        "FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid "
+        "JOIN pg_namespace n ON n.oid = c.relnamespace "
+        "WHERE n.nspname = 'device_inventory_store' AND c.relname = $1 "
+        "AND i.indrelid = 'device_inventory_store.device_ci'::regclass",
+        std::vector<std::string>{chk.name});
+    if (res.status() != PGRES_TUPLES_OK) {
+        spdlog::warn("DeviceInventoryStore: could not check index {} ({}); the bulk device-CI read "
+                     "stays correct but may be slow if it is missing",
+                     chk.name, ::yuzu::log_key_token(PQerrorMessage(conn)));
+        return;
+    }
+    std::string problem;
+    if (PQntuples(res.get()) == 0) {
+        problem = "is missing";
+    } else {
+        const std::string valid = PQgetvalue(res.get(), 0, 0);
+        const std::string ready = PQgetvalue(res.get(), 0, 1);
+        const std::string partial = PQgetvalue(res.get(), 0, 2);
+        const std::string def = PQgetvalue(res.get(), 0, 3);
+        // The definition is judged by the key list `pg_get_indexdef` prints after "USING btree",
+        // compared whole to the migration's own spelling (the index NAME also contains
+        // "agent_id", so a substring test would accept a same-named index on another column).
+        constexpr std::string_view kUsing = " USING btree ";
+        const auto using_at = def.find(kUsing);
+        const std::string_view key =
+            using_at == std::string::npos ? std::string_view{}
+                                          : std::string_view{def}.substr(using_at + kUsing.size());
+        // A storage parameter (an operator-tuned `WITH (fillfactor=...)`) prints after the key list
+        // and does not change what the planner can use the index for, so it is accepted; an INCLUDE
+        // list prints between them and a predicate is read from `indpred`, so both still differ.
+        constexpr std::string_view kWith = " WITH (";
+        const bool same_key =
+            key == chk.key || (key.substr(0, chk.key.size()) == chk.key &&
+                               key.substr(chk.key.size(), kWith.size()) == kWith);
+        if (valid != "t" || ready != "t")
+            problem = "is invalid (an interrupted build, or a concurrent build still running)";
+        else if (partial == "t" || !same_key)
+            problem = "is defined differently from the migration";
+    }
+    if (problem.empty())
+        return;
+    // A missing index has nothing to drop; an invalid or differently defined one must be dropped
+    // first (`CREATE INDEX IF NOT EXISTS` would be skipped over it). Say which, and print both
+    // statements, each terminated, so the tail of the line can be pasted into a session as written.
+    const std::string statements =
+        problem == "is missing"
+            ? chk.create_sql + ";"
+            : std::string("DROP INDEX device_inventory_store.") + chk.name + "; " + chk.create_sql + ";";
+    spdlog::warn("DeviceInventoryStore: index {} {}. GET /api/v1/hardware-ci and list_hardware_ci_"
+                 "records stay correct but {} Create it as the table owner, in a session that first "
+                 "ran SET lock_timeout = '30s' (a plain build blocks writers to device_ci and queues "
+                 "behind any session holding a lock on it), then run{}: {} See "
+                 "docs/user-manual/upgrading.md, \"Checked at every start\".",
+                 chk.name, problem, chk.consequence,
+                 problem == "is missing" ? "" : " both statements (the existing index must be dropped first)",
+                 statements);
+}
+
+void warn_if_read_indexes_unusable(PGconn* conn) {
+    // The keyset index serves every page; without it each page is a scan plus a sort of device_ci.
+    warn_if_index_unusable(
+        conn, {kKeysetIndexName, kKeysetIndexKey, kKeysetIndexCreateSql,
+               "every page becomes a scan plus a sort of device_ci (about 317 ms a page at 1M "
+               "devices in one measurement, growing with the table), which can exhaust the database "
+               "pool under load, and a delta of a few percent of the table that is clustered in "
+               "agent_id order reads most of it. (If v4's device_ci_agent_id_c_idx still exists, plain "
+               "pages are served from it and only such a delta is slow.)"});
+    // The changed_at index serves a sparse delta; without it a delta page falls back to the keyset
+    // index with the changed_at test inside it, so a delta is still correct and bounded.
+    warn_if_index_unusable(
+        conn, {kChangedAtIndexName, kChangedAtIndexKey, kChangedAtIndexCreateSql,
+               "a sparse delta page is then served from the keyset index instead (a few tens of "
+               "milliseconds a page at 1M devices in the review record's measurement, against a few "
+               "milliseconds with this index)."});
 }
 
 } // namespace
 
+const std::vector<pg::PgMigration>& device_inventory_migrations() {
+    return migrations();
+}
+
 std::string DeviceInventoryStore::canonical_hash(const DeviceCiRecord& rec) {
+    // v2: the agent's canonical bytes ARE the blob; the parser pinned its sha256 into
+    // content_hash (empty on a digest failure -> the store nacks). v1 keeps the positional
+    // 22-field join below, byte-identical, so old agents never loop on need_full.
+    if (rec.blob_version >= 2)
+        return rec.content_hash;
     // POSITIONAL — field order is the contract; MUST match the agent's
     // device_ci_canonical_blob (sync_source_device_ci.cpp) byte-for-byte. The
     // fields are already scrub+clamp'd by the ingest seam's parse (like
@@ -218,7 +612,7 @@ std::string DeviceInventoryStore::canonical_hash(const DeviceCiRecord& rec) {
         first = false;
     }
     canon += '\x1e';
-    return sha256_hex(canon);
+    return sha256_hex(canon).value_or("");
 }
 
 DeviceInventoryStore::DeviceInventoryStore(pg::PgPool& pool) : pool_(pool) {
@@ -234,7 +628,99 @@ DeviceInventoryStore::DeviceInventoryStore(pg::PgPool& pool) : pool_(pool) {
                       "disabled");
         return;
     }
+    // Post-migration projection check (postgres-store-playbook "Runner guards"; the same shape as
+    // ApiTokenStore and SoftwareInventoryStore). The runner skips any version at or below the
+    // stored high-water mark, so a database that ran an earlier revision of v2 or v3 (or one
+    // stamped by a different binary) can lack a table or column this binary reads while run()
+    // still reports success - and every sections read then fails with 42P01/42703 on the first
+    // request. One LIMIT 0 SELECT per table, over every column the runtime uses, touches no rows
+    // and refuses here instead (server.cpp then refuses to start). The child tables are driven by
+    // the registry, so a registry kind with no table fails at boot. Column PRESENCE only: an extra
+    // column is tolerated (#3894's ahead-database stance); names, types, nullability, order and
+    // the key shape are pinned for the shipped literals by the schema test in
+    // test_device_inventory_store.cpp, column defaults are not pinned by anything.
+    {
+        struct Probe {
+            std::string table;
+            std::string columns;
+        };
+        std::vector<Probe> probes;
+        probes.push_back({"device_ci", std::string("content_hash, ") + kSelectCols});
+        probes.push_back(
+            {"device_ci_section", "agent_id, kind, level, reason, row_count, content_digest"});
+        for (const auto& d : kDeviceCiSections) {
+            if (d.table == nullptr)
+                continue;
+            probes.push_back({d.table, std::string("agent_id, ord, ") + d.columns});
+        }
+        for (const auto& p : probes) {
+            const std::string sql =
+                "SELECT " + p.columns + " FROM device_inventory_store." + p.table + " LIMIT 0";
+            pg::PgResult probe =
+                pg::exec_params(lease.get(), sql.c_str(), std::vector<std::string>{});
+            if (probe.status() != PGRES_TUPLES_OK) {
+                // SQLSTATE 42P01 (undefined table) / 42703 (undefined column) is a schema defect;
+                // anything else (a dropped connection, a statement timeout, a permission error)
+                // is not evidence of one, and a restart is the retry. The message names no
+                // destructive step: the supported reset for a development or UAT database is in
+                // the upgrade notes, and it is not advice for any other database.
+                const char* state = PQresultErrorField(probe.get(), PG_DIAG_SQLSTATE);
+                const std::string sqlstate = state != nullptr ? state : "";
+                const bool schema_defect = sqlstate == "42P01" || sqlstate == "42703";
+                const bool permission = sqlstate == "42501";
+                spdlog::error(
+                    "DeviceInventoryStore: post-migration schema projection check failed on {} "
+                    "(SQLSTATE {}) - {} The server will not start; see docs/user-manual/"
+                    "upgrading.md, \"the server refuses to start on a device inventory schema it "
+                    "cannot read\". Database said: {}",
+                    p.table, sqlstate.empty() ? "none" : sqlstate,
+                    schema_defect
+                        ? "the database lacks a table or column this build reads (an earlier "
+                          "revision of the unreleased migration v2/v3, a skipped or partial "
+                          "migration, or a database from a different build)."
+                        : permission
+                              ? "the server's database role cannot read it (grant SELECT on the "
+                                "store's schema; a restart will not fix a permission error)."
+                              : "this is not a missing-object error (a dropped connection or a "
+                                "timeout); restart once before treating the schema as damaged.",
+                    PQresultErrorMessage(probe.get()));
+                return;
+            }
+        }
+    }
+    warn_if_read_indexes_unusable(lease.get());
     open_ = true;
+}
+
+void DeviceInventoryStore::note_write_deferred(const char* op) noexcept {
+    try {
+        if (metrics_)
+            metrics_->counter("yuzu_device_ci_writes_deferred_total", {{"op", op}}).increment();
+        // One line per entry into the refusing state: the flag is cleared by the next call that
+        // finds the gate open (see clear_write_pause_flag), so a long pause is one line, not one
+        // per call.
+        if (!write_pause_logged_.exchange(true, std::memory_order_relaxed))
+            spdlog::warn("DeviceInventoryStore: device_ci writes are PAUSED because the PostgreSQL "
+                         "collation version recorded for the database differs from the "
+                         "operating system's (text-key lookups cannot be trusted): ingest is "
+                         "refused (agents resend later) and decommission of device_ci rows is not "
+                         "attempted. Repair per the \"PostgreSQL collation version\" section of "
+                         "docs/user-manual/server-admin.md; writes resume after the next "
+                         "collation check passes");
+    } catch (...) { // a metrics or log failure must never change the refusal itself
+    }
+}
+
+void DeviceInventoryStore::clear_write_pause_flag() noexcept {
+    // Relaxed load first: the open-gate hot path pays one load, not a read-modify-write.
+    if (write_pause_logged_.load(std::memory_order_relaxed) &&
+        write_pause_logged_.exchange(false, std::memory_order_relaxed)) {
+        try {
+            spdlog::info("DeviceInventoryStore: device_ci writes resumed (the collation gate no "
+                         "longer reads mismatch)");
+        } catch (...) {
+        }
+    }
 }
 
 InventoryIngestOutcome DeviceInventoryStore::apply_device_ci(std::string_view agent_id,
@@ -243,6 +729,14 @@ InventoryIngestOutcome DeviceInventoryStore::apply_device_ci(std::string_view ag
                                                             [[maybe_unused]] std::int64_t collected_at) {
     if (!open_ || agent_id.empty())
         return InventoryIngestOutcome::kError;
+
+    // Write pause: refuse BEFORE the pool is touched, for the hash-only touch and the full upsert
+    // alike (both resolve the row by the text primary key).
+    if (writes_deferred()) {
+        note_write_deferred("ingest");
+        return InventoryIngestOutcome::kDeferred;
+    }
+    clear_write_pause_flag();
 
     // last_seen / first_seen are the SERVER receipt time, never the agent-supplied
     // collected_at (#1685): the freshness comparison must stay on one clock.
@@ -285,50 +779,231 @@ InventoryIngestOutcome DeviceInventoryStore::apply_device_ci(std::string_view ag
         return InventoryIngestOutcome::kTouched;
     }
 
-    // ── Full payload: recompute the hash from the record, upsert the single row ──
+    // ── Full payload: recompute the hash, replace the parent row AND every child row ──
     const DeviceCiRecord r = std::move(*rec);
     const std::string server_hash = canonical_hash(r);
-    auto lease = pool_.try_acquire_for(kIngestAcquireTimeout);
-    if (!lease) {
-        spdlog::warn("DeviceInventoryStore: full ingest skipped for agent={}, no connection ({})",
-                     agent_id, pool_.last_error());
+    if (server_hash.empty()) {
+        // v2 record without a pinned hash (digest failure): never store it under a
+        // placeholder hash — nack so the agent resends rather than loop on a bad compare.
+        spdlog::warn("DeviceInventoryStore: no canonical hash for agent={} (blob_version={}) — "
+                     "not stored",
+                     agent_id, r.blob_version);
         return InventoryIngestOutcome::kError;
     }
-    // Single-row ON CONFLICT upsert is atomic — no advisory lock needed (unlike the
-    // multi-row software replace). first_seen is preserved on conflict; last_seen is
-    // the server receipt time. RETURNING carries the result (no sqlite3_changes race).
-    pg::PgResult res = pg::exec_params(
-        lease.get(),
-        "INSERT INTO device_inventory_store.device_ci ("
-        "agent_id, content_hash, manufacturer, model, serial, system_uuid, hostname, domain, ou, "
-        "bios_vendor, bios_version, bios_date, cpu_model, cpu_cores, cpu_threads, ram_bytes, "
-        "disks_summary, primary_mac, macs_summary, nic_count, os_name, os_version, os_build, arch, "
-        "first_seen, last_seen) VALUES ("
-        "$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14::bigint, $15::bigint, "
-        "$16::bigint, $17, $18, $19, $20::bigint, $21, $22, $23, $24, $25::bigint, $26::bigint) "
-        "ON CONFLICT (agent_id) DO UPDATE SET "
-        "content_hash = EXCLUDED.content_hash, manufacturer = EXCLUDED.manufacturer, "
-        "model = EXCLUDED.model, serial = EXCLUDED.serial, system_uuid = EXCLUDED.system_uuid, "
-        "hostname = EXCLUDED.hostname, domain = EXCLUDED.domain, ou = EXCLUDED.ou, "
-        "bios_vendor = EXCLUDED.bios_vendor, bios_version = EXCLUDED.bios_version, "
-        "bios_date = EXCLUDED.bios_date, cpu_model = EXCLUDED.cpu_model, "
-        "cpu_cores = EXCLUDED.cpu_cores, cpu_threads = EXCLUDED.cpu_threads, "
-        "ram_bytes = EXCLUDED.ram_bytes, disks_summary = EXCLUDED.disks_summary, "
-        "primary_mac = EXCLUDED.primary_mac, macs_summary = EXCLUDED.macs_summary, "
-        "nic_count = EXCLUDED.nic_count, os_name = EXCLUDED.os_name, "
-        "os_version = EXCLUDED.os_version, os_build = EXCLUDED.os_build, arch = EXCLUDED.arch, "
-        "last_seen = EXCLUDED.last_seen "
-        "RETURNING agent_id",
-        std::vector<std::string>{std::string(agent_id), server_hash, r.manufacturer, r.model,
-                                 r.serial, r.system_uuid, r.hostname, r.domain, r.ou, r.bios_vendor,
-                                 r.bios_version, r.bios_date, r.cpu_model, bigint_param(r.cpu_cores),
-                                 bigint_param(r.cpu_threads), bigint_param(r.ram_bytes),
-                                 r.disks_summary, r.primary_mac, r.macs_summary,
-                                 bigint_param(r.nic_count), r.os_name, r.os_version, r.os_build,
-                                 r.arch, std::to_string(ts), std::to_string(ts)});
-    if (res.status() != PGRES_TUPLES_OK) {
-        spdlog::warn("DeviceInventoryStore: upsert failed for agent={}: {}", agent_id,
-                     PQerrorMessage(lease.get()));
+    const std::string agent_id_s{agent_id};
+    const std::string ts_s = std::to_string(ts);
+
+    // Which statement failed and Postgres's primary error line, for the warn below.
+    const char* fail_stage = "";
+    std::string fail_err;
+    const bool ok = pool_.with_txn_for(kIngestAcquireTimeout, [&](PGconn* c) -> bool {
+        // First line only: later lines (DETAIL) can echo row values.
+        const auto fail = [&](const char* stage) {
+            fail_stage = stage;
+            fail_err = PQerrorMessage(c);
+            fail_err.resize(std::min(fail_err.find('\n'), fail_err.size()));
+            return false;
+        };
+        // Serialise concurrent full replaces for THIS agent (two fulls under READ COMMITTED
+        // would interleave their child DELETE+INSERT and leave a mixed set under a hash that
+        // matches neither). Transaction-scoped and blocking on purpose — same rationale as
+        // SoftwareInventoryStore. The key is PREFIXED so it never collides with that store's
+        // unprefixed per-agent key on the same report thread.
+        pg::PgResult lk = pg::exec_params(
+            c, "SELECT pg_advisory_xact_lock(hashtextextended('device_ci:' || $1::text, 0))",
+            std::vector<std::string>{agent_id_s});
+        if (lk.status() != PGRES_TUPLES_OK)
+            return fail("lock");
+
+        // Parent upsert. first_seen is preserved on conflict; last_seen is the server
+        // receipt time. blob_version + the 11 appended scalars are replaced wholesale, so a
+        // v2 -> v1 downgrade blanks them.
+        pg::PgResult up = pg::exec_params(
+            c,
+            (// The statement is text-built (the DB-clock expression is spliced in, never a bound
+             // parameter, so the stamp is the database's own); the temporary lives to the end of
+             // this full expression.
+             "INSERT INTO device_inventory_store.device_ci ("
+            "agent_id, content_hash, manufacturer, model, serial, system_uuid, hostname, domain, "
+            "ou, bios_vendor, bios_version, bios_date, cpu_model, cpu_cores, cpu_threads, "
+            "ram_bytes, disks_summary, primary_mac, macs_summary, nic_count, os_name, os_version, "
+            "os_build, arch, first_seen, last_seen, blob_version, chassis_type, chassis_serial, "
+            "chassis_asset_tag, chassis_source, board_vendor, board_product, board_serial, "
+            "board_source, machine_id_hash, machine_id_algorithm, machine_id_source, changed_at) VALUES ("
+            "$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14::bigint, $15::bigint, "
+            "$16::bigint, $17, $18, $19, $20::bigint, $21, $22, $23, $24, $25::bigint, "
+            "$26::bigint, $27::smallint, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, " +
+                std::string(kDbClockSecsExpr) +
+                ") "
+            "ON CONFLICT (agent_id) DO UPDATE SET "
+            "content_hash = EXCLUDED.content_hash, manufacturer = EXCLUDED.manufacturer, "
+            "model = EXCLUDED.model, serial = EXCLUDED.serial, system_uuid = EXCLUDED.system_uuid, "
+            "hostname = EXCLUDED.hostname, domain = EXCLUDED.domain, ou = EXCLUDED.ou, "
+            "bios_vendor = EXCLUDED.bios_vendor, bios_version = EXCLUDED.bios_version, "
+            "bios_date = EXCLUDED.bios_date, cpu_model = EXCLUDED.cpu_model, "
+            "cpu_cores = EXCLUDED.cpu_cores, cpu_threads = EXCLUDED.cpu_threads, "
+            "ram_bytes = EXCLUDED.ram_bytes, disks_summary = EXCLUDED.disks_summary, "
+            "primary_mac = EXCLUDED.primary_mac, macs_summary = EXCLUDED.macs_summary, "
+            "nic_count = EXCLUDED.nic_count, os_name = EXCLUDED.os_name, "
+            "os_version = EXCLUDED.os_version, os_build = EXCLUDED.os_build, arch = EXCLUDED.arch, "
+            "last_seen = EXCLUDED.last_seen, blob_version = EXCLUDED.blob_version, "
+            "chassis_type = EXCLUDED.chassis_type, chassis_serial = EXCLUDED.chassis_serial, "
+            "chassis_asset_tag = EXCLUDED.chassis_asset_tag, "
+            "chassis_source = EXCLUDED.chassis_source, board_vendor = EXCLUDED.board_vendor, "
+            "board_product = EXCLUDED.board_product, board_serial = EXCLUDED.board_serial, "
+            "board_source = EXCLUDED.board_source, machine_id_hash = EXCLUDED.machine_id_hash, "
+            "machine_id_algorithm = EXCLUDED.machine_id_algorithm, "
+            "machine_id_source = EXCLUDED.machine_id_source, "
+            // changed_at moves only when the stored content hash differs from the incoming one. The
+            // right-hand sides of a DO UPDATE read the OLD row, so `device_ci.content_hash` is the
+            // stored hash even though `content_hash = EXCLUDED.content_hash` sits earlier in the
+            // list. A full re-send of unchanged content therefore keeps it.
+            "changed_at = CASE WHEN device_ci.content_hash IS DISTINCT FROM EXCLUDED.content_hash "
+            "THEN " + std::string(kDbClockSecsExpr) + " ELSE device_ci.changed_at END "
+            "RETURNING agent_id").c_str(),
+            std::vector<std::string>{
+                agent_id_s, server_hash, r.manufacturer, r.model, r.serial, r.system_uuid,
+                r.hostname, r.domain, r.ou, r.bios_vendor, r.bios_version, r.bios_date,
+                r.cpu_model, bigint_param(r.cpu_cores), bigint_param(r.cpu_threads),
+                bigint_param(r.ram_bytes), r.disks_summary, r.primary_mac, r.macs_summary,
+                bigint_param(r.nic_count), r.os_name, r.os_version, r.os_build, r.arch, ts_s, ts_s,
+                std::to_string(r.blob_version), r.chassis_type, r.chassis_serial,
+                r.chassis_asset_tag, r.chassis_source, r.board_vendor, r.board_product,
+                r.board_serial, r.board_source, r.machine_id_hash, r.machine_id_algorithm,
+                r.machine_id_source});
+        if (up.status() != PGRES_TUPLES_OK)
+            return fail("upsert");
+
+        // Child replace: the full payload IS the new set, so a v1 full (no sections) or a
+        // shrunk v2 leaves no stale rows. Driven by the registry so a kind costs no code.
+        for (const auto& d : kDeviceCiSections) {
+            if (d.table == nullptr)
+                continue;
+            const std::string del =
+                std::string("DELETE FROM device_inventory_store.") + d.table + " WHERE agent_id = $1";
+            pg::PgResult dr = pg::exec_params(c, del.c_str(), std::vector<std::string>{agent_id_s});
+            if (dr.status() != PGRES_COMMAND_OK)
+                return fail("child_delete");
+        }
+        pg::PgResult ds = pg::exec_params(
+            c, "DELETE FROM device_inventory_store.device_ci_section WHERE agent_id = $1",
+            std::vector<std::string>{agent_id_s});
+        if (ds.status() != PGRES_COMMAND_OK)
+            return fail("section_delete");
+
+        // Only registered kinds persist (a hand-built record cannot smuggle a stray kind).
+        // One pass: each kept section's row INSERT runs inline while its status columns are
+        // collected for the single device_ci_section INSERT after the loop.
+        std::vector<std::string_view> kinds, levels, reasons;
+        // Per kept section: the child-row count the INSERT below ACTUALLY stored (read from its
+        // command tag, never from the agent; it is expected to equal the parser-capped
+        // `sec.rows.size()`, and the tag is authoritative if a trigger ever diverges), or "" for
+        // a status-only kind (-> NULL: nothing to verify). The read side compares this to the
+        // rows it reads.
+        std::vector<std::string> row_counts;
+        // Per kept section: the content digest of the rows inserted (server-computed from the same
+        // padded rows the INSERT stores, via the one shared serialization), or "" -> NULL for a
+        // status-only kind. Written in the same transaction as the rows and the status row.
+        std::vector<std::string> digests;
+        for (const auto& sec : r.sections) {
+            const auto si = device_ci_section_index(sec.kind);
+            if (!si)
+                continue;
+            const auto& def = kDeviceCiSections[*si];
+            kinds.emplace_back(sec.kind);
+            levels.emplace_back(sec.level);
+            reasons.emplace_back(sec.reason);
+            if (def.table == nullptr) {
+                row_counts.emplace_back(); // status-only kind: NULL
+                digests.emplace_back();
+                continue;
+            }
+            const auto cols = split_columns(def.columns);
+            const std::size_t ncol = cols.size();
+            // Computed from exactly what is about to be stored (short rows pad, long rows
+            // truncate to the registry's columns - the same rule the INSERT applies below).
+            const auto digest =
+                section_content_digest(def, sec.rows, digest_fn_ ? digest_fn_ : &sha256_hex);
+            if (!digest) {
+                const bool failed = fail("digest");
+                fail_err = "digest_provider_failed"; // no libpq statement failed: name the cause
+                return failed;
+            }
+            digests.push_back(*digest);
+            if (sec.rows.empty()) {
+                row_counts.emplace_back("0"); // table-backed, nothing inserted
+                continue;
+            }
+            std::vector<std::string> ords;
+            ords.reserve(sec.rows.size());
+            std::vector<std::vector<std::string_view>> arrays(ncol);
+            for (auto& a : arrays)
+                a.reserve(sec.rows.size());
+            const std::string blank;
+            for (std::size_t i = 0; i < sec.rows.size(); ++i) {
+                ords.push_back(std::to_string(i));
+                for (std::size_t k = 0; k < ncol; ++k)
+                    arrays[k].emplace_back(k < sec.rows[i].size() ? sec.rows[i][k] : blank);
+            }
+            std::vector<std::string_view> ord_views(ords.begin(), ords.end());
+            std::string sql = std::string("INSERT INTO device_inventory_store.") + def.table +
+                              " (agent_id, ord";
+            for (const auto& col : cols)
+                sql += ", " + col;
+            sql += ") SELECT $1, o";
+            for (std::size_t k = 0; k < ncol; ++k)
+                sql += ", c" + std::to_string(k);
+            sql += " FROM unnest($2::int[]";
+            for (std::size_t k = 0; k < ncol; ++k)
+                sql += ", $" + std::to_string(k + 3) + "::text[]";
+            sql += ") AS t(o";
+            for (std::size_t k = 0; k < ncol; ++k)
+                sql += ", c" + std::to_string(k);
+            sql += ")";
+            std::vector<std::string> params;
+            params.reserve(ncol + 2);
+            params.push_back(agent_id_s);
+            params.push_back(pg::to_text_array(ord_views));
+            for (const auto& a : arrays)
+                params.push_back(pg::to_text_array(a));
+            pg::PgResult ins = pg::exec_params(c, sql.c_str(), params);
+            if (ins.status() != PGRES_COMMAND_OK)
+                return fail("row_insert");
+            // The tag's row count is what Postgres stored under this transaction. A successful
+            // INSERT always carries one; an empty tag would silently store NULL (= unverified),
+            // so refuse it rather than fail open.
+            const char* const tag = PQcmdTuples(ins.get());
+            if (tag == nullptr || *tag == '\0')
+                return fail("row_insert");
+            row_counts.emplace_back(tag);
+        }
+        if (!kinds.empty()) {
+            pg::PgResult si = pg::exec_params(
+                c,
+                "INSERT INTO device_inventory_store.device_ci_section (agent_id, kind, level, "
+                "reason, row_count, content_digest) SELECT $1, k, l, r, NULLIF(n, '')::integer, "
+                "NULLIF(d, '') FROM unnest($2::text[], $3::text[], $4::text[], $5::text[], "
+                "$6::text[]) AS t(k, l, r, n, d)",
+                std::vector<std::string>{
+                    agent_id_s, pg::to_text_array(kinds), pg::to_text_array(levels),
+                    pg::to_text_array(reasons),
+                    pg::to_text_array(std::vector<std::string_view>(row_counts.begin(),
+                                                                    row_counts.end())),
+                    pg::to_text_array(std::vector<std::string_view>(digests.begin(),
+                                                                    digests.end()))});
+            if (si.status() != PGRES_COMMAND_OK)
+                return fail("section_insert");
+        }
+        return true;
+    });
+    if (!ok) {
+        // Rolled back (or never began): the previous set survives intact; the caller nacks
+        // need_full and the agent resends. Never a half-replaced set. An empty stage means
+        // no statement ran (no connection in time, or BEGIN failed): the pool error says why.
+        spdlog::warn("DeviceInventoryStore: full ingest failed for agent={} stage={} err='{}' "
+                     "pool='{}'",
+                     agent_id, *fail_stage != '\0' ? fail_stage : "acquire_or_begin", ::yuzu::log_key_token(fail_err),
+                     pool_.last_error());
         return InventoryIngestOutcome::kError;
     }
     return InventoryIngestOutcome::kStored;
@@ -370,47 +1045,437 @@ DeviceInventoryStore::get_device_ci(std::string_view agent_id) {
     return std::optional<DeviceCiRecord>{std::move(out)};
 }
 
-std::optional<std::vector<DeviceCiRecord>> DeviceInventoryStore::list_device_ci(int limit) {
+std::optional<std::vector<DeviceCiRecord>>
+DeviceInventoryStore::list_device_ci_for(const std::vector<std::string>& agent_ids,
+                                         DeviceCiKeyedReadLimits limits) {
     if (!open_) {
         static DegradeSampler s;
         if (note_read_degrade(metrics_, kReasonStoreNotOpen, s).should_log)
-            spdlog::warn("DeviceInventoryStore: list on a closed store");
+            spdlog::warn("DeviceInventoryStore: keyed list on a closed store");
         return std::nullopt;
     }
+    std::vector<DeviceCiRecord> out;
+    if (agent_ids.empty())
+        return out; // nothing asked, nothing to read: an empty success, no lease taken
     auto lease = pool_.try_acquire_for(kQueryAcquireTimeout);
     if (!lease) {
         static DegradeSampler s;
         if (note_read_degrade(metrics_, kReasonPoolTimeout, s).should_log)
-            spdlog::warn("DeviceInventoryStore: list skipped, no connection in time ({})",
+            spdlog::warn("DeviceInventoryStore: keyed list skipped, no connection in time ({})",
                          pool_.last_error());
         return std::nullopt;
     }
-    int eff = limit > 0 && limit < kListRowCap ? limit : kListRowCap;
+    const std::size_t chunk = limits.chunk > 0 ? limits.chunk : 1;
+    // Clamped both ways so neither an "unlimited" sentinel (milliseconds::max()) nor a hugely
+    // negative value can overflow the time_point arithmetic (signed overflow is UB). A day is far
+    // past any real read, and a negative budget behaves like zero: the first chunk runs, then the
+    // read degrades.
+    const auto budget = std::clamp(limits.budget, std::chrono::milliseconds{0},
+                                   std::chrono::milliseconds{std::chrono::hours{24}});
+    const auto deadline = std::chrono::steady_clock::now() + budget;
     const std::string sql =
         std::string("SELECT ") + kSelectCols +
-        " FROM device_inventory_store.device_ci ORDER BY hostname ASC, agent_id ASC LIMIT $1::bigint";
-    pg::PgResult res = pg::exec_params(lease.get(), sql.c_str(),
-                                       std::vector<std::string>{std::to_string(eff)});
-    if (res.status() != PGRES_TUPLES_OK) {
-        static DegradeSampler s;
-        if (note_read_degrade(metrics_, kReasonQueryError, s).should_log)
-            spdlog::warn("DeviceInventoryStore: list failed: {}", PQerrorMessage(lease.get()));
-        return std::nullopt;
-    }
-    const int rows = PQntuples(res.get());
-    std::vector<DeviceCiRecord> out;
-    out.reserve(static_cast<std::size_t>(rows));
-    for (int i = 0; i < rows; ++i) {
-        DeviceCiRecord r;
-        fill_record(res.get(), i, r);
-        out.push_back(std::move(r));
+        " FROM device_inventory_store.device_ci WHERE agent_id = ANY($1::text[])";
+    std::vector<std::string_view> views;
+    views.reserve(std::min(chunk, agent_ids.size()));
+    for (std::size_t off = 0; off < agent_ids.size(); off += chunk) {
+        if (off > 0 && std::chrono::steady_clock::now() >= deadline) {
+            static DegradeSampler s;
+            if (note_read_degrade(metrics_, kReasonKeyedBudget, s).should_log)
+                spdlog::warn("DeviceInventoryStore: keyed list abandoned after {} of {} ids, "
+                             "budget {} ms spent",
+                             off, agent_ids.size(), limits.budget.count());
+            return std::nullopt; // never a partial map: an absent row must mean "no CI", not "not read"
+        }
+        const std::size_t end = std::min(off + chunk, agent_ids.size());
+        views.assign(agent_ids.begin() + static_cast<std::ptrdiff_t>(off),
+                     agent_ids.begin() + static_cast<std::ptrdiff_t>(end));
+        pg::PgResult res = pg::exec_params(lease.get(), sql.c_str(),
+                                           std::vector<std::string>{pg::to_text_array(views)});
+        if (res.status() != PGRES_TUPLES_OK) {
+            static DegradeSampler s;
+            if (note_read_degrade(metrics_, kReasonQueryError, s).should_log)
+                spdlog::warn("DeviceInventoryStore: keyed list failed: {}", PQerrorMessage(lease.get()));
+            return std::nullopt;
+        }
+        const int rows = PQntuples(res.get());
+        // No per-chunk reserve: reserve(n) allocates exactly n, which defeats the vector's geometric
+        // growth and reallocates the whole result once per chunk.
+        for (int i = 0; i < rows; ++i) {
+            DeviceCiRecord r;
+            fill_record(res.get(), i, r);
+            out.push_back(std::move(r));
+        }
     }
     return out;
+}
+
+DeviceCiKeysetStatement device_ci_keyset_statement(const DeviceCiKeysetQuery& q) {
+    const int eff = q.limit > 0 && q.limit < kListRowCap ? q.limit : kListRowCap;
+    // The bound parameters are built alongside the placeholders, in order.
+    DeviceCiKeysetStatement st;
+    std::vector<std::string>& params = st.params;
+    std::string& sql = st.sql;
+    sql = std::string("SELECT ") + kSelectCols +
+          ", content_hash FROM device_inventory_store.device_ci WHERE true";
+    // Byte order, not the database collation: every `agent_id` comparison and the ORDER BY are
+    // spelled `agent_id COLLATE "C"`. That keeps a collation change under the primary key's index
+    // from making the walk skip or miss a row (a duplicate row that a write admitted through a stale
+    // primary key is a write-side residual: it may be served more than once, and a page boundary on
+    // a duplicated id can hide the extra copies because the cursor is strictly `agent_id > after`;
+    // at least one row per id is always served), from making the single-device read miss an
+    // existing id (a plain `agent_id = $n` is served by that same primary key), and lets the
+    // planner use the keyset index (v6; v4's `agent_id` expression index before it), which serves
+    // only a query spelling exactly this expression. All four sites must keep it.
+    if (!q.after.empty()) {
+        params.push_back(q.after);
+        sql += " AND agent_id COLLATE \"C\" > $" + std::to_string(params.size());
+    }
+    if (q.agent_id) {
+        params.push_back(*q.agent_id);
+        sql += " AND agent_id COLLATE \"C\" = $" + std::to_string(params.size());
+    }
+    if (q.agent_ids) {
+        const std::vector<std::string_view> ids(q.agent_ids->begin(), q.agent_ids->end());
+        params.push_back(pg::to_text_array(ids));
+        sql += " AND agent_id COLLATE \"C\" = ANY($" + std::to_string(params.size()) + "::text[])";
+    }
+    if (q.changed_since) {
+        // `>=`, never `>`: a row stamped in the same second as the client's watermark must still be
+        // delivered (at-least-once). The comparison is on the plain column, so the v5 btree index
+        // can serve it; no filter adds no text and no parameter.
+        params.push_back(std::to_string(*q.changed_since));
+        sql += " AND changed_at >= $" + std::to_string(params.size()) + "::bigint";
+    }
+    params.push_back(std::to_string(eff));
+    sql += " ORDER BY agent_id COLLATE \"C\" ASC LIMIT $" + std::to_string(params.size()) + "::bigint";
+    return st;
+}
+
+std::optional<std::vector<DeviceCiRecord>>
+DeviceInventoryStore::list_device_ci_after(const DeviceCiKeysetQuery& q) {
+    if (!open_) {
+        static DegradeSampler s;
+        if (note_read_degrade(metrics_, kReasonStoreNotOpen, s).should_log)
+            spdlog::warn("DeviceInventoryStore: keyset list on a closed store");
+        return std::nullopt;
+    }
+    if (q.agent_ids && q.agent_ids->empty())
+        return std::vector<DeviceCiRecord>{}; // a deny-all scope: nothing to read, no SQL
+    const DeviceCiKeysetStatement stmt = device_ci_keyset_statement(q);
+    const std::string& sql = stmt.sql;
+    const std::vector<std::string>& params = stmt.params;
+    // Run in a transaction whose SELECT is capped by SET LOCAL statement_timeout (the
+    // count_stale_agents idiom): this page holds one connection of the pool the RBAC and audit
+    // stores share, so a slow SELECT is cancelled at 5 s rather than at the pool's 30 s default.
+    // A timeout errors the SELECT, rolls back and is a nullopt like any other query error.
+    std::optional<std::vector<DeviceCiRecord>> out;
+    bool entered = false;
+    std::string err;
+    const bool ok = pool_.with_txn_for(kQueryAcquireTimeout, [&](PGconn* c) -> bool {
+        entered = true;
+        pg::PgResult t = pg::exec_params(
+            c, (std::string("SET LOCAL statement_timeout = '") + kKeysetStatementTimeout + "'").c_str(),
+            std::vector<std::string>{});
+        if (t.status() != PGRES_COMMAND_OK) {
+            err = PQerrorMessage(c);
+            return false;
+        }
+        pg::PgResult res = pg::exec_params(c, sql.c_str(), params);
+        if (res.status() != PGRES_TUPLES_OK) {
+            err = PQerrorMessage(c);
+            return false;
+        }
+        const int rows = PQntuples(res.get());
+        std::vector<DeviceCiRecord> page;
+        page.reserve(static_cast<std::size_t>(rows));
+        for (int i = 0; i < rows; ++i) {
+            DeviceCiRecord r;
+            const int next = fill_record(res.get(), i, r);
+            r.content_hash = PQgetvalue(res.get(), i, next);
+            page.push_back(std::move(r));
+        }
+        out = std::move(page);
+        return true;
+    });
+    if (ok)
+        return out;
+    // `entered == false` means the callback never ran: no connection within the bound, OR the
+    // BEGIN on a leased connection failed (the helper does not tell the two apart, as in
+    // instruction_store.cpp's insert path). The counter label keeps its existing `pool_acquire_
+    // timeout` spelling, so it can also count a failed BEGIN; the log line below says both.
+    static DegradeSampler pool_sampler;
+    static DegradeSampler query_sampler;
+    if (note_read_degrade(metrics_, entered ? kReasonQueryError : kReasonPoolTimeout,
+                          entered ? query_sampler : pool_sampler)
+            .should_log) {
+        // `err` is empty only when the callback returned true and the COMMIT then did not take: the
+        // transaction helper does not expose the COMMIT's error text, so say so rather than log
+        // nothing.
+        const std::string cause = !entered ? "pool acquire timeout or BEGIN failed: " + pool_.last_error()
+                                  : err.empty() ? std::string("commit failed")
+                                                : ::yuzu::log_key_token(err);
+        spdlog::warn("DeviceInventoryStore: keyset list degraded: {}", cause);
+    }
+    return std::nullopt;
+}
+
+std::optional<std::int64_t> DeviceInventoryStore::device_ci_watermark() {
+    if (!open_) {
+        static DegradeSampler s;
+        if (note_read_degrade(metrics_, kReasonStoreNotOpen, s).should_log)
+            spdlog::warn("DeviceInventoryStore: watermark read on a closed store");
+        return std::nullopt;
+    }
+    // The database's clock, minus the margin, in one statement: the same expression that authors
+    // `changed_at`, so on ONE primary the watermark and the stamps it brackets read the same clock
+    // and rounding (across a failover or a clock step they can disagree: the margin's residual).
+    // Run in a transaction whose SELECT is capped by SET LOCAL statement_timeout (the keyset read's
+    // idiom): the statement touches no table, but a stalled backend must not hold one of the shared
+    // pool's connections for the pool's 30 s default on every first page. A timeout is a nullopt
+    // (a degrade) like any other query error, never a guessed value.
+    const std::string sql = std::string("SELECT (") + kDbClockSecsExpr + ") - $1::bigint";
+    // Acquire first (bounded) so a lease timeout and a failure on a held connection (a failed
+    // BEGIN, a statement error, a timeout) keep their two distinct degrade reasons.
+    auto lease = pool_.try_acquire_for(kQueryAcquireTimeout);
+    if (!lease) {
+        static DegradeSampler s;
+        if (note_read_degrade(metrics_, kReasonPoolTimeout, s).should_log)
+            spdlog::warn("DeviceInventoryStore: watermark skipped, no connection in time ({})",
+                         pool_.last_error());
+        return std::nullopt;
+    }
+    std::optional<std::int64_t> out;
+    std::string err;
+    const bool ok = pool_.with_txn_on(std::move(lease), [&](PGconn* c) -> bool {
+        pg::PgResult t = pg::exec_params(
+            c, (std::string("SET LOCAL statement_timeout = '") + kDeviceCiWatermarkStatementTimeout + "'").c_str(),
+            std::vector<std::string>{});
+        if (t.status() != PGRES_COMMAND_OK) {
+            err = PQerrorMessage(c);
+            return false;
+        }
+        pg::PgResult res = pg::exec_params(c, sql.c_str(),
+                                           std::vector<std::string>{std::to_string(kChangedSinceMarginSecs)});
+        if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) != 1 || PQgetisnull(res.get(), 0, 0)) {
+            err = PQerrorMessage(c);
+            return false;
+        }
+        out = to_i64(PQgetvalue(res.get(), 0, 0));
+        return true;
+    });
+    if (ok)
+        return out;
+    static DegradeSampler s;
+    if (note_read_degrade(metrics_, kReasonQueryError, s).should_log) {
+        // `err` is empty when BEGIN failed (the helper logs that itself) or the COMMIT did not take.
+        spdlog::warn("DeviceInventoryStore: watermark read failed: {}",
+                     err.empty() ? std::string("begin or commit failed") : ::yuzu::log_key_token(err));
+    }
+    return std::nullopt;
+}
+
+namespace {
+
+/// The section reads of one device, run on a connection that is ALREADY inside a REPEATABLE READ
+/// transaction (the caller owns BEGIN/isolation/COMMIT), so the section SELECT and every
+/// per-kind SELECT share the caller's snapshot. Appends to `out` in registry order (a status row
+/// or rows make a kind present; a kind with rows but no status row still surfaces, with a blank
+/// level). False on any statement failure - `out` is then partial and must be discarded.
+bool read_sections_in_txn(PGconn* c, const std::string& agent_id_s, std::vector<DeviceCiSection>& out) {
+    // `sections` is indexed by registry position; a non-empty `kind` marks a section seen.
+    std::array<DeviceCiSection, kDeviceCiSectionCount> sections;
+    pg::PgResult sres = pg::exec_params(
+        c,
+        "SELECT kind, level, reason, row_count, content_digest "
+        "FROM device_inventory_store.device_ci_section "
+        "WHERE agent_id = $1",
+        std::vector<std::string>{agent_id_s});
+    if (sres.status() != PGRES_TUPLES_OK)
+        return false;
+    for (int i = 0; i < PQntuples(sres.get()); ++i) {
+        const auto si = device_ci_section_index(PQgetvalue(sres.get(), i, 0));
+        if (!si)
+            continue; // unregistered kind: never surfaced
+        sections[*si].kind = kDeviceCiSections[*si].section;
+        sections[*si].level = PQgetvalue(sres.get(), i, 1);
+        sections[*si].reason = PQgetvalue(sres.get(), i, 2);
+        // NULL = status-only kind, or a row written before migration v3: never verified.
+        if (!PQgetisnull(sres.get(), i, 3))
+            sections[*si].row_count = static_cast<int>(to_i64(PQgetvalue(sres.get(), i, 3)));
+        if (!PQgetisnull(sres.get(), i, 4))
+            sections[*si].content_digest = PQgetvalue(sres.get(), i, 4);
+    }
+    // Registry order (deterministic).
+    for (std::size_t si = 0; si < kDeviceCiSectionCount; ++si) {
+        const auto& d = kDeviceCiSections[si];
+        auto& sec = sections[si];
+        if (d.table != nullptr) {
+            const std::string sql = std::string("SELECT ") + d.columns +
+                                    " FROM device_inventory_store." + d.table +
+                                    " WHERE agent_id = $1 ORDER BY ord";
+            pg::PgResult rres = pg::exec_params(c, sql.c_str(), std::vector<std::string>{agent_id_s});
+            if (rres.status() != PGRES_TUPLES_OK)
+                return false;
+            const int nrow = PQntuples(rres.get());
+            const int ncol = PQnfields(rres.get());
+            sec.rows.reserve(static_cast<std::size_t>(nrow));
+            for (int i = 0; i < nrow; ++i) {
+                std::vector<std::string> row;
+                row.reserve(static_cast<std::size_t>(ncol));
+                for (int k = 0; k < ncol; ++k)
+                    row.emplace_back(PQgetvalue(rres.get(), i, k));
+                sec.rows.push_back(std::move(row));
+            }
+        }
+        if (sec.kind.empty() && sec.rows.empty())
+            continue;
+        sec.kind = d.section;
+        out.push_back(std::move(sec));
+    }
+    return true;
+}
+
+} // namespace
+
+std::expected<std::vector<DeviceCiSection>, CiReadError>
+DeviceInventoryStore::get_device_ci_sections(std::string_view agent_id) {
+    if (!open_) {
+        static DegradeSampler s;
+        if (note_read_degrade(metrics_, kReasonStoreNotOpen, s).should_log)
+            spdlog::warn("DeviceInventoryStore: sections get on a closed store");
+        return std::unexpected(CiReadError::kDegraded);
+    }
+    if (agent_id.empty())
+        return std::vector<DeviceCiSection>{}; // precondition miss -> empty, not a degrade
+    const std::string agent_id_s{agent_id};
+
+    // One REPEATABLE READ READ ONLY transaction so the section SELECT and every per-kind SELECT
+    // share ONE snapshot: a concurrent full replace committing between them can never mix
+    // generations (a plain with_txn_for is READ COMMITTED - each statement re-snapshots).
+    // with_txn_on runs the lambda exactly once, so the registry-order result is assembled
+    // inside it.
+    //
+    // The lease is acquired here (bounded, nothing in between) rather than inside
+    // with_txn_for so "no connection in time" and "the transaction failed" are told apart:
+    // with_txn_for answers both with one false. A read has no compensating step, so the
+    // lost-COMMIT ambiguity documented on with_txn_on does not apply.
+    auto lease = pool_.try_acquire_for(kQueryAcquireTimeout);
+    if (!lease) {
+        static DegradeSampler s;
+        if (note_read_degrade(metrics_, kReasonPoolTimeout, s).should_log)
+            spdlog::warn("DeviceInventoryStore: sections get skipped for agent={}, no connection "
+                         "in time ({})",
+                         agent_id, pool_.last_error());
+        return std::unexpected(CiReadError::kDegraded);
+    }
+    std::vector<DeviceCiSection> out;
+    const bool ok = pool_.with_txn_on(std::move(lease), [&](PGconn* c) -> bool {
+        pg::PgResult iso{PQexec(c, "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")};
+        if (iso.status() != PGRES_COMMAND_OK)
+            return false;
+        return read_sections_in_txn(c, agent_id_s, out);
+    });
+    if (!ok) {
+        // Never an empty success on a failed read: a degrade the caller can surface.
+        static DegradeSampler s;
+        if (note_read_degrade(metrics_, kReasonSectionsQueryError, s).should_log)
+            spdlog::warn("DeviceInventoryStore: sections get failed for agent={} ({})", agent_id,
+                         pool_.last_error());
+        return std::unexpected(CiReadError::kDegraded);
+    }
+    return out;
+}
+
+std::expected<DeviceCiWithSections, CiReadError>
+DeviceInventoryStore::get_device_ci_with_sections(std::string_view agent_id) {
+    if (!open_) {
+        static DegradeSampler s;
+        if (note_read_degrade(metrics_, kReasonStoreNotOpen, s).should_log)
+            spdlog::warn("DeviceInventoryStore: record+sections get on a closed store");
+        return std::unexpected(CiReadError::kDegraded);
+    }
+    if (agent_id.empty())
+        return DeviceCiWithSections{}; // precondition miss -> absent, not a degrade
+    const std::string agent_id_s{agent_id};
+
+    // ONE lease and ONE REPEATABLE READ READ ONLY transaction for the record AND its sections:
+    // the scalars and the rows are always the same replace generation (two separate reads could
+    // pair gen N scalars with gen N+1 rows, undetectably). Acquired here, with nothing between
+    // the acquire and with_txn_on (that call's contract); see get_device_ci_sections.
+    auto lease = pool_.try_acquire_for(kQueryAcquireTimeout);
+    if (!lease) {
+        static DegradeSampler s;
+        if (note_read_degrade(metrics_, kReasonPoolTimeout, s).should_log)
+            spdlog::warn("DeviceInventoryStore: record+sections get skipped for agent={}, no "
+                         "connection in time ({})",
+                         agent_id, pool_.last_error());
+        return std::unexpected(CiReadError::kDegraded);
+    }
+    // Held OUTSIDE the lambda so the record survives the rollback a failed section statement
+    // forces (an aborted Postgres transaction cannot run further statements).
+    enum class Stage { kNone, kRecordRead, kSectionsFailed, kDone };
+    Stage stage = Stage::kNone;
+    DeviceCiWithSections result;
+    const bool ok = pool_.with_txn_on(std::move(lease), [&](PGconn* c) -> bool {
+        pg::PgResult iso{PQexec(c, "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")};
+        if (iso.status() != PGRES_COMMAND_OK)
+            return false;
+        const std::string sql = std::string("SELECT ") + kSelectCols +
+                                " FROM device_inventory_store.device_ci WHERE agent_id = $1";
+        pg::PgResult res = pg::exec_params(c, sql.c_str(), std::vector<std::string>{agent_id_s});
+        if (res.status() != PGRES_TUPLES_OK)
+            return false;
+        stage = Stage::kRecordRead;
+        if (PQntuples(res.get()) == 0) {
+            stage = Stage::kDone; // no CI row yet -> absent
+            return true;
+        }
+        DeviceCiRecord rec;
+        fill_record(res.get(), 0, rec);
+        const bool v2 = rec.blob_version >= 2;
+        result.record = std::move(rec);
+        if (v2) {
+            std::vector<DeviceCiSection> sections;
+            if (!read_sections_in_txn(c, agent_id_s, sections)) {
+                stage = Stage::kSectionsFailed;
+                return false;
+            }
+            result.record->sections = std::move(sections);
+        }
+        stage = Stage::kDone;
+        return true;
+    });
+    if (ok)
+        return result;
+    if (stage == Stage::kSectionsFailed) {
+        // The record read answered; only a section statement failed. Say so - never an
+        // empty-sections success - and keep the record the caller may still need.
+        static DegradeSampler s;
+        if (note_read_degrade(metrics_, kReasonSectionsQueryError, s).should_log)
+            spdlog::warn("DeviceInventoryStore: sections get failed for agent={} ({})", agent_id,
+                         pool_.last_error());
+        result.record->sections.clear();
+        result.sections_failed = true;
+        return result;
+    }
+    // Isolation, the record SELECT, or COMMIT failed (a COMMIT failure after a complete read is
+    // treated as a degrade, never a possibly-torn success).
+    static DegradeSampler s;
+    if (note_read_degrade(metrics_, kReasonQueryError, s).should_log)
+        spdlog::warn("DeviceInventoryStore: record+sections get failed for agent={} ({})", agent_id,
+                     pool_.last_error());
+    return std::unexpected(CiReadError::kDegraded);
 }
 
 bool DeviceInventoryStore::delete_agent(std::string_view agent_id) {
     if (!open_ || agent_id.empty())
         return false;
+    if (writes_deferred()) { // the DELETE would resolve the row by the text key: not attempted
+        note_write_deferred("delete");
+        return false;
+    }
+    clear_write_pause_flag();
     auto lease = pool_.try_acquire_for(kIngestAcquireTimeout);
     if (!lease) {
         spdlog::debug("DeviceInventoryStore: delete skipped for agent={}, no connection ({})",

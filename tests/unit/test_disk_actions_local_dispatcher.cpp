@@ -30,6 +30,7 @@
 #include "disk_actions_legs.hpp"
 #include "disk_actions_parsers.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdlib>
@@ -416,7 +417,8 @@ constexpr const char* kPlannedToken = "macos:planned";
 constexpr const char* kPlannedToken = "linux:planned";
 #endif
 
-TEST_CASE("disk_actions plugin: partitions and topology are declared PLANNED on every leg",
+TEST_CASE("disk_actions plugin: partitions is read on Windows, otherwise partitions and topology "
+          "are declared PLANNED",
           "[disk_actions][descriptors]") {
     auto plugin = load_disk_actions_plugin();
     if (!plugin) {
@@ -430,10 +432,15 @@ TEST_CASE("disk_actions plugin: partitions and topology are declared PLANNED on 
         const std::string_view name{a.action};
         INFO("action: " << name);
         if (name == "partitions" || name == "topology") {
-            for (const auto* leg : {&a.linux_leg, &a.macos_leg, &a.windows_leg}) {
+            for (const auto* leg : {&a.linux_leg, &a.macos_leg}) {
                 CHECK(leg->support == YUZU_SUPPORT_PLANNED);
                 CHECK(leg->rung == 1);
             }
+            // H.5b: the Windows partitions leg is read (constrained: it cannot see the Microsoft
+            // Reserved partition or a folder mount point); Windows topology has no source ruled.
+            CHECK(a.windows_leg.rung == 1);
+            CHECK(a.windows_leg.support ==
+                  (name == "partitions" ? YUZU_SUPPORT_CONSTRAINED : YUZU_SUPPORT_PLANNED));
         } else if (name == "smart") {
             CHECK(a.linux_leg.support == YUZU_SUPPORT_UNSUPPORTED);
             CHECK(a.macos_leg.support == YUZU_SUPPORT_CONSTRAINED);
@@ -457,6 +464,10 @@ TEST_CASE("disk_actions plugin: partitions and topology answer one typed planned
     yuzu::agent::LocalDispatcher dispatcher;
     for (const char* name : {"partitions", "topology"}) {
         INFO("action: " << name);
+#if defined(_WIN32)
+        if (std::string_view{name} == "partitions")
+            continue; // read on Windows: covered by the live test below
+#endif
         auto result = dispatcher.run(plugin->descriptor, name);
         CHECK(result.rc == 0);
         const auto rows = captured_rows(result.captured);
@@ -467,6 +478,88 @@ TEST_CASE("disk_actions plugin: partitions and topology answer one typed planned
         CHECK(result.result_provenance == kPlannedToken);
     }
 }
+
+#if defined(_WIN32)
+// H.5b: the real leg, against this host's WMI. Shapes only -- the values are the machine's.
+// Host requirement: a Windows host that booted from a disk, so WMI answers with at least one
+// partition. A container runner with no storage WMI fails REQUIRE below, deliberately: the leg
+// reports `constrained` (windows:partitions:no_rows) there and this test is not meant to pass.
+TEST_CASE("disk_actions plugin: Windows partitions answers a status row then 7-column partition rows",
+          "[disk_actions][actions][windows_partitions]") {
+    auto plugin = load_disk_actions_plugin();
+    if (!plugin) {
+        require_plugin_or_skip();
+        return;
+    }
+    yuzu::agent::LocalDispatcher dispatcher;
+    auto result = dispatcher.run(plugin->descriptor, "partitions");
+    CHECK(result.rc == 0);
+    const auto rows = captured_rows(result.captured);
+    REQUIRE_FALSE(rows.empty());
+    // Exactly one status row, and it is first.
+    CHECK(rows[0].starts_with("status|partitions|"));
+    CHECK(std::count_if(rows.begin(), rows.end(),
+                        [](const std::string& r) { return r.starts_with("status|"); }) == 1);
+    // A clean read declares nothing (derived OK, empty provenance); anything else is CONSTRAINED
+    // with a windows:partitions:* provenance. The status row's word and the typed status must agree.
+    const bool clean = result.result_status == YUZU_RESULT_STATUS_OK ||
+                       result.result_status == YUZU_RESULT_STATUS_UNDECLARED;
+    CHECK((clean || result.result_status == YUZU_RESULT_STATUS_CONSTRAINED));
+    CHECK(rows[0].starts_with("status|partitions|supported|") == clean);
+    if (!clean)
+        CHECK(result.result_provenance.starts_with("windows:partitions:"));
+    // A Windows host that booted from a disk has a system partition.
+    REQUIRE(rows.size() >= 2);
+    bool saw_physical_drive = false;
+    for (std::size_t i = 1; i < rows.size(); ++i) {
+        INFO("row: " << rows[i]);
+        const auto f = split_fields_escape_aware(rows[i]);
+        REQUIRE(f.size() == 7);
+        CHECK(f[0] == "partition");
+        if (f[1].starts_with("PhysicalDrive"))
+            saw_physical_drive = true;
+        // An unread size is "-", never a fabricated zero; a read one is all digits.
+        const bool digits = !f[3].empty() &&
+                            std::all_of(f[3].begin(), f[3].end(), [](char c) { return c >= '0' && c <= '9'; });
+        CHECK((digits ? f[3] != "0" : f[3] == "-"));
+    }
+    CHECK(saw_physical_drive);
+    // A clean read means the join worked: this host has a lettered local volume (the boot
+    // volume), so some row must carry a drive letter. Without this a leg that never finds a
+    // letter, or is always constrained, would pass every other check here.
+    if (clean) {
+        const bool any_letter = std::any_of(rows.begin() + 1, rows.end(), [](const std::string& r) {
+            const auto f = split_fields_escape_aware(r);
+            return f.size() == 7 && f[5].size() >= 3 && f[5][0] >= 'A' && f[5][0] <= 'Z' &&
+                   f[5][1] == ':' && f[5][2] == '/';
+        });
+        CHECK(any_letter);
+    }
+    // Deterministic: a second read gives the same disk / partition / size / type columns (the
+    // daily-sync blob is hashed). The mount-point and detail columns are left out on purpose, and
+    // so is a changed row SET: another job on a shared runner may attach or detach a VHD between
+    // the two reads, so a second read that sees a different number of rows is retried once and
+    // the comparison is made only between two reads that agree on the row count.
+    auto again = dispatcher.run(plugin->descriptor, "partitions");
+    auto rows2 = captured_rows(again.captured);
+    if (rows2.size() != rows.size()) {
+        again = dispatcher.run(plugin->descriptor, "partitions");
+        rows2 = captured_rows(again.captured);
+    }
+    if (rows2.size() == rows.size()) {
+        for (std::size_t i = 1; i < rows.size(); ++i) {
+            const auto a = split_fields_escape_aware(rows[i]);
+            const auto b = split_fields_escape_aware(rows2[i]);
+            REQUIRE(a.size() == 7);
+            REQUIRE(b.size() == 7);
+            for (std::size_t c = 0; c < 5; ++c)
+                CHECK(a[c] == b[c]);
+        }
+    } else {
+        WARN("partition row count changed between reads (a concurrent job attached or detached a disk); stability not compared");
+    }
+}
+#endif // _WIN32
 
 TEST_CASE("disk_actions plugin: an unknown action is refused, not silently ignored",
           "[disk_actions][actions]") {

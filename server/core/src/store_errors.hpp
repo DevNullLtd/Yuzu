@@ -22,6 +22,12 @@ namespace yuzu::server {
 // in the response body — see strip_conflict_prefix() below.
 inline constexpr std::string_view kConflictPrefix = "conflict:";
 
+// Shared prefix for "the named row does not exist" store errors. Unlike kConflictPrefix it
+// carries its trailing space (the literal every producer has always written), so the text after
+// it is the human detail. The instruction store's producers and `classify_store_error` (which
+// maps it to a 404) both use this constant, so a rename cannot silently turn a 404 into a 400.
+inline constexpr std::string_view kNotFoundPrefix = "not_found: ";
+
 // Strip the kConflictPrefix (and the single space that follows it in the
 // canonical form) from an error string for inclusion in operator-facing
 // error responses. Returns the input unchanged if the prefix is absent.

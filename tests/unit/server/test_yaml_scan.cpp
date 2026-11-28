@@ -13,8 +13,39 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <string>
+#include <vector>
 
 using namespace yuzu::server::yaml_scan;
+
+namespace {
+
+// Re-terminate every LF line with `eol` ("\r\n" or "\r"), so one LF fixture
+// yields its CRLF and lone-CR twins byte-for-byte (#2123).
+std::string with_eol(const std::string& lf, const std::string& eol) {
+    std::string out;
+    for (char c : lf) {
+        if (c == '\n')
+            out += eol;
+        else
+            out += c;
+    }
+    return out;
+}
+
+// A selector with a blank line between its two children: the #2123 shape.
+const std::string kSelectorWithBlank = "spec:\n"
+                                       "  scope:\n"
+                                       "    selector:\n"
+                                       "      platform: windows\n"
+                                       "\n"
+                                       "      tags:\n"
+                                       "        - prod\n";
+
+std::vector<std::string> selector_tags(const std::string& yaml) {
+    return extract_yaml_list(extract_yaml_section(yaml, "spec.scope.selector"), "tags");
+}
+
+} // namespace
 
 TEST_CASE("yaml_scan: extract_yaml_value scalar / quoted / mapping", "[yaml_scan]") {
     CHECK(extract_yaml_value("name: hello\n", "name") == "hello");
@@ -133,4 +164,403 @@ TEST_CASE("yaml_scan: a key inside a quoted value does not leak into a sibling s
     auto scope = extract_yaml_section(yaml, "spec.scope");
     CHECK_FALSE(yaml_has_key(scope, "fromResultSet"));
     CHECK(yaml_has_key(scope, "selector"));
+}
+
+// ── #2123: line endings, blank lines, comment lines ─────────────────────────
+//
+// Every case below asserts the LF result. Pre-fix the scanners split on '\n'
+// only, so a CRLF blank line ("\r") read as a non-blank line at column 0 and
+// ended the block early. For a policy that drops the later scope predicates
+// and the policy targets MORE devices than its YAML says (fail-open).
+
+TEST_CASE("yaml_scan: LF baseline for the #2123 selector shape", "[yaml_scan]") {
+    auto tags = selector_tags(kSelectorWithBlank);
+    REQUIRE(tags.size() == 1);
+    CHECK(tags[0] == "prod");
+}
+
+TEST_CASE("yaml_scan: a CRLF blank line does not truncate a section (#2123)", "[yaml_scan]") {
+    const auto crlf = with_eol(kSelectorWithBlank, "\r\n");
+    CHECK(extract_yaml_value(extract_yaml_section(crlf, "spec.scope.selector"), "platform") ==
+          "windows");
+    auto tags = selector_tags(crlf);
+    REQUIRE(tags.size() == 1);
+    CHECK(tags[0] == "prod");
+}
+
+TEST_CASE("yaml_scan: one CRLF blank line in an LF document (mixed endings) (#2123)",
+          "[yaml_scan]") {
+    std::string mixed = kSelectorWithBlank;
+    mixed.replace(mixed.find("windows\n\n"), 9, "windows\n\r\n");
+    auto tags = selector_tags(mixed);
+    REQUIRE(tags.size() == 1);
+    CHECK(tags[0] == "prod");
+}
+
+TEST_CASE("yaml_scan: a lone CR is a line break (#2123)", "[yaml_scan]") {
+    SECTION("whole document with lone-CR endings") {
+        auto tags = selector_tags(with_eol(kSelectorWithBlank, "\r"));
+        REQUIRE(tags.size() == 1);
+        CHECK(tags[0] == "prod");
+    }
+    SECTION("one lone CR inside an LF document") {
+        std::string doc = kSelectorWithBlank;
+        doc.replace(doc.find("windows\n\n"), 9, "windows\n\r");
+        auto tags = selector_tags(doc);
+        REQUIRE(tags.size() == 1);
+        CHECK(tags[0] == "prod");
+    }
+}
+
+TEST_CASE("yaml_scan: a whitespace-then-CR blank line shallower than the block (#2123)",
+          "[yaml_scan]") {
+    std::string doc = kSelectorWithBlank;
+    doc.replace(doc.find("windows\n\n"), 9, "windows\n  \r\n");
+    auto tags = selector_tags(doc);
+    REQUIRE(tags.size() == 1);
+    CHECK(tags[0] == "prod");
+}
+
+TEST_CASE("yaml_scan: trailing whitespace is harmless - guard that passes pre-fix", "[yaml_scan]") {
+    SECTION("on every content line") {
+        auto tags = selector_tags(with_eol(kSelectorWithBlank, "   \n"));
+        REQUIRE(tags.size() == 1);
+        CHECK(tags[0] == "prod");
+    }
+    SECTION("a whitespace-only blank line shallower than the block") {
+        std::string doc = kSelectorWithBlank;
+        doc.replace(doc.find("windows\n\n"), 9, "windows\n  \n");
+        auto tags = selector_tags(doc);
+        REQUIRE(tags.size() == 1);
+        CHECK(tags[0] == "prod");
+    }
+}
+
+TEST_CASE("yaml_scan: a comment line inside a block does not end it (#2123)", "[yaml_scan]") {
+    // YAML comment lines take no part in indentation. Pre-fix these truncate
+    // even with plain LF endings.
+    SECTION("comment at column 0") {
+        std::string doc = kSelectorWithBlank;
+        doc.replace(doc.find("windows\n\n"), 9, "windows\n# narrow to prod\n");
+        auto tags = selector_tags(doc);
+        REQUIRE(tags.size() == 1);
+        CHECK(tags[0] == "prod");
+    }
+    SECTION("comment indented less than the block") {
+        std::string doc = kSelectorWithBlank;
+        doc.replace(doc.find("windows\n\n"), 9, "windows\n  # prod only\n");
+        auto tags = selector_tags(doc);
+        REQUIRE(tags.size() == 1);
+        CHECK(tags[0] == "prod");
+    }
+    SECTION("comment at column 0, CRLF") {
+        std::string doc = kSelectorWithBlank;
+        doc.replace(doc.find("windows\n\n"), 9, "windows\n# narrow to prod\n");
+        auto tags = selector_tags(with_eol(doc, "\r\n"));
+        REQUIRE(tags.size() == 1);
+        CHECK(tags[0] == "prod");
+    }
+}
+
+TEST_CASE("yaml_scan: extract_yaml_mapping across blank and comment lines (#2123)", "[yaml_scan]") {
+    const std::string lf = "spec:\n"
+                           "  check:\n"
+                           "    instruction: x\n"
+                           "    parameters:\n"
+                           "      a: 1\n"
+                           "\n"
+                           "      b: 2\n";
+    auto count = [](const std::string& doc) {
+        return extract_yaml_mapping(extract_yaml_section(doc, "spec.check"), "parameters").size();
+    };
+    CHECK(count(lf) == 2);
+    CHECK(count(with_eol(lf, "\r\n")) == 2);
+    CHECK(count(with_eol(lf, "\r")) == 2);
+
+    std::string commented = lf;
+    commented.replace(commented.find("1\n\n"), 3, "1\n# second parameter\n");
+    CHECK(count(commented) == 2);
+}
+
+TEST_CASE("yaml_scan: extract_yaml_list across blank lines (#2123)", "[yaml_scan]") {
+    const std::string between = "groups:\n  - g1\n\n  - g2\n";
+    CHECK(extract_yaml_list(between, "groups").size() == 2);
+    CHECK(extract_yaml_list(with_eol(between, "\r\n"), "groups").size() == 2);
+    CHECK(extract_yaml_list(with_eol(between, "\r"), "groups").size() == 2);
+
+    const std::string before_first = "groups:\n\n  - g1\n";
+    CHECK(extract_yaml_list(with_eol(before_first, "\r\n"), "groups").size() == 1);
+}
+
+TEST_CASE("yaml_scan: a commented-out key before the real one is not matched (#2123)",
+          "[yaml_scan]") {
+    // yaml_scan.hpp's SECURITY CONTRACT: lookups anchor to real, line-leading
+    // keys. Pre-fix extract_yaml_list and extract_yaml_mapping used a bare
+    // find(), so the commented key won and the policy targeted tag:lab.
+    SECTION("extract_yaml_list") {
+        const std::string sel = "      platform: windows\n"
+                                "      # tags: [lab]\n"
+                                "      tags: [prod]\n";
+        auto tags = extract_yaml_list(sel, "tags");
+        REQUIRE(tags.size() == 1);
+        CHECK(tags[0] == "prod");
+    }
+    SECTION("extract_yaml_list, inline comment carrying the key") {
+        const std::string sel = "      platform: windows  # tags: [lab]\n"
+                                "      tags: [prod]\n";
+        auto tags = extract_yaml_list(sel, "tags");
+        REQUIRE(tags.size() == 1);
+        CHECK(tags[0] == "prod");
+    }
+    SECTION("extract_yaml_list, key that is a superstring") {
+        const std::string sel = "      extratags: [lab]\n"
+                                "      tags: [prod]\n";
+        auto tags = extract_yaml_list(sel, "tags");
+        REQUIRE(tags.size() == 1);
+        CHECK(tags[0] == "prod");
+    }
+    SECTION("extract_yaml_mapping") {
+        const std::string check = "    # parameters:\n"
+                                  "    #   evil: 1\n"
+                                  "    parameters:\n"
+                                  "      real: 2\n";
+        auto m = extract_yaml_mapping(check, "parameters");
+        REQUIRE(m.size() == 1);
+        CHECK(m[0].first == "real");
+    }
+}
+
+// ── #2123 security review: list extent ──────────────────────────────────────
+//
+// managementGroups is a UNION (an extra id widens targeting) while selector
+// tags are AND-ed (an extra tag narrows, a dropped one widens). So a block
+// list must neither absorb items from an outer/sibling list nor end early on
+// a line that still belongs to it.
+
+namespace {
+std::vector<std::string> groups(const std::string& doc) {
+    return extract_yaml_list(doc, "managementGroups");
+}
+using Items = std::vector<std::string>;
+} // namespace
+
+TEST_CASE("yaml_scan: a block list never absorbs an outer list's items as its own (#2123)",
+          "[yaml_scan]") {
+    SECTION("managementGroups as the last key of an outer list item") {
+        CHECK(groups("spec:\n"
+                     "  things:\n"
+                     "    - name: a\n"
+                     "      managementGroups:\n"
+                     "        - g1\n"
+                     "    - g2\n") == Items{"g1", "- g2"});
+    }
+    SECTION("dedented item after a blank line, CRLF") {
+        CHECK(groups(with_eol("spec:\n"
+                              "  assignment:\n"
+                              "    managementGroups:\n"
+                              "      - g1\n"
+                              "\n"
+                              "  - g2\n",
+                              "\r\n")) == Items{"g1", "- g2"});
+    }
+    SECTION("dedented item after blank and comment lines, LF") {
+        CHECK(groups("spec:\n"
+                     "  assignment:\n"
+                     "    managementGroups:\n"
+                     "      - g1\n"
+                     "\n"
+                     "      # c\n"
+                     "  - g2\n") == Items{"g1", "- g2"});
+    }
+    SECTION("a document separator ends the list") {
+        CHECK(groups("spec:\n"
+                     "  assignment:\n"
+                     "    managementGroups:\n"
+                     "      - g1\n"
+                     "---\n"
+                     "kind: X\n") == Items{"g1"});
+        CHECK(groups("managementGroups:\n- g1\n---\n- g2\n") == Items{"g1"});
+        CHECK(groups("managementGroups:\n- g1\n...\n") == Items{"g1"});
+    }
+}
+
+TEST_CASE("yaml_scan: compact (same-indent) block lists still parse (#2123)", "[yaml_scan]") {
+    CHECK(groups("managementGroups:\n- g1\n- g2\nnext: x\n") == Items{"g1", "g2"});
+    // An outer list's next item right after a compact list is kept raw (refused
+    // downstream), never absorbed as `y`.
+    CHECK(extract_yaml_list("- name: a\n  tags:\n  - x\n- y\n", "tags") == Items{"x", "- y"});
+    CHECK(extract_yaml_list("- name: a\n  tags:\n  - x\n  other: 1\n- y\n", "tags") == Items{"x"});
+}
+
+TEST_CASE("yaml_scan: a block list does not end early inside itself (#2123)", "[yaml_scan]") {
+    // Ending early would drop later tags, and a dropped tag widens a scope.
+    SECTION("a deeper continuation line joins the current item, never vanishes") {
+        // YAML reads `prod extra` (a multi-line plain scalar). Folding it in keeps
+        // the item honest: the space fails the tag charset, so the policy is
+        // rejected rather than stored with a different tag (governance G4-CON-F3).
+        CHECK(extract_yaml_list("tags:\n  - prod\n    extra\n  - pci\n", "tags") ==
+              Items{"prod extra", "pci"});
+    }
+    SECTION("an item written -b (no space) is still read (lock: passes pre-fix)") {
+        CHECK(extract_yaml_list("tags:\n  - a\n  -b\n  - c\n", "tags") == Items{"a", "b", "c"});
+    }
+}
+
+TEST_CASE("yaml_scan: a misplaced - line inside a block list fails closed (#2123)", "[yaml_scan]") {
+    // A `-` line the list's column rules cannot place must never vanish: a
+    // vanished tag widens a scope. It is kept as one raw item (`- prod`), whose
+    // space fails validate_scope_block's charset, so the policy is rejected.
+    // Governance G2-SEC-F1 (a, b) and G3-DSL-F1.
+    SECTION("first item one column shallower than its key") {
+        CHECK(extract_yaml_list("      tags:\n     - prod\n", "tags") == Items{"- prod"});
+    }
+    SECTION("a deeper - line under an item") {
+        CHECK(extract_yaml_list("tags:\n  - a\n    - prod\n", "tags") == Items{"a", "- prod"});
+    }
+    SECTION("a later item between the key's column and the item column") {
+        CHECK(extract_yaml_list("      tags:\n        - a\n       - prod\n", "tags") ==
+              Items{"a", "- prod"});
+    }
+    SECTION("an outer list's item after a list with items is kept raw, not absorbed") {
+        CHECK(extract_yaml_list("    - name: a\n      tags:\n        - g1\n    - g2\n", "tags") ==
+              Items{"g1", "- g2"});
+    }
+    SECTION("a compact item one column shallower than the key is kept raw (CH-1)") {
+        CHECK(extract_yaml_list("      tags:\n      - a\n     - b\n", "tags") == Items{"a", "- b"});
+    }
+    SECTION("a key with no items followed by an outer list's item is not absorbed") {
+        // Valid YAML reads `tags` as null here. The scanner cannot tell this from a
+        // one-column misindent, so it fails closed: the raw item is rejected
+        // downstream (write `tags: []` for an explicitly empty list).
+        CHECK(extract_yaml_list("    - name: a\n      tags:\n    - g2\n", "tags") == Items{"- g2"});
+    }
+}
+
+TEST_CASE("yaml_scan: an inline list must close on the key's own line (#2123)", "[yaml_scan]") {
+    // A comment inside a multi-line flow list, or an unterminated one, must
+    // never contribute ids. With no ] on the key's line the raw value is
+    // returned as ONE item: a tag containing '[' fails validate_scope_block's
+    // charset (the policy is rejected), and a group id containing '[' matches
+    // no group. Returning an EMPTY list instead would silently drop every tag.
+    SECTION("leading-comma multi-line list with a comment") {
+        // The continuation line comes back raw as well (round 4: a value on the key
+        // line never hides the lines after it). Every item is refused downstream.
+        CHECK(groups("managementGroups: [g1,  # canary, prod\n  , g2]\n") ==
+              Items{"[g1,", "-  , g2]"});
+    }
+    SECTION("comma inside a comment") {
+        CHECK(groups("managementGroups: [g1,  # canary, prod-all,\n  g2]\n") ==
+              Items{"[g1,", "-  g2]"});
+    }
+    SECTION("unterminated list followed by another key's inline list") {
+        CHECK(groups("spec:\n"
+                     "  assignment:\n"
+                     "    managementGroups: [g1\n"
+                     "  triggers: [x, prod-all]\n") == Items{"[g1"});
+    }
+    SECTION("single-line list with a trailing comment (lock: passes pre-fix)") {
+        CHECK(groups("managementGroups: [g1, g2] # x, y\n") == Items{"g1", "g2"});
+    }
+}
+
+// ── #2123 Gate 8: a raw item must always be refusable, and no list line vanishes ──
+
+TEST_CASE("yaml_scan: a raw item always carries a space so it is refused (#2123 Gate 8)",
+          "[yaml_scan]") {
+    // A misplaced `-prod` / bare `-` used to come back as `-prod` / `-`, which pass
+    // the scope-token charset, so the policy was stored (governance Gate 8:
+    // cpp-safety, cpp-expert C8-1, dsl-engineer R2-1).
+    CHECK(extract_yaml_list("tags:\n  - a\n    -prod\n", "tags") == Items{"a", "- prod"});
+    CHECK(extract_yaml_list("tags:\n  - a\n -prod\n", "tags") == Items{"a", "- prod"});
+    CHECK(extract_yaml_list("    tags:\n  -\n", "tags") == Items{"- "});
+}
+
+TEST_CASE(
+    "yaml_scan: a scalar where a list is expected is refused, never read or dropped (#2123 Gate 8)",
+    "[yaml_scan]") {
+    // `tags: prod` used to read as no tags at all, widening the scope (governance
+    // Gate 8 dsl-engineer R2-2). Reading it as one item then made a scalar
+    // `managementGroups: <id>` anywhere in the document a group, and
+    // `managementGroups: null` the group `null` (architect A1, unhappy-path
+    // UP-A/UP-B). So a scalar is kept as ONE raw item (leading space), which every
+    // caller's charset refuses — except a YAML null, which is an empty list.
+    CHECK(extract_yaml_list("tags: prod\n", "tags") == Items{" prod"});
+    CHECK(extract_yaml_list("tags: \"prod\"\n", "tags") == Items{" \"prod\""});
+    CHECK(extract_yaml_list("tags: &t [prod]\n", "tags") == Items{" &t [prod]"});
+    for (const std::string null_form : {"null", "Null", "NULL", "~"})
+        CHECK(
+            extract_yaml_list("managementGroups: " + null_form + "\n", "managementGroups").empty());
+    CHECK(extract_yaml_list("tags:   # the tags\n  - prod\n", "tags") == Items{"prod"});
+}
+
+TEST_CASE("yaml_scan: an empty-string item is kept so it is refused (#2123 Gate 8)",
+          "[yaml_scan]") {
+    // `- ""` and `[a, ""]` used to vanish, dropping a tag (security-guardian N3).
+    // A bare `- ` is a YAML null and is still not an item.
+    CHECK(extract_yaml_list("tags:\n  - a\n  - \"\"\n", "tags") == Items{"a", ""});
+    CHECK(extract_yaml_list("tags: [a, \"\"]\n", "tags") == Items{"a", ""});
+    CHECK(extract_yaml_list("tags:\n  - a\n  -\n", "tags") == Items{"a"});
+}
+
+TEST_CASE("yaml_scan: only a key at or shallower than the list's key ends the list (#2123 Gate 8)",
+          "[yaml_scan]") {
+    // A `key:` line deeper than the list's key cannot be its sibling, so it is a
+    // raw item, not a terminator that drops the items after it (security-guardian
+    // N1, dsl-engineer R3-1b, unhappy-path UP-D).
+    CHECK(extract_yaml_list("      tags:\n        - a\n        pci:\n        - c\n", "tags") ==
+          Items{"a", " pci:", "c"});
+    CHECK(extract_yaml_list("      tags:\n        - a\n       x: 1\n        - c\n", "tags") ==
+          Items{"a", " x: 1", "c"});
+    // A mapping where a list is expected is refused, not read as no items.
+    CHECK(extract_yaml_list("      tags:\n        env: prod\n", "tags") == Items{" env: prod"});
+    // A sibling key still ends the list.
+    CHECK(extract_yaml_list("      tags:\n        - a\n      platform: x\n", "tags") == Items{"a"});
+}
+
+TEST_CASE("yaml_scan: a line missing its dash is kept raw, not a list terminator (#2123 Gate 8)",
+          "[yaml_scan]") {
+    // A forgotten `- ` used to end the list, silently dropping that item and
+    // every later one (governance Gate 8 security-guardian F8). A `key:` line
+    // still ends the list (compact form followed by a sibling key).
+    CHECK(extract_yaml_list("tags:\n  - a\n  pci\n  - c\n", "tags") == Items{"a", " pci", "c"});
+    CHECK(extract_yaml_list("tags:\n  prod\n", "tags") == Items{" prod"});
+    CHECK(extract_yaml_list("tags:\n- a\nnext: x\n", "tags") == Items{"a"});
+    CHECK(extract_yaml_list("tags:\n  - a\nplatform: linux\n", "tags") == Items{"a"});
+}
+
+TEST_CASE("yaml_scan: a value on the key line never hides the list lines after it (#2123 Gate 8)",
+          "[yaml_scan]") {
+    // `tags: null` followed by `- prod` used to return no tags, dropping prod
+    // (round 4: dsl-engineer F1, security-guardian R4-1, unhappy-path UP-F). The
+    // same for a closed inline list (`tags: [a]` then `- prod`, dsl-engineer F2)
+    // and a scalar. The following lines come back raw, so the caller refuses.
+    CHECK(extract_yaml_list("tags: null\n  - prod\n", "tags") == Items{" null", "- prod"});
+    CHECK(extract_yaml_list("tags: ~   # none\n  - prod\n", "tags") ==
+          Items{" ~   # none", "- prod"});
+    CHECK(extract_yaml_list("managementGroups: null\n  a1b2c3d4e5f6\n", "managementGroups") ==
+          Items{" null", "-  a1b2c3d4e5f6"});
+    CHECK(extract_yaml_list("tags: [a]\n  - prod\n", "tags") == Items{"a", "- prod"});
+    CHECK(extract_yaml_list("tags: prod\n  - pci\n", "tags") == Items{" prod", "- pci"});
+    // Followed by the next key, they are untouched.
+    CHECK(extract_yaml_list("tags: null\nplatform: x\n", "tags").empty());
+    CHECK(extract_yaml_list("tags: [a, b]\nplatform: x\n", "tags") == Items{"a", "b"});
+}
+
+TEST_CASE("yaml_scan: a key-shaped list item is kept raw (#2123 Gate 8)", "[yaml_scan]") {
+    // `- pci:` is a mapping entry, not a plain item; `:` passes the scope-token
+    // charset, so it must not come back as `pci:` (round 4 cpp-expert F1).
+    CHECK(extract_yaml_list("tags:\n  - a\n  - pci:\n", "tags") == Items{"a", "- pci:"});
+    CHECK(extract_yaml_list("tags:\n  -\n    pci:\n", "tags") == Items{" pci:"});
+    // A plain value containing ':' with no space after it is still a value.
+    CHECK(extract_yaml_list("tags:\n  - a:b\n", "tags") == Items{"a:b"});
+}
+
+TEST_CASE(
+    "yaml_scan: a scalar managementGroups inside a description block is refused (#2123 Gate 8)",
+    "[yaml_scan]") {
+    // Pins UP-B's placement (round 4 quality-engineer): the whole-document read
+    // finds the line inside the block scalar; it must come back raw (refused),
+    // never as a group that replaces the selector.
+    CHECK(extract_yaml_list("spec:\n  description: |\n    managementGroups: abc123def456\n",
+                            "managementGroups") == Items{" abc123def456"});
 }

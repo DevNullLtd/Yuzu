@@ -1,4 +1,4 @@
-captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (jsmith) · leg-hash 20eab902257c
+captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (jsmith) · leg-hash 6ba36d994237
 == action=status
 error|Echo database not initialized
 [result_status] UNDECLARED / UNKNOWN / 

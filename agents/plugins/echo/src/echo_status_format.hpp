@@ -19,12 +19,22 @@
  * exists to let a test assert. See `echo.yaml` and `docs/user-manual/echo.md`.
  */
 
+#include <chrono>
+#include <cstddef>
 #include <cstdint>
+#include <format>
+#include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace yuzu::echo {
+
+/// The reason token of a store closed at run time by a failed rollback (OfflineReason::
+/// rollback_wedged). Named here because the status reply below, which comes before the enum,
+/// publishes it as its second line so the reply and the heartbeat tag agree.
+inline constexpr std::string_view kRollbackWedgedToken = "rollback_wedged";
 
 /// The complete `echo status` reply for a store that has failed closed, in the
 /// order it must be written.
@@ -48,8 +58,176 @@ format_storage_offline_lines(bool query_engine_available) {
                     "are both stopped. "}
             .append(read_path)
             .append(" Restart the agent to recover."),
-        "storage_state|offline",
+        std::format("storage_state|offline|{}", kRollbackWedgedToken),
     };
+}
+
+/// The prefix of EchoDatabase::open's refusal when the v10 roll-up migration finds less than twice
+/// the database file (plus its write-ahead log) free on its volume (echo_db_v10_migration.cpp). The plugin tells that refusal
+/// from every other open failure by this text.
+inline constexpr std::string_view kFreeSpaceRefusalPrefix = "not enough free disk space to migrate";
+
+[[nodiscard]] inline bool is_free_space_refusal(std::string_view open_error) {
+    return open_error.find(kFreeSpaceRefusalPrefix) != std::string_view::npos;
+}
+
+/// The prefixes of EchoDatabase::open's two refusals that mean the v10 roll-up step did not
+/// complete (echo_db.cpp builds both messages from these, so the text and the classifier cannot
+/// drift): the step itself failed, or an earlier migration step had not finished so the roll-up
+/// step waited. Both leave the database untouched at its old schema version.
+inline constexpr std::string_view kV10MigrationFailedPrefix = "v10 roll-up migration failed";
+inline constexpr std::string_view kEarlierStepPrefix = "an earlier migration step did not finish";
+/// Inside the v10 failure text when the attempt hit its wall-clock deadline (echo_db_v10_migration.cpp
+/// builds the message from this; the retry loop counts a hit by finding it, to double the next deadline).
+inline constexpr std::string_view kV10DeadlineMarker = "did not finish inside its";
+
+/// Why Echo loaded offline at open (the plugin is present, nothing collects, the open is retried).
+/// `none` = the failure is not one of the retried kinds and `init` fails as it always did.
+/// The tokens are mirrored by server/core/src/echo_storage_offline_tag.hpp.
+/// `rollback_wedged` is the one reason that is not an open failure: the database opened and ran,
+/// then was closed at run time after a ROLLBACK failed with the transaction still open
+/// (EchoDatabase closes the write connection; only an agent restart recovers). It never comes out
+/// of classify_open_failure and is never retried.
+enum class OfflineReason { none, free_space, migration_failed, open_failed, rollback_wedged };
+
+[[nodiscard]] constexpr std::string_view offline_reason_token(OfflineReason reason) noexcept {
+    switch (reason) {
+    case OfflineReason::free_space:
+        return "free_space";
+    case OfflineReason::migration_failed:
+        return "migration_failed";
+    case OfflineReason::open_failed:
+        return "open_failed";
+    case OfflineReason::rollback_wedged:
+        return kRollbackWedgedToken;
+    case OfflineReason::none:
+        break;
+    }
+    return "";
+}
+
+/// The plugin KV key the agent's heartbeat bridge publishes as the status tag
+/// `yuzu.plugin.echo.storage_offline` (agents/core plugin_heartbeat_tags.hpp); its value is the
+/// reason token. The server's fleet gauge (server/core/src/echo_storage_offline_tag.hpp) mirrors
+/// the tag and the four tokens as literals; a test on each side pins them.
+inline constexpr std::string_view kStorageOfflineKey = "heartbeat.storage_offline";
+
+/// Tell the retried open failures from every other one by the wrapper text open() puts at the
+/// START of each: `v10 roll-up migration failed ...` (echo_db.cpp wraps every migrate_to_v10
+/// failure, the free-space refusal included, in it) or `schema vN: an earlier migration step did
+/// not finish ...`. Both are matched at their fixed offset, never anywhere in the text: open()'s
+/// other failures carry the data-directory path, and a directory named after a wrapper phrase must
+/// not turn a fail-init refusal into offline-with-retry. The free-space text is looked for only
+/// under the v10 anchor, because only migrate_to_v10 produces it.
+/// The one limit left: the link refusal leads with the file name (echo_db.cpp), so a RELATIVE data
+/// directory whose own name begins with a wrapper phrase could still match; an absolute path cannot.
+[[nodiscard]] inline OfflineReason classify_open_failure(std::string_view open_error) {
+    if (open_error.starts_with(kV10MigrationFailedPrefix))
+        return is_free_space_refusal(open_error) ? OfflineReason::free_space
+                                                 : OfflineReason::migration_failed;
+    if (open_error.starts_with("schema v")) {
+        const auto sep = open_error.find(": ");
+        if (sep != std::string_view::npos && open_error.substr(sep + 2).starts_with(kEarlierStepPrefix))
+            return OfflineReason::migration_failed;
+    }
+    return OfflineReason::none;
+}
+
+/// Whether an open failure's text says the attempt ran into its wall-clock deadline (the next
+/// attempt's deadline is doubled for each such hit). The text is the v10 migration's own, so it is
+/// looked for only under the same wrapper anchor as classify_open_failure.
+[[nodiscard]] inline bool is_deadline_hit(std::string_view open_error) {
+    return open_error.starts_with(kV10MigrationFailedPrefix) &&
+           open_error.find(kV10DeadlineMarker) != std::string_view::npos;
+}
+
+/// The reason a RETRY attempt's failure is recorded under: the classified reason, or `open_failed`
+/// for any failure that is not one of the first-open kinds (a failure on a later attempt never
+/// fails the plugin; it stays offline).
+[[nodiscard]] inline OfflineReason retry_failure_reason(std::string_view open_error) {
+    const auto reason = classify_open_failure(open_error);
+    return reason == OfflineReason::none ? OfflineReason::open_failed : reason;
+}
+
+/// The complete `echo status` reply when the database is not open because an open failed with a
+/// retried reason, in the order it must be written (`error|` FIRST, for the reason
+/// format_storage_offline_lines documents). `detail` is the open error. The plugin has loaded but
+/// nothing collects and no trigger is registered. `next_retry_in` is the wait until the next
+/// automatic attempt; `nullopt` means none is scheduled (collection failed to start after a late
+/// open, so only an agent restart recovers) and the reply says so instead of promising a retry.
+///
+/// The fixed state and the retry or restart clause come BEFORE the detail: the dashboard shows only
+/// the first 400 bytes of line 0 after `error|` (web_utils.hpp agent_error_display), and a real
+/// free-space refusal alone is about 470 bytes, so a detail written first would cut the guidance
+/// off. Keep the fixed text short and free of '-'.
+[[nodiscard]] inline std::vector<std::string>
+format_storage_refused_lines(OfflineReason reason, std::string_view detail,
+                             std::optional<std::chrono::seconds> next_retry_in) {
+    std::string line0 = "error|Echo storage is offline on this endpoint. ";
+    if (!next_retry_in) {
+        // The open itself succeeded (and may have migrated), so no "not changed" claim here.
+        line0.append("Collection and retention are stopped. The open is not retried; restart the agent.");
+    } else {
+        line0.append("Collection and retention are stopped and the database was not changed. "
+                     "The open is retried automatically. ")
+            .append(next_retry_in->count() > 0
+                        ? std::format("The next attempt is in about {} s.", next_retry_in->count())
+                        : std::string{"Retrying now."});
+    }
+    line0.append(" Cause: ").append(detail);
+    return {
+        std::move(line0),
+        std::format("storage_state|offline|{}", offline_reason_token(reason)),
+    };
+}
+
+/// What the slow-tick reconcile does with the storage-offline tag while the plugin is online
+/// (the open succeeded; go_offline never runs here). `store_open` is EchoDatabase::is_open(),
+/// `key_present` whether the tag is set, `current` its value. A store closed at run time by a
+/// failed rollback publishes `rollback_wedged` (once: a key already at that token is left, so a
+/// stuck tick does not rewrite it); an open store clears any tag, which is a stale one from a
+/// previous run or a failed delete replayed.
+enum class OfflineTagAction { leave, publish_wedged, clear };
+
+[[nodiscard]] constexpr OfflineTagAction online_offline_tag_action(bool store_open, bool key_present,
+                                                                   std::string_view current) noexcept {
+    if (!store_open)
+        return key_present && current == kRollbackWedgedToken ? OfflineTagAction::leave
+                                                              : OfflineTagAction::publish_wedged;
+    return key_present ? OfflineTagAction::clear : OfflineTagAction::leave;
+}
+
+/// Whether `action` is refused while the write connection is closed (EchoDatabase::is_open() is
+/// false: a failed rollback closed it at run time, #8099). Dispatch gates only on `online_`, which
+/// that close never clears, so every action still runs. Traced against the code, these five answer
+/// WRONG on a closed store and are refused:
+///   collect_fast, collect_slow  every source's enable flag reads as unreadable, each leg is skipped
+///                               and the tick answers `echo|collect_*|0|events_recorded`, rc 0: the
+///                               reply of an idle healthy host
+///   fleet_snapshot              process and tcp read as disabled, so the snapshot carries
+///                               `process_source_paused` and `tcp_source_paused`, a pause no operator made
+///   rollup                      retention and the byte budget are skipped (logged) and it answers
+///                               `echo|rollup|0|rows_aggregated`, rc 0
+///   configure                   writes fail and say so, except a `usage_enabled=true` re-assert: the
+///                               closed store returns the default, no change is seen, and it answers
+///                               `status|ok` with nothing written
+/// The rest answer honestly and are left as they are: status (the offline lines), sql (the read-only
+/// connection, which the status reply promises), compatibility (static), query and export
+/// (`error|database not open`), purge_source (`error|config_unreadable`), snapshot (partial, every
+/// source named), collect_perf and collect_software (`state_unreadable`). A new action that reads
+/// or writes through the write connection must be classified here.
+[[nodiscard]] constexpr bool refused_on_closed_store(std::string_view action) noexcept {
+    return action == "collect_fast" || action == "collect_slow" || action == "configure" ||
+           action == "fleet_snapshot" || action == "rollup";
+}
+
+/// The one line a refused action answers with: line 0 of the offline status reply, so the two read
+/// the same. `nullopt` = the action runs (the store is open, or the action answers honestly).
+[[nodiscard]] inline std::optional<std::string>
+format_closed_store_refusal(std::string_view action, bool store_open, bool query_engine_available) {
+    if (store_open || !refused_on_closed_store(action))
+        return std::nullopt;
+    return format_storage_offline_lines(query_engine_available).front();
 }
 
 /// `db_health|<ok|quarantined>|<epoch>` (#1567). `quarantined` iff THIS open
@@ -59,6 +237,36 @@ format_storage_offline_lines(bool query_engine_available) {
                                                        int64_t last_epoch) {
     return std::string{"db_health|"} + (quarantined_this_open ? "quarantined|" : "ok|") +
            std::to_string(last_epoch);
+}
+
+/// The two always-present `config|` lines that say what shape the store is in (#2626):
+/// `config|schema_version|<N>` and `config|warehouse_tables_ok|<true|false>`, in that order.
+/// `warehouse_tables_ok` is false when open() succeeded but could not create every
+/// registry-declared warehouse table, which otherwise shows only as a stream of per-pass write
+/// failures. Server readers of `config|` lines skip keys they do not know, so adding these is not
+/// a wire break.
+[[nodiscard]] inline std::vector<std::string> format_schema_status_lines(int schema_version,
+                                                                         bool warehouse_ok) {
+    return {
+        std::format("config|schema_version|{}", schema_version),
+        std::format("config|warehouse_tables_ok|{}", warehouse_ok ? "true" : "false"),
+    };
+}
+
+/// `partial|applied|<k1,k2,...>` (#2155): the line `echo.configure` writes, ahead of its error
+/// line, when a write failed AFTER some earlier ones persisted. Keys are the config keys that did
+/// persist, in the order they were written. Empty (no line at all) when nothing persisted: that
+/// reply is the flat error alone, never a "partial" one.
+[[nodiscard]] inline std::string format_configure_partial(const std::vector<std::string>& applied) {
+    if (applied.empty())
+        return {};
+    std::string line = "partial|applied|";
+    for (std::size_t i = 0; i < applied.size(); ++i) {
+        if (i != 0)
+            line += ',';
+        line += applied[i];
+    }
+    return line;
 }
 
 } // namespace yuzu::echo

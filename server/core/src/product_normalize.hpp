@@ -38,10 +38,12 @@ inline constexpr std::int64_t kRearmSecs = 7 * 24 * 3600;
 /// architecture, and edition tokens removed, plus the first edition token
 /// extracted (empty when the raw title carries none). The matcher operates on
 /// the stripped `title`; `edition` feeds the `products.edition` column and
-/// the `norm_key` suffix.
+/// the `norm_key` suffix; `version` is the first version-ish token that was
+/// stripped (the title dimension's `title_version`).
 struct NormalizedTitle {
     std::string title;
     std::string edition;
+    std::string version; ///< first stripped version-ish token, leading 'v' removed; empty when none
 };
 
 /// Normalise a raw product title deterministically:
@@ -57,17 +59,53 @@ struct NormalizedTitle {
 ///   - edition tokens (professional, pro, enterprise, standard, community,
 ///     ultimate, home, education, datacenter, express) are removed from the
 ///     title; the FIRST one encountered is returned verbatim (lowercased) as
-///     `edition`, later ones are dropped.
+///     `edition`, later ones are dropped. An edition word is an edition only
+///     AFTER a title word has been kept: a title that is one ("Home") or starts
+///     with one ("Pro Display Calibrator") keeps it as a title word, so a title
+///     never normalises to nothing because of it,
+///   - the word "edition" directly after an architecture token, or after a word
+///     taken as the edition, is dropped with it ("7-Zip 26.04 (x64 edition)" and
+///     "Visual Studio Pro Edition" lose it; elsewhere it is a title word, so a
+///     leading edition word kept as a title word does not arm it: "Home Edition"
+///     is "home edition"),
+///   - a standalone "-" token is dropped ("Redistributable (x64) - 14.38"),
+///   - a Homebrew-style "name@version" token keeps `name` in the title and
+///     supplies the version when none was seen before it ("openssl@3" gives
+///     "openssl", version "3"); an "@" without a version-shaped tail is left
+///     alone.
+/// A year range such as "2015-2022" is not version-shaped, so it stays in the
+/// title: it names the runtime generation. Versions glued onto a name
+/// ("python3.14", "postgresql-18") are not touched either: digit-bearing
+/// package names are legitimate, so such a name needs its own alias row.
 /// Total over arbitrary bytes; never throws.
 NormalizedTitle normalize_title(std::string_view raw);
 
+/// Normalise the value of an EDITION COLUMN (the alias pack's and a curated alias's `edition`
+/// field): the first edition token, lowercased, when every token of `raw` is an edition,
+/// architecture or version-ish token ("Standard", "Enterprise x64"); empty when `raw` is empty or
+/// carries any other word. Unlike a title, a lone edition word here IS the edition, so this is
+/// the one parser both column callers use; `normalize_title`'s positional rule never applies.
+std::string normalize_edition(std::string_view raw);
+
+/// The origin-label prefix the agent writes into `publisher` when a source declares no vendor
+/// (`via:<ecosystem>`, ADR-0016 update 2026-11-04). It names where a row came from, never who
+/// made it. MUST equal the agent's kOriginLabelPrefix (sync_source_installed_software.hpp).
+inline constexpr std::string_view kOriginLabelPrefix = "via:";
+
 /// Normalise a raw vendor/publisher name deterministically: ASCII lowercase,
-/// commas/semicolons trimmed from token edges, legal-suffix tokens stripped
-/// (inc, inc., incorporated, corp, corp., corporation, ltd, ltd., llc, gmbh,
-/// s.a., co., company, technologies, software, systems, foundation),
-/// whitespace collapsed, then a tiny built-in alias table (Microsoft, Adobe,
-/// Oracle, JetBrains, VMware forms) maps well-known variants onto one
-/// canonical vendor. Total over arbitrary bytes; never throws.
+/// commas/semicolons trimmed from token edges, the TRAILING run of legal-suffix
+/// tokens stripped (inc, inc., incorporated, corp, corp., corporation, ltd,
+/// ltd., llc, l.l.c., gmbh, s.a., co., company, technologies, software,
+/// systems, foundation), whitespace collapsed, then a tiny built-in alias table
+/// (Microsoft, Adobe, Oracle, JetBrains, VMware forms) maps well-known
+/// variants onto one canonical vendor. A suffix word that is not trailing is
+/// part of the name ("macOS Software Signing", "Software AG"), and the last
+/// remaining token is never stripped, so a non-empty vendor never normalises
+/// to nothing ("Software" stays "software"). Compound legal forms ("GmbH & Co.
+/// KG", "S.A.S.") are not reduced: kg, co and & are not in the list. A RAW value starting with
+/// kOriginLabelPrefix (case-sensitive, exact: the agent emits it lowercase, so a Windows
+/// Publisher of "VIA:..." is a vendor) is an origin label, not a vendor, and normalises to "".
+/// Total over arbitrary bytes; never throws.
 std::string normalize_vendor(std::string_view raw);
 
 /// Deterministic canonical product key — the `products.norm_key` UNIQUE
@@ -81,6 +119,12 @@ std::string normalize_vendor(std::string_view raw);
 /// vs Enterprise), so they mint distinct product rows; the `title_vendor`
 /// match tier below still relates them across editions.
 std::string norm_key(std::string_view title, std::string_view vendor);
+
+/// The key shape itself, from already-normalised parts: the ONE owner of
+/// `<vendor>:<title>[:<edition>]`. `norm_key()` ends in it, and the SAM.4 alias-pack
+/// parser calls it for a pack product's key, so the two can never drift.
+std::string make_norm_key(std::string_view norm_vendor, std::string_view norm_title,
+                          std::string_view edition);
 
 /// Strictly ordered deterministic match tiers (ADR-0024 Decision 6). Lower
 /// enumerators are stronger matches; the matcher returns the first tier that

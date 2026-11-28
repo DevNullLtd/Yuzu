@@ -16,7 +16,7 @@
  * file's suite.
  *
  * Three things are bound, matching the #881 spec's own layering:
- *   1. `is_quarantine_control_plugin` — the pure, case-insensitive
+ *   1. `is_firewall_control_plugin` — the pure, case-insensitive
  *      closed four-action exemption predicate (now in
  *      common/include/yuzu/protective_actions.hpp). No store, no ServerImpl.
  *   2. `evaluate_quarantine_degradation` — the pure bounded-staleness
@@ -42,6 +42,7 @@
 
 #include "dispatch_confined_arms.hpp"
 #include "dispatch_scope_ladder.hpp"
+#include <yuzu/protective_actions.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -59,7 +60,7 @@ using yuzu::server::ContainmentGate;
 using yuzu::server::dispatch_confined_arms;
 using yuzu::server::DispatchArm;
 using yuzu::server::evaluate_quarantine_degradation;
-using yuzu::server::is_quarantine_control_plugin;
+using yuzu::server::is_firewall_control_plugin;
 using yuzu::server::kQuarantineGateOutcomeFailClosed;
 using yuzu::server::kQuarantineGateOutcomeFresh;
 using yuzu::server::kQuarantineGateOutcomeStale;
@@ -116,33 +117,34 @@ const std::vector<std::string> kThree{"dev-A", "dev-B", "dev-C"};
 
 // ============================================================ predicate ===
 
-TEST_CASE("is_quarantine_control_plugin: exempts the quarantine plugin case-insensitively, "
-          "without a store",
+TEST_CASE("is_firewall_control_plugin: exempts the firewall containment actions "
+          "case-insensitively, without a store",
           "[server][dispatch][quarantine]") {
-    CHECK(is_quarantine_control_plugin("quarantine", "unquarantine"));
-    CHECK(is_quarantine_control_plugin("Quarantine", "unquarantine"));
-    CHECK(is_quarantine_control_plugin("QUARANTINE", "UnQuarantine"));
-    CHECK_FALSE(is_quarantine_control_plugin("quarantined", "unquarantine"));
-    CHECK_FALSE(is_quarantine_control_plugin("quarantin", "unquarantine"));
-    CHECK_FALSE(is_quarantine_control_plugin("", "unquarantine"));
-    CHECK_FALSE(is_quarantine_control_plugin("firewall", "unquarantine"));
+    CHECK(is_firewall_control_plugin("firewall", "release"));
+    CHECK(is_firewall_control_plugin("Firewall", "release"));
+    CHECK(is_firewall_control_plugin("FIREWALL", "Quarantine_Status"));
+    CHECK_FALSE(is_firewall_control_plugin("firewalls", "release"));
+    CHECK_FALSE(is_firewall_control_plugin("firewal", "release"));
+    CHECK_FALSE(is_firewall_control_plugin("", "release"));
+    // The removed plugin's name is no longer an exemption for anything.
+    CHECK_FALSE(is_firewall_control_plugin("quarantine", "release"));
 }
 
-TEST_CASE("is_quarantine_control_plugin: the exemption is keyed on the ACTION too",
+TEST_CASE("is_firewall_control_plugin: the exemption is keyed on the ACTION too",
           "[server][dispatch][quarantine]") {
-    // The four the plugin declares are exempt: release, the read, the
-    // whitelist repair path, and the re-dispatch #3127 relies on.
-    for (const auto* action : {"quarantine", "unquarantine", "status", "whitelist"}) {
+    // The four containment actions are exempt: release, the read, the
+    // allow-list repair path, and the re-dispatch #3127 relies on.
+    for (const auto* action : {"quarantine", "release", "quarantine_status", "quarantine_allow"}) {
         INFO("action=" << action);
-        CHECK(is_quarantine_control_plugin("quarantine", action));
+        CHECK(is_firewall_control_plugin("firewall", action));
     }
-    // A FIFTH action must NOT inherit the exemption by belonging to the same
-    // plugin — that is the whole reason this is keyed on the pair. If someone
-    // adds an action to the plugin, it arrives gated until it is named here
-    // deliberately.
-    for (const auto* action : {"exec", "run", "collect", "reset", ""}) {
+    // Any other action must NOT inherit the exemption by belonging to the same
+    // plugin — that is the whole reason this is keyed on the pair. firewall's own
+    // `state` and `rules`, and any action added later, arrive gated until named
+    // here deliberately.
+    for (const auto* action : {"state", "rules", "exec", "run", "collect", "reset", ""}) {
         INFO("action=" << action);
-        CHECK_FALSE(is_quarantine_control_plugin("quarantine", action));
+        CHECK_FALSE(is_firewall_control_plugin("firewall", action));
     }
 }
 
@@ -615,10 +617,36 @@ TEST_CASE("compose_containment_gate: ONLY the quarantine control plugin is exemp
         CHECK(d.gate.enforced);
     }
     QuarantineSnapshot snap;
-    const auto exempt = compose_containment_gate("quarantine", "unquarantine", false, std::optional{quarantined},
+    const auto exempt = compose_containment_gate("firewall", "release", false, std::optional{quarantined},
                                                  snap, now);
     CHECK_FALSE(exempt.gate.enforced);
     CHECK(exempt.outcome == "exempt_control_plugin");
+}
+
+// The containment gate's exemption and the protective set are ONE predicate
+// (`is_firewall_control_plugin`): a contained device must accept all four containment actions, and
+// no enablement gate may refuse them. This pins that the two decisions cannot drift apart again.
+TEST_CASE("compose_containment_gate: the four firewall containment actions are exempt and protective",
+          "[dispatch][quarantine][server][protective]") {
+    using namespace yuzu::server;
+    const auto now = std::chrono::steady_clock::now();
+    std::unordered_set<std::string> quarantined{"dev-A"};
+    for (const char* action : {"quarantine", "release", "quarantine_status", "quarantine_allow"}) {
+        INFO(action);
+        QuarantineSnapshot snap;
+        const auto d = compose_containment_gate("firewall", action, false, std::optional{quarantined}, snap, now);
+        CHECK_FALSE(d.gate.enforced);
+        CHECK(d.outcome == "exempt_control_plugin");
+        CHECK(yuzu::protective::is_protective_action("firewall", action));
+    }
+    // `state` and `rules` are the same plugin's ordinary actions: gated by the containment gate.
+    for (const char* action : {"state", "rules"}) {
+        INFO(action);
+        QuarantineSnapshot snap;
+        const auto d = compose_containment_gate("firewall", action, false, std::optional{quarantined}, snap, now);
+        CHECK(d.gate.enforced);
+        CHECK_FALSE(yuzu::protective::is_protective_action("firewall", action));
+    }
 }
 
 TEST_CASE("compose_containment_gate: the exemption does not consult the store",
@@ -629,7 +657,7 @@ TEST_CASE("compose_containment_gate: the exemption does not consult the store",
     // Store durably unavailable AND no read available: release must still be
     // exempt, because a store outage must never block the path that lifts a
     // quarantine.
-    const auto d = compose_containment_gate("quarantine", "unquarantine", /*store_unavailable=*/true,
+    const auto d = compose_containment_gate("firewall", "release", /*store_unavailable=*/true,
                                             std::nullopt, snap, now);
     CHECK_FALSE(d.gate.enforced);
     CHECK_FALSE(d.gate.fail_closed);

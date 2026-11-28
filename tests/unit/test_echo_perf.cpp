@@ -13,7 +13,9 @@
  * rest runs on every host.
  */
 
+#include "echo_aggregator.hpp"  // interval_baseline_reset_due
 #include "echo_collectors.hpp" // kCollectStatus* — the operator-facing token contract
+#include "echo_fold_schema.hpp"
 #include "echo_perf.hpp"
 #include "echo_schema_registry.hpp"
 
@@ -62,6 +64,28 @@ TEST_CASE("perf: invalid inputs and zero elapsed never derive", "[echo][perf]") 
     CHECK(!derive_sample(good, PerfCounters{}).valid);
     PerfCounters same_ts = good;
     CHECK(!derive_sample(good, same_ts).valid); // elapsed == 0
+}
+
+TEST_CASE("perf: a baseline reset on errored recovery derives nothing across the gap",
+          "[echo][perf][issue1624]") {
+    // The device sampler keeps its previous reading in memory across skipped
+    // (errored) ticks, so the first tick after recovery would otherwise derive a
+    // sample spanning the whole errored interval (#1624). do_configure resets the
+    // baseline to a default PerfCounters when interval_baseline_reset_due says so.
+    PerfCounters before_error = baseline();
+    PerfCounters first_tick_after = before_error;
+    first_tick_after.ts_epoch = 1300;
+    first_tick_after.cpu_idle += 3'000'000'000;
+    first_tick_after.cpu_kernel += 4'000'000'000; // kernel includes the idle delta
+    first_tick_after.cpu_user += 2'000'000'000;
+
+    // Control: the stale baseline WOULD yield a valid sample over the gap.
+    REQUIRE(derive_sample(before_error, first_tick_after).valid);
+
+    PerfCounters kept = before_error;
+    if (yuzu::echo::interval_baseline_reset_due("errored", "true"))
+        kept = PerfCounters{};
+    CHECK(!derive_sample(kept, first_tick_after).valid);
 }
 
 TEST_CASE("perf: normal 30 s derivation", "[echo][perf]") {
@@ -429,39 +453,49 @@ TEST_CASE("perf: a failed counter read maps to a token by registry support (#184
 // ── Schema registry pins ─────────────────────────────────────────────────────
 
 TEST_CASE("perf: registry tables translate and are operator-queryable", "[echo][perf]") {
-    auto live = translate_dollar_name("$Perf_Live");
-    REQUIRE(live);
-    CHECK(*live == "perf_live");
+    CHECK_FALSE(translate_dollar_name("$Perf_Live").has_value()); // retired raw name
     auto hourly = translate_dollar_name("$Perf_Hourly");
     REQUIRE(hourly);
     CHECK(*hourly == "perf_hourly");
-    CHECK(is_queryable_table("perf_live"));
+    CHECK_FALSE(is_queryable_table("perf_live"));
     CHECK(is_queryable_table("perf_hourly"));
 
-    auto cols = columns_for_table("perf_live");
-    CHECK(std::find(cols.begin(), cols.end(), "cpu_pct") != cols.end());
-    CHECK(std::find(cols.begin(), cols.end(), "net_tx_bps") != cols.end());
+    auto cols = columns_for_table("perf_hourly");
+    CHECK(std::find(cols.begin(), cols.end(), "cpu_avg") != cols.end());
+    CHECK(std::find(cols.begin(), cols.end(), "tx_bps_max") != cols.end());
 }
 
-TEST_CASE("perf: hourly rollup SQL exists and targets perf_hourly", "[echo][perf]") {
-    auto sql = rollup_sql("perf", "hourly");
-    REQUIRE(!sql.empty());
-    CHECK(sql.find("INSERT INTO perf_hourly") != std::string::npos);
-    CHECK(sql.find("MAX(cpu_pct)") != std::string::npos);
+TEST_CASE("perf: the hourly tier is derived from the roll-up declaration", "[echo][perf]") {
+    // The tier's columns exist once (fold_sources()); the registry copies them, bucket first.
+    const auto cols = columns_for_table("perf_hourly");
+    REQUIRE(!cols.empty());
+    CHECK(cols[0] == "id");
+    CHECK(cols[1] == "hour_ts");
+    for (const auto* c : {"samples", "cpu_avg", "cpu_max", "cpu_sum"})
+        CHECK(std::find(cols.begin(), cols.end(), c) != cols.end());
 }
 
-TEST_CASE("perf: live retention is time-based", "[echo][perf]") {
-    auto sql = retention_sql("perf_live", 2'000'000);
-    REQUIRE(!sql.empty());
-    CHECK(sql.find("DELETE FROM perf_live WHERE ts <") != std::string::npos);
+TEST_CASE("perf: the tiers are time-based and keep the default windows", "[echo][perf]") {
+    for (const auto& src : capture_sources()) {
+        if (src.name != "perf")
+            continue;
+        REQUIRE(src.granularities.size() == 2);
+        CHECK(src.granularities[0].suffix == "hourly");
+        CHECK(src.granularities[0].retention_type == RetentionType::kTimeBased);
+        CHECK(src.granularities[0].retention_default == 7776000); // 90 days
+        CHECK(src.granularities[1].suffix == "daily");
+        CHECK(src.granularities[1].retention_default == 15552000); // 180 days
+    }
 }
 
 TEST_CASE("perf: DDL declares the perf tables with numeric defaults", "[echo][perf]") {
-    auto ddl = generate_warehouse_ddl();
-    CHECK(ddl.find("CREATE TABLE IF NOT EXISTS perf_live") != std::string::npos);
-    CHECK(ddl.find("CREATE TABLE IF NOT EXISTS perf_hourly") != std::string::npos);
+    const auto ddl = generate_fold_ddl();
+    CHECK(ddl.find("CREATE TABLE IF NOT EXISTS perf_hourly_r") != std::string::npos);
+    CHECK(ddl.find("CREATE VIEW IF NOT EXISTS perf_hourly AS") != std::string::npos);
     // REAL columns must default 0, not '' (generator fix shipped with A1).
-    CHECK(ddl.find("cpu_pct REAL NOT NULL DEFAULT 0") != std::string::npos);
+    CHECK(ddl.find("cpu_sum REAL NOT NULL DEFAULT 0") != std::string::npos);
+    // The registry no longer creates a table for a roll-up tier name (it is a view).
+    CHECK(generate_warehouse_ddl().find("perf_hourly") == std::string::npos);
 }
 
 TEST_CASE("perf #538: a reset baseline (post-disable) emits no off-period-spanning row",

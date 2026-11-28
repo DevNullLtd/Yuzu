@@ -10,8 +10,9 @@
 /// COEXISTS with `SoftwareInventoryStore` (the `installed_software` projection)
 /// and `AppPerfDailyStore` (`app_perf`) — each daily-sync source that needs typed
 /// fleet reads gets its own born-on-PG store. Device-CI is **1:1 per agent**
-/// (unlike software's 1:N rows), so the projection is a single table, replaced
-/// wholesale on change.
+/// (unlike software's 1:N rows), so the parent is a single row, replaced wholesale on
+/// change. The v2 blob adds typed per-kind child tables (cpu, dimm, disk, swap, volume,
+/// partition, topology) and a per-section status table, replaced in the same transaction.
 ///
 /// Substrate contract (ADR-0008/0012): holds a `pg::PgPool&`, migrates at
 /// construction on a pinned lease, schema-qualifies every runtime statement, uses
@@ -25,9 +26,14 @@
 ///   - `last_seen`/`first_seen` are the **SERVER receipt time**, never the
 ///     agent-supplied `collected_at` (the #1685 lesson, baked in from day one).
 
+#include "collation_gate_types.hpp"      // pg::CollationGate (the optional write-pause gate)
 #include "device_inventory_types.hpp"
+#include "digest_fn.hpp"                // DigestFn (the writer's test seam; no OpenSSL here)
 #include "inventory_ingest_outcome.hpp" // InventoryIngestOutcome (shared sync-ingest vocabulary)
 
+#include <atomic>
+#include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <expected>
 #include <optional>
@@ -41,9 +47,53 @@ class MetricsRegistry;
 
 namespace yuzu::server::pg {
 class PgPool;
-}
+struct PgMigration;
+} // namespace yuzu::server::pg
 
 namespace yuzu::server {
+
+/// The store's name and PostgreSQL schema (the migration runner's key). The ONE spelling: the
+/// collation check reads it to look for an invalid index in this schema
+/// (`pg::check_collation_version`), so a rename cannot leave that guard looking elsewhere.
+inline constexpr const char* kDeviceInventoryStoreSchema = "device_inventory_store";
+
+/// The store's migration array (schema `device_inventory_store`), so a test can pin the text a
+/// migration carries (the transaction-local settings of v4) without a second copy of it.
+[[nodiscard]] const std::vector<pg::PgMigration>& device_inventory_migrations();
+
+/// Safety margin, in seconds, subtracted from the database clock to form the `changed_since`
+/// watermark a client keeps (`DeviceInventoryStore::device_ci_watermark`). It absorbs a row whose
+/// `changed_at` was authored (`clock_timestamp()`) inside an ingest transaction that committed
+/// later than a page that missed it, and small skew between database nodes. An ESTIMATE of how late
+/// a commit can land, not a proof: a transaction held open longer than this is missed by a delta
+/// pull, and the periodic full walk is the backstop.
+inline constexpr std::int64_t kChangedSinceMarginSecs = 300;
+
+/// Execution cap of the watermark statement (`SET LOCAL statement_timeout` inside its transaction,
+/// like the keyset read's), so a stalled backend frees the pooled connection at this bound rather
+/// than at the pool's 30 s default. A first bulk page takes this lease after its keyset read.
+inline constexpr const char* kDeviceCiWatermarkStatementTimeout = "5s";
+
+/// The statement `DeviceInventoryStore::list_device_ci_after` runs for `q` and its bound
+/// parameters, in placeholder order. Exposed so a test can EXPLAIN the REAL statement (a copy of
+/// the text in a test would stay green with the store's spelling changed). Does not check the
+/// deny-all scope (`q.agent_ids` present and empty), which the store answers without SQL.
+struct DeviceCiKeysetStatement {
+    std::string sql;
+    std::vector<std::string> params;
+};
+[[nodiscard]] DeviceCiKeysetStatement device_ci_keyset_statement(const DeviceCiKeysetQuery& q);
+
+/// Bounds of one `list_device_ci_for` read. A struct so a test can inject a tiny chunk and an
+/// already-spent budget without the production caller naming either.
+struct DeviceCiKeyedReadLimits {
+    /// Ids per statement. 10k ids is ~0.4 MB of array text; the whole 100k-device roster is ten
+    /// statements on ONE lease.
+    std::size_t chunk = 10000;
+    /// One budget for the whole read, checked BEFORE each chunk after the first. Without it N chunks
+    /// could each run to the pool's 30 s statement bound and pin a shared lease for N x 30 s.
+    std::chrono::milliseconds budget{20000};
+};
 
 class DeviceInventoryStore {
 public:
@@ -61,8 +111,40 @@ public:
     /// single-threaded startup; read without synchronisation on serving threads.
     void set_metrics(yuzu::MetricsRegistry* m) noexcept { metrics_ = m; }
 
+    /// Wire the collation gate that pauses writes (nullable; the DEFAULT is NO gate, and a store
+    /// with none wired writes exactly as it did before the gate existed). While the gate reads
+    /// `Mismatch`, `apply_device_ci` returns `kDeferred` and `delete_agent` returns false, both
+    /// before the pool is touched: a text-keyed write under a changed collation misses its row
+    /// and can add a duplicate. `Unproven` and `Trusted` never pause (a failed collation read is
+    /// not evidence of a mismatch). The pointee is BORROWED and must outlive this store; set it
+    /// ONCE during single-threaded startup, like `set_metrics`.
+    void set_write_gate(const std::atomic<pg::CollationGate>* gate) noexcept { write_gate_ = gate; }
+
+    /// True iff a gate is wired and currently reads `Mismatch`. One acquire load, no lock, no
+    /// allocation: safe on the ingest hot path.
+    [[nodiscard]] bool writes_deferred() const noexcept {
+        return write_gate_ != nullptr &&
+               write_gate_->load(std::memory_order_acquire) == pg::CollationGate::Mismatch;
+    }
+
+    /// Account for a device_ci ingest the SEAM refused on `writes_deferred()` before it called
+    /// `apply_device_ci` (counter `yuzu_device_ci_writes_deferred_total{op="ingest"}` plus the
+    /// once-per-transition log line). `apply_device_ci` does the same for its own refusals, so a
+    /// refusal is counted exactly once whichever site made it.
+    void note_ingest_deferred() noexcept { note_write_deferred("ingest"); }
+
+    /// TEST SEAM (#7163): replace the digest provider the full-replace writer hashes section
+    /// rows with, so a test can fail it (return std::nullopt, as `sha256_hex` does when
+    /// `EVP_Digest` fails) and reach the `digest_provider_failed` abort. nullptr (the default)
+    /// means `sha256_hex`; production never calls this. Set before the store is used from other
+    /// threads, like `set_metrics`.
+    void set_digest_provider_for_test(DigestFn digest) noexcept { digest_fn_ = digest; }
+
     /// Canonical content hash over a device-CI record — the SAME bytes the agent
-    /// hashes (`device_ci_canonical_blob` + SHA-256). The record's fields are
+    /// hashes. PER VERSION: v1 (`blob_version` 1) = positional 22-field join + SHA-256
+    /// (`device_ci_canonical_blob`, unchanged so old agents never loop on need_full); v2 =
+    /// the sha256 of the received blob that the parser pinned into `content_hash` (empty if
+    /// the digest failed; the full-ingest path then answers kError). The record's fields are
     /// assumed already UTF-8-scrubbed + clamped by the ingest seam's parse (mirrors
     /// `SoftwareInventoryStore::canonical_hash`, which trusts the seam's clamp), so
     /// this joins positionally + hashes; it does NOT re-clamp. Pure/deterministic.
@@ -73,8 +155,9 @@ public:
     ///    the stored hash. Match → bump last_seen (kTouched); no row or mismatch →
     ///    kNeedFull.
     ///  - `rec` set → full payload: the server **recomputes** the canonical hash
-    ///    from the record (never trusts `claimed_hash`) and upserts the single row →
-    ///    kStored. `first_seen` is preserved across updates; `last_seen` is the
+    ///    from the record (never trusts `claimed_hash`) and replaces the parent row and
+    ///    every v2 child row in ONE transaction under a per-agent advisory lock →
+    ///    kStored (any failure rolls back, previous set intact, kError). `first_seen` is preserved across updates; `last_seen` is the
     ///    server receipt time.
     /// `collected_at` is part of the contract (proto-carried) but drives no
     /// persisted timestamp (#1685). `rec` is taken by value (moved into the upsert).
@@ -89,21 +172,95 @@ public:
     [[nodiscard]] std::expected<std::optional<DeviceCiRecord>, CiReadError>
     get_device_ci(std::string_view agent_id);
 
-    /// The whole device-CI roster (the Hardware list source), hostname-sorted,
-    /// capped at a hard ceiling regardless of `limit`. Authoritative: `std::nullopt`
-    /// on a store/pool/query degrade, NEVER a silent empty. An empty value = no rows.
-    [[nodiscard]] std::optional<std::vector<DeviceCiRecord>> list_device_ci(int limit);
+    /// The device-CI records of exactly the named agents (the Hardware list's CI join, keyed by the
+    /// roster it is joined onto, #7549). There is NO row cap: the result holds at most one record per
+    /// id, so it is bounded by the caller's roster and cannot silently drop a device the way the
+    /// hostname-ordered whole-table read it replaced did. An id with no CI row is simply absent from
+    /// the result (not yet synced). An empty `agent_ids` is an empty success. Authoritative: a store /
+    /// pool / statement failure, or the budget running out between chunks, is `std::nullopt` for the
+    /// WHOLE read, never a partial vector and never a silent empty. Order is unspecified.
+    [[nodiscard]] std::optional<std::vector<DeviceCiRecord>>
+    list_device_ci_for(const std::vector<std::string>& agent_ids, DeviceCiKeyedReadLimits limits = {});
+
+    /// One KEYSET page of the stored CI rows (scalar columns plus the stored `content_hash`, no
+    /// sections), ordered by the BYTE value of `agent_id` ascending (`agent_id COLLATE "C"`, not the
+    /// database collation, so a libc/ICU change under an existing volume cannot make a walk skip
+    /// or miss a row; a duplicate row admitted by a write through a stale primary key is a
+    /// write-side residual; migration v4 builds the matching index): `agent_id > after`, then up to
+    /// `limit` rows (a `limit` `<= 0` or above the 100000-row ceiling, the store's `kListRowCap`,
+    /// reads the ceiling). `agent_id` and `agent_ids` narrow the
+    /// read in SQL; a present-empty `agent_ids` is an empty page with no SQL. The query runs in a
+    /// transaction under `SET LOCAL statement_timeout = '5s'`: a SELECT that runs past 5 s is
+    /// cancelled and that is a `std::nullopt` (the cap is per statement, not a bound on the whole
+    /// call). Reads the CI table directly, so a device is returned for as long as its row exists,
+    /// whatever its last contact. Authoritative: `std::nullopt` on a closed store, a lease timeout
+    /// or a query error, NEVER an empty page. Reads serial / UUID / MAC: any caller must sit behind
+    /// the fail-closed `inventory.devices.ci` audit and the Inventory:Read scope gate.
+    /// `changed_since` narrows to rows whose `changed_at >= changed_since` (migration v5's btree
+    /// index serves a sparse delta; the planner picks it or the agent_id index per page).
+    /// `changed_at` is the CONTENT-change marker, NOT a membership marker: a device entering or
+    /// leaving a caller's scope does not move it, so a scope-confined caller cannot use the filter
+    /// correctly (the route layer refuses that combination).
+    [[nodiscard]] std::optional<std::vector<DeviceCiRecord>>
+    list_device_ci_after(const DeviceCiKeysetQuery& q);
+
+    /// The value a delta client keeps as its next `changed_since`: the PostgreSQL clock in epoch
+    /// seconds (`EXTRACT(EPOCH FROM clock_timestamp())::bigint`, the SAME expression that authors
+    /// `changed_at`, so one primary's stamps and watermark share a clock) MINUS `kChangedSinceMarginSecs`. `std::nullopt` on a closed store, a lease
+    /// timeout or a query error, NEVER a guess from the replica's own clock.
+    [[nodiscard]] std::optional<std::int64_t> device_ci_watermark();
+
+    /// One agent's v2 per-section statuses + list rows (cpu, dimm, disk, swap, volume,
+    /// partition, topology; chassis/baseboard/machine_id carry a status only), in the
+    /// registry order of `device_ci_kinds.hpp`. Read in ONE REPEATABLE READ transaction so
+    /// every section is from the same replace generation. An empty vector means nothing is
+    /// stored (a v1 agent, or no record) — NOT "the device has none"; a store/pool/query
+    /// failure is `std::unexpected(CiReadError::kDegraded)`, never an empty success.
+    /// No production caller: any production use MUST sit behind the fail-closed
+    /// `inventory.device.ci` audit and the Inventory:Read scope gate; reads DIMM serials. The
+    /// record routes use `get_device_ci_with_sections` below (one snapshot with the record).
+    /// The levels returned here are RAW: they are neither row-count nor content-digest verified.
+    /// Anything that serves them must pass each section through `verify_section_content`
+    /// (hardware_list_model.hpp; it applies `verify_section_row_count` first) or it re-opens the
+    /// lost-rows and same-count-drift read-as-complete defects.
+    [[nodiscard]] std::expected<std::vector<DeviceCiSection>, CiReadError>
+    get_device_ci_sections(std::string_view agent_id);
+
+    /// One agent's CI record AND its v2 sections from ONE REPEATABLE READ READ ONLY transaction
+    /// (one lease), so the scalars and the section rows can never come from two different
+    /// replace generations (two separate reads could pair gen N scalars with gen N+1 rows).
+    /// Served by GET /api/v1/hardware/{id} and MCP get_hardware_ci behind the audited
+    /// `inventory.device.ci` read (H.7); it reads DIMM serials, so any new caller needs the same
+    /// fail-closed audit and Inventory:Read scope gate.
+    /// The sections are read only when a record was found and `blob_version >= 2`; they land
+    /// in `record->sections`. Failure semantics:
+    ///   * the record read fails (closed store, pool timeout, query error) ->
+    ///     `std::unexpected(CiReadError::kDegraded)`;
+    ///   * the record read succeeded but a SECTION statement failed -> the record with
+    ///     `sections_failed = true` (never an empty-sections success);
+    ///   * no record -> `record == nullopt`, not an error.
+    [[nodiscard]] std::expected<DeviceCiWithSections, CiReadError>
+    get_device_ci_with_sections(std::string_view agent_id);
 
     /// Drop an agent's CI record (e.g. on agent removal). Returns true iff the
     /// DELETE executed (COMMAND_OK); false on a closed store, a lease timeout, or
-    /// a SQL failure — so the decommission cascade records Failed, not a false
-    /// "erased".
+    /// a SQL failure, or while `writes_deferred()` (nothing attempted), so the
+    /// decommission cascade records Failed, not a false "erased".
     [[nodiscard]] bool delete_agent(std::string_view agent_id);
 
 private:
+    /// Count one refused write (`op` is "ingest" or "delete") and log once per entry into the
+    /// refusing state, not once per call.
+    void note_write_deferred(const char* op) noexcept;
+    /// Called when a write finds the gate open: re-arms the once-per-pause log line.
+    void clear_write_pause_flag() noexcept;
+
     pg::PgPool& pool_;
     bool open_{false};
     yuzu::MetricsRegistry* metrics_{nullptr};
+    const std::atomic<pg::CollationGate>* write_gate_{nullptr}; // borrowed; see set_write_gate
+    std::atomic<bool> write_pause_logged_{false}; // true while the pause has already been logged
+    DigestFn digest_fn_{nullptr}; // nullptr = sha256_hex; see set_digest_provider_for_test
 };
 
 } // namespace yuzu::server

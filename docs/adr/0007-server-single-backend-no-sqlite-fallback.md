@@ -5,6 +5,7 @@ owner: Nathan Dornbrook (platform)
 deciders: Nathan Dornbrook; grill-with-docs design session 2026-06-09
 scope: platform — the server storage layer architecture
 builds-on: ADR-0006 (PostgreSQL is the server substrate)
+related: 0035-server-is-linux-only-windows-is-agent-only (the server is now single-OS as well as single-backend)
 ---
 
 # 0007 — The server is single-backend: PostgreSQL only, no SQLite fallback

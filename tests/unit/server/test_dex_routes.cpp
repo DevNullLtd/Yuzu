@@ -9,16 +9,21 @@
  *   - agent-reported values are HTML-escaped (no stored XSS)
  *   - route gating: authed renders / unauth → 302 / perm-denied → 403 before audit
  */
+#include "dex_api_local.hpp"
 #include "dex_read_builders.hpp" // dex_device_score -- dex_routes.hpp no longer re-exports it (WS-A4 PR-1 F1 fix)
 #include "dex_routes.hpp"
 #include "guaranteed_state_store.hpp"
 #include "pg/pg_pool.hpp"
+#include "test_dex_api_double.hpp"
 #include "test_dex_perf_api_double.hpp"
 #include "test_route_sink.hpp"
 
 #include "../test_helpers.hpp"
+#include "../test_log_capture.hpp"
 
 #include <catch2/catch_test_macros.hpp>
+
+#include <nlohmann/json.hpp>
 
 #include <algorithm>
 #include <cctype>
@@ -29,6 +34,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -229,7 +235,12 @@ TEST_CASE("DEX catalogue grid lists every family + the sub-nav", "[pg][dex][rout
     // The Alerts tab is static chrome: present for every viewer, no capability probe
     // behind it (the Alerts fragment itself shows the role note).
     CHECK(html.find("hx-get=\"/fragments/dex/alerts?window=7d\"") != std::string::npos);
-    CHECK(html.find(">Alerts</a>") != std::string::npos);
+    CHECK(html.find(">Alerts</button>") != std::string::npos);
+    // The Scoring tab is static chrome too, placed before Alerts.
+    const auto scoring = html.find("hx-get=\"/fragments/dex/scoring?window=7d\"");
+    CHECK(scoring != std::string::npos);
+    CHECK(html.find(">Scoring</button>") != std::string::npos);
+    CHECK(scoring < html.find("hx-get=\"/fragments/dex/alerts?window=7d\""));
     CHECK(html.find("actively monitored") != std::string::npos);
     CHECK(html.find("of 114 signal types") != std::string::npos);
     // every family heading renders as a card (escaped where needed)
@@ -623,7 +634,7 @@ TEST_CASE("DEX catalogue routes: os=macos param survives route dispatch into bot
     // The macOS chip renders as the ACTIVE chip (proves the route read os=macos,
     // not just defaulted to "all").
     CHECK(grid->body.find(
-              "<a class=\"gp-chip on\" hx-get=\"/fragments/dex/catalogue?window=7d&os=macos\"") !=
+              "<button type=\"button\" class=\"gp-chip on\" aria-pressed=\"true\" hx-get=\"/fragments/dex/catalogue?window=7d&os=macos\"") !=
           std::string::npos);
     CHECK(family_score(grid->body, "Network") == expected); // macOS-scoped score, route → renderer
 
@@ -631,7 +642,7 @@ TEST_CASE("DEX catalogue routes: os=macos param survives route dispatch into bot
     auto group = sink.Get("/fragments/dex/catalogue/group?name=Network&window=7d&os=macos");
     REQUIRE(group);
     CHECK(group->status == 200);
-    CHECK(group->body.find("<a class=\"gp-chip on\" hx-get=\"/fragments/dex/catalogue/group?"
+    CHECK(group->body.find("<button type=\"button\" class=\"gp-chip on\" aria-pressed=\"true\" hx-get=\"/fragments/dex/catalogue/group?"
                            "name=Network&window=7d&os=macos\"") != std::string::npos);
     CHECK(group_score(group->body) == expected);
 }
@@ -1243,31 +1254,6 @@ TEST_CASE("DEX device history rows drill to the observation detail", "[pg][dex][
     CHECK(html.find("id=\"dex-obs-detail\"") != std::string::npos);
 }
 
-TEST_CASE("DEX apps list: ranks apps by crashes+hangs, drillable", "[pg][dex][routes]") {
-    YUZU_REQUIRE_PG_DB_TPL(db, guardian_pg_tpl);
-    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
-    GuaranteedStateStore store(pool);
-    seed_crash(store, "c1", "WS-1", "AcmeCRM.exe", "AcmeCRM.dll", "windows", kDayA + "T10:00:00Z");
-    seed_crash(store, "c2", "WS-2", "AcmeCRM.exe", "ntdll.dll", "windows", kDayA + "T11:00:00Z");
-    seed_hang(store, "h1", "WS-1", "chrome.exe", kDayA + "T12:00:00Z");
-
-    auto html = render_dex_apps_fragment(&store, "", 7);
-    CHECK(html.find("Applications") != std::string::npos);
-    CHECK(html.find("AcmeCRM.exe") != std::string::npos);
-    CHECK(html.find("chrome.exe") != std::string::npos);
-    // app rows drill to the per-app blast-radius view; the Apps subnav tab is present
-    CHECK(html.find("name=AcmeCRM.exe") != std::string::npos);
-    CHECK(html.find("/fragments/dex/apps") != std::string::npos);
-}
-
-TEST_CASE("DEX apps list: empty store → no-data placeholder", "[pg][dex][routes]") {
-    YUZU_REQUIRE_PG_DB_TPL(db, guardian_pg_tpl);
-    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
-    GuaranteedStateStore store(pool);
-    auto html = render_dex_apps_fragment(&store, "", 7);
-    CHECK(html.find("No data") != std::string::npos);
-}
-
 // Kills: a wrong active_key literal on /dex — apply_shell lights nothing and says nothing for an
 // unknown key, so only a test that fetches the page can see it. The page handler touches only
 // auth_fn_ and apply_shell, so no store is wired and this runs without Postgres.
@@ -1536,10 +1522,44 @@ TEST_CASE("DEX routes: auth/perm gating + dispatch", "[pg][dex][routes][rbac]") 
         yuzu::server::test::TestRouteSink sink;
         DexRoutes routes;
         routes.register_routes(sink, okAuth, okPerm, &store, fleet, audit);
+        // The Apps tab reads the same DexApi::apps model as the REST twin: wire a LocalDexApi over this
+        // store, with the seeded agents online so the share/rate/score figures exist too.
+        auto apps_fleet = []() {
+            DexFleet f;
+            f.connected_agents = {{"WS-1", "windows"}, {"WS-2", "windows"}, {"WS-3", "windows"}};
+            return f;
+        };
+        auto api = make_local_dex_api(&store, apps_fleet, {});
+        routes.set_dex_api(api);
         auto apps = sink.Get("/fragments/dex/apps");
         REQUIRE(apps);
         CHECK(apps->status == 200);
         CHECK(apps->body.find("chrome.exe") != std::string::npos); // the seeded crasher ranks
+
+        // Row-scoped, not a whole-page search: inside the chrome.exe row, the Crashes cell (the
+        // third <td>) equals chrome.exe's crashes figure in the REST payload for the same store.
+        const auto model = api->apps("7d", "all");
+        REQUIRE(!model.degraded); // dex_apps_json asserts on a degraded model and would abort the shard
+        const auto payload = nlohmann::json::parse(dex_apps_json(model));
+        int64_t expected_crashes = -1;
+        for (const auto& a : payload["apps"])
+            if (a["subject"] == "chrome.exe")
+                expected_crashes = a["crashes"].get<int64_t>();
+        REQUIRE(expected_crashes > 0);
+        const auto& body = apps->body;
+        const auto name_at = body.find(">chrome.exe</button>"); // the drill link is a native button
+        REQUIRE(name_at != std::string::npos);
+        const auto row_start = body.rfind("<tr", name_at);
+        const auto row_end = body.find("</tr>", name_at);
+        REQUIRE(row_start != std::string::npos);
+        const std::string row = body.substr(row_start, row_end - row_start);
+        const auto td1 = row.find("<td", 0);
+        const auto td2 = row.find("<td", td1 + 1); // Score
+        const auto td3 = row.find("<td", td2 + 1); // Crashes
+        const auto td4 = row.find("<td", td3 + 1);
+        REQUIRE(td4 != std::string::npos);
+        CHECK(row.substr(td3, td4 - td3) ==
+              "<td class=\"gp-num\">" + std::to_string(expected_crashes) + "</td>");
     }
 
     SECTION("unauthenticated shell redirects to /login") {
@@ -3195,4 +3215,189 @@ TEST_CASE("DEX perf devices fragment: a malformed limit is a 400 and a valid one
     auto ok = sink.Get("/fragments/dex/perf/devices?metric=cpu&limit=10");
     REQUIRE(ok);
     CHECK(ok->status != 400);
+}
+
+// -- #7520: nothing escapes the Apps handler ------------------------------------------------
+
+namespace {
+struct AppsRouteHarness {
+    yuzu::server::test::TestRouteSink sink;
+    DexRoutes routes;
+    AppsRouteHarness() {
+        auto okAuth = [](const httplib::Request&, httplib::Response&) {
+            return std::optional<auth::Session>(auth::Session{});
+        };
+        auto okPerm = [](const httplib::Request&, httplib::Response&, const std::string&,
+                         const std::string&) { return true; };
+        routes.register_routes(sink, okAuth, okPerm, nullptr, []() { return DexFleet{}; }, /*audit_fn=*/{});
+    }
+};
+
+std::size_t count_substr(const std::string& hay, const std::string& needle) {
+    std::size_t n = 0;
+    for (auto p = hay.find(needle); p != std::string::npos; p = hay.find(needle, p + needle.size()))
+        ++n;
+    return n;
+}
+} // namespace
+
+TEST_CASE("DEX apps route: a DexApi whose apps() throws still answers 200 with a panel",
+          "[dex][routes][apps_model]") {
+    AppsRouteHarness h;
+    int calls = 0;
+    h.routes.set_dex_api(std::make_shared<yuzu::server::test::FnDexApi>(
+        nullptr, nullptr, nullptr, nullptr,
+        [&calls](const std::string&, const std::string&) -> DexAppsModel {
+            ++calls;
+            throw std::runtime_error("boom\nforged");
+        }));
+    yuzu::test::LogCapture log;
+    for (const char* target : {"/fragments/dex/apps", "/fragments/dex/apps?platform=linux&window=30d"}) {
+        auto r = h.sink.Get(target);
+        REQUIRE(r);
+        CHECK(r->status == 200); // htmx drops a 5xx body, which would leave the pane blank
+        CHECK(r->body.find("Application stability is unavailable") != std::string::npos);
+        CHECK(r->body.find("internal_error") != std::string::npos); // the cause, as a code token
+        CHECK(r->body.find("boom") == std::string::npos);            // the exception text stays in the log
+        CHECK(r->body.find("<tr") == std::string::npos);             // never a figure
+    }
+    CHECK(calls == 2);
+    // The cause is logged: once for the two failing requests (one throttle key per reason), naming the
+    // route, the reason token and the exception text, with the line break folded so the text cannot
+    // forge a second line.
+    log.stop();
+    const std::string logged = log.text();
+    CHECK(count_substr(logged, "[error]") == 1);
+    CHECK(logged.find("GET /fragments/dex/apps: boom_forged (internal_error)") != std::string::npos);
+    CHECK(logged.find("boom\nforged") == std::string::npos);
+}
+
+TEST_CASE("DEX apps route: no DexApi set answers 200 with the not_wired panel",
+          "[dex][routes][apps_model]") {
+    AppsRouteHarness h;
+    yuzu::test::LogCapture log;
+    auto r = h.sink.Get("/fragments/dex/apps");
+    REQUIRE(r);
+    CHECK(r->status == 200);
+    CHECK(r->body.find("not_wired") != std::string::npos);
+    CHECK(r->body.find("<tr") == std::string::npos);
+    // The same request again: still the panel, and the throttle keeps it to one log line.
+    auto again = h.sink.Get("/fragments/dex/apps?window=30d");
+    REQUIRE(again);
+    CHECK(again->body.find("not_wired") != std::string::npos);
+    // An invalid platform is still its own panel, even with nothing wired.
+    auto bad = h.sink.Get("/fragments/dex/apps?platform=plan9");
+    REQUIRE(bad);
+    CHECK(bad->body.find("Unknown platform") != std::string::npos);
+    log.stop();
+    const std::string logged = log.text();
+    CHECK(count_substr(logged, "[error]") == 1);
+    CHECK(logged.find("GET /fragments/dex/apps: no DexApi is wired for the Apps page (not_wired)") !=
+          std::string::npos);
+}
+
+TEST_CASE("DEX apps route: a degraded model with reason statement_timeout reaches the page as the "
+          "shorter-window panel",
+          "[dex][routes][apps_model]") {
+    AppsRouteHarness h;
+    h.routes.set_dex_api(std::make_shared<yuzu::server::test::FnDexApi>(
+        nullptr, nullptr, nullptr, nullptr,
+        [](const std::string& window, const std::string&) {
+            DexAppsModel m;
+            m.window = window;
+            m.degraded = true;
+            m.degraded_reason = "statement_timeout";
+            return m;
+        }));
+    auto week = h.sink.Get("/fragments/dex/apps?window=7d");
+    REQUIRE(week);
+    CHECK(week->body.find("Choose a shorter window") != std::string::npos);
+    auto day = h.sink.Get("/fragments/dex/apps?window=24h");
+    REQUIRE(day);
+    CHECK(day->body.find("already the shortest window") != std::string::npos);
+    CHECK(day->body.find("Choose a shorter window") == std::string::npos);
+}
+
+// #7811: every per-device DEX fragment takes the device id raw from the URL and hands it to the
+// scoped permission check, whose denial audit carries it, and to `target_id`. An over-long or
+// control-byte id is refused with a 400 before that check, before any audit row and before any
+// dispatch. The scoped gate below refuses every device, so a route that reached it would answer
+// 403: a 400 with `scoped_calls == 0` proves the id check runs first, where an empty audit log
+// alone is also true of a route that never audits. No store is wired, so this runs without Postgres.
+TEST_CASE("DEX routes: a per-device fragment refuses an unsafe device id before the scoped check, "
+          "any audit row or dispatch",
+          "[dex][routes][audit][authz]") {
+    auto okAuth = [](const httplib::Request&, httplib::Response&) {
+        return std::optional<auth::Session>(auth::Session{});
+    };
+    auto okPerm = [](const httplib::Request&, httplib::Response&, const std::string&,
+                     const std::string&) { return true; };
+    int scoped_calls = 0;
+    auto denyScoped = [&scoped_calls](const httplib::Request&, httplib::Response& res,
+                                      const std::string&, const std::string&, const std::string&) {
+        ++scoped_calls;
+        res.status = 403;
+        return false;
+    };
+    std::vector<std::string> audited;
+    auto audit = [&audited](const httplib::Request&, const std::string& action, const std::string&,
+                            const std::string&, const std::string& target_id,
+                            const std::string&) -> bool {
+        audited.push_back(action + "|" + target_id);
+        return true;
+    };
+    int dispatched = 0;
+    auto dispatch = [&dispatched](const std::string& plugin, const std::string&,
+                                  const std::vector<std::string>&, const std::string&,
+                                  const std::unordered_map<std::string, std::string>&)
+        -> yuzu::server::ConfinedDispatchOutcome {
+        ++dispatched;
+        return {.sent = 1, .command_id = plugin + "-x"};
+    };
+    auto responses = [](const std::string&, const std::string&) {
+        return std::vector<DexAgentResponse>{};
+    };
+    DexRoutes routes;
+    yuzu::server::test::TestRouteSink sink; // after `routes`: its handlers capture `this`
+    routes.register_routes(sink, okAuth, okPerm, /*store=*/nullptr, /*fleet_fn=*/{}, audit, dispatch,
+                           responses, denyScoped);
+
+    struct Route {
+        const char* path;
+        const char* id_param;
+        const char* rest; // the other parameters a real request carries
+    };
+    const std::vector<Route> device_routes = {
+        {"/fragments/dex/device", "id", ""},
+        {"/fragments/dex/observation", "agent_id", "&event_id=e1"},
+        {"/fragments/dex/device/perf", "agent_id", ""},
+        {"/fragments/dex/device/perf/result", "agent_id", "&command_id=echo-1"},
+        {"/fragments/dex/device/procperf", "agent_id", ""},
+        {"/fragments/dex/device/procperf/result", "agent_id", "&command_id=echo-1"},
+        {"/fragments/dex/device/app-perf", "agent_id", ""},
+    };
+    const std::vector<std::string> bad = {std::string(257, 'a'), "dev%00A", "dev%0D%0AA", "dev%0AA",
+                                          "dev%09A"};
+    for (const auto& route : device_routes) {
+        INFO(route.path);
+        for (const auto& id : bad) {
+            INFO(id.substr(0, 16));
+            auto r = sink.Get(std::string(route.path) + "?" + route.id_param + "=" + id + route.rest);
+            REQUIRE(r);
+            CHECK(r->status == 400);
+            CHECK(r->body.find("Invalid device id.") != std::string::npos);
+        }
+        // The same route does reach the permission check for a safe id, at the 256-byte limit.
+        const int before = scoped_calls;
+        auto safe = sink.Get(std::string(route.path) + "?" + route.id_param + "=" +
+                             std::string(256, 'a') + route.rest);
+        REQUIRE(safe);
+        CHECK(safe->status == 403);
+        CHECK(safe->body.find("Invalid device id.") == std::string::npos);
+        CHECK(scoped_calls == before + 1);
+    }
+    // Only the safe-id controls reached the gate: one per route, none for any refused id.
+    CHECK(scoped_calls == static_cast<int>(device_routes.size()));
+    CHECK(audited.empty());
+    CHECK(dispatched == 0);
 }

@@ -1,0 +1,39 @@
+%% idle_memory ceilings (see yuzu_gw_scale_SUITE:idle_ceiling_check/2 and
+%% docs/testing/gateway-scale-tests.md, "The ceiling (ratchet)").
+%%
+%% {{Os, Transport}, #{min_n => N, per_conn => #{Metric => Bytes}}}: checked
+%% against the largest point of a run when that point has at least min_n
+%% connections, on the named os:type() family. Metric is a key of the run's
+%% per_conn map (bytes per connection, (M(N) - M(0)) / N).
+%%
+%% These values may only go DOWN. A change that lowers the measured cost
+%% lowers the ceiling in the same commit; raising one is a reviewed decision,
+%% never a fix for a failing run.
+%%
+%% Source: run 20261026T172533-6I6BU, Rocky Linux 9 VM (EL9, kernel 5.14, x86_64,
+%% 16 schedulers), OTP 28.4.2, default settings (150000 B snapshot on every
+%% 30 s heartbeat, 97 status tags), N = 10000, every point steady. Measured
+%% per connection: TLS beam_total 845531, os_anon 923816; plain beam_total
+%% 441183, os_anon 576255. Ceilings are those plus 15% headroom, rounded up to
+%% 1000 B. The headroom is a guess until run-to-run variance is measured on
+%% the CI host (one earlier, shorter-settle run read TLS beam_total 707 KiB).
+%% The goal these ratchet towards is 8 KiB.
+%%
+%% `provisional' (a list of metrics): checked and printed, NEVER gated, even
+%% with YUZU_GW_SCALE_GATE=1. os_anon is provisional on both entries: the
+%% source run above predates two harness changes of 2026-10-27 that move it
+%% (the gateway node now runs config/vm.args.src's own flags, and Linux
+%% os_anon is now /proc/self/status RssAnon, not smaps_rollup Anonymous), and
+%% the first TLS run on the current harness (dev dfdffa4c0, 2026-10-29, one
+%% run, N = 10000) measured 1,095.4 KiB, over the 1,063,000 B below. Until
+%% os_anon is re-derived from repeated runs on the current harness these
+%% numbers are a record, not a ratchet; re-deriving them (and dropping
+%% `provisional') is a reviewed change, and only then does "may only go
+%% DOWN" apply to os_anon. beam_total stays gated: that run measured TLS
+%% beam_total 829.0 KiB (848,896 B), under its ceiling and in line with the
+%% source run's 825.7 KiB.
+{ceilings,
+ [{{linux, tls},   #{min_n => 10000, provisional => [os_anon],
+                     per_conn => #{beam_total => 973000, os_anon => 1063000}}},
+  {{linux, plain}, #{min_n => 10000, provisional => [os_anon],
+                     per_conn => #{beam_total => 508000, os_anon => 663000}}}]}.

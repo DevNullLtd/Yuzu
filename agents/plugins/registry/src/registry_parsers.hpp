@@ -79,6 +79,8 @@ inline constexpr std::string_view kTokUnsupportedOldType = "unsupported_old_type
 inline constexpr std::string_view kTokUnrepresentableName = "unrepresentable_name";
 inline constexpr std::string_view kTokDependentItems = "dependent_items";
 inline constexpr std::string_view kTokInvalidHive = "invalid_hive";
+/// WP06 F62: an ungated read (get_value / key_exists / enumerate_*) of a per-user hive under HKU.
+inline constexpr std::string_view kTokPerUserHiveRequiresGetUserValue = "per_user_hive_requires_get_user_value";
 
 // Win32 codes this layer branches on (registry_win.cpp static_asserts each against the SDK).
 inline constexpr long kErrorSuccess = 0;
@@ -162,6 +164,39 @@ namespace detail {
 }
 
 } // namespace detail
+
+/// WP06 F62: whether an HKU key names MACHINE-scope data, as an ALLOWLIST (anything else under HKU is a
+/// per-user hive or something this layer cannot prove is not one, so the ungated reads refuse it and send the
+/// caller to get_user_value, which is gated AdminOrApproval). Machine-scope first components: `.DEFAULT` and the
+/// three service-account SIDs S-1-5-18/19/20, each also with the `_Classes` suffix; ASCII-case-insensitive.
+/// Leading backslashes are skipped (they cannot hide the first component); an empty first component names the
+/// HKU root itself, which is machine scope. Pure.
+[[nodiscard]] inline bool hku_key_is_machine_scope(std::string_view key) noexcept {
+    while (!key.empty() && key.front() == '\\') key.remove_prefix(1);
+    const auto sep = key.find('\\');
+    const std::string_view first = sep == std::string_view::npos ? key : key.substr(0, sep);
+    if (first.empty()) return true;
+    // Allocation-free (the function is noexcept): the base name, optionally followed by the
+    // literal `_classes` suffix, compared ASCII-case-insensitively.
+    constexpr std::string_view kSuffix = "_classes";
+    const auto starts_ci = [](std::string_view s, std::string_view lit) {
+        return s.size() >= lit.size() &&
+               std::equal(lit.begin(), lit.end(), s.begin(),
+                          [](char p, char c) { return detail::lower_ascii(p) == detail::lower_ascii(c); });
+    };
+    for (const std::string_view base : {std::string_view{".default"}, std::string_view{"s-1-5-18"},
+                                        std::string_view{"s-1-5-19"}, std::string_view{"s-1-5-20"}}) {
+        if (!starts_ci(first, base)) continue;
+        const std::string_view rest = first.substr(base.size());
+        if (rest.empty() || (rest.size() == kSuffix.size() && starts_ci(rest, kSuffix))) return true;
+    }
+    return false;
+}
+
+/// The read actions' guard (WP06 F62): true when `hive`/`key` name a per-user hive the ungated reads must refuse.
+[[nodiscard]] inline bool read_refuses_per_user_hive(Hive hive, std::string_view key) noexcept {
+    return hive == Hive::hku && !hku_key_is_machine_scope(key);
+}
 
 /// L7: whether an access names a path the agent log should note (the Run keys and the service tree under HKLM).
 /// ASCII-case-insensitive prefix match on the raw, not yet validated, key; no copy of it.
@@ -551,8 +586,10 @@ struct OldValue {
 
 /// Neutralises untrusted text for an `audit|k=v|...` line: invalid UTF-8 -> '?', control bytes, DEL, space, '=' and
 /// ',' (yuzu::log_token) -> '_', and '|' -> '_' (log_token does not map the field separator).
-/// The C1 controls U+0080-U+009F (NEL U+0085 among them), U+2028 and U+2029 -> '_' too (fold_line_breaks; log_token
-/// passes every byte >= 0x80). A trailing backslash becomes '_'. Over `cap` bytes it is cut on a character boundary
+/// log_token already folds the C1 controls U+0080-U+009F (NEL U+0085 among them), U+2028 and U+2029 to '_'; the
+/// fold_line_breaks call below is a now-redundant belt-and-braces fold. fold_line_breaks already folded the whole
+/// C1 range before log_token did, so the emitted bytes are unchanged by log_token folding them too; the call stays
+/// as belt and braces. A trailing backslash becomes '_'. Over `cap` bytes it is cut on a character boundary
 /// and gets `~<total length>`; the cap and `~<total>` are measured after folding.
 [[nodiscard]] inline std::string audit_token(std::string_view s, std::size_t cap = kAuditTokenCap) {
     std::string t;
@@ -564,7 +601,7 @@ struct OldValue {
         t = yuzu::log_token(scrubbed);
     }
     std::replace(t.begin(), t.end(), '|', '_');
-    yuzu::profiles::fold_line_breaks(t); // log_token folds C0 and DEL but passes C1, U+2028 and U+2029
+    yuzu::profiles::fold_line_breaks(t); // redundant after log_token (which folds C1, U+2028, U+2029); kept belt-and-braces
     // A field that ends in a backslash would make the following separator read as an escaped `|` to the server's
     // splitter (result_parsing.hpp find_unescaped_pipe) and merge two cells.
     if (!t.empty() && t.back() == '\\') t.back() = '_';

@@ -38,7 +38,11 @@
 /// A null / empty `audit_fn` means the deployment runs audit-off; that is NOT
 /// a persistence failure, so the kernel returns `true` and sets no header —
 /// the established `AuditFn` contract (callers that fail closed must keep
-/// serving when audit is simply disabled).
+/// serving when audit is simply disabled). One deliberate exception is a
+/// mutation's `attempted` row (`DashboardRoutes::audit_attempted`, #3619): it
+/// refuses on an unwired sink, because the mutation must not run without a
+/// row; production always wires the sink there (`server.cpp`), and audit-off
+/// still reports the row as persisted from inside `audit_log`.
 ///
 /// **`result` semantics (#4858) — read this before assuming "success" means
 /// "data was shown".** The bool returned by `try_persist_audit`/
@@ -59,8 +63,8 @@
 ///     already recorded `success` audit row.
 ///   * Some surfaces instead audit AFTER the read and set `result` by ACTUAL
 ///     outcome — the Guardian REST/MCP twins (e.g. `guardian.device.view`
-///     on REST/MCP, which passes `rows ? "success" : "failure"`; the
-///     device-page Guardian lens fragment is a DIFFERENT posture, see below)
+///     on REST/MCP and the device-page Guardian lens fragment, which pass
+///     `rows ? "success" : "failure"`)
 ///     and `dex.app_perf.devices.view` record `success`/`failure` reflecting
 ///     whether the read itself succeeded, not merely whether it was
 ///     authorised and attempted.
@@ -77,13 +81,23 @@
 ///     runs, with the same constant `"success"`) — two different MCP tools
 ///     emitting the same verb under the same post-read-constant-success
 ///     convention, not a drift between them.
-///   * A fourth, surface-specific split on the SAME verb: `guardian.device.
-///     view` is audited post-read-by-outcome on REST and MCP (bucket two
-///     above), but the device-page Guardian lens dashboard fragment
-///     (`device_lens_routes.cpp`) audits it BEFORE the read with a constant
-///     `"success"` (bucket-one shape) — the same audit verb therefore
-///     carries a DIFFERENT ordering/outcome convention depending on which
-///     surface emitted it.
+///   * `guardian.device.view` is audited post-read-by-outcome on REST, MCP
+///     and (since #7217) the device-page Guardian lens dashboard fragment
+///     (`device_lens_routes.cpp`, set-and-proceed on that HTML surface): all
+///     three record `success`/`failure` by the read's actual outcome. Rows
+///     written by earlier builds on the lens carry a constant `"success"`
+///     written BEFORE the read, so a historical lens row can say `success`
+///     for a read that rendered the degraded placeholder.
+///   * `device.live.uptime` / `device.live.processes` (the per-device live
+///     read: REST `POST /api/v1/dex/devices/{id}/live` and MCP
+///     `get_device_live`) audit BEFORE the dispatch with `result="requested"`
+///     and fail closed: the row says only that the probe was authorised and
+///     is about to be sent. Nothing is sent when it cannot be stored (while
+///     audit is on). What happened afterwards is a later `failure` row on the
+///     same verb (nothing sent, a permission withdrawn or unreadable) or the
+///     answer itself; the MCP tool adds a generic `mcp.get_device_live` row
+///     after a successful answer. The device-page "Get live info" panel
+///     audits AFTER the dispatch (`dispatched`/`no_agents`, set-and-proceed).
 /// These postures are a known, accepted split across surfaces, not a bug in
 /// any one of them — an auditor reading raw rows must not assume one meaning
 /// fleet-wide, and must key off (verb, surface), not verb alone. Converging
@@ -93,7 +107,10 @@
 #include <httplib.h>
 #include <spdlog/spdlog.h>
 
+#include "rest_a4_envelope_http.hpp" // a4_error — the JSON refusal of refuse_unsafe_device_id_a4
 #include "web_utils.hpp" // audit_token — CWE-117 neutralisation for a hostile target_id (#4665)
+
+#include <yuzu/server/auth.hpp> // auth::agent_id_is_audit_safe
 
 #include <exception>
 #include <string>
@@ -218,6 +235,47 @@ template <class AuditFn>
     if (!persisted && !res.has_header("Sec-Audit-Failed"))
         res.set_header("Sec-Audit-Failed", "true");
     return persisted;
+}
+
+/// Refusal for a device id that fails the audit-trail floor (`auth::agent_id_is_audit_safe`) on
+/// an HTML fragment route: answers 400 with a static `Invalid device id.` note and returns true
+/// (the handler then returns). Call it FIRST, before the scoped permission check and before any
+/// audit write, because the id reaches `target_id` on the permission-denial audit and on every
+/// row the route writes, and the audit store keeps CR, LF and TAB. It writes no audit row
+/// itself, so a refused id leaves no row at all. Never put request data in the note.
+[[nodiscard]] inline bool refuse_unsafe_device_id(httplib::Response& res, const std::string& id) {
+    if (auth::agent_id_is_audit_safe(id))
+        return false;
+    res.status = 400;
+    res.set_content("<div class=\"gp-note\">Invalid device id.</div>", "text/html; charset=utf-8");
+    return true;
+}
+
+/// The JSON twin of `refuse_unsafe_device_id` for `/api` and `/api/v1` routes: the same floor,
+/// answered with a 400 A4 envelope whose message is the static `Invalid device id.` (the
+/// `X-Correlation-Id` header is reused when the handler already set one). Call it right after the
+/// id is read from the path, query or body, before the permission check and before any audit
+/// write; it writes no audit row. Never put request data in the message.
+[[nodiscard]] inline bool refuse_unsafe_device_id_a4(httplib::Response& res, const std::string& id) {
+    if (auth::agent_id_is_audit_safe(id))
+        return false;
+    res.status = 400;
+    res.set_content(a4_error(res, "Invalid device id."), "application/json");
+    return true;
+}
+
+/// The tag-key twin of `refuse_unsafe_device_id_a4`: the key reaches `target_id` (`agent_id:key`)
+/// on every tag audit row, so a key over 64 bytes or with a byte below `0x20`
+/// (`auth::tag_key_is_audit_safe`) answers 400 with the static message `Invalid tag key.`. A size
+/// and control-byte check only, never the key charset, so a delete route still reaches a stored
+/// key `TagStore::validate_key` would refuse. Call it right after the key is read, before the
+/// service-tag guard, the permission check and any audit write; it writes no audit row.
+[[nodiscard]] inline bool refuse_unsafe_tag_key_a4(httplib::Response& res, const std::string& key) {
+    if (auth::tag_key_is_audit_safe(key))
+        return false;
+    res.status = 400;
+    res.set_content(a4_error(res, "Invalid tag key."), "application/json");
+    return true;
 }
 
 } // namespace yuzu::server::detail

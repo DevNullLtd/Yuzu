@@ -58,6 +58,17 @@
   },
   {
     "method": "GET",
+    "path": "/fragments/dex/apps/usage",
+    "capability_id": "get.fragments-dex-apps-usage",
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/dex/apps/usage"
+    },
+    "mcp_twin": "get_dex_apps_usage",
+    "status": "twinned"
+  },
+  {
+    "method": "GET",
     "path": "/fragments/dex/catalogue",
     "capability_id": "get.fragments-dex-catalogue",
     "rest_v1_twin": {
@@ -268,5 +279,49 @@
     "rest_v1_twin": null,
     "mcp_twin": null,
     "status": "composed-of:get.fragments-settings-dex-alerts"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/dex/scoring",
+    "capability_id": "get.fragments-dex-scoring",
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/dex/score-policy"
+    },
+    "mcp_twin": "get_dex_score_policy",
+    "status": "twinned"
+  },
+  {
+    "method": "POST",
+    "path": "/api/settings/dex-scoring/save",
+    "capability_id": "post.api-settings-dex-scoring-save",
+    "rest_v1_twin": {
+      "method": "PUT",
+      "path": "/api/v1/dex/score-policy"
+    },
+    "mcp_twin": "set_dex_score_policy",
+    "status": "twinned"
+  },
+  {
+    "method": "POST",
+    "path": "/api/settings/dex-scoring/preview",
+    "capability_id": "post.api-settings-dex-scoring-preview",
+    "rest_v1_twin": {
+      "method": "PUT",
+      "path": "/api/v1/dex/score-policy"
+    },
+    "mcp_twin": "set_dex_score_policy",
+    "status": "twinned"
+  },
+  {
+    "method": "POST",
+    "path": "/api/settings/dex-scoring/reset",
+    "capability_id": "post.api-settings-dex-scoring-reset",
+    "rest_v1_twin": {
+      "method": "DELETE",
+      "path": "/api/v1/dex/score-policy"
+    },
+    "mcp_twin": "reset_dex_score_policy",
+    "status": "twinned"
   }
 ]

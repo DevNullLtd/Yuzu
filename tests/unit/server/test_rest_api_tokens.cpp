@@ -357,6 +357,30 @@ TEST_CASE("REST DELETE /api/v1/tokens: unknown token id returns 404 with no audi
     CHECK(h.audit_log.empty());
 }
 
+TEST_CASE("REST DELETE /api/v1/tokens: an invalid id revokes nothing and audits no success",
+          "[pg][rest][token][validation]") {
+    RestTokensHarness h;
+    auto token_id = h.create_token_for("alice", "alice-key");
+    h.session_user = "alice";
+    h.session_role = auth::Role::user;
+
+    auto res = h.delete_token(token_id + std::string("\0junk", 5));
+    REQUIRE(res);
+    // The ownership read is refused by the store, so the route reports a retryable store
+    // fault: 503 with a retry hint, never 200 and never the not-found answer.
+    CHECK(res->status == 503);
+    CHECK(res->get_header_value("Retry-After") == "2");
+    CHECK(res->body.find("token store unavailable") != std::string::npos);
+    CHECK(res->body.find("\"revoked\"") == std::string::npos);
+
+    // The existing token is untouched.
+    auto looked_up = h.token_store()->get_token(token_id).value();
+    REQUIRE(looked_up.has_value());
+    CHECK_FALSE(looked_up->revoked);
+    // No audit row at all: the refusal happens before any revoke is attempted.
+    CHECK(h.audit_log.empty());
+}
+
 // ──────────────────────────────────────────────────────────────────────────
 // F-002 (governance Gate 2, security-guardian): CSPRNG failure on token
 // creation paths must emit a `failure` audit row carrying the
@@ -781,6 +805,41 @@ TEST_CASE("REST POST /api/v1/device-tokens: oversized device_id (>256 chars) rej
     CHECK(res->status == 400);
     CHECK(res->body.find("invalid_input_length") != std::string::npos);
     CHECK(h.audit_log.empty());
+}
+
+// #7811: device_id is the `target_id` of the failure rows, and the audit store keeps CR, LF and
+// TAB, so a device id carrying a byte below 0x20 is refused with a 400 before the store and any
+// audit row (the length half stays the invalid_input_length refusal above).
+TEST_CASE("REST POST /api/v1/device-tokens: a device_id with a control byte is a 400 before the "
+          "store and any audit row (#7811)",
+          "[pg][rest][token][audit]") {
+    RestTokensHarness h;
+    h.session_user = "alice";
+    h.session_role = auth::Role::user;
+
+    const std::vector<std::string> bad = {std::string("dev\0A", 5), "dev\r\nA", "dev\nA",
+                                          "dev\tA"};
+    for (const auto& id : bad) {
+        INFO(id.substr(0, 16));
+        auto res = h.sink.Post("/api/v1/device-tokens",
+                               nlohmann::json{{"name", "dev-token"},
+                                              {"device_id", id},
+                                              {"definition_id", "d"}}
+                                   .dump());
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        CHECK(nlohmann::json::parse(res->body)["error"]["message"] == "Invalid device id.");
+    }
+    CHECK(h.audit_log.empty());
+
+    // A 256-byte printable device_id is safe (the length bound is inclusive): it reaches the store.
+    auto edge = h.sink.Post("/api/v1/device-tokens",
+                            nlohmann::json{{"name", "dev-token"},
+                                           {"device_id", std::string(256, 'D')},
+                                           {"definition_id", "d"}}
+                                .dump());
+    REQUIRE(edge);
+    CHECK(edge->status == 201);
 }
 
 TEST_CASE("REST POST /api/v1/tokens: CSPRNG failure increments "

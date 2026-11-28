@@ -16,7 +16,16 @@
 #   docker compose down           # stop all
 #
 # Dashboard: http://localhost:8080
-# Grafana:   http://localhost:3000 (admin/admin)
+# Grafana:   http://localhost:3000 (admin / $YUZU_GRAFANA_ADMIN_PASSWORD)
+#
+# Required before any `docker compose` command that reads this file, `down`
+# included (#4817):
+#   export YUZU_GRAFANA_ADMIN_PASSWORD="$(openssl rand -hex 16)"
+# (or put it in deploy/docker/.env; keep the same value across shells). For
+# `down`, `ps` and `logs` any non-empty value works. Grafana applies it only when
+# it first creates its database: an existing grafana-data volume keeps its old
+# password (admin/admin if it predates #4817); change it with
+#   docker compose exec grafana grafana cli admin reset-admin-password '<new>'
 # Prometheus: http://localhost:9090
 
 services:
@@ -26,7 +35,7 @@ services:
       context: ../..
       dockerfile: deploy/docker/Dockerfile.server
     ports:
-      - "8080:8080"     # Web dashboard + REST API
+      - "127.0.0.1:8080:8080" # Web dashboard + REST API: plain HTTP (YUZU_NO_HTTPS below), so loopback only
       - "50051:50051"   # gRPC (agent connections)
       - "50052:50052"   # gRPC (management)
     environment:
@@ -39,6 +48,17 @@ services:
       # dev rig. Production deployments use docker-compose.reference.yml,
       # which REQUIRES distinct YUZU_POSTGRES_PASSWORD + YUZU_DB_PASSWORD.
       YUZU_POSTGRES_DSN: postgresql://yuzu:${YUZU_DB_PASSWORD:-yuzu-app}@postgres:5432/yuzu
+      # DEV-ONLY: /metrics requires authentication by default; this rig's Prometheus
+      # (prometheus-docker.yml) sends no credential, so the server is explicitly opted in to an
+      # unauthenticated /metrics on the published :8080. Production monitoring sends a bearer
+      # token instead: docs/user-manual/metrics.md "Scraping /metrics with a bearer token".
+      YUZU_METRICS_NO_AUTH: "true"
+      # DEV-ONLY: with HTTPS on (the default) the published :8080 is only the redirect listener and
+      # does NOT serve /metrics (it is on :8443), so this DEV-ONLY rig serves plain HTTP on :8080 (what its
+      # dashboard URL and prometheus-docker.yml, which scrapes server:8080 on the compose network, assume).
+      # The published port is bound to 127.0.0.1 so cleartext credentials and metrics never leave the
+      # host. Never copy this to a deployment: docker-compose.reference.yml keeps HTTPS.
+      YUZU_NO_HTTPS: "true"
     volumes:
       - server-data:/var/lib/yuzu
       # The internal CA, the default certs and the secrets KEK
@@ -122,7 +142,8 @@ services:
     ports:
       - "3000:3000"
     environment:
-      - GF_SECURITY_ADMIN_PASSWORD=admin
+      # Required, no default (#4817): Grafana's built-in default is admin/admin.
+      - GF_SECURITY_ADMIN_PASSWORD=${YUZU_GRAFANA_ADMIN_PASSWORD:?set YUZU_GRAFANA_ADMIN_PASSWORD to a strong random value, e.g. openssl rand -hex 16}
       - GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH=/var/lib/grafana/dashboards/yuzu-dashboard.json
     volumes:
       - ../grafana/provisioning:/etc/grafana/provisioning:ro

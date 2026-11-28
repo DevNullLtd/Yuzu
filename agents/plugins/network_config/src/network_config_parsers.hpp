@@ -9,7 +9,7 @@
  * owns every subprocess/socket/sysctl call and hands this header the raw
  * text or bytes it captured.
  *
- * Three families:
+ * Four families:
  *   - /proc/net/arp text parsing (Linux arp leg). A standalone copy, not a
  *     re-include of discovery_parsers.hpp — the two decoders read the same
  *     kernel format but produce DIFFERENT field sets (this plugin's arp
@@ -28,6 +28,8 @@
  *     dereferenced, a malformed/short record stops the walk rather than
  *     looping or reading out of bounds, and the caller learns about
  *     truncation instead of silently receiving a partial result.
+ *   - Row builders for the Windows adapters/ip_addresses/dns_servers legs,
+ *     over the owned adapter list agent-core reads.
  *
  *     ALIGNMENT CONTRACT (rtnetlink decoders only): the nlmsghdr/rtattr walk
  *     reads its header fields through the kernel's own NLMSG_ and RTA_
@@ -55,6 +57,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <format>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -84,7 +87,130 @@
 #include <netinet/in.h>
 #endif
 
+#include <uri_userinfo_redact.hpp> // yuzu::shared::redact_proxy_value
+#include <row_field.hpp>           // yuzu::shared::row_field
+
+#include <yuzu/agent/win_adapter_list.hpp> // AdapterList (types only here)
+
 namespace yuzu::network_config {
+
+/// VESTIGIAL. An earlier design treated a single URL and a WinHTTP list
+/// differently; the redaction is now ONE fail-closed rule and both shapes
+/// behave identically. Kept (with the Windows call site that passes `list`)
+/// because that code cannot be recompiled from every build host; do not add
+/// behaviour that depends on it.
+enum class ProxyShape { single, list };
+
+/// One `proxy_address|<value>` row. The value is an endpoint-supplied proxy
+/// setting. If it holds ANY '@' the output is `REDACTED@` plus the text after
+/// the LAST '@' of the whole value (scheme, earlier list entries and a path
+/// '@' are dropped on purpose: yuzu::shared::redact_proxy_value); a value with
+/// no '@' is unchanged. The result goes through yuzu::shared::row_field (backslash-preserving) so a '|', CR
+/// or LF cannot forge columns or rows. `shape` is vestigial (see ProxyShape).
+[[nodiscard]] inline std::string format_proxy_address_row(std::string_view raw,
+                                                          ProxyShape shape = ProxyShape::single) {
+    return "proxy_address|" + yuzu::shared::row_field(
+                                  shape == ProxyShape::list
+                                      ? yuzu::shared::redact_proxy_value(raw)
+                                      : yuzu::shared::redact_proxy_single(raw));
+}
+
+/// One `bypass|<value>` row (`no_proxy`, the WinHTTP bypass list, the macOS
+/// exceptions list). Endpoint-controlled free text: yuzu::shared::row_field keeps a
+/// '|', CR or LF from adding columns or forging `proxy_*` rows.
+[[nodiscard]] inline std::string format_bypass_row(std::string_view raw) {
+    return "bypass|" + yuzu::shared::row_field(raw);
+}
+
+// ── Windows adapters / ip_addresses / dns_servers rows ───────────────────
+
+// SDK values, static_asserted against the headers in network_config_plugin.cpp.
+inline constexpr std::uint32_t kIfTypeSoftwareLoopback = 24; // IF_TYPE_SOFTWARE_LOOPBACK
+inline constexpr std::uint32_t kIfTypeTunnel = 131;          // IF_TYPE_TUNNEL
+inline constexpr std::uint32_t kIfOperStatusUp = 1;          // IfOperStatusUp
+
+/// The rows one action writes and the return code it ends with.
+struct WindowsRows {
+    std::vector<std::string> rows;
+    int rc = 0;
+};
+
+/// False when the read did not complete or the OS refused it.
+inline bool adapter_list_answered(const yuzu::agent::win::AdapterList& list) {
+    return list.status == yuzu::agent::BoundedStatus::Completed && list.win_error == 0;
+}
+
+/// Loopback and tunnel adapters are left out of all three actions.
+inline bool is_listed_adapter(const yuzu::agent::win::Adapter& a) {
+    return a.if_type != kIfTypeSoftwareLoopback && a.if_type != kIfTypeTunnel;
+}
+
+/// The Windows MAC rendering: uppercase, the first six bytes, '-' when shorter. Not format_mac
+/// below, which is lowercase and refuses any length but six.
+inline std::string format_windows_mac(const std::vector<std::uint8_t>& addr) {
+    if (addr.size() < 6)
+        return "-";
+    return std::format("{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}", addr[0], addr[1], addr[2],
+                       addr[3], addr[4], addr[5]);
+}
+
+/// `adapter|name|mac|speed_mbps|status`. A failed read is an in-band error row at rc 1.
+inline WindowsRows windows_adapter_rows(const yuzu::agent::win::AdapterList& list) {
+    if (!adapter_list_answered(list))
+        return {{"adapter|Error enumerating adapters|-|0|unknown"}, 1};
+    if (list.empty_table)
+        return {{"adapter|No adapters found|-|0|unknown"}, 0};
+    WindowsRows out;
+    for (const auto& a : list.adapters) {
+        if (!is_listed_adapter(a))
+            continue;
+        out.rows.push_back(std::format("adapter|{}|{}|{}|{}", a.friendly_name,
+                                       format_windows_mac(a.physical_address),
+                                       a.transmit_link_speed / 1'000'000,
+                                       a.oper_status == kIfOperStatusUp ? "up" : "down"));
+    }
+    return out;
+}
+
+/// `ip|name|address|prefix_len|gateway`, the gateway being the adapter's first renderable one.
+/// A failed read is rc 1 with no rows.
+inline WindowsRows windows_ip_rows(const yuzu::agent::win::AdapterList& list) {
+    if (!adapter_list_answered(list))
+        return {{}, 1};
+    WindowsRows out;
+    for (const auto& a : list.adapters) {
+        if (!is_listed_adapter(a))
+            continue;
+        const auto gw = std::find_if(a.gateways.begin(), a.gateways.end(),
+                                     [](const std::string& g) { return !g.empty(); });
+        const std::string_view gateway = gw == a.gateways.end() ? std::string_view{"-"} : *gw;
+        for (const auto& ua : a.unicast) {
+            if (ua.address.empty())
+                continue;
+            out.rows.push_back(std::format("ip|{}|{}|{}|{}", a.friendly_name, ua.address,
+                                           ua.prefix_len, gateway));
+        }
+    }
+    return out;
+}
+
+/// `dns|name|address|IPv4 or IPv6`. A failed read is rc 1 with no rows.
+inline WindowsRows windows_dns_rows(const yuzu::agent::win::AdapterList& list) {
+    if (!adapter_list_answered(list))
+        return {{}, 1};
+    WindowsRows out;
+    for (const auto& a : list.adapters) {
+        if (!is_listed_adapter(a))
+            continue;
+        for (const auto& dns : a.dns_servers) {
+            if (dns.address.empty())
+                continue;
+            out.rows.push_back(std::format("dns|{}|{}|{}", a.friendly_name, dns.address,
+                                           dns.family == 6 ? "IPv6" : "IPv4"));
+        }
+    }
+    return out;
+}
 
 // ── /proc/net/arp (Linux arp leg) ────────────────────────────────────────
 

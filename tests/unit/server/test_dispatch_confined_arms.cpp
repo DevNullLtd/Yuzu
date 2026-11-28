@@ -29,6 +29,8 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
+#include <cstddef>
+#include <map>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -210,7 +212,7 @@ TEST_CASE("system-reserved ids: a present-EMPTY visible set reaches NOBODY",
 
 TEST_CASE("system-reserved ids: the fail-closed containment gate is not applied (a contained device still answers)",
           "[server][dispatch][scope][security][sync_fanout]") {
-    // The quarantine plugin gate itself is exercised in test_quarantine_dispatch_gate.cpp; this pins
+    // The containment gate itself is exercised in test_quarantine_dispatch_gate.cpp; this pins
     // only that this arm does not fail closed on an empty quarantine set.
     std::vector<std::string> sent_to;
     const auto r = dispatch_system_reserved_ids(
@@ -723,6 +725,25 @@ TEST_CASE("resolve_scope_targets: an Unresolvable registry evaluation aborts as 
     CHECK(*result.abort_reason == ScopeAbortReason::Unresolvable);
 }
 
+TEST_CASE("resolve_scope_targets: a ResultSetUnusable registry evaluation aborts as "
+          "result_set_unusable and matched is absent",
+          "[server][dispatch][scope]") {
+    std::string aborted_reason;
+    ScopeLadderAudit audit;
+    audit.evaluation_aborted = [&](const std::string& reason) { aborted_reason = reason; };
+    const auto result = resolve_scope_targets(
+        "ostype == \"Windows\"", "alice", nullptr,
+        [](const yuzu::scope::Expression&) -> std::expected<std::vector<std::string>, ScopeEvalError> {
+            return std::unexpected(ScopeEvalError{ScopeEvalError::Kind::ResultSetUnusable, "rs_x"});
+        },
+        audit);
+    CHECK_FALSE(result.matched.has_value());
+    CHECK(aborted_reason == "result_set_unusable");
+    REQUIRE(result.abort_reason.has_value());
+    CHECK(*result.abort_reason == ScopeAbortReason::ResultSetUnusable);
+    CHECK(result.abort_detail == "rs_x"); // the registry's detail is carried for this reason
+}
+
 TEST_CASE("scope_eval_error/scope_abort_reason string vocabularies agree pairwise",
           "[server][dispatch][scope]") {
     // #4981 PR-1: scope_eval_error.hpp's to_string(ScopeEvalError::Kind) and
@@ -742,6 +763,19 @@ TEST_CASE("scope_eval_error/scope_abort_reason string vocabularies agree pairwis
           to_string(to_abort_reason(Kind::OwnerCheckFailed)));
     CHECK(std::string(to_string(Kind::PresenceDegraded)) ==
           to_string(to_abort_reason(Kind::PresenceDegraded)));
+    CHECK(std::string(to_string(Kind::ResultSetUnusable)) ==
+          to_string(to_abort_reason(Kind::ResultSetUnusable)));
+    CHECK(std::string(to_string(Kind::ResultSetUnusable)) == "result_set_unusable");
+    // A pending set may fill, so a retry can succeed: transient, not permanent.
+    CHECK_FALSE(scope_abort_is_permanent(Kind::ResultSetUnusable));
+    // A failed set, or an incomplete one where a missing member would match (for example under
+    // NOT, LEN or STARTSWITH), does not change by retrying: permanent, with the same wire reason.
+    CHECK(std::string(to_string(Kind::ResultSetUnusablePermanent)) ==
+          to_string(to_abort_reason(Kind::ResultSetUnusablePermanent)));
+    CHECK(std::string(to_string(Kind::ResultSetUnusablePermanent)) == "result_set_unusable");
+    CHECK(to_abort_reason(Kind::ResultSetUnusablePermanent) ==
+          ScopeAbortReason::ResultSetUnusablePermanent);
+    CHECK(scope_abort_is_permanent(Kind::ResultSetUnusablePermanent));
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1210,11 +1244,217 @@ TEST_CASE("wire_and_dispatch_confined: a local-miss agent with a ROUTABLE direct
     CHECK(*pending[0].cluster_id == "cluster-b");
 }
 
-// Echo rename, upgrade window: a command for the echo plugin to an agent that only has a
-// directory row (no local session) carries the legacy plugin name iff the row says the agent
-// registered it. The legacy spelling `tar` is the point of this case.
-TEST_CASE("wire_and_dispatch_confined: a directory-routed echo command is written as `tar` only "
-          "for a row flagged legacy_echo_wire_name",
+// HA WS-5 #5685 hp-1: a local session that has NO delivery path here (empty `gateway_node`, no
+// Subscribe stream) is what a replica holds for an agent whose CONNECTED a different replica
+// handled — `send_to` returns false for it. That session must not shadow the directory.
+TEST_CASE("wire_and_dispatch_confined: a local session with no delivery path (empty gateway_node "
+          "and no stream) falls through to a ROUTABLE directory row (#5685 hp-1)",
+          "[pg][server][dispatch][scope][gateway_route_dispatch][ha]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, dispatch_route_fallback_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayRouteStore store{pool};
+    REQUIRE(store.is_open());
+
+    EventBus bus;
+    yuzu::MetricsRegistry metrics;
+    AgentRegistry registry(bus, metrics);
+    // Registered here (this replica did the ProxyRegister) but its CONNECTED was handled by
+    // another replica, so gateway_node stays empty and no stream is attached.
+    (void)registry.register_agent(make_wiring_test_info("dev-shadowed"));
+    REQUIRE(registry.lacks_local_delivery_path("dev-shadowed"));
+
+    auto fresh = store.register_fresh("dev-shadowed", "sess-shadowed-1");
+    REQUIRE(fresh.has_value());
+    REQUIRE(fresh->won);
+    auto announced =
+        store.announce_connected("dev-shadowed", "sess-shadowed-1", "cluster-b", "node-b", 90);
+    REQUIRE(announced.has_value());
+    REQUIRE(announced->matched);
+
+    auto classified = ClassifiedCommandTestAccess::make(make_route_fallback_cmd("route-fb-shadow"));
+    auto noop_audit = [](const std::string&, const std::string&, const std::string&,
+                         const std::string&) {};
+    const auto outcome = yuzu::server::wire_and_dispatch_confined(
+        registry, nullptr, nullptr, nullptr, nullptr, nullptr, noop_audit, noop_audit,
+        /*command_id=*/"route-fb-shadow", /*execution_id=*/"", /*principal_role=*/"",
+        /*agent_ids=*/{"dev-shadowed"}, /*scope_expr=*/"", /*exec_visible=*/unfiltered(),
+        /*broadcast_on_none=*/false, kNoContainment, classified, /*definition_id=*/{},
+        /*concurrency_mode=*/{}, &store);
+
+    CHECK(outcome.sent == 1);
+    CHECK_FALSE(outcome.route_unreadable);
+    CHECK(outcome.not_sent.empty());
+    auto pending = registry.drain_gateway_pending();
+    REQUIRE(pending.size() == 1); // exact send set: one queue entry, no duplicate
+    CHECK(pending[0].agent_id == "dev-shadowed");
+    REQUIRE(pending[0].cluster_id.has_value());
+    CHECK(*pending[0].cluster_id == "cluster-b");
+}
+
+TEST_CASE("wire_and_dispatch_confined: a local session with no delivery path and NO directory "
+          "row is still a definite no-route (#5685 hp-1: no outcome that succeeded changes)",
+          "[pg][server][dispatch][scope][gateway_route_dispatch][ha]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, dispatch_route_fallback_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayRouteStore store{pool};
+    REQUIRE(store.is_open());
+
+    EventBus bus;
+    yuzu::MetricsRegistry metrics;
+    AgentRegistry registry(bus, metrics);
+    (void)registry.register_agent(make_wiring_test_info("dev-nopath"));
+
+    auto classified = ClassifiedCommandTestAccess::make(make_route_fallback_cmd("route-fb-nopath"));
+    auto noop_audit = [](const std::string&, const std::string&, const std::string&,
+                         const std::string&) {};
+    const auto outcome = yuzu::server::wire_and_dispatch_confined(
+        registry, nullptr, nullptr, nullptr, nullptr, nullptr, noop_audit, noop_audit,
+        /*command_id=*/"route-fb-nopath", /*execution_id=*/"", /*principal_role=*/"",
+        /*agent_ids=*/{"dev-nopath"}, /*scope_expr=*/"", /*exec_visible=*/unfiltered(),
+        /*broadcast_on_none=*/false, kNoContainment, classified, /*definition_id=*/{},
+        /*concurrency_mode=*/{}, &store);
+
+    CHECK(outcome.sent == 0);
+    CHECK_FALSE(outcome.route_unreadable);
+    CHECK(outcome.not_sent == std::vector<std::string>{"dev-nopath"});
+    CHECK(registry.drain_gateway_pending().empty());
+}
+
+// An unfiltered fleet-wide dispatch takes `send_to_all`, which skips a session with no delivery
+// path. The fast-path gate must therefore not treat such a session as "local, reachable".
+TEST_CASE("wire_and_dispatch_confined: a Broadcast reaches a shadowed local session through the "
+          "directory and does not double-send a deliverable one (#5685 hp-1)",
+          "[pg][server][dispatch][scope][gateway_route_dispatch][ha]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, dispatch_route_fallback_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayRouteStore store{pool};
+    REQUIRE(store.is_open());
+
+    EventBus bus;
+    yuzu::MetricsRegistry metrics;
+    AgentRegistry registry(bus, metrics);
+    (void)registry.register_agent(make_wiring_test_info("dev-ok"));
+    REQUIRE(registry.set_gateway_route(
+        "dev-ok", /*session_id=*/{}, "test-gateway",
+        {std::string(yuzu::server::detail::kGatewayWireCapabilityDispatchTagV1)}));
+    // A routable decoy row for the DELIVERABLE agent: if the directory were consulted for it the
+    // command would carry cluster-c and be sent twice.
+    {
+        auto f = store.register_fresh("dev-ok", "sess-ok-1");
+        REQUIRE(f.has_value());
+        auto a = store.announce_connected("dev-ok", "sess-ok-1", "cluster-c", "node-c", 90);
+        REQUIRE(a.has_value());
+        REQUIRE(a->matched);
+    }
+    (void)registry.register_agent(make_wiring_test_info("dev-shadowed"));
+
+    auto fresh = store.register_fresh("dev-shadowed", "sess-shadowed-2");
+    REQUIRE(fresh.has_value());
+    auto announced =
+        store.announce_connected("dev-shadowed", "sess-shadowed-2", "cluster-b", "node-b", 90);
+    REQUIRE(announced.has_value());
+    REQUIRE(announced->matched);
+
+    auto classified = ClassifiedCommandTestAccess::make(make_route_fallback_cmd("route-fb-bcast"));
+    auto noop_audit = [](const std::string&, const std::string&, const std::string&,
+                         const std::string&) {};
+    const auto outcome = yuzu::server::wire_and_dispatch_confined(
+        registry, nullptr, nullptr, nullptr, nullptr, nullptr, noop_audit, noop_audit,
+        /*command_id=*/"route-fb-bcast", /*execution_id=*/"", /*principal_role=*/"",
+        /*agent_ids=*/{}, /*scope_expr=*/"", /*exec_visible=*/unfiltered(),
+        /*broadcast_on_none=*/true, kNoContainment, classified, /*definition_id=*/{},
+        /*concurrency_mode=*/{}, &store);
+
+    CHECK(outcome.sent == 2);
+    auto pending = registry.drain_gateway_pending();
+    REQUIRE(pending.size() == 2); // exact send set: one entry each
+    std::map<std::string, std::optional<std::string>> by_agent;
+    for (auto& pc : pending)
+        by_agent[pc.agent_id] = pc.cluster_id;
+    REQUIRE(by_agent.size() == 2);
+    CHECK_FALSE(by_agent.at("dev-ok").has_value()); // local gateway_node path
+    REQUIRE(by_agent.at("dev-shadowed").has_value());
+    CHECK(*by_agent.at("dev-shadowed") == "cluster-b"); // directory path
+}
+
+// The monolith guarantee behind hp-1: a DIRECT agent (live Subscribe stream, empty gateway_node)
+// is deliverable, so it is never shadowed, never sent to the directory and never widens the
+// broadcast fast path.
+TEST_CASE("a direct agent with a live stream is NOT treated as having no delivery path "
+          "(#5685 hp-1 monolith guarantee)",
+          "[server][dispatch][ha]") {
+    EventBus bus;
+    yuzu::MetricsRegistry metrics;
+    AgentRegistry registry(bus, metrics);
+    (void)registry.register_agent(make_wiring_test_info("dev-direct"));
+    auto sess = registry.get_session("dev-direct");
+    REQUIRE(sess != nullptr);
+    alignas(std::max_align_t) char stream_stand_in = 0; // never dereferenced: only null-checked
+    {
+        std::lock_guard lock(sess->stream_mu);
+        sess->stream = reinterpret_cast<decltype(sess->stream)>(&stream_stand_in);
+    }
+    CHECK_FALSE(registry.lacks_local_delivery_path("dev-direct"));
+    CHECK_FALSE(registry.needs_directory_consult("dev-direct"));
+    CHECK_FALSE(registry.has_remote_presence({"dev-direct"}));
+    {
+        std::lock_guard lock(sess->stream_mu);
+        sess->stream = nullptr; // the registry must not see the stand-in again
+    }
+    // And the opposite states, so the three predicates cannot be vacuously false.
+    CHECK(registry.lacks_local_delivery_path("dev-direct"));
+    CHECK(registry.needs_directory_consult("dev-direct"));
+    CHECK(registry.needs_directory_consult("dev-never-registered"));
+    CHECK(registry.has_remote_presence({"dev-direct"}));
+}
+
+// The directory decision is made once per dispatch (prepare); the session's CONNECTED can land
+// before the per-id send. Then send_via_directory must hand the id to send_to, which stamps the
+// local placement and applies the dispatch-tag capability check, instead of queueing it under a
+// stale directory cluster with neither.
+TEST_CASE("send_via_directory sends a session that gained a delivery path through send_to "
+          "and so keeps its capability check (#5685 hp-1)",
+          "[server][dispatch][ha]") {
+    EventBus bus;
+    yuzu::MetricsRegistry metrics;
+    AgentRegistry registry(bus, metrics);
+    auto classified = ClassifiedCommandTestAccess::make(make_route_fallback_cmd("late-connected"));
+
+    (void)registry.register_agent(make_wiring_test_info("dev-late"));
+    REQUIRE(registry.needs_directory_consult("dev-late")); // the decision prepare() would make
+    REQUIRE(registry.set_gateway_route(
+        "dev-late", /*session_id=*/{}, "test-gateway",
+        {std::string(yuzu::server::detail::kGatewayWireCapabilityDispatchTagV1)}));
+    CHECK(registry.send_via_directory("dev-late", classified, "cluster-stale"));
+    auto pending = registry.drain_gateway_pending();
+    REQUIRE(pending.size() == 1);
+    CHECK(pending[0].agent_id == "dev-late");
+    CHECK_FALSE(pending[0].cluster_id.has_value()); // send_to's local stamp, not the stale cluster
+
+    // A gateway that never advertised the dispatch tag: send_to refuses and counts it; the stale
+    // directory path must not bypass that.
+    (void)registry.register_agent(make_wiring_test_info("dev-nocap"));
+    REQUIRE(registry.set_gateway_route("dev-nocap", /*session_id=*/{}, "test-gateway", {}));
+    CHECK_FALSE(registry.send_via_directory("dev-nocap", classified, "cluster-stale"));
+    CHECK(registry.drain_gateway_pending().empty());
+    CHECK(metrics
+              .counter("yuzu_server_gateway_capability_denied_total",
+                       {{"capability", std::string(
+                             yuzu::server::detail::kGatewayWireCapabilityDispatchTagV1)}})
+              .value() == 1.0);
+
+    // A session that still has no delivery path is queued under the directory cluster.
+    (void)registry.register_agent(make_wiring_test_info("dev-still-shadowed"));
+    CHECK(registry.send_via_directory("dev-still-shadowed", classified, "cluster-b"));
+    pending = registry.drain_gateway_pending();
+    REQUIRE(pending.size() == 1);
+    REQUIRE(pending[0].cluster_id.has_value());
+    CHECK(*pending[0].cluster_id == "cluster-b");
+}
+
+// A command for the echo plugin to an agent that only has a directory row (no local session) is
+// queued under its own plugin name.
+TEST_CASE("wire_and_dispatch_confined: a directory-routed echo command is written as `echo`",
           "[pg][server][dispatch][scope][gateway_route_dispatch][echo_rename]") {
     YUZU_REQUIRE_PG_DB_TPL(db, dispatch_route_fallback_tpl);
     pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
@@ -1225,13 +1465,12 @@ TEST_CASE("wire_and_dispatch_confined: a directory-routed echo command is writte
     yuzu::MetricsRegistry metrics;
     AgentRegistry registry(bus, metrics);
 
-    for (const auto& [id, session, legacy] :
-         {std::tuple{"dev-remote-legacy", "sess-legacy", true},
-          std::tuple{"dev-remote-current", "sess-current", false}}) {
-        auto fresh = store.register_fresh(id, session, legacy);
+    {
+        auto fresh = store.register_fresh("dev-remote-echo", "sess-echo");
         REQUIRE(fresh.has_value());
         REQUIRE(fresh->won);
-        auto announced = store.announce_connected(id, session, "cluster-b", "node-b", 90);
+        auto announced = store.announce_connected("dev-remote-echo", "sess-echo", "cluster-b",
+                                                  "node-b", 90);
         REQUIRE(announced.has_value());
         REQUIRE(announced->matched);
     }
@@ -1247,19 +1486,16 @@ TEST_CASE("wire_and_dispatch_confined: a directory-routed echo command is writte
         /*tag_store=*/nullptr, /*custom_properties_store=*/nullptr,
         /*execution_tracker=*/nullptr, noop_audit, noop_audit,
         /*command_id=*/"route-fb-echo", /*execution_id=*/"", /*principal_role=*/"",
-        /*agent_ids=*/{"dev-remote-legacy", "dev-remote-current"}, /*scope_expr=*/"",
+        /*agent_ids=*/{"dev-remote-echo"}, /*scope_expr=*/"",
         /*exec_visible=*/unfiltered(), /*broadcast_on_none=*/false, kNoContainment, classified,
         /*definition_id=*/{}, /*concurrency_mode=*/{}, &store);
 
-    CHECK(outcome.sent == 2);
+    CHECK(outcome.sent == 1);
     auto pending = registry.drain_gateway_pending();
-    REQUIRE(pending.size() == 2);
-    for (const auto& p : pending) {
-        INFO(p.agent_id);
-        CHECK(p.cmd.plugin() == (p.agent_id == "dev-remote-legacy" ? "tar" : "echo"));
-        REQUIRE(p.cluster_id.has_value());
-        CHECK(*p.cluster_id == "cluster-b");
-    }
+    REQUIRE(pending.size() == 1);
+    CHECK(pending[0].cmd.plugin() == "echo");
+    REQUIRE(pending[0].cluster_id.has_value());
+    CHECK(*pending[0].cluster_id == "cluster-b");
 }
 
 TEST_CASE("wire_and_dispatch_confined: a local-miss agent ABSENT from the directory is a "
@@ -1486,4 +1722,27 @@ TEST_CASE("resolve_scope_targets: a result set deleted between gate_scope_dispat
 
     // Re-create under the SAME id is astronomically unlikely (random suffix,
     // see ResultSetStore::generate_id) so no re-fetch/cleanup is needed here.
+}
+
+// SAM-39: the fifth internal push. The label switch has no default, so a missing case fails to
+// compile; this pins the label (the boot pre-seed and the capability row use the same string) and
+// that the pre-seed array lists every enumerator.
+TEST_CASE("kSystemReservedPushes lists the five internal pushes, labelled",
+          "[server][dispatch][system_reserved]") {
+    using yuzu::server::kSystemReservedPushes;
+    using yuzu::server::SystemReservedPush;
+    using yuzu::server::system_reserved_push_label;
+
+    STATIC_REQUIRE(kSystemReservedPushes.size() == 5);
+    CHECK(system_reserved_push_label(SystemReservedPush::inventory_settings_push) ==
+          "__sync__.settings");
+    CHECK(system_reserved_push_label(SystemReservedPush::inventory_sync_now) == "__sync__.now");
+
+    std::unordered_set<std::string_view> labels;
+    for (const auto push : kSystemReservedPushes)
+        labels.insert(system_reserved_push_label(push));
+    CHECK(labels.size() == 5);
+    CHECK_FALSE(labels.contains("unknown"));
+    CHECK(std::ranges::find(kSystemReservedPushes, SystemReservedPush::inventory_settings_push) !=
+          kSystemReservedPushes.end());
 }

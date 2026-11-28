@@ -42,6 +42,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <unordered_set>
 #include <vector>
 
 namespace yuzu::server {
@@ -75,6 +76,14 @@ inline std::string_view strip_db_error_prefix(std::string_view msg) {
 
 // ── PolicyStore ──────────────────────────────────────────────────────────────
 
+/// One policy that uses a fragment, as `PolicyStore::policies_using_fragments` answers it: just
+/// the three columns a refusal names, no trigger/input/binding rows.
+struct FragmentUse {
+    std::string fragment_id;
+    std::string policy_id;
+    std::string policy_name; ///< may be empty
+};
+
 class PolicyStore {
 public:
     explicit PolicyStore(pg::PgPool& pool);
@@ -92,6 +101,33 @@ public:
     [[nodiscard]] std::expected<std::optional<PolicyFragment>, PolicyReadError>
     get_fragment(const std::string& id) const;
     [[nodiscard]] bool delete_fragment(const std::string& id);
+    /// Ids of the fragments whose check, fix or post-check names `instruction_id` (an instruction
+    /// DEFINITION id), at most `limit` of them. The evaluator resolves those three fields by
+    /// definition id, so a fragment pointing at a deleted definition silently stops maturing
+    /// verdicts. `exclude_ids` are left out INSIDE the query, so an excluded row never takes one
+    /// of the `limit` slots. `kDegraded` = the question could not be answered; it is never an
+    /// empty list.
+    [[nodiscard]] std::expected<std::vector<std::string>, PolicyReadError>
+    fragments_referencing_instruction(
+        const std::string& instruction_id, int limit,
+        const std::unordered_set<std::string>& exclude_ids = {}) const;
+    /// The same question for ANY of `instruction_ids` at once (one read for the whole list); each
+    /// fragment is listed once however many of the ids its three fields name. An empty list
+    /// answers an empty vector without a read. `fragments_referencing_instruction` above is the
+    /// one-element call of this method.
+    [[nodiscard]] std::expected<std::vector<std::string>, PolicyReadError>
+    fragments_referencing_instructions(
+        const std::vector<std::string>& instruction_ids, int limit,
+        const std::unordered_set<std::string>& exclude_ids = {}) const;
+    /// The policies that use any of `fragment_ids`, at most `per_fragment_limit` for each fragment
+    /// (ordered by name, then id as a stable tiebreak; `query_policies` orders by name only), in
+    /// ONE read of the policy rows only (no trigger/input/binding detail is loaded, so a bad
+    /// detail row cannot fail it). A
+    /// fragment no policy uses is simply absent. An empty list answers an empty vector without a
+    /// read. `kDegraded` = the question could not be answered; it is never an empty list.
+    [[nodiscard]] std::expected<std::vector<FragmentUse>, PolicyReadError>
+    policies_using_fragments(const std::vector<std::string>& fragment_ids,
+                             int per_fragment_limit) const;
 
     /// Extract the operator-facing fragment name from a YAML source string
     /// without parsing the entire fragment. Used by route handlers that
@@ -100,6 +136,18 @@ public:
     /// finally falling back to "" if none are present. Defined as a static
     /// helper because route layers should not own YAML parsing themselves.
     static std::string peek_fragment_name(const std::string& yaml_source);
+
+    /// The instruction ids a fragment's YAML names, in the order check, fix, postCheck,
+    /// empty ones skipped, without parsing or validating the whole fragment. Used by the
+    /// authoring routes to ask the evaluator whether a pair may be dispatched before the
+    /// fragment is accepted. Defined here, beside `peek_fragment_name`, for the same
+    /// reason: route layers should not own YAML parsing.
+    static std::vector<std::string> peek_fragment_instructions(const std::string& yaml_source);
+
+    /// The fragment a policy's YAML names (the `fragment:` value `create_policy` reads), or ""
+    /// when it names none. Lets the authoring routes look the fragment up before the policy is
+    /// accepted.
+    static std::string peek_policy_fragment(const std::string& yaml_source);
 
     // ── Policies ─────────────────────────────────────────────────────────
     [[nodiscard]] std::expected<std::string, std::string>
@@ -138,6 +186,52 @@ public:
     update_agent_status(const std::string& policy_id, const std::string& agent_id,
                         const std::string& status, const std::string& check_result = "",
                         std::optional<int64_t> expected_gen = std::nullopt);
+
+    /// What `mark_blocked` did. `changed` is the number of rows whose status or
+    /// `check_result` actually changed (zero when the same refusal is recorded again, even
+    /// though its `last_check_at` is refreshed).
+    /// `fenced_out` is the number of requested targets a FENCED call did not match because
+    /// their claim generation no longer owns the row (a sibling reclaimed it); it is always
+    /// zero for the unfenced check-phase write. The two are separate on purpose: "nothing
+    /// changed" and "lost the fence" must not look the same.
+    struct MarkBlockedResult {
+        int64_t changed{0};
+        int64_t fenced_out{0};
+    };
+
+    /// Records that policy evaluation REFUSED to dispatch `phase`'s pair for `agent_ids`:
+    /// sets their status to `blocked` with a `check_result` of
+    /// `{"phase","result":"blocked","reason","plugin","action"}`. This is the only writer of
+    /// `blocked` (`update_agent_status` rejects it), so a fix or check outcome can never be
+    /// recorded as one by accident.
+    ///
+    /// Change and refresh: `changed` counts the rows that really changed (absent, not yet
+    /// `blocked`, or a different `check_result`), so it is zero in a steady state and is what
+    /// the caller audits. Every target row is also written with a fresh `last_check_at`, so a
+    /// refusal that still applies never ages out of the 24 hour fleet figure, while a row that
+    /// nothing marks again (policy disabled, agent out of scope, agent gone) decays to
+    /// `unknown` like any other status. A fenced call refreshes only the rows that still match
+    /// its fence. `fix_attempt_count` and `last_fix_at` are never touched.
+    ///
+    /// `plugin` and `action` are stored as two fields, never joined (the identifier charset
+    /// includes '.'), and only when `dispatch_pair_well_formed`: an over-length or off-charset
+    /// part is NEVER stored. In that case the row is written with reason
+    /// `dispatch_identifier_invalid` and null plugin and action, whatever `reason` the caller
+    /// passed, so no caller can store text authoring would refuse.
+    ///
+    /// FENCED when `expected_gen` is set (a fix or verify refusal while the claim is held): a
+    /// plain UPDATE guarded on `remediation_claim_gen`, never an INSERT, exactly like
+    /// `update_agent_status`, so a sibling's reclaim is never overwritten. Unfenced (a check
+    /// refusal) it is the UPSERT, since the first refusal for an agent may be its first row.
+    ///
+    /// Ids are written in chunks of at most 500 and the counts summed. A later chunk failing
+    /// returns an error; earlier chunks stay written, and a retry is idempotent. Invalidates
+    /// the fleet compliance cache when a row changed (a refresh alone does not).
+    [[nodiscard]] std::expected<MarkBlockedResult, std::string>
+    mark_blocked(const std::string& policy_id, const std::vector<std::string>& agent_ids,
+                 std::string_view phase, std::string_view plugin, std::string_view action,
+                 std::string_view reason, std::optional<int64_t> expected_gen = std::nullopt);
+
     [[nodiscard]] std::expected<std::optional<PolicyAgentStatus>, PolicyReadError>
     get_agent_status(const std::string& policy_id, const std::string& agent_id) const;
     [[nodiscard]] std::expected<std::vector<PolicyAgentStatus>, PolicyReadError>

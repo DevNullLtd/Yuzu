@@ -58,7 +58,7 @@ enum class EngineStoreErrorClass {
         return EngineStoreErrorClass::Transient;
 
     // 1b. "no in-flight rotation to confirm" — the deliberately-ambiguous
-    //     0-active / malformed-pair read (`RotationConfirmState::kNoneActive`,
+    //     0-active read (`RotationConfirmState::kNoneActive`,
     //     `GroupRotationConfirmState::kAmbiguousEmpty`): a swallowed read
     //     failure and a genuinely empty active-credential set are
     //     indistinguishable here (UP-6, rotation_confirm_state.hpp), so this

@@ -217,6 +217,63 @@ TEST_CASE("StoreWorkerPool: submit fails after quiesce() has been called",
     CHECK_FALSE(pool.submit([] {}));
 }
 
+// ── Why a submit was refused, and the backlog accessors (delivery-pool observability) ──
+
+TEST_CASE("StoreWorkerPool: try_submit tells a full queue from a closed pool",
+          "[store_worker_pool]") {
+    using Result = StoreWorkerPool::SubmitResult;
+    StoreWorkerPool pool(/*num_threads=*/1, /*max_queue=*/1);
+    std::atomic<bool> release_first{false};
+    ReleaseGuard guard(release_first);
+    std::atomic<bool> first_started{false};
+    REQUIRE(pool.try_submit([&] {
+                first_started.store(true);
+                while (!release_first.load())
+                    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            }) == Result::kQueued);
+    while (!first_started.load())
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    REQUIRE(pool.try_submit([] {}) == Result::kQueued); // fills the one queue slot
+    const auto full = pool.try_submit([] {});
+    CHECK(full == Result::kQueueFull);
+    CHECK(std::string(StoreWorkerPool::drop_reason(full)) == "queue_full");
+
+    release_first.store(true);
+    REQUIRE(pool.quiesce(std::chrono::seconds(5)));
+    const auto closed = pool.try_submit([] {});
+    CHECK(closed == Result::kClosed);
+    CHECK(std::string(StoreWorkerPool::drop_reason(closed)) == "quiescing");
+}
+
+TEST_CASE("StoreWorkerPool: pending counts queued plus running, capacity is queue bound plus workers",
+          "[store_worker_pool]") {
+    StoreWorkerPool pool(/*num_threads=*/2, /*max_queue=*/3);
+    CHECK(pool.capacity() == 5);
+    CHECK(pool.pending() == 0);
+
+    std::atomic<bool> release{false};
+    ReleaseGuard guard(release);
+    std::atomic<int> started{0};
+    for (int i = 0; i < 2; ++i)
+        REQUIRE(pool.submit([&] {
+            ++started;
+            while (!release.load())
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }));
+    while (started.load() < 2)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    CHECK(pool.pending() == 2); // both running, none queued
+    REQUIRE(pool.submit([] {}));
+    REQUIRE(pool.submit([] {}));
+    REQUIRE(pool.submit([] {}));
+    CHECK(pool.pending() == pool.capacity()); // full: the next submit is refused
+    CHECK_FALSE(pool.submit([] {}));
+
+    release.store(true);
+    REQUIRE(pool.quiesce(std::chrono::seconds(5)));
+    CHECK(pool.pending() == 0);
+}
+
 // ── Concurrent submitters ────────────────────────────────────────────────
 
 TEST_CASE("StoreWorkerPool: concurrent submitters do not race or drop accepted tasks",
@@ -251,4 +308,13 @@ TEST_CASE("StoreWorkerPool: a task that throws does not take down the worker",
     REQUIRE(pool.submit([&ran_after] { ran_after.store(true); }));
     REQUIRE(pool.quiesce(std::chrono::seconds(5)));
     CHECK(ran_after.load());
+}
+
+TEST_CASE("StoreWorkerPool: capacity() counts the clamped worker count, not the requested one",
+          "[store_worker_pool]") {
+    // The constructor clamps the worker count to [1, 16]; capacity is the queue bound plus the
+    // workers that actually exist.
+    CHECK(StoreWorkerPool(0, 8).capacity() == 9);    // 0 workers requested -> 1
+    CHECK(StoreWorkerPool(100, 8).capacity() == 24); // 100 requested -> 16
+    CHECK(StoreWorkerPool(4, 256).capacity() == 260);
 }

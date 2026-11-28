@@ -50,11 +50,14 @@
 /// The `fire_event` call path is fire-and-forget and dispatches onto the
 /// bounded worker pool so a slow endpoint can't drown the server.
 
+#include "bounded_resolver.hpp" // net::LookupFn (test seam)
+#include "refusal_throttle.hpp"
 #include "store_worker_pool.hpp"
 
 #include <chrono>
 #include <cstdint>
 #include <expected>
+#include <functional>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -129,6 +132,8 @@ inline constexpr int kMaxOffloadBatchSize = 10000;
 /// REST seam, mirrors `WebhookWriteError`). `invalid_input` is a CALLER
 /// error (400); the other two are store/infra degradation (503).
 enum class OffloadWriteError {
+    destination_refused, ///< the url host is a link-local/metadata/unspecified/multicast/reserved
+                         ///< address (or a numeric spelling of one) — caller error, 400, audited distinctly
     invalid_input,     ///< empty name/url, bad url scheme, batch_size outside 1..kMaxOffloadBatchSize, duplicate name,
                        ///< or a control byte in a free-text field — caller error, 400
     store_unavailable, ///< not open / pool exhausted / codec unavailable — 503
@@ -178,6 +183,16 @@ public:
     /// contract, same as DexAlertRouter::set_metrics.
     void set_metrics(yuzu::MetricsRegistry* metrics);
 
+    /// As WebhookStore::set_delivery_refused_sink, for an offload target.
+    using DeliveryRefusedFn = std::function<void(std::int64_t target_id, std::string_view cause,
+                                                 std::string_view destination_class,
+                                                 const std::string& url_detail)>;
+    void set_delivery_refused_sink(DeliveryRefusedFn fn) { refused_sink_ = std::move(fn); }
+
+    /// TEST SEAM: replaces the name lookup used to vet a delivery destination (the OIDC provider has
+    /// the same hook). Never set in production.
+    void set_lookup_for_test(net::LookupFn fn) { lookup_for_test_ = std::move(fn); }
+
     /// Stop accepting new deliveries and wait up to `timeout` for every
     /// queued/in-flight delivery to finish. Returns true if fully drained.
     /// The caller (ServerImpl::stop()) MUST NOT destroy this store, or the
@@ -185,6 +200,12 @@ public:
     /// still-draining delivery decrypts the credential on its worker thread
     /// right up until it finishes (see the file header).
     bool quiesce(std::chrono::milliseconds timeout);
+
+    /// Deliveries queued plus running on the delivery pool, and the most that can be (queue bound
+    /// plus workers). Feed `yuzu_server_delivery_pool_pending` / `_capacity` (store="offload").
+    /// A snapshot, safe from any thread.
+    [[nodiscard]] std::size_t delivery_pool_pending() const;
+    [[nodiscard]] std::size_t delivery_pool_capacity() const noexcept;
 
     /// Create a new offload target. `auth_credential` may be empty (no
     /// credential — `has_credential=false`, dispatch sends no auth header
@@ -278,6 +299,9 @@ private:
     pg::SecretCodec& secret_codec_;
     bool open_{false};
     yuzu::MetricsRegistry* metrics_{nullptr};
+    DeliveryRefusedFn refused_sink_;
+    net::LookupFn lookup_for_test_; // empty in production: the system resolver
+    RefusalThrottle refusal_throttle_;
 
     /// Delivery-time view of one target: carries the still-ENCRYPTED
     /// credential blob (or none), never plaintext — decrypt happens in
@@ -318,9 +342,9 @@ private:
     bool record_delivery(int64_t target_id, const std::string& event_type, int event_count,
                          const std::string& payload, int status_code, const std::string& error);
 
-    /// Log + count a delivery dropped because delivery_pool_.submit()
-    /// returned false (queue full or the store is quiescing/shutting down).
-    void log_dropped_delivery(const std::string& target_url);
+    /// Log + count a delivery the delivery pool refused at submit, by the reason
+    /// StoreWorkerPool::drop_reason gives (queue_full, or quiescing during shutdown).
+    void log_dropped_delivery(const std::string& target_url, StoreWorkerPool::SubmitResult why);
 
     /// Build the JSON body to POST. For a single event this is the raw
     /// payload_json. For a batched flush, the events are wrapped in a

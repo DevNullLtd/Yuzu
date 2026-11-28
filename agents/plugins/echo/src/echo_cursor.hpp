@@ -9,7 +9,7 @@
 // and is unit-testable without a live OS subscription (tests/unit/
 // test_echo_cursor.cpp).
 //
-// WHY A SEPARATE MODEL FROM THE SNAPSHOT-DIFF SOURCES (service/mapdrive/arp) --
+// WHY A SEPARATE MODEL FROM THE SNAPSHOT-DIFF SOURCES (service/user/mapdrive/arp) --
 // those sources re-enumerate a full table every tick and diff it against the
 // last COMPLETE snapshot (echo_capture_status.hpp's collect_or_retain). Power
 // and removable-media events are OS-LOGGED TRANSITIONS (event-log records, a
@@ -27,7 +27,11 @@
 //     usage) retains the cursor UNCHANGED and skips the persist for this tick
 //     -- the same collect_or_retain policy documented at echo_capture_status.
 //     hpp:187. This is a RETRY signal, not a data-loss signal: the next tick
-//     re-reads from the same (unchanged) cursor.
+//     re-reads from the same (unchanged) cursor. The retry is BACKED OFF
+//     (CursorRetry below): a source whose ticks keep failing is not re-read on
+//     every tick, because each failed tick costs the same re-read and a
+//     persistent fault would repeat it forever. A skipped tick is reported as
+//     `retry_backoff`, never as a failure of its own.
 //
 //  2. A LOST/INVALID cursor -- the stored cursor references a log position
 //     that no longer exists (the log WRAPPED past it, the subscription handle
@@ -42,12 +46,18 @@
 //     1432 -> 1352 records mid-capture (the provider recycled/wrapped the
 //     channel) -- a real, not hypothetical, log-wrap.
 //
-//  3. Replay idempotence comes from the UNIQUE `record_key` column + INSERT OR
-//     IGNORE (echo_db.hpp/.cpp), never from cursor arithmetic. A cursor that is
-//     re-read from a slightly earlier position than strictly necessary (e.g.
-//     after rule 2's re-baseline, or a retry) must never double-insert -- the
-//     database's unique index is the single source of truth for "have I
-//     already stored this event", not any offset math a source might do.
+//  3. Replay idempotence comes from the fold's digest-checked replay ring
+//     (`echo_fold_seen`, EchoFold::fold_cursor_rows in echo_fold.hpp: the newest
+//     kReplayRingDepth = 4096 record_keys per source with their identity
+//     digests), never from cursor arithmetic. A cursor that is re-read from a
+//     slightly earlier position than strictly necessary (e.g. after rule 2's
+//     re-baseline, or a retry) must never double-fold -- the ring is the single
+//     source of truth for "have I already folded this event", not any offset
+//     math a source might do. The ring is BOUNDED: a record re-offered after
+//     4096 newer keys of its source folds again (a summed measure double
+//     counts; max, min and last do not), and a reused key with a different
+//     digest is a permanent KeyCollision error. There is no raw table and no
+//     UNIQUE column any more.
 //
 //     TWO INVARIANTS THIS PLACES ON YOU, because the store VERIFIES the claim
 //     rather than trusting it. A key that is already present is only accepted
@@ -89,8 +99,8 @@
 //     name, never one row per input.
 //
 //  4b. FREE-TEXT FIELDS ARE THE SOURCE'S RESPONSIBILITY, AND THE SEAM DOES NOT
-//     REDACT FOR YOU. `removable_live.image_path` and `evidence` are free text
-//     and the atomic inserts write them verbatim. The user manual states the
+//     REDACT FOR YOU. `RemovableEvent::image_path` and `evidence` are free text
+//     and the fold writes the ones a tier keeps verbatim. The user manual states the
 //     built-in redaction patterns are "enforced on every collect path"; that is
 //     a claim about the SOURCE, because this seam has no hook. So:
 //
@@ -201,6 +211,7 @@
 #include "echo_capture_status.hpp" // IncompleteCaptureError
 
 #include <algorithm> // std::min in BoundedPendingQueue::ack()
+#include <charconv>
 #include <cstddef>
 #include <cstdint> // std::uint64_t -- BoundedPendingQueue's internal seq (R-005)
 #include <deque>
@@ -208,6 +219,8 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <string_view>
+#include <system_error>
 #include <utility> // std::pair -- BoundedPendingQueue's seq-stamped storage (R-005)
 #include <vector>
 
@@ -488,6 +501,51 @@ private:
     std::deque<std::pair<std::uint64_t, Event>> q_;
     std::uint64_t next_seq_{1};
     std::size_t dropped_{0};
+};
+
+
+/// The slow-tick period from its config string (`slow_interval_seconds`), in seconds. An
+/// unparsable or non-positive value is the 300 s default; never throws.
+[[nodiscard]] inline int parse_tick_seconds(std::string_view text) noexcept {
+    int v = 0;
+    const auto [end, ec] = std::from_chars(text.data(), text.data() + text.size(), v);
+    return (ec == std::errc{} && end == text.data() + text.size() && v > 0) ? v : 300;
+}
+
+/// Per-source retry backoff for a cursor source whose tick keeps failing (contract rule 1).
+/// Pure: the caller passes the epoch seconds and the tick period. After the n-th consecutive
+/// failure the source is next attempted tick_seconds * min(2^(n-1), 12) later -- 1, 2, 4, 8,
+/// 12, 12 ... ticks -- so a one-off failure costs one tick and a persistent one is capped at
+/// 12 ticks (one hour at the default 300 s). Half a tick of slack is taken off each delay so
+/// trigger jitter, or a failure noted late in a tick, cannot turn "retry on the next tick"
+/// into "retry on the one after".
+///
+/// In memory only: an agent restart retries at once. `failures` is internal to this policy;
+/// the operator-facing streak is the health ledger's `<src>_consecutive_failures`.
+struct CursorRetry {
+    static constexpr int kMaxTicks = 12;
+
+    int failures{0};
+    std::int64_t first_failure_ts{0};
+    std::int64_t next_attempt_ts{0};
+
+    /// True when the source may be attempted at `now`: no failure on record, the delay has
+    /// elapsed, or the clock stepped back before the first failure (so a backoff stamped from
+    /// a later clock can never hold the source off for the length of the step).
+    [[nodiscard]] bool due(std::int64_t now) const noexcept {
+        return failures == 0 || now >= next_attempt_ts || now < first_failure_ts;
+    }
+
+    void note_failure(std::int64_t now, int tick_seconds) noexcept {
+        if (failures == 0)
+            first_failure_ts = now;
+        if (failures < kMaxTicks)
+            ++failures; // saturates: past the cap the delay no longer grows
+        const int ticks = failures >= 5 ? kMaxTicks : (1 << (failures - 1));
+        next_attempt_ts = now + static_cast<std::int64_t>(tick_seconds) * ticks - tick_seconds / 2;
+    }
+
+    void note_success() noexcept { *this = CursorRetry{}; }
 };
 
 } // namespace yuzu::echo

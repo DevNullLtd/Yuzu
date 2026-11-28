@@ -10,40 +10,56 @@
  */
 
 #include "echo_aggregator.hpp"
+#include "echo_collectors.hpp" // compute_process_events: the baseline diff-equivalence case
 #include "echo_db.hpp"
+#include "echo_test_db.hpp"
+#include "echo_fold_schema.hpp"
 #include "echo_schema_registry.hpp"
+#include "echo_software_core.hpp"
 #include "echo_status_format.hpp"
+#include "echo_wire_scrub.hpp" // scrub_wire_strings (F16 follow-up)
 #include "test_helpers.hpp"
 
+#include <yuzu/agent/process_enum.hpp> // detail::parse_proc_status (F16)
+
+#include <nlohmann/json.hpp>
 #include <sqlite3.h> // second connection: selective config-read fault injection
 
 #include <catch2/catch_approx.hpp>
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 
 #include <algorithm>
+#include <sstream>
 #include <chrono>
 #include <format>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <expected>
 #include <filesystem>
+#include <fstream>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <set>
 #include <string>
 #include <string_view>
 #include <thread>
+#include <utility>
 #include <vector>
 
 using namespace yuzu::echo;
 
+namespace fs = std::filesystem;
+
 namespace {
 
-// Issue #539 anchor: 24h cutoff for the hourly tier in the schema registry.
-// If the registry's `process_hourly` retention_default ever changes, the
-// helpers below have to follow.
-constexpr int64_t kHourlyCutoffSec = 24 * 3600;
+// Issue #539 anchor: the hourly tier's retention window in the schema registry (90 days: the
+// roll-up tiers replaced the raw table, so they carry the whole record). If the registry's
+// `process_hourly` retention_default ever changes, the helpers below have to follow.
+constexpr int64_t kHourlyCutoffSec = 7'776'000;
 
 int64_t row_count(EchoDatabase& db, const std::string& table) {
     auto res = db.execute_query("SELECT COUNT(*) FROM " + table);
@@ -76,27 +92,53 @@ void make_config_key_unreadable(const std::filesystem::path& db_path, const std:
     REQUIRE(sqlite3_exec(owner.db, sql.c_str(), nullptr, nullptr, nullptr) == SQLITE_OK);
 }
 
+// Insert `count` rows into the roll-up tier `<source>_<tier>`; row i (0-based) is stamped
+// `bucket_expr` (SQL over `i`). The rows go to the physical `_r` table (the view is read-only).
+// Keys are distinct dictionary ids: retention and the budget never read the dictionary, so no
+// text is interned. Measures keep their DEFAULT.
+void insert_tier_rows(EchoDatabase& db, std::string_view source, std::string_view tier,
+                      const std::string& bucket_expr, int count) {
+    const FoldSourceDef* def = fold_source(source);
+    REQUIRE(def != nullptr);
+    std::string cols{ts_column_for_suffix(tier)};
+    std::string vals = bucket_expr;
+    for (const auto& c : def->columns) {
+        if (c.role != ColumnRole::kKey)
+            continue;
+        cols += "," + physical_column_name(c);
+        vals += (c.sql_type == "TEXT" && !c.interned) ? ",'k'||i" : ",i";
+    }
+    REQUIRE(db.execute_sql(std::format(
+        "WITH RECURSIVE s(i) AS (SELECT 0 UNION ALL SELECT i+1 FROM s WHERE i<{}) "
+        "INSERT INTO {} ({}) SELECT {} FROM s",
+        count - 1, physical_table_name(source, tier), cols, vals)));
+}
+
+// `count` rows all in the bucket starting at exactly `ts`.
+void seed_tier_at(EchoDatabase& db, std::string_view source, std::string_view tier, int64_t ts,
+                  int count) {
+    insert_tier_rows(db, source, tier, std::to_string(ts), count);
+}
+
 // Seed 48 hourly rows centered on t_now so half (h=0..23) fall inside the
-// 24h retention window and half (h=24..47) fall outside it. With the source
+// retention window and half (h=24..47) fall outside it. With the source
 // enabled, retention at t_now deletes the outside half only; with the source
 // disabled, retention preserves all 48.
+void seed_centered_hourly(EchoDatabase& db, std::string_view source, int64_t t_now) {
+    for (int h = 0; h < 48; ++h)
+        seed_tier_at(db, source, "hourly", t_now - h * (kHourlyCutoffSec / 24), 1);
+}
+
+// Rows left by one pass over seed_centered_hourly(): hours h=0..24 sit at or inside the cutoff
+// (t_now - h * cutoff/24 >= t_now - cutoff), h=25..47 are older and deleted.
+constexpr int64_t kCenteredSurvivors = 25;
+
 void seed_process_hourly(EchoDatabase& db, int64_t t_now) {
-    for (int h = 0; h < 48; ++h) {
-        REQUIRE(db.execute_sql(std::format("INSERT INTO process_hourly "
-                                           "(hour_ts,name,user,start_count,stop_count) "
-                                           "VALUES ({}, 'svc.exe', 'SYSTEM', 1, 1)",
-                                           t_now - h * 3600)));
-    }
+    seed_centered_hourly(db, "process", t_now);
 }
 
 void seed_tcp_hourly(EchoDatabase& db, int64_t t_now) {
-    for (int h = 0; h < 48; ++h) {
-        REQUIRE(db.execute_sql(std::format("INSERT INTO tcp_hourly "
-                                           "(hour_ts,remote_addr,remote_port,proto,process_name,"
-                                           "connect_count,disconnect_count) "
-                                           "VALUES ({}, '10.0.0.1', 5000, 'tcp', 'sshd', 1, 1)",
-                                           t_now - h * 3600)));
-    }
+    seed_centered_hourly(db, "tcp", t_now);
 }
 
 } // namespace
@@ -110,8 +152,8 @@ TEST_CASE("Echo retention: disabled source preserves hourly rows past cutoff",
     // per-source guard, two retention passes (t0+1h and t0+25h) drain
     // process_hourly entirely after the operator disables process_enabled
     // — even though the configure docstring promises queryability.
-    yuzu::test::TempDbFile tmp{std::string_view{"echo-issue539-"}};
-    auto opened = EchoDatabase::open(tmp.path);
+    yuzu::test::TempDbFile tmp{std::string_view{"yuzu_test_echo_issue539_"}};
+    auto opened = yuzu::test::open_echo_db(tmp.path);
     REQUIRE(opened.has_value());
     EchoDatabase db = std::move(*opened);
     REQUIRE(db.create_warehouse_tables());
@@ -135,8 +177,8 @@ TEST_CASE("Echo retention: enabled sources still age out past cutoff",
     // the #539 fix would silently disable retention everywhere. With the
     // 48-row centered seed, exactly the rows with hour_ts < (t_now -
     // retention_default) are deleted.
-    yuzu::test::TempDbFile tmp{std::string_view{"echo-issue539-enabled-"}};
-    auto opened = EchoDatabase::open(tmp.path);
+    yuzu::test::TempDbFile tmp{std::string_view{"yuzu_test_echo_issue539_enabled_"}};
+    auto opened = yuzu::test::open_echo_db(tmp.path);
     REQUIRE(opened.has_value());
     EchoDatabase db = std::move(*opened);
     REQUIRE(db.create_warehouse_tables());
@@ -163,8 +205,8 @@ TEST_CASE("Echo retention: re-enabling a source resumes retention", "[echo][rete
     // resume normal aging. The guard is purely config-driven, so flipping
     // <source>_enabled back to "true" must immediately re-arm time-based
     // retention on the next rollup tick.
-    yuzu::test::TempDbFile tmp{std::string_view{"echo-issue539-resume-"}};
-    auto opened = EchoDatabase::open(tmp.path);
+    yuzu::test::TempDbFile tmp{std::string_view{"yuzu_test_echo_issue539_resume_"}};
+    auto opened = yuzu::test::open_echo_db(tmp.path);
     REQUIRE(opened.has_value());
     EchoDatabase db = std::move(*opened);
     REQUIRE(db.create_warehouse_tables());
@@ -196,8 +238,8 @@ TEST_CASE("Echo retention: usage_daily_user prunes independently of usage_daily'
     // has nothing to do this pass, usage_daily_user still prunes its own
     // expired row on its own facts.
     yuzu::echo::RetentionGuardState guard;
-    yuzu::test::TempDbFile tmp{std::string_view{"echo-usage-retention-"}};
-    auto opened = EchoDatabase::open(tmp.path);
+    yuzu::test::TempDbFile tmp{std::string_view{"yuzu_test_echo_usage_retention_"}};
+    auto opened = yuzu::test::open_echo_db(tmp.path);
     REQUIRE(opened.has_value());
     EchoDatabase db = std::move(*opened);
     REQUIRE(db.create_warehouse_tables());
@@ -239,8 +281,8 @@ TEST_CASE("Echo retention: usage_daily_user prunes independently of usage_daily'
 TEST_CASE("Echo paused_at: enabled→disabled writes the timestamp", "[echo][paused_at][pr-a]") {
     // Operator transitions process_enabled from default ("true") to "false"
     // — paused_at must record the wall-clock now passed to the helper.
-    yuzu::test::TempDbFile tmp{std::string_view{"echo-pra-disable-"}};
-    auto opened = EchoDatabase::open(tmp.path);
+    yuzu::test::TempDbFile tmp{std::string_view{"yuzu_test_echo_pra_disable_"}};
+    auto opened = yuzu::test::open_echo_db(tmp.path);
     REQUIRE(opened.has_value());
     EchoDatabase db = std::move(*opened);
     REQUIRE(db.create_warehouse_tables());
@@ -261,8 +303,8 @@ TEST_CASE("Echo paused_at: disabled→enabled clears the timestamp to \"0\"",
     // distinguish "never paused" from "no key present"). The reverse
     // transition is the operator-journey close-out: freeze → export →
     // re-enable; the row drops out of the dashboard's retention-paused list.
-    yuzu::test::TempDbFile tmp{std::string_view{"echo-pra-reenable-"}};
-    auto opened = EchoDatabase::open(tmp.path);
+    yuzu::test::TempDbFile tmp{std::string_view{"yuzu_test_echo_pra_reenable_"}};
+    auto opened = yuzu::test::open_echo_db(tmp.path);
     REQUIRE(opened.has_value());
     EchoDatabase db = std::move(*opened);
     REQUIRE(db.create_warehouse_tables());
@@ -286,8 +328,8 @@ TEST_CASE("Echo paused_at: recovering an errored source via =true clears the tim
     // enabled=true alongside a paused timestamp (dashboard renders a collecting
     // source as paused). Both legs now gate on the canonical tri-state, so the
     // recovery clears paused_at. Pre-fix this CHECK held the stale 1735689600.
-    yuzu::test::TempDbFile tmp{std::string_view{"echo-560-errored-reenable-"}};
-    auto opened = EchoDatabase::open(tmp.path);
+    yuzu::test::TempDbFile tmp{std::string_view{"yuzu_test_echo_560_errored_reenable_"}};
+    auto opened = yuzu::test::open_echo_db(tmp.path);
     REQUIRE(opened.has_value());
     EchoDatabase db = std::move(*opened);
     REQUIRE(db.create_warehouse_tables());
@@ -318,8 +360,8 @@ TEST_CASE("Echo source_enabled: the destructive-purge paused-guard predicate (15
     // paused one) even though do_purge_source lives in the (test-unlinked) plugin
     // TU; the unreadable arm is pinned by the source_enabled_state case below.
     // Governance B1.
-    yuzu::test::TempDbFile tmp{std::string_view{"echo-15a-guard-"}};
-    auto opened = EchoDatabase::open(tmp.path);
+    yuzu::test::TempDbFile tmp{std::string_view{"yuzu_test_echo_15a_guard_"}};
+    auto opened = yuzu::test::open_echo_db(tmp.path);
     REQUIRE(opened.has_value());
     EchoDatabase db = std::move(*opened);
     REQUIRE(db.create_warehouse_tables());
@@ -350,8 +392,8 @@ TEST_CASE("Echo paused_at: idempotent re-set leaves the timestamp untouched",
     // already holds, paused_at must NOT advance — otherwise repeated
     // configure round-trips would pretend the pause is fresher than it is,
     // misleading the retention-paused list's "paused since" column.
-    yuzu::test::TempDbFile tmp{std::string_view{"echo-pra-idem-"}};
-    auto opened = EchoDatabase::open(tmp.path);
+    yuzu::test::TempDbFile tmp{std::string_view{"yuzu_test_echo_pra_idem_"}};
+    auto opened = yuzu::test::open_echo_db(tmp.path);
     REQUIRE(opened.has_value());
     EchoDatabase db = std::move(*opened);
     REQUIRE(db.create_warehouse_tables());
@@ -367,8 +409,8 @@ TEST_CASE("Echo paused_at: idempotent re-set leaves the timestamp untouched",
 TEST_CASE("Echo paused_at: per-source isolation", "[echo][paused_at][pr-a]") {
     // Disabling process must not touch tcp / service / user paused_at — the
     // PR-A retention-paused list relies on per-source rows being independent.
-    yuzu::test::TempDbFile tmp{std::string_view{"echo-pra-iso-"}};
-    auto opened = EchoDatabase::open(tmp.path);
+    yuzu::test::TempDbFile tmp{std::string_view{"yuzu_test_echo_pra_iso_"}};
+    auto opened = yuzu::test::open_echo_db(tmp.path);
     REQUIRE(opened.has_value());
     EchoDatabase db = std::move(*opened);
     REQUIRE(db.create_warehouse_tables());
@@ -391,8 +433,8 @@ TEST_CASE("Echo paused_at: per-source isolation", "[echo][paused_at][pr-a]") {
 
 TEST_CASE("Echo #538: enabled→disabled clears the diff baseline state",
           "[echo][paused_at][issue538]") {
-    yuzu::test::TempDbFile tmp{std::string_view{"echo-538-clear-"}};
-    auto opened = EchoDatabase::open(tmp.path);
+    yuzu::test::TempDbFile tmp{std::string_view{"yuzu_test_echo_538_clear_"}};
+    auto opened = yuzu::test::open_echo_db(tmp.path);
     REQUIRE(opened.has_value());
     EchoDatabase db = std::move(*opened);
     REQUIRE(db.create_warehouse_tables());
@@ -414,8 +456,8 @@ TEST_CASE("Echo #538: disabling tcp clears the 'network' baseline key, not 'tcp'
     // tcp's snapshot-diff baseline lives under "network" (diff_state_key). A
     // clear that targeted the literal source name "tcp" would be a silent no-op
     // and the ghost-death bug would survive — pin the mapping here.
-    yuzu::test::TempDbFile tmp{std::string_view{"echo-538-tcpmap-"}};
-    auto opened = EchoDatabase::open(tmp.path);
+    yuzu::test::TempDbFile tmp{std::string_view{"yuzu_test_echo_538_tcpmap_"}};
+    auto opened = yuzu::test::open_echo_db(tmp.path);
     REQUIRE(opened.has_value());
     EchoDatabase db = std::move(*opened);
     REQUIRE(db.create_warehouse_tables());
@@ -439,8 +481,8 @@ TEST_CASE("Echo #538: every snapshot-diff source clears its mapped baseline",
                           {"software", "software"},
                           {"arp", "arp"},         {"dns", "dns"}}; // ADR-0015 snapshot-diff sources
 
-    yuzu::test::TempDbFile tmp{std::string_view{"echo-538-parity-"}};
-    auto opened = EchoDatabase::open(tmp.path);
+    yuzu::test::TempDbFile tmp{std::string_view{"yuzu_test_echo_538_parity_"}};
+    auto opened = yuzu::test::open_echo_db(tmp.path);
     REQUIRE(opened.has_value());
     EchoDatabase db = std::move(*opened);
     REQUIRE(db.create_warehouse_tables());
@@ -464,8 +506,8 @@ TEST_CASE("Echo #538: disabling one source does not clear another's baseline",
     // Cross-source isolation: a regression that cleared ALL keys instead of the
     // targeted one would still pass the per-source parity test above. Seed all
     // four side-by-side, disable one, assert only its key is wiped.
-    yuzu::test::TempDbFile tmp{std::string_view{"echo-538-xsrc-"}};
-    auto opened = EchoDatabase::open(tmp.path);
+    yuzu::test::TempDbFile tmp{std::string_view{"yuzu_test_echo_538_xsrc_"}};
+    auto opened = yuzu::test::open_echo_db(tmp.path);
     REQUIRE(opened.has_value());
     EchoDatabase db = std::move(*opened);
     REQUIRE(db.create_warehouse_tables());
@@ -490,8 +532,8 @@ TEST_CASE("Echo #538: a failed baseline clear leaves the source ENABLED (UP-1)",
     // baseline, which reintroduces ghost "stopped" events on re-enable while the
     // operator saw success. Inject a clear failure by dropping echo_state so the
     // set_state INSERT prepare fails.
-    yuzu::test::TempDbFile tmp{std::string_view{"echo-538-clearfail-"}};
-    auto opened = EchoDatabase::open(tmp.path);
+    yuzu::test::TempDbFile tmp{std::string_view{"yuzu_test_echo_538_clearfail_"}};
+    auto opened = yuzu::test::open_echo_db(tmp.path);
     REQUIRE(opened.has_value());
     EchoDatabase db = std::move(*opened);
     REQUIRE(db.create_warehouse_tables());
@@ -504,13 +546,102 @@ TEST_CASE("Echo #538: a failed baseline clear leaves the source ENABLED (UP-1)",
     CHECK(db.get_config("process_paused_at", "0") == "0");     // never paused
 }
 
+TEST_CASE("Echo #1624: recovering an errored source clears its mapped baseline",
+          "[echo][paused_at][issue1624]") {
+    // The baseline was last written before the flag went bad and nothing has
+    // maintained it since (collection is gated closed on a non-canonical flag).
+    // Resuming against it diffs the whole errored interval into ghost events.
+    const struct {
+        const char* source;
+        const char* state_key;
+    } cases[] = {{"process", "process"}, {"tcp", "network"}, {"service", "service"},
+                 {"user", "user"},       {"software", "software"},
+                 {"arp", "arp"},         {"dns", "dns"},
+                 {"mapdrive", "mapdrive"}};
+
+    yuzu::test::TempDbFile tmp{std::string_view{"yuzu_test_echo_1624_errored_"}};
+    auto opened = yuzu::test::open_echo_db(tmp.path);
+    REQUIRE(opened.has_value());
+    EchoDatabase db = std::move(*opened);
+    REQUIRE(db.create_warehouse_tables());
+
+    for (const auto& c : cases) {
+        INFO("source: " << c.source);
+        REQUIRE(db.set_state(c.state_key, R"([{"x":1}])"));
+        REQUIRE_FALSE(db.get_state(c.state_key).empty());
+        // The flag clobbered to a value the plugin never writes; a stale pause stamp too.
+        REQUIRE(db.set_config(std::string{c.source} + "_enabled", "maybe"));
+        REQUIRE(db.set_config(std::string{c.source} + "_paused_at", "1735689600"));
+        REQUIRE(canonical_source_enabled(db.get_config(std::string{c.source} + "_enabled", "true")) ==
+                "errored");
+
+        REQUIRE(apply_source_enabled_transition(db, c.source, "true", 1'735'700'000));
+
+        CHECK(db.get_state(c.state_key).empty());
+        CHECK(db.get_config(std::string{c.source} + "_enabled", "") == "true");
+        CHECK(db.get_config(std::string{c.source} + "_paused_at", "") == "0");
+    }
+}
+
+TEST_CASE("Echo #1624: true to true and false to true do not clear a baseline",
+          "[echo][paused_at][issue1624]") {
+    // Negative control: only the errored recovery is new. A re-assert of an
+    // enabled source and a plain un-pause must keep whatever baseline exists.
+    yuzu::test::TempDbFile tmp{std::string_view{"yuzu_test_echo_1624_control_"}};
+    auto opened = yuzu::test::open_echo_db(tmp.path);
+    REQUIRE(opened.has_value());
+    EchoDatabase db = std::move(*opened);
+    REQUIRE(db.create_warehouse_tables());
+
+    REQUIRE(db.set_state("process", R"([{"pid":1}])"));
+    REQUIRE(apply_source_enabled_transition(db, "process", "true", 1'735'689'600)); // true -> true
+    CHECK_FALSE(db.get_state("process").empty());
+
+    REQUIRE(apply_source_enabled_transition(db, "process", "false", 1'735'689'700)); // clears
+    REQUIRE(db.get_state("process").empty());
+    REQUIRE(db.set_state("process", R"([{"pid":2}])")); // something re-seeds it
+    REQUIRE(apply_source_enabled_transition(db, "process", "true", 1'735'689'800)); // false -> true
+    CHECK_FALSE(db.get_state("process").empty());
+}
+
+TEST_CASE("Echo #1624: a failed baseline clear on errored recovery leaves the flag unmoved",
+          "[echo][paused_at][issue1624]") {
+    // Mirror of the UP-1 case above for the new edge: the clear and the flag
+    // commit together or not at all, so a failed clear never reports a recovery.
+    yuzu::test::TempDbFile tmp{std::string_view{"yuzu_test_echo_1624_clearfail_"}};
+    auto opened = yuzu::test::open_echo_db(tmp.path);
+    REQUIRE(opened.has_value());
+    EchoDatabase db = std::move(*opened);
+    REQUIRE(db.create_warehouse_tables());
+
+    REQUIRE(db.set_config("process_enabled", "maybe"));
+    REQUIRE(db.set_config("process_paused_at", "1735689600"));
+    REQUIRE(db.execute_sql("DROP TABLE echo_state"));
+
+    CHECK_FALSE(apply_source_enabled_transition(db, "process", "true", 1'735'700'000));
+    CHECK(db.get_config("process_enabled", "true") == "maybe");        // still errored
+    CHECK(db.get_config("process_paused_at", "0") == "1735689600");    // stamp untouched
+}
+
+TEST_CASE("Echo #1624: interval_baseline_reset_due decides the in-memory reset",
+          "[echo][paused_at][issue1624]") {
+    // A disable always resets; an enable resets only when it leaves "errored".
+    for (const char* prev : {"true", "false", "errored"}) {
+        INFO("prev: " << prev);
+        CHECK(interval_baseline_reset_due(prev, "false"));
+    }
+    CHECK(interval_baseline_reset_due("errored", "true"));
+    CHECK_FALSE(interval_baseline_reset_due("true", "true"));
+    CHECK_FALSE(interval_baseline_reset_due("false", "true"));
+}
+
 TEST_CASE("Echo #538: only the enable→disable TRANSITION clears (idempotent)",
           "[echo][paused_at][issue538]") {
     // The clear must fire on the transition, not on every false-write — a
     // repeated `configure ..._enabled=false` after a re-seed must NOT wipe a
     // freshly-rebuilt baseline (that would re-introduce the race by another door).
-    yuzu::test::TempDbFile tmp{std::string_view{"echo-538-idem-"}};
-    auto opened = EchoDatabase::open(tmp.path);
+    yuzu::test::TempDbFile tmp{std::string_view{"yuzu_test_echo_538_idem_"}};
+    auto opened = yuzu::test::open_echo_db(tmp.path);
     REQUIRE(opened.has_value());
     EchoDatabase db = std::move(*opened);
     REQUIRE(db.create_warehouse_tables());
@@ -529,8 +660,8 @@ TEST_CASE("Echo #538: only the enable→disable TRANSITION clears (idempotent)",
 
 TEST_CASE("Echo #538: re-enable neither clears nor resurrects the baseline",
           "[echo][paused_at][issue538]") {
-    yuzu::test::TempDbFile tmp{std::string_view{"echo-538-reenable-"}};
-    auto opened = EchoDatabase::open(tmp.path);
+    yuzu::test::TempDbFile tmp{std::string_view{"yuzu_test_echo_538_reenable_"}};
+    auto opened = yuzu::test::open_echo_db(tmp.path);
     REQUIRE(opened.has_value());
     EchoDatabase db = std::move(*opened);
     REQUIRE(db.create_warehouse_tables());
@@ -606,8 +737,8 @@ TEST_CASE("Echo #538: disabling perf/procperf does not touch any baseline state"
           "[echo][paused_at][issue538]") {
     // perf/procperf keep an in-memory previous reading (out of scope for #538);
     // the transition must not error and must leave the state store untouched.
-    yuzu::test::TempDbFile tmp{std::string_view{"echo-538-perf-"}};
-    auto opened = EchoDatabase::open(tmp.path);
+    yuzu::test::TempDbFile tmp{std::string_view{"yuzu_test_echo_538_perf_"}};
+    auto opened = yuzu::test::open_echo_db(tmp.path);
     REQUIRE(opened.has_value());
     EchoDatabase db = std::move(*opened);
     REQUIRE(db.create_warehouse_tables());
@@ -627,8 +758,8 @@ TEST_CASE("Echo retention: disabling one source does not pause others",
     // process_enabled must not freeze tcp / service / user retention —
     // otherwise a future refactor could turn the per-source guard into a
     // global switch without deleting a named test.
-    yuzu::test::TempDbFile tmp{std::string_view{"echo-issue539-isolation-"}};
-    auto opened = EchoDatabase::open(tmp.path);
+    yuzu::test::TempDbFile tmp{std::string_view{"yuzu_test_echo_issue539_isolation_"}};
+    auto opened = yuzu::test::open_echo_db(tmp.path);
     REQUIRE(opened.has_value());
     EchoDatabase db = std::move(*opened);
     REQUIRE(db.create_warehouse_tables());
@@ -752,67 +883,54 @@ TEST_CASE("Echo parse_pattern_config enforces the min-core floor on the LOAD pat
     CHECK(redact->size() == 3);
 }
 
-// ── $Module rollup wiring (M1 hardening — governance UP-1 / architect BLOCKING) ─
+// ── Roll-up tiers written by the fold (no aggregation pass any more) ─────────
 
-TEST_CASE("Echo rollup: $Module hourly aggregation fires and counts loads only",
+TEST_CASE("Echo roll-up: $Module hourly tier counts loads and blocks separately",
           "[echo][module][rollup]") {
-    // run_aggregation is now data-driven over capture_sources(); this proves the
-    // $Module hourly rollup actually executes (the old hand-maintained steps[]
-    // array omitted it, so the registered rollup SQL was dead code) AND that
-    // load_count counts only the 'loaded' action — a 'blocked' BYOVD load stays
-    // full-fidelity in module_live but is excluded from the aggregate count.
-    yuzu::test::TempDbFile tmp{std::string_view{"echo-module-rollup-"}};
-    auto opened = EchoDatabase::open(tmp.path);
+    // The fold writes the hourly tier as events arrive. Only a 'loaded' action
+    // counts into load_count; a 'blocked' BYOVD load is counted in blocked_count,
+    // and a boot-gap 'seed' and an 'unloaded' event contribute to neither. All
+    // six events share evil.dll's key tuple, so they fold into ONE hourly row.
+    yuzu::test::TempDbFile tmp{std::string_view{"yuzu_test_echo_module_rollup_"}};
+    auto opened = yuzu::test::open_echo_db(tmp.path);
     REQUIRE(opened.has_value());
     EchoDatabase db = std::move(*opened);
     REQUIRE(db.create_warehouse_tables());
 
     const int64_t t0 = 1'735'689'600; // 2025-01-01 00:00:00 UTC (an hour boundary)
-    auto insert_module = [&](std::string_view action) {
-        REQUIRE(db.execute_sql(
-            std::format("INSERT INTO module_live "
-                        "(ts,snapshot_id,action,pid,process_name,module_name,module_dir,"
-                        "signed_state,signer,is_kernel) "
-                        "VALUES ({}, 1, '{}', 100, 'app.exe', 'evil.dll', 'appdir', "
-                        "'unsigned', '', 0)",
-                        t0, action)));
+    auto module_row = [&](std::string_view action) {
+        ModuleRow r;
+        r.ts = t0;
+        r.snapshot_id = 1;
+        r.action = action;
+        r.pid = 100;
+        r.process_name = "app.exe";
+        r.module_name = "evil.dll";
+        r.module_dir = "appdir";
+        r.signed_state = "unsigned";
+        r.is_kernel = false;
+        return r;
     };
-    insert_module("loaded");
-    insert_module("loaded");
-    insert_module("loaded");
-    // Every non-'loaded' action must be EXCLUDED from load_count while staying
-    // full-fidelity in module_live: a 'blocked' BYOVD load, a boot-gap 'seed',
-    // and an 'unloaded' event. They share evil.dll's GROUP-BY tuple (module_name,
-    // signer, signed_state, is_kernel), so they fold into the same hourly row —
-    // proving the rollup's `action='loaded'` predicate, not just row identity,
-    // is what filters them.
-    insert_module("blocked");
-    insert_module("seed");
-    insert_module("unloaded");
-
-    REQUIRE(row_count(db, "module_live") == 6);
-    REQUIRE(row_count(db, "module_hourly") == 0);
-
-    run_aggregation(db, t0 + 7200); // boundary two hours on → window covers t0
+    REQUIRE(db.fold_module_events({module_row("loaded"), module_row("loaded"), module_row("loaded"),
+                                   module_row("blocked"), module_row("seed"), module_row("unloaded")}));
 
     REQUIRE(row_count(db, "module_hourly") == 1);
-    auto res = db.execute_query("SELECT load_count FROM module_hourly");
+    auto res = db.execute_query("SELECT load_count, blocked_count FROM module_hourly");
     REQUIRE(res.has_value());
     REQUIRE(res->rows.size() == 1);
-    CHECK(std::stoll(res->rows[0][0]) == 3); // only the 3 'loaded'; blocked/seed/unloaded excluded
+    CHECK(std::stoll(res->rows[0][0]) == 3); // only the 3 'loaded'
+    CHECK(std::stoll(res->rows[0][1]) == 1); // the one 'blocked'
 }
 
-TEST_CASE("Echo rollup: procperf hourly aggregation keeps a kernel-thread and "
-          "same-name userspace row SEPARATE (execution-level, not just SQL-string match)",
+TEST_CASE("Echo roll-up: procperf hourly tier keeps a kernel-thread and "
+          "same-name userspace row SEPARATE",
           "[echo][procperf][rollup]") {
-    // The schema test ("hourly rollup SQL exists and groups...") only string-
-    // matches that `is_kthread` appears in the GROUP BY; this proves it
-    // actually PARTITIONS the aggregation — a kernel thread and a userspace
-    // process sharing one `name` (the PF_KTHREAD-flag/comm-collision case,
-    // UP-7) must fold into TWO hourly rows, not one mislabelled row that
-    // silently mixes kernel-scheduling noise into a real app's numbers.
-    yuzu::test::TempDbFile tmp{std::string_view{"echo-procperf-rollup-"}};
-    auto opened = EchoDatabase::open(tmp.path);
+    // A kernel thread and a userspace process sharing one `name` (the
+    // PF_KTHREAD-flag/comm-collision case, UP-7) must fold into TWO hourly rows,
+    // not one mislabelled row that silently mixes kernel-scheduling noise into a
+    // real app's numbers.
+    yuzu::test::TempDbFile tmp{std::string_view{"yuzu_test_echo_procperf_rollup_"}};
+    auto opened = yuzu::test::open_echo_db(tmp.path);
     REQUIRE(opened.has_value());
     EchoDatabase db = std::move(*opened);
     REQUIRE(db.create_warehouse_tables());
@@ -833,14 +951,9 @@ TEST_CASE("Echo rollup: procperf hourly aggregation keeps a kernel-thread and "
     user_proc.ws_bytes = 100'000'000;
     user_proc.is_kthread = false;
 
-    REQUIRE(db.insert_proc_perf_samples({kthread, user_proc}));
-    REQUIRE(row_count(db, "procperf_live") == 2);
-    REQUIRE(row_count(db, "procperf_hourly") == 0);
+    REQUIRE(db.fold_proc_perf_samples({kthread, user_proc}));
 
-    run_aggregation(db, t0 + 7200); // boundary two hours on → window covers t0
-
-    // Two rows, not one collapsed row — is_kthread genuinely partitions the
-    // GROUP BY rather than merely appearing in its column list.
+    // Two rows, not one collapsed row: is_kthread genuinely partitions the key.
     REQUIRE(row_count(db, "procperf_hourly") == 2);
     auto res = db.execute_query(
         "SELECT is_kthread, cpu_avg FROM procperf_hourly WHERE name = 'collide' "
@@ -853,58 +966,43 @@ TEST_CASE("Echo rollup: procperf hourly aggregation keeps a kernel-thread and "
     CHECK(std::stod(res->rows[1][1]) == Catch::Approx(5.0));
 }
 
-TEST_CASE("Echo rollup: $Software live→daily→monthly counts by action",
+TEST_CASE("Echo roll-up: $Software daily and monthly tiers count by action",
           "[echo][software][rollup]") {
-    // The software source has no hourly tier (live → daily → monthly), proving
-    // the data-driven aggregator handles a non-uniform granularity set: daily
-    // rolls from live and monthly rolls from daily in one pass. Each action gets
-    // its own count column.
-    yuzu::test::TempDbFile tmp{std::string_view{"echo-software-rollup-"}};
-    auto opened = EchoDatabase::open(tmp.path);
+    // One fold writes the hourly, daily and monthly tiers. Each action gets its own count column;
+    // the version is part of the key, so the upgrade (to 24.00) lands in a row of its own.
+    yuzu::test::TempDbFile tmp{std::string_view{"yuzu_test_echo_software_rollup_"}};
+    auto opened = yuzu::test::open_echo_db(tmp.path);
     REQUIRE(opened.has_value());
     EchoDatabase db = std::move(*opened);
     REQUIRE(db.create_warehouse_tables());
 
     const int64_t t0 = 1'735'689'600; // 2025-01-01 00:00:00 UTC (day + month boundary)
-    auto insert_sw = [&](std::string_view action, std::string_view version,
-                         std::string_view prev_version) {
-        REQUIRE(db.execute_sql(std::format(
-            "INSERT INTO software_live "
-            "(ts,snapshot_id,action,name,version,prev_version,publisher,install_date) "
-            "VALUES ({}, 1, '{}', '7-Zip', '{}', '{}', 'Acme', '20250101')",
-            t0, action, version, prev_version)));
+    auto sw = [&](std::string_view action, std::string_view version, std::string_view prev_version) {
+        SoftwareEvent e;
+        e.ts = t0;
+        e.snapshot_id = 1;
+        e.action = action;
+        e.name = "7-Zip";
+        e.version = version;
+        e.prev_version = prev_version;
+        e.publisher = "Acme";
+        e.install_date = "20250101";
+        return e;
     };
-    insert_sw("installed", "23.01", "");
-    insert_sw("installed", "23.01", "");
-    insert_sw("removed", "23.01", "");
-    insert_sw("upgraded", "24.00", "23.01");
+    REQUIRE(db.fold_software_events({sw("installed", "23.01", ""), sw("installed", "23.01", ""),
+                                     sw("removed", "23.01", ""), sw("upgraded", "24.00", "23.01")}));
 
-    REQUIRE(row_count(db, "software_live") == 4);
-    REQUIRE(row_count(db, "software_daily") == 0);
-    REQUIRE(row_count(db, "software_monthly") == 0);
-
-    // Aggregate from a point in the FOLLOWING month so both the daily window
-    // (covers t0's day) and the monthly window (covers t0's whole month) include
-    // the seeded events in a single pass.
-    run_aggregation(db, t0 + 45 * 86400); // ~2025-02-15
-
-    REQUIRE(row_count(db, "software_daily") == 1);
-    auto daily = db.execute_query(
-        "SELECT install_count, remove_count, upgrade_count FROM software_daily");
-    REQUIRE(daily.has_value());
-    REQUIRE(daily->rows.size() == 1);
-    CHECK(std::stoll(daily->rows[0][0]) == 2); // installed
-    CHECK(std::stoll(daily->rows[0][1]) == 1); // removed
-    CHECK(std::stoll(daily->rows[0][2]) == 1); // upgraded
-
-    REQUIRE(row_count(db, "software_monthly") == 1);
-    auto monthly = db.execute_query(
-        "SELECT install_count, remove_count, upgrade_count FROM software_monthly");
-    REQUIRE(monthly.has_value());
-    REQUIRE(monthly->rows.size() == 1);
-    CHECK(std::stoll(monthly->rows[0][0]) == 2);
-    CHECK(std::stoll(monthly->rows[0][1]) == 1);
-    CHECK(std::stoll(monthly->rows[0][2]) == 1);
+    for (const char* tier : {"software_hourly", "software_daily", "software_monthly"}) {
+        INFO(tier);
+        REQUIRE(row_count(db, tier) == 2); // 23.01 (installed, removed) and 24.00 (upgraded)
+        auto sums = db.execute_query(std::string{"SELECT SUM(install_count), SUM(remove_count), "
+                                                 "SUM(upgrade_count) FROM "} + tier);
+        REQUIRE(sums.has_value());
+        REQUIRE(sums->rows.size() == 1);
+        CHECK(std::stoll(sums->rows[0][0]) == 2); // installed
+        CHECK(std::stoll(sums->rows[0][1]) == 1); // removed
+        CHECK(std::stoll(sums->rows[0][2]) == 1); // upgraded
+    }
 }
 
 // ── Default-on: every source starts enabled ──────────────────────────────────
@@ -916,7 +1014,7 @@ TEST_CASE("Echo default-on: source_enabled() is true for every registered source
     // source_enabled(), which reads the registry default for a never-configured
     // source.
     yuzu::test::TempDbFile tmp{std::string_view{"yuzu_test_echo_default_on_"}};
-    auto opened = EchoDatabase::open(tmp.path);
+    auto opened = yuzu::test::open_echo_db(tmp.path);
     REQUIRE(opened.has_value());
     EchoDatabase db = std::move(*opened);
     REQUIRE(db.create_warehouse_tables());
@@ -937,7 +1035,7 @@ TEST_CASE("Echo source_enabled_state: a failed read is nullopt; absent/stored/er
     // do_purge_source lives in the test-unlinked plugin TU, so this pins the
     // tri-state it consumes.
     yuzu::test::TempDbFile tmp{std::string_view{"yuzu_test_echo_enabled_state_"}};
-    auto opened = EchoDatabase::open(tmp.path);
+    auto opened = yuzu::test::open_echo_db(tmp.path);
     REQUIRE(opened.has_value());
     EchoDatabase db = std::move(*opened);
     REQUIRE(db.create_warehouse_tables());
@@ -964,7 +1062,7 @@ TEST_CASE("Echo default-on: the first disable of any source is a real transition
     // Every source defaults enabled, so the first-ever `<src>_enabled=false` on
     // a fresh DB is an enabled->disabled transition and writes paused_at.
     yuzu::test::TempDbFile tmp{std::string_view{"yuzu_test_echo_default_on_"}};
-    auto opened = EchoDatabase::open(tmp.path);
+    auto opened = yuzu::test::open_echo_db(tmp.path);
     REQUIRE(opened.has_value());
     EchoDatabase db = std::move(*opened);
     REQUIRE(db.create_warehouse_tables());
@@ -982,7 +1080,7 @@ TEST_CASE("Echo default-on: the first disable of any source is a real transition
     CHECK(db.get_config("module_paused_at", "x") == "0");
 }
 
-TEST_CASE("Echo retention: a corrupt/errored _enabled value preserves rows, never prunes (#560)",
+TEST_CASE("Echo retention: an errored _enabled value on a paused source preserves rows (#560)",
           "[echo][retention][source-lifecycle]") {
     yuzu::echo::RetentionGuardState guard;
     // The collect-time gate (source_enabled) fails closed on a non-canonical
@@ -990,8 +1088,8 @@ TEST_CASE("Echo retention: a corrupt/errored _enabled value preserves rows, neve
     // that source's rows — otherwise a tampered or bit-flipped value would stop
     // collection (per the gate) yet still let run_retention prune the forensic
     // window the operator believes is paused, the exact breach #560/#559 guard.
-    yuzu::test::TempDbFile tmp{std::string_view{"echo-560-retention-"}};
-    auto opened = EchoDatabase::open(tmp.path);
+    yuzu::test::TempDbFile tmp{std::string_view{"yuzu_test_echo_560_retention_"}};
+    auto opened = yuzu::test::open_echo_db(tmp.path);
     REQUIRE(opened.has_value());
     EchoDatabase db = std::move(*opened);
     REQUIRE(db.create_warehouse_tables());
@@ -1004,7 +1102,9 @@ TEST_CASE("Echo retention: a corrupt/errored _enabled value preserves rows, neve
     REQUIRE(db.set_config("retention_guard_last_pass", std::to_string(t_now)));
 
     // A value the plugin never writes — canonical_source_enabled => "errored".
+    // It was paused when it went bad (paused_at > 0), so the hold survives (#1572).
     db.set_config("process_enabled", "maybe");
+    REQUIRE(db.set_config("process_paused_at", std::to_string(t_now - 100)));
     REQUIRE(canonical_source_enabled(db.get_config("process_enabled", "true")) == "errored");
     // tcp_enabled left at default => "true" (actively, validly enabled).
     run_retention(db, t_now, guard);
@@ -1013,6 +1113,81 @@ TEST_CASE("Echo retention: a corrupt/errored _enabled value preserves rows, neve
     auto tcp_remaining = row_count(db, "tcp_hourly");
     CHECK(tcp_remaining > 0); // enabled => aged normally
     CHECK(tcp_remaining < 48);
+}
+
+// Fixture for the #1572 cases: process errored with the given paused_at (nullopt = unset), tcp
+// enabled as the control. Returns the process rows left after one retention pass.
+namespace {
+int64_t errored_process_rows_after_retention(const char* tag, std::optional<std::string> paused_at) {
+    yuzu::echo::RetentionGuardState guard;
+    yuzu::test::TempDbFile tmp{std::string_view{tag}};
+    auto opened = EchoDatabase::open(tmp.path);
+    REQUIRE(opened.has_value());
+    EchoDatabase db = std::move(*opened);
+    REQUIRE(db.create_warehouse_tables());
+    const int64_t t_now = 1'735'689'600 + kHourlyCutoffSec;
+    seed_process_hourly(db, t_now);
+    seed_tcp_hourly(db, t_now);
+    REQUIRE(db.set_config("retention_guard_last_pass", std::to_string(t_now)));
+    REQUIRE(db.set_config("process_enabled", "maybe"));
+    if (paused_at)
+        REQUIRE(db.set_config("process_paused_at", *paused_at));
+    run_retention(db, t_now, guard);
+    CHECK(row_count(db, "tcp_hourly") == kCenteredSurvivors); // control: the pass ran and pruned
+    return row_count(db, "process_hourly");
+}
+} // namespace
+
+TEST_CASE("Echo retention: an errored source that was never paused loses rows past its retention",
+          "[echo][retention][source-lifecycle][issue1572]") {
+    CHECK(errored_process_rows_after_retention("yuzu_test_echo_1572_unset_", std::nullopt) ==
+          kCenteredSurvivors);
+    CHECK(errored_process_rows_after_retention("yuzu_test_echo_1572_zero_", "0") ==
+          kCenteredSurvivors);
+}
+
+TEST_CASE("Echo retention: an errored source that was paused when its flag went bad keeps its rows",
+          "[echo][retention][source-lifecycle][issue1572]") {
+    CHECK(errored_process_rows_after_retention("yuzu_test_echo_1572_paused_", "1735000000") == 48);
+}
+
+TEST_CASE("Echo retention: an errored source with a malformed paused_at keeps its rows",
+          "[echo][retention][source-lifecycle][issue1572]") {
+    for (const char* bad : {"abc", "-1", "12x", "", "99999999999999999999", "-0", "00"})
+        CHECK(errored_process_rows_after_retention("yuzu_test_echo_1572_bad_", bad) == 48);
+}
+
+TEST_CASE("Echo retention: an errored source whose paused_at cannot be read keeps its rows",
+          "[echo][retention][source-lifecycle][fail-closed][issue1572]") {
+    yuzu::echo::RetentionGuardState guard;
+    yuzu::test::TempDbFile tmp{std::string_view{"yuzu_test_echo_1572_unreadable_"}};
+    auto opened = EchoDatabase::open(tmp.path);
+    REQUIRE(opened.has_value());
+    EchoDatabase db = std::move(*opened);
+    REQUIRE(db.create_warehouse_tables());
+    const int64_t t_now = 1'735'689'600 + kHourlyCutoffSec;
+    seed_process_hourly(db, t_now);
+    REQUIRE(db.set_config("retention_guard_last_pass", std::to_string(t_now)));
+    REQUIRE(db.set_config("process_enabled", "maybe"));
+    make_config_key_unreadable(tmp.path, "process_paused_at");
+    REQUIRE(source_retention_exempt(db, "process"));
+    run_retention(db, t_now, guard);
+    CHECK(row_count(db, "process_hourly") == 48);
+}
+
+TEST_CASE("Echo retention: an absent flag follows the registry default, not an exemption",
+          "[echo][retention][source-lifecycle][issue1572]") {
+    // No registered source ships default-off today, so the default-off leg is exercised through
+    // source_default_enabled(): the helper must agree with it for every source with no flag.
+    yuzu::test::TempDbFile tmp{std::string_view{"yuzu_test_echo_1572_default_"}};
+    auto opened = EchoDatabase::open(tmp.path);
+    REQUIRE(opened.has_value());
+    EchoDatabase db = std::move(*opened);
+    REQUIRE(db.create_warehouse_tables());
+    for (const auto& src : capture_sources())
+        CHECK(source_retention_exempt(db, src.name) == !source_default_enabled(src.name));
+    REQUIRE(db.set_config("tcp_enabled", "false")); // operator pause stays exempt
+    CHECK(source_retention_exempt(db, "tcp"));
 }
 
 TEST_CASE("Echo retention: an UNREADABLE enable flag preserves rows and never prunes (#560)",
@@ -1025,7 +1200,7 @@ TEST_CASE("Echo retention: an UNREADABLE enable flag preserves rows and never pr
     // rows survive because of the gate, not because the whole pass bailed.
     yuzu::echo::RetentionGuardState guard;
     yuzu::test::TempDbFile tmp{std::string_view{"yuzu_test_echo_unreadable_flag_"}};
-    auto opened = EchoDatabase::open(tmp.path);
+    auto opened = yuzu::test::open_echo_db(tmp.path);
     REQUIRE(opened.has_value());
     EchoDatabase db = std::move(*opened);
     REQUIRE(db.create_warehouse_tables());
@@ -1069,33 +1244,19 @@ namespace {
 
 // Insert `count` process_hourly rows all stamped at exactly `ts`.
 void seed_process_hourly_at(EchoDatabase& db, int64_t ts, int count) {
-    REQUIRE(db.execute_sql("BEGIN TRANSACTION"));
-    for (int i = 0; i < count; ++i) {
-        REQUIRE(db.execute_sql(std::format("INSERT INTO process_hourly "
-                                           "(hour_ts,name,user,start_count,stop_count) "
-                                           "VALUES ({}, 'svc.exe', 'SYSTEM', 1, 1)",
-                                           ts)));
-    }
-    REQUIRE(db.execute_sql("COMMIT"));
+    seed_tier_at(db, "process", "hourly", ts, count);
 }
 
 // Insert `count` process_monthly rows all stamped at exactly `ts`. The monthly
-// tier is the one whose retention window (~365d) exceeds kEchoMinBigStepSec, so
-// it is the only tier that can tell an ABSOLUTE step threshold apart from the
+// tier is the one whose retention window (~365d) exceeds kEchoMinBigStepSec by
+// the widest margin, so it tells an ABSOLUTE step threshold apart from the
 // max(window, constant) shape an earlier round used.
 void seed_process_monthly_at(EchoDatabase& db, int64_t ts, int count) {
-    REQUIRE(db.execute_sql("BEGIN TRANSACTION"));
-    for (int i = 0; i < count; ++i) {
-        REQUIRE(db.execute_sql(std::format("INSERT INTO process_monthly "
-                                           "(month_ts,name,user,start_count,stop_count) "
-                                           "VALUES ({}, 'svc.exe', 'SYSTEM', 1, 1)",
-                                           ts)));
-    }
-    REQUIRE(db.execute_sql("COMMIT"));
+    seed_tier_at(db, "process", "monthly", ts, count);
 }
 
 struct EchoGuardFixture {
-    yuzu::test::TempDbFile tmp{std::string_view{"echo-2361-"}};
+    yuzu::test::TempDbFile tmp{std::string_view{"yuzu_test_echo_2361_"}};
     std::optional<EchoDatabase> db;
     yuzu::echo::RetentionGuardState guard;
 
@@ -1109,7 +1270,7 @@ struct EchoGuardFixture {
     // delete with no decline and then persist the bad clock (Sol adversarial
     // review). Tests about that bootstrap path pass false and assert the decline.
     explicit EchoGuardFixture(bool prime_anchor = true) {
-        auto opened = EchoDatabase::open(tmp.path);
+        auto opened = yuzu::test::open_echo_db(tmp.path);
         REQUIRE(opened.has_value());
         db.emplace(std::move(*opened));
         REQUIRE(db->create_warehouse_tables());
@@ -1301,7 +1462,7 @@ TEST_CASE("Echo #2361: an ordinary over-cap backlog records no fact set",
     CHECK(declines_of(f.guard, "process_hourly") == 0);
 
     // Now a real anomaly. A recorded entry would let this delete silently.
-    REQUIRE(f.db->execute_sql("DELETE FROM process_hourly"));
+    REQUIRE(f.db->execute_sql("DELETE FROM process_hourly_r"));
     seed_process_hourly_at(*f.db, kT0 - 10 * kHourlyCutoffSec, 3);
     run_retention(*f.db, kT0 + 2, f.guard);
     CHECK(row_count(*f.db, "process_hourly") == 3);
@@ -1318,7 +1479,10 @@ TEST_CASE("Echo #2361: a disabled source with all-expired rows neither declines 
     seed_process_hourly_at(*f.db, kT0 - 10 * kHourlyCutoffSec, 20);
 
     SECTION("paused") { f.db->set_config("process_enabled", "false"); }
-    SECTION("errored") { f.db->set_config("process_enabled", "maybe"); }
+    SECTION("errored while paused") {
+        f.db->set_config("process_enabled", "maybe");
+        f.db->set_config("process_paused_at", std::to_string(kT0 - 100));
+    }
 
     run_retention(*f.db, kT0, f.guard);
 
@@ -1368,14 +1532,8 @@ TEST_CASE("Echo #2361: a table whose count cannot be read is skipped, not declin
     // to break the count also breaks the delete that would follow it.
     EchoGuardFixture f;
     seed_process_hourly_at(*f.db, kT0 - 10 * kHourlyCutoffSec, 20);
-    for (int h = 0; h < 20; ++h) {
-        REQUIRE(f.db->execute_sql(
-            std::format("INSERT INTO tcp_hourly (hour_ts,remote_addr,remote_port,proto,"
-                        "process_name,connect_count,disconnect_count) "
-                        "VALUES ({}, '10.0.0.1', 5000, 'tcp', 'sshd', 1, 1)",
-                        kT0 - 10 * kHourlyCutoffSec)));
-    }
-    REQUIRE(f.db->execute_sql("DROP TABLE process_hourly"));
+    seed_tier_at(*f.db, "tcp", "hourly", kT0 - 10 * kHourlyCutoffSec, 20);
+    REQUIRE(f.db->execute_sql("DROP TABLE process_hourly_r"));
 
     run_retention(*f.db, kT0, f.guard);
 
@@ -1384,6 +1542,22 @@ TEST_CASE("Echo #2361: a table whose count cannot be read is skipped, not declin
     // The sweep kept going: tcp_hourly is all-expired, so it declines normally.
     CHECK(declines_of(f.guard, "tcp_hourly") == 1);
     CHECK(row_count(*f.db, "tcp_hourly") == 20);
+}
+
+TEST_CASE("Echo #6197: a clock that steps backward between passes declines both, single-threaded",
+          "[echo][retention][clock-guard]") {
+    // Deterministic twin of the concurrent case below: the second pass sees a
+    // stored reading ahead of its own `now`, which is a different fact set from
+    // the first pass's, so it declines again instead of reading as already
+    // reported. No expired row goes in either pass.
+    EchoGuardFixture f;
+    seed_process_hourly_at(*f.db, kT0 - 10 * kHourlyCutoffSec, 200); // all expired, no survivor
+
+    run_retention(*f.db, kT0 + 10, f.guard);
+    run_retention(*f.db, kT0 + 5, f.guard);
+
+    CHECK(declines_of(f.guard, "process_hourly") == 2);
+    CHECK(row_count(*f.db, "process_hourly") == 200);
 }
 
 TEST_CASE("Echo #2361: concurrent rollup passes are race-free when the caller serialises",
@@ -1463,7 +1637,7 @@ TEST_CASE("Echo #2361: a status reader racing a rollup is safe (guard.mu has tee
     // fail, so EVERY pass writes `guard.failures[...]`, which the reader reads.
     EchoGuardFixture f;
     seed_process_hourly_at(*f.db, kT0 - 10 * kHourlyCutoffSec, 20);
-    REQUIRE(f.db->execute_sql("DROP TABLE process_hourly"));
+    REQUIRE(f.db->execute_sql("DROP TABLE process_hourly_r"));
 
     std::atomic<bool> stop{false};
     std::atomic<int> reads{0};
@@ -1515,16 +1689,22 @@ TEST_CASE("Echo #2361: a status reader racing a rollup is safe (guard.mu has tee
     CHECK(failures_of(f.guard, "process_hourly") > 0);
 }
 
-TEST_CASE("Echo #2361: retention_sql's SQL text is unchanged (the guard reroutes at the caller)",
+TEST_CASE("Echo #2361: a roll-up tier is pruned by bucket start at the registry window",
           "[echo][retention][clock-guard]") {
-    // test_echo_warehouse.cpp and test_echo_perf.cpp pin retention_sql's exact
-    // output. The guard therefore lives in run_retention, NOT in retention_sql -
-    // this restates that contract locally so a future refactor that "tidies" the
-    // guard into retention_sql fails here rather than in an unrelated file.
-    const auto time_based = retention_sql("process_hourly", kT0);
-    CHECK(time_based == std::format("DELETE FROM process_hourly WHERE hour_ts < {}",
-                                    kT0 - kHourlyCutoffSec));
-    CHECK(time_based.find("LIMIT") == std::string::npos);
+    // The delete runs over the physical `_r` table and cuts at `now - retention_default` by BUCKET
+    // START: a bucket stamped exactly on the cutoff stays, one second older goes. The window comes
+    // from the registry (90 days for an hourly tier), not from a literal in the pass.
+    EchoGuardFixture f;
+    const int64_t cutoff = kT0 - kHourlyCutoffSec;
+    seed_process_hourly_at(*f.db, cutoff - 1, 3); // one second past the window -> deleted
+    seed_process_hourly_at(*f.db, cutoff, 2);     // exactly on the cutoff -> kept
+    seed_process_hourly_at(*f.db, kT0 - 3600, 1); // survivor: not a wipe
+
+    run_retention(*f.db, kT0, f.guard);
+
+    CHECK(row_count(*f.db, "process_hourly") == 3);
+    CHECK(row_count(*f.db, "process_hourly WHERE hour_ts = " + std::to_string(cutoff - 1)) == 0);
+    CHECK(declines_of(f.guard, "process_hourly") == 0);
 }
 
 TEST_CASE("Echo #2361: the clock-step check survives an agent restart",
@@ -1573,12 +1753,12 @@ TEST_CASE("Echo #2361: an unreadable table re-arms the guard and is counted sepa
     REQUIRE(reported_of(f.guard, "process_hourly"));
 
     // Probes fail for exactly one pass.
-    REQUIRE(f.db->execute_sql("ALTER TABLE process_hourly RENAME TO process_hourly_hidden"));
+    REQUIRE(f.db->execute_sql("ALTER TABLE process_hourly_r RENAME TO process_hourly_hidden"));
     run_retention(*f.db, kT0 + 1, f.guard);
     CHECK(failures_of(f.guard, "process_hourly") == 1);
     CHECK(declines_of(f.guard, "process_hourly") == 1); // NOT counted as a clock anomaly
     CHECK_FALSE(reported_of(f.guard, "process_hourly")); // re-armed
-    REQUIRE(f.db->execute_sql("ALTER TABLE process_hourly_hidden RENAME TO process_hourly"));
+    REQUIRE(f.db->execute_sql("ALTER TABLE process_hourly_hidden RENAME TO process_hourly_r"));
 
     // The same wipe condition, still unresolved: must decline again rather than
     // delete on an entry the failure had erased.
@@ -1612,6 +1792,64 @@ TEST_CASE("Echo #2361: the status lines always carry both totals",
     CHECK(lines[1] == "retention_guard_failed|module_hourly|2");
     CHECK(lines[2] == "retention_guard_declines_total|3");
     CHECK(lines[3] == "retention_guard_failures_total|2");
+}
+
+TEST_CASE("Echo budget: the __budget__ skip line is in neither retention guard total",
+          "[echo][retention][clock-guard][budget]") {
+    // A skipped byte-budget pass is the consequence of a decline or failure that is already
+    // counted, so it must surface as its own line and stay out of both totals. Folding it into
+    // declines would double a clock decline and turn a failures-only event (an anchor write
+    // failure) into a non-zero declines total, the misread the status text warns against.
+    yuzu::echo::RetentionGuardState g;
+    {
+        std::lock_guard lock(g.mu);
+        g.budget_skips = 2;
+        g.declines["process_hourly"] = 1;
+    }
+    auto lines = yuzu::echo::format_retention_guard_lines(g);
+    REQUIRE(lines.size() == 4);
+    CHECK(lines[0] == "retention_guard|process_hourly|1");
+    CHECK(lines[1] == "retention_guard|__budget__|2");
+    CHECK(lines[2] == "retention_guard_declines_total|1");
+    CHECK(lines[3] == "retention_guard_failures_total|0");
+
+    // Failures only (no decline): the skip line appears and the declines total stays 0.
+    yuzu::echo::RetentionGuardState f;
+    {
+        std::lock_guard lock(f.mu);
+        f.budget_skips = 1;
+        f.failures["__clock_state__"] = 1;
+    }
+    lines = yuzu::echo::format_retention_guard_lines(f);
+    REQUIRE(lines.size() == 4);
+    CHECK(lines[0] == "retention_guard_failed|__clock_state__|1");
+    CHECK(lines[1] == "retention_guard|__budget__|1");
+    CHECK(lines[2] == "retention_guard_declines_total|0");
+    CHECK(lines[3] == "retention_guard_failures_total|1");
+}
+
+TEST_CASE("Echo budget: retention_clock_events counts clock refusals and not delete failures",
+          "[echo][retention][clock-guard][budget]") {
+    // The budget pass skips when this total rises across run_retention. A table whose DELETE
+    // fails every pass is a delete problem, not a clock problem (the guard admitted the clock),
+    // so it must not switch the byte cap off.
+    yuzu::echo::RetentionGuardState g;
+    CHECK(yuzu::echo::retention_clock_events(g) == 0);
+    {
+        std::lock_guard lock(g.mu);
+        g.delete_failures["x"] = 5;
+    }
+    CHECK(yuzu::echo::retention_clock_events(g) == 0);
+    {
+        std::lock_guard lock(g.mu);
+        g.declines["x"] = 1;
+    }
+    CHECK(yuzu::echo::retention_clock_events(g) == 1);
+    {
+        std::lock_guard lock(g.mu);
+        g.failures["__clock_state__"] = 1;
+    }
+    CHECK(yuzu::echo::retention_clock_events(g) == 2);
 }
 
 TEST_CASE("Echo #2361: every registered granularity declares the ts column its suffix maps to",
@@ -1709,7 +1947,7 @@ TEST_CASE("Echo #2361: a failed delete is counted, so the totals stay honest",
     EchoGuardFixture f;
     seed_process_hourly_at(*f.db, kT0 - 10 * kHourlyCutoffSec, 5);
     seed_process_hourly_at(*f.db, kT0 - 3600, 1); // survivor: the pass is accepted
-    REQUIRE(f.db->execute_sql("CREATE TRIGGER block_del BEFORE DELETE ON process_hourly "
+    REQUIRE(f.db->execute_sql("CREATE TRIGGER block_del BEFORE DELETE ON process_hourly_r "
                               "BEGIN SELECT RAISE(ABORT, 'blocked'); END;"));
 
     run_retention(*f.db, kT0, f.guard);
@@ -1759,6 +1997,70 @@ TEST_CASE("Echo #2361: an implausible stored reading is an anomaly, not a quiet 
     CHECK(declines_after("99999999999999") == 1);  // far ahead of now
 }
 
+TEST_CASE("Echo #3104: an implausible stored reading is counted once per pass, with no expired rows",
+          "[echo][retention][clock-guard]") {
+    // The per-table decline for a corrupt stored reading fires only when a table
+    // has expired rows to decline, so on an idle device (every row inside its
+    // window) a tampered anchor produced no signal at all. The guard now counts
+    // the corruption itself, once, under a sentinel no table can collide with.
+    auto failures_after = [](const char* stored) {
+        EchoGuardFixture f;
+        seed_process_hourly_at(*f.db, kT0 - 3600, 3); // in-window only: nothing is expired
+        REQUIRE(f.db->set_config("retention_guard_last_pass", stored));
+
+        CHECK(yuzu::echo::retention_clock_events(f.guard) == 0);
+        run_retention(*f.db, kT0, f.guard);
+        CHECK(failures_of(f.guard, "__implausible_stored__") == 1);
+        CHECK(declines_of(f.guard, "process_hourly") == 0); // per-table behaviour unchanged
+        CHECK(row_count(*f.db, "process_hourly") == 3);
+        // The sentinel is a clock event: do_rollup skips the byte-budget pass when this
+        // total rises across run_retention, so a corrupt reading costs one budget pass.
+        CHECK(yuzu::echo::retention_clock_events(f.guard) == 1);
+        // And it reaches `echo status` as its own line, inside the failures total.
+        const auto lines = yuzu::echo::format_retention_guard_lines(f.guard);
+        REQUIRE(lines.size() == 3);
+        CHECK(lines[0] == "retention_guard_failed|__implausible_stored__|1");
+        CHECK(lines[1] == "retention_guard_declines_total|0");
+        CHECK(lines[2] == "retention_guard_failures_total|1");
+        // Re-anchored to now, so the corruption is not counted again.
+        CHECK(f.db->get_config("retention_guard_last_pass", "") == std::to_string(kT0));
+        run_retention(*f.db, kT0 + 1, f.guard);
+        return failures_of(f.guard, "__implausible_stored__");
+    };
+    CHECK(failures_after("not-a-number") == 1);   // unparseable
+    CHECK(failures_after("-1") == 1);             // negative
+    CHECK(failures_after("99999999999999") == 1); // far ahead of now
+
+    // A healthy anchor counts nothing.
+    EchoGuardFixture f;
+    seed_process_hourly_at(*f.db, kT0 - 3600, 3);
+    run_retention(*f.db, kT0, f.guard);
+    CHECK(failures_of(f.guard, "__implausible_stored__") == 0);
+    CHECK(yuzu::echo::retention_clock_events(f.guard) == 0);
+}
+
+TEST_CASE("Echo #3104: a corrupt stored reading that cannot be re-anchored is counted every pass",
+          "[echo][retention][clock-guard]") {
+    // The re-anchor is what makes the sentinel a once-only count. When that write
+    // fails the bad reading stays, so each pass reports it again, beside the
+    // `__clock_state__` failure for the write itself.
+    EchoGuardFixture f;
+    seed_process_hourly_at(*f.db, kT0 - 3600, 3); // in-window only: nothing is expired
+    REQUIRE(f.db->set_config("retention_guard_last_pass", "not-a-number"));
+    REQUIRE(f.db->execute_sql("CREATE TRIGGER block_cfg BEFORE UPDATE ON echo_config "
+                              "WHEN NEW.key = 'retention_guard_last_pass' "
+                              "BEGIN SELECT RAISE(ABORT, 'blocked'); END;"));
+
+    for (int pass = 1; pass <= 3; ++pass) {
+        run_retention(*f.db, kT0 + pass, f.guard);
+        CHECK(failures_of(f.guard, "__implausible_stored__") == pass);
+        CHECK(failures_of(f.guard, "__clock_state__") == pass);
+        CHECK(yuzu::echo::retention_clock_events(f.guard) == 2 * pass);
+    }
+    CHECK(f.db->get_config("retention_guard_last_pass", "") == "not-a-number");
+    CHECK(row_count(*f.db, "process_hourly") == 3); // nothing deleted meanwhile
+}
+
 TEST_CASE("Echo #2361: a failed persist of the clock reading is reported",
           "[echo][retention][clock-guard]") {
     // `set_config` used to return void, so a write that never landed left the
@@ -1789,18 +2091,10 @@ TEST_CASE("Echo #2361: a delete failure stops the pass instead of leaking autoco
     seed_process_hourly_at(*f.db, kT0 - 3600, 1);
     // tcp_hourly must be ACCEPTED (a survivor, so it is not declined) or it never
     // reaches the plan list and the leak this test hunts for cannot occur.
-    auto seed_tcp = [&](int64_t ts, int n) {
-        for (int h = 0; h < n; ++h) {
-            REQUIRE(f.db->execute_sql(
-                std::format("INSERT INTO tcp_hourly (hour_ts,remote_addr,remote_port,proto,"
-                            "process_name,connect_count,disconnect_count) "
-                            "VALUES ({}, '10.0.0.1', 5000, 'tcp', 'sshd', 1, 1)",
-                            ts)));
-        }
-    };
+    auto seed_tcp = [&](int64_t ts, int n) { seed_tier_at(*f.db, "tcp", "hourly", ts, n); };
     seed_tcp(kT0 - 10 * kHourlyCutoffSec, 5); // expired
     seed_tcp(kT0 - 3600, 1);                  // survivor -> accepted, queued
-    REQUIRE(f.db->execute_sql("CREATE TRIGGER block_del BEFORE DELETE ON process_hourly "
+    REQUIRE(f.db->execute_sql("CREATE TRIGGER block_del BEFORE DELETE ON process_hourly_r "
                               "BEGIN SELECT RAISE(ROLLBACK, 'aborted'); END;"));
 
     run_retention(*f.db, kT0, f.guard);
@@ -1826,19 +2120,11 @@ TEST_CASE("Echo #2361: a NON-aborting statement error fails one table, not the w
     EchoGuardFixture f;
     seed_process_hourly_at(*f.db, kT0 - 10 * kHourlyCutoffSec, 5);
     seed_process_hourly_at(*f.db, kT0 - 3600, 1); // survivor -> accepted, queued
-    auto seed_tcp = [&](int64_t ts, int n) {
-        for (int h = 0; h < n; ++h) {
-            REQUIRE(f.db->execute_sql(
-                std::format("INSERT INTO tcp_hourly (hour_ts,remote_addr,remote_port,proto,"
-                            "process_name,connect_count,disconnect_count) "
-                            "VALUES ({}, '10.0.0.1', 5000, 'tcp', 'sshd', 1, 1)",
-                            ts)));
-        }
-    };
+    auto seed_tcp = [&](int64_t ts, int n) { seed_tier_at(*f.db, "tcp", "hourly", ts, n); };
     seed_tcp(kT0 - 10 * kHourlyCutoffSec, 5); // expired -> must still be deleted
     seed_tcp(kT0 - 3600, 1);                  // survivor -> accepted, queued
     // ABORT, deliberately, NOT ROLLBACK: the transaction survives this one.
-    REQUIRE(f.db->execute_sql("CREATE TRIGGER block_del BEFORE DELETE ON process_hourly "
+    REQUIRE(f.db->execute_sql("CREATE TRIGGER block_del BEFORE DELETE ON process_hourly_r "
                               "BEGIN SELECT RAISE(ABORT, 'one bad table'); END;"));
 
     run_retention(*f.db, kT0, f.guard);
@@ -1881,7 +2167,7 @@ TEST_CASE("Echo #2361: a rolled-back retention pass does not discard another wri
     EchoGuardFixture f;
     seed_process_hourly_at(*f.db, kT0 - 10 * kHourlyCutoffSec, 5);
     seed_process_hourly_at(*f.db, kT0 - 3600, 1); // survivor -> accepted, queued
-    REQUIRE(f.db->execute_sql("CREATE TRIGGER block_del BEFORE DELETE ON process_hourly "
+    REQUIRE(f.db->execute_sql("CREATE TRIGGER block_del BEFORE DELETE ON process_hourly_r "
                               "BEGIN SELECT RAISE(ROLLBACK, 'aborted'); END;"));
 
     std::atomic<bool> stop{false};
@@ -1895,16 +2181,14 @@ TEST_CASE("Echo #2361: a rolled-back retention pass does not discard another wri
     // yield() hands the CPU on without throttling the burst the ~1-in-5 detection
     // above depends on (a per-write sleep would, at Windows' timer granularity; the
     // effect of yield() on that detection is not measured on Windows);
-    // kMaxProbeWrites stops the writer re-taking mu_ past a ceiling retention never
-    // needs, so it can never be starved indefinitely.
+    // kMaxProbeWrites ends the writer at a ceiling retention never needs (it exits rather
+    // than idling), so it can never be starved indefinitely.
     constexpr int kMaxProbeWrites = 50000;
     std::thread writer([&] {
         int n = 0;
         while (!stop.load(std::memory_order_relaxed)) {
-            if (n >= kMaxProbeWrites) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(1));
-                continue;
-            }
+            if (n >= kMaxProbeWrites)
+                break; // the ceiling ends the writer; the Joiner below still joins it
             const int mine = ++n;
             if (f.db->set_config(std::format("collector_probe_{}", mine), std::to_string(mine))) {
                 std::lock_guard lk(ack_mu);
@@ -1971,20 +2255,14 @@ TEST_CASE("Echo #2361: a batch rolls back as a unit, and does not reach outside 
     // batch must not survive a later failing one.
     EchoGuardFixture f;
     seed_process_hourly_at(*f.db, kT0 - 10 * kHourlyCutoffSec, 4);
-    for (int h = 0; h < 4; ++h) {
-        REQUIRE(f.db->execute_sql(
-            std::format("INSERT INTO tcp_hourly (hour_ts,remote_addr,remote_port,proto,"
-                        "process_name,connect_count,disconnect_count) "
-                        "VALUES ({}, '10.0.0.1', 5000, 'tcp', 'sshd', 1, 1)",
-                        kT0 - 10 * kHourlyCutoffSec)));
-    }
+    seed_tier_at(*f.db, "tcp", "hourly", kT0 - 10 * kHourlyCutoffSec, 4);
     REQUIRE(f.db->set_config("pre_batch_write", "kept"));
-    REQUIRE(f.db->execute_sql("CREATE TRIGGER block_del BEFORE DELETE ON process_hourly "
+    REQUIRE(f.db->execute_sql("CREATE TRIGGER block_del BEFORE DELETE ON process_hourly_r "
                               "BEGIN SELECT RAISE(ROLLBACK, 'aborted'); END;"));
 
     // First statement succeeds, second aborts the transaction.
     const auto r = f.db->execute_atomic_batch(
-        {"DELETE FROM tcp_hourly", "DELETE FROM process_hourly", "DELETE FROM tcp_hourly"});
+        {"DELETE FROM tcp_hourly_r", "DELETE FROM process_hourly_r", "DELETE FROM tcp_hourly_r"});
 
     CHECK_FALSE(r.committed);
     REQUIRE(r.failed.size() == 3);
@@ -2062,7 +2340,7 @@ TEST_CASE("Echo #2361: a failed delete re-arms the guard, matching the audit sib
     REQUIRE(reported_of(f.guard, "process_hourly"));
 
     // Recorded, so this pass ACCEPTS -- and the delete fails.
-    REQUIRE(f.db->execute_sql("CREATE TRIGGER block_del BEFORE DELETE ON process_hourly "
+    REQUIRE(f.db->execute_sql("CREATE TRIGGER block_del BEFORE DELETE ON process_hourly_r "
                               "BEGIN SELECT RAISE(ABORT, 'blocked'); END;"));
     run_retention(*f.db, kT0 + 1, f.guard);
     CHECK(row_count(*f.db, "process_hourly") ==
@@ -2120,9 +2398,9 @@ TEST_CASE("Echo #2361: a closed store skips the pass instead of reporting clock 
     // The pass must say the true thing once and stop.
     //
     // A moved-from EchoDatabase has `db_ == nullptr`, which is the same state the
-    // wedge path produces via sqlite3_close_v2. The close itself needs a rollback
-    // that fails with the transaction still open -- a disk-level fault, not
-    // inducible here -- so this covers the downstream behaviour, not the close.
+    // wedge path produces via sqlite3_close_v2. This case covers the downstream
+    // behaviour; the close itself is driven through the OpenSeams::rollback seam in
+    // the cases that follow it.
     EchoGuardFixture f;
     seed_process_hourly_at(*f.db, kT0 - 10 * kHourlyCutoffSec, 10);
 
@@ -2146,6 +2424,276 @@ TEST_CASE("Echo #2361: a closed store skips the pass instead of reporting clock 
     CHECK(row_count(live, "process_hourly") == 10);
 }
 
+// A database seeded from the migrated template and opened with `seams` (a current-version open, so
+// no ladder and no extra fsyncs).
+static EchoDatabase open_with_seams(const fs::path& path, const OpenSeams& seams) {
+    (void)yuzu::test::seed_echo_db_from_template(path);
+    auto opened = EchoDatabase::open(path, seams);
+    INFO(std::string{opened.has_value() ? "" : opened.error()});
+    REQUIRE(opened.has_value());
+    return std::move(*opened);
+}
+
+TEST_CASE("Echo #8099: checked_transaction closes the store when ROLLBACK fails inside the transaction",
+          "[echo][store][rollback-wedge]") {
+    // A seam that reports an error WITHOUT rolling back leaves the connection in the transaction,
+    // which is the wedge: the store must close, the write path must fail, and the read-only query
+    // connection (a separate handle) must survive.
+    yuzu::test::TempDbFile tmp{"yuzu_test_echo_8099_ct_"};
+    int rollbacks = 0;
+    OpenSeams seams;
+    seams.rollback = [&](sqlite3*) {
+        ++rollbacks;
+        return SQLITE_IOERR;
+    };
+    auto db = open_with_seams(tmp.path, seams);
+    REQUIRE(db.is_open());
+    REQUIRE(db.query_engine_available());
+
+    const auto result = db.checked_transaction(
+        [](TransactionHandle&) -> std::expected<void, std::string> { return std::unexpected("injected"); });
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error() == "injected");
+    CHECK(rollbacks == 1);
+    CHECK_FALSE(db.is_open());
+    CHECK_FALSE(db.set_config("k", "v"));
+    CHECK(db.query_engine_available());
+}
+
+TEST_CASE("Echo #8099: execute_atomic_batch closes the store when ROLLBACK fails inside the transaction",
+          "[echo][store][rollback-wedge]") {
+    yuzu::test::TempDbFile tmp{"yuzu_test_echo_8099_ab_"};
+    int rollbacks = 0;
+    OpenSeams seams;
+    seams.rollback = [&](sqlite3*) {
+        ++rollbacks;
+        return SQLITE_IOERR;
+    };
+    auto db = open_with_seams(tmp.path, seams);
+
+    // SQLITE_TOOBIG is neither a plain error nor a constraint, so the batch abandons the pass
+    // while the transaction is still open and goes to ROLLBACK. This holds only while the compiled
+    // SQLITE_MAX_LENGTH is below 2,000,000,000 (the SQLite default is 1,000,000,000); a build that
+    // raised it would let the statement succeed, and the checks below then fail instead of passing
+    // by accident: began is required first, then committed, the rollback count and the close.
+    const auto batch = db.execute_atomic_batch({"SELECT zeroblob(2000000000)"});
+    REQUIRE(batch.began);
+    CHECK_FALSE(batch.committed);
+    CHECK(rollbacks == 1);
+    CHECK_FALSE(db.is_open());
+    CHECK_FALSE(db.set_config("k", "v")); // the write path is closed, not merely flagged
+    CHECK(db.query_engine_available());
+}
+
+TEST_CASE("Echo #8099: a ROLLBACK that rolled back and then reported an error leaves the store open",
+          "[echo][store][rollback-wedge]") {
+    // The benign case the wedge branch must not mistake for a wedge: SQLite already ended the
+    // transaction (autocommit is 1), so closing the store would be a false alarm.
+    yuzu::test::TempDbFile tmp{"yuzu_test_echo_8099_ok_"};
+    OpenSeams seams;
+    seams.rollback = [](sqlite3* raw) {
+        sqlite3_exec(raw, "ROLLBACK", nullptr, nullptr, nullptr);
+        return SQLITE_IOERR;
+    };
+    auto db = open_with_seams(tmp.path, seams);
+
+    const auto result = db.checked_transaction(
+        [](TransactionHandle&) -> std::expected<void, std::string> { return std::unexpected("injected"); });
+    REQUIRE_FALSE(result.has_value());
+    CHECK(db.is_open());
+    CHECK(db.set_config("k", "v")); // a connection still inside a transaction would refuse this
+    CHECK(db.get_config("k") == "v");
+}
+
+TEST_CASE("Echo #8099: a batch ROLLBACK that rolled back and then reported an error leaves the store open",
+          "[echo][store][rollback-wedge]") {
+    // The same benign shape as the checked_transaction case above, through the batch path's own
+    // discriminator: the two paths are separate code and must each keep the store open.
+    yuzu::test::TempDbFile tmp{"yuzu_test_echo_8099_abok_"};
+    OpenSeams seams;
+    seams.rollback = [](sqlite3* raw) {
+        sqlite3_exec(raw, "ROLLBACK", nullptr, nullptr, nullptr);
+        return SQLITE_IOERR;
+    };
+    auto db = open_with_seams(tmp.path, seams);
+
+    const auto batch = db.execute_atomic_batch({"SELECT zeroblob(2000000000)"});
+    CHECK(batch.began);
+    CHECK_FALSE(batch.committed);
+    CHECK(db.is_open());
+    CHECK(db.set_config("k", "v")); // a connection still inside a transaction would refuse this
+    CHECK(db.get_config("k") == "v");
+}
+
+TEST_CASE("Echo #8099: a failed rollback during the v10 step is an open failure, not a runtime wedge",
+          "[echo][store][rollback-wedge]") {
+    // The open-time counterpart, already reported as migration_failed: the step fails (here the
+    // retired daily tier has a row but no roll-up mark, so the step refuses inside its
+    // transaction), its ROLLBACK fails with the transaction open, and open() refuses (the
+    // connection closes with the transaction undone). The file stays v9 with its retired row, and classify_open_failure keeps
+    // the reason it always gave. No `rollback_wedged` tag comes out of an open.
+    yuzu::test::TempDbFile tmp{"yuzu_test_echo_8099_v10_"};
+    // RAII handles: a failing REQUIRE unwinds through these lambdas, and a raw handle would leak.
+    const auto open_raw = [&] {
+        sqlite3* raw = nullptr;
+        const int rc = sqlite3_open(tmp.path.string().c_str(), &raw);
+        std::unique_ptr<sqlite3, int (*)(sqlite3*)> handle{raw, sqlite3_close}; // owned even on failure
+        REQUIRE(rc == SQLITE_OK);
+        return handle;
+    };
+    const auto exec_raw = [&](const char* sql) {
+        const auto raw = open_raw();
+        REQUIRE(sqlite3_exec(raw.get(), sql, nullptr, nullptr, nullptr) == SQLITE_OK);
+    };
+    const auto scalar = [&](const char* sql) {
+        const auto raw = open_raw();
+        sqlite3_stmt* stmt_raw = nullptr;
+        const int rc = sqlite3_prepare_v2(raw.get(), sql, -1, &stmt_raw, nullptr);
+        std::unique_ptr<sqlite3_stmt, int (*)(sqlite3_stmt*)> stmt{stmt_raw, sqlite3_finalize};
+        REQUIRE(rc == SQLITE_OK);
+        REQUIRE(sqlite3_step(stmt.get()) == SQLITE_ROW);
+        const auto* text = reinterpret_cast<const char*>(sqlite3_column_text(stmt.get(), 0));
+        REQUIRE(text != nullptr);
+        return std::string{text};
+    };
+    exec_raw("CREATE TABLE echo_config (key TEXT PRIMARY KEY, value TEXT NOT NULL DEFAULT '');"
+             "INSERT INTO echo_config VALUES ('schema_version', '9');"
+             "CREATE TABLE process_daily (id INTEGER PRIMARY KEY AUTOINCREMENT, day_ts INTEGER NOT "
+             "NULL DEFAULT 0, name TEXT NOT NULL DEFAULT '', user TEXT NOT NULL DEFAULT '', "
+             "start_count INTEGER NOT NULL DEFAULT 0, stop_count INTEGER NOT NULL DEFAULT 0);"
+             "INSERT INTO process_daily VALUES (NULL, 1793613600, 'a', 'u', 3, 1);");
+
+    int rollbacks = 0;
+    OpenSeams seams;
+    seams.rollback = [&](sqlite3*) {
+        ++rollbacks;
+        return SQLITE_IOERR;
+    };
+    const auto failed = EchoDatabase::open(tmp.path, seams);
+    REQUIRE_FALSE(failed.has_value());
+    CHECK(rollbacks == 1);
+    CHECK(failed.error().starts_with(kV10MigrationFailedPrefix));
+    CHECK(classify_open_failure(failed.error()) == OfflineReason::migration_failed);
+    CHECK(scalar("SELECT value FROM echo_config WHERE key = 'schema_version'") == "9");
+    CHECK(scalar("SELECT COUNT(*) FROM process_daily") == "1");
+}
+
+// A store a failed ROLLBACK has closed: the seam reports an error without rolling back, so the
+// transaction stays open and checked_transaction takes the real close path.
+static EchoDatabase open_wedged(const fs::path& path) {
+    OpenSeams seams;
+    seams.rollback = [](sqlite3*) { return SQLITE_IOERR; };
+    auto db = open_with_seams(path, seams);
+    REQUIRE(db.is_open());
+    const auto result = db.checked_transaction(
+        [](TransactionHandle&) -> std::expected<void, std::string> { return std::unexpected("injected"); });
+    REQUIRE_FALSE(result.has_value());
+    REQUIRE_FALSE(db.is_open());
+    return db;
+}
+
+TEST_CASE("Echo #8099: the ROLLBACK seam follows the database through a move assignment",
+          "[echo][store][rollback-wedge]") {
+    // EchoDatabase has two move operations and open_with_seams exercises only the constructor. A
+    // move assignment that dropped the seam would run a real ROLLBACK, which succeeds, and the
+    // store would stay open.
+    yuzu::test::TempDbFile seamed_file{"yuzu_test_echo_8099_mva_"};
+    yuzu::test::TempDbFile plain_file{"yuzu_test_echo_8099_mvb_"};
+    OpenSeams seams;
+    seams.rollback = [](sqlite3*) { return SQLITE_IOERR; };
+    auto seamed = open_with_seams(seamed_file.path, seams);
+    auto target = open_with_seams(plain_file.path, OpenSeams{});
+
+    target = std::move(seamed);
+    REQUIRE(target.is_open());
+    const auto result = target.checked_transaction(
+        [](TransactionHandle&) -> std::expected<void, std::string> { return std::unexpected("injected"); });
+    REQUIRE_FALSE(result.has_value());
+    CHECK_FALSE(target.is_open());
+}
+
+TEST_CASE("Echo #8099: each guarded action is refused on a store a failed ROLLBACK closed, and only then",
+          "[echo][store][rollback-wedge]") {
+    // The action gate (EchoPlugin::refuse_on_closed_store) is TU-local, so this drives its decision
+    // with the real liveness probes of a real closed store: the store is wedged through the seam,
+    // not faked, and the probes are the ones the shell reads. The wiring itself is pinned by
+    // tests/test_echo_storage_offline_reconcile_lexical.py.
+    const std::string action = GENERATE(as<std::string>{}, "collect_fast", "collect_slow", "configure",
+                                        "fleet_snapshot", "rollup");
+    yuzu::test::TempDbFile tmp{"yuzu_test_echo_8099_gate_"};
+    OpenSeams seams;
+    seams.rollback = [](sqlite3*) { return SQLITE_IOERR; };
+    auto db = open_with_seams(tmp.path, seams);
+
+    // open: runs
+    CHECK_FALSE(format_closed_store_refusal(action, db.is_open(), db.query_engine_available()));
+
+    const auto closed = [&] {
+        const auto result = db.checked_transaction(
+            [](TransactionHandle&) -> std::expected<void, std::string> { return std::unexpected("injected"); });
+        REQUIRE_FALSE(result.has_value());
+    };
+    closed();
+    REQUIRE_FALSE(db.is_open());
+    REQUIRE(db.query_engine_available());
+
+    // closed: refused with line 0 of the offline status reply, `error|` first, promising the read path
+    const auto refusal = format_closed_store_refusal(action, db.is_open(), db.query_engine_available());
+    REQUIRE(refusal.has_value());
+    CHECK(refusal->starts_with("error|"));
+    CHECK(*refusal == format_storage_offline_lines(true).front());
+    CHECK(refusal->find("`echo sql`") != std::string::npos);
+}
+
+TEST_CASE("Echo #8099: the actions left unguarded on a closed store answer honestly, as the gate's contract says",
+          "[echo][store][rollback-wedge]") {
+    // refused_on_closed_store leaves these alone because each already tells the truth about a closed
+    // store. Pin the facts that claim rests on, against a real closed store, so a change that makes
+    // one of them report a healthy empty store moves the action into the refused set instead of
+    // slipping through.
+    yuzu::test::TempDbFile tmp{"yuzu_test_echo_8099_honest_"};
+    auto db = open_wedged(tmp.path);
+
+    // the gate lets all of them run
+    for (const std::string_view action : {"status", "sql", "compatibility", "query", "export", "purge_source",
+                                          "snapshot", "collect_perf", "collect_software"})
+        CHECK_FALSE(format_closed_store_refusal(action, db.is_open(), db.query_engine_available()));
+
+    // query and export read through the write connection: an error, never an empty result set
+    const auto read = db.execute_query("SELECT 1");
+    REQUIRE_FALSE(read.has_value());
+    CHECK(read.error() == "database not open");
+
+    // purge_source, snapshot, collect_perf and collect_software gate on the enable flag: unreadable
+    // (nullopt) on a closed store, which the shell reports as config_unreadable, a partial snapshot
+    // naming every source, and `state_unreadable`
+    for (const auto& src : capture_sources())
+        CHECK_FALSE(source_enabled_state(db, src.name).has_value());
+
+    // sql reads the separate read-only connection, which survives the close: the one action that
+    // keeps answering, and the offline status reply says so
+    const auto user = db.execute_user_query("SELECT 1");
+    CHECK(user.has_value());
+    CHECK(format_storage_offline_lines(db.query_engine_available())[0].find("`echo sql`") !=
+          std::string::npos);
+}
+
+TEST_CASE("Echo #8099: why configure is refused on a closed store: a usage re-assert reads the default and succeeds",
+          "[echo][store][rollback-wedge]") {
+    // The one configure write that reports success on a closed store, and the reason the gate
+    // refuses the whole action. A closed store returns the registry default for every config read
+    // (`usage` defaults to enabled), so re-asserting `usage_enabled=true` sees no change and returns
+    // true with nothing written: an operator resuming a paused source would read `status|ok` for a
+    // store that cannot hold the change. Every other source's toggle is one transaction and fails.
+    // If the usage branch ever fails closed itself, this case documents the original defect and may
+    // be reduced to the second check.
+    yuzu::test::TempDbFile tmp{"yuzu_test_echo_8099_cfg_"};
+    auto db = open_wedged(tmp.path);
+    CHECK(apply_source_enabled_transition(db, "usage", "true", 1'000'000));
+    CHECK_FALSE(apply_source_enabled_transition(db, "process", "false", 1'000'000));
+    CHECK_FALSE(db.set_config("slow_interval_seconds", "60"));
+}
+
 TEST_CASE("Echo #2361: the offline status reply leads with error|, not storage_state",
           "[echo][retention][clock-guard]") {
     // Governance Gate 3 (quality-engineer) BLOCKING: this ordering is the fix
@@ -2162,7 +2710,7 @@ TEST_CASE("Echo #2361: the offline status reply leads with error|, not storage_s
     const auto lines = yuzu::echo::format_storage_offline_lines(/*query_engine_available=*/true);
     REQUIRE(lines.size() == 2);
     CHECK(lines[0].starts_with("error|"));
-    CHECK(lines[1] == "storage_state|offline");
+    CHECK(lines[1] == "storage_state|offline|rollback_wedged");
     CHECK(lines[0].find("echo sql") != std::string::npos);
 
     // And when the read-only connection is gone too, the line must NOT promise
@@ -2170,7 +2718,7 @@ TEST_CASE("Echo #2361: the offline status reply leads with error|, not storage_s
     const auto dark = yuzu::echo::format_storage_offline_lines(/*query_engine_available=*/false);
     REQUIRE(dark.size() == 2);
     CHECK(dark[0].starts_with("error|"));
-    CHECK(dark[1] == "storage_state|offline");
+    CHECK(dark[1] == "storage_state|offline|rollback_wedged");
     CHECK(dark[0].find("cannot read") != std::string::npos);
 }
 
@@ -2249,7 +2797,7 @@ TEST_CASE("Echo #2573: a DIFFERENT anomaly while a decline is still latched dele
     REQUIRE(row_count(*f.db, "process_hourly") == 21);
 
     REQUIRE(f.db->execute_sql(
-        std::format("DELETE FROM process_hourly WHERE hour_ts = {}", kT0 - 3600)));
+        std::format("DELETE FROM process_hourly_r WHERE hour_ts = {}", kT0 - 3600)));
 
     run_retention(*f.db, kT0 + 1, f.guard); // now Wipe: a DIFFERENT fact set
 
@@ -2468,7 +3016,7 @@ TEST_CASE("Echo #2573: a stale Wipe entry is erased, not left dangling, when NoA
 
     // A fresh, independent Wipe must still decline -- proving the erase was
     // real and nothing suppressed it by residue.
-    REQUIRE(f.db->execute_sql(std::format("DELETE FROM process_hourly WHERE hour_ts = {}",
+    REQUIRE(f.db->execute_sql(std::format("DELETE FROM process_hourly_r WHERE hour_ts = {}",
                                           kT0 - 3600)));
     run_retention(*f.db, kT0 + 2, f.guard);
     CHECK(declines_of(f.guard, "process_hourly") == 3);
@@ -2495,7 +3043,7 @@ void install_fault(EchoDatabase& db, const char* table, const char* col, const c
 TEST_CASE("Echo #1654: a failed enabled-flag write rolls back the baseline clear",
           "[echo][paused_at][issue1654]") {
     yuzu::test::TempDbFile tmp{std::string_view{"yuzu_test_echo_1654_flagfail_"}};
-    auto opened = EchoDatabase::open(tmp.path);
+    auto opened = yuzu::test::open_echo_db(tmp.path);
     REQUIRE(opened.has_value());
     EchoDatabase db = std::move(*opened);
     REQUIRE(db.create_warehouse_tables());
@@ -2513,7 +3061,7 @@ TEST_CASE("Echo #1654: a failed enabled-flag write rolls back the baseline clear
 TEST_CASE("Echo #1654: a failed baseline clear leaves the flag untouched (transactional)",
           "[echo][paused_at][issue1654]") {
     yuzu::test::TempDbFile tmp{std::string_view{"yuzu_test_echo_1654_clearfail_"}};
-    auto opened = EchoDatabase::open(tmp.path);
+    auto opened = yuzu::test::open_echo_db(tmp.path);
     REQUIRE(opened.has_value());
     EchoDatabase db = std::move(*opened);
     REQUIRE(db.create_warehouse_tables());
@@ -2529,7 +3077,7 @@ TEST_CASE("Echo #1654: a failed baseline clear leaves the flag untouched (transa
 TEST_CASE("Echo #1654: a failed paused_at write leaves an enable transition unapplied",
           "[echo][paused_at][issue1654]") {
     yuzu::test::TempDbFile tmp{std::string_view{"yuzu_test_echo_1654_pausefail_"}};
-    auto opened = EchoDatabase::open(tmp.path);
+    auto opened = yuzu::test::open_echo_db(tmp.path);
     REQUIRE(opened.has_value());
     EchoDatabase db = std::move(*opened);
     REQUIRE(db.create_warehouse_tables());
@@ -2545,7 +3093,7 @@ TEST_CASE("Echo #1654: a failed paused_at write leaves an enable transition unap
 TEST_CASE("Echo #1654: in-function guard rejects unvalidated values and unknown sources",
           "[echo][paused_at][issue1654]") {
     yuzu::test::TempDbFile tmp{std::string_view{"yuzu_test_echo_1654_guard_"}};
-    auto opened = EchoDatabase::open(tmp.path);
+    auto opened = yuzu::test::open_echo_db(tmp.path);
     REQUIRE(opened.has_value());
     EchoDatabase db = std::move(*opened);
     REQUIRE(db.create_warehouse_tables());
@@ -2562,4 +3110,1034 @@ TEST_CASE("Echo #1567: db_health line format", "[echo][status][issue1567]") {
     CHECK(format_db_health_line(true, 1700000000) == "db_health|quarantined|1700000000");
     CHECK(format_db_health_line(false, 0) == "db_health|ok|0");
     CHECK(format_db_health_line(false, 1700000000) == "db_health|ok|1700000000");
+}
+
+TEST_CASE("configure reply: a partial commit lists the applied keys in order",
+          "[echo][status][issue2155]") {
+    CHECK(format_configure_partial({"db_budget_bytes"}) == "partial|applied|db_budget_bytes");
+    CHECK(format_configure_partial({"fast_interval_seconds", "process_enabled", "redaction_patterns"}) ==
+          "partial|applied|fast_interval_seconds,process_enabled,redaction_patterns");
+}
+
+TEST_CASE("configure reply: nothing applied produces no partial line", "[echo][status][issue2155]") {
+    CHECK(format_configure_partial({}).empty());
+}
+
+// =============================================================================
+// Byte budget: run_budget eviction, vacuum_decision, parse_budget_bytes
+// =============================================================================
+
+namespace {
+
+constexpr int64_t kBudgetNow = 1'700'000'000; // a fixed "now": no test here reads the real clock
+constexpr int64_t kHourlyFloor = kBudgetNow - kBudgetHourlyFloorSec;
+
+EchoDatabase open_budget_db(const yuzu::test::TempDbFile& tmp) {
+    auto opened = yuzu::test::open_echo_db(tmp.path);
+    REQUIRE(opened.has_value());
+    return std::move(*opened);
+}
+
+// n rows of `<source>_hourly` spread evenly over [oldest, newest], ascending in id and bucket.
+void seed_hourly_span(EchoDatabase& db, std::string_view source, int n, int64_t oldest,
+                      int64_t newest) {
+    insert_tier_rows(db, source, "hourly",
+                     std::format("{0} + (i * ({1} - {0})) / {2}", oldest, newest, std::max(n - 1, 1)),
+                     n);
+}
+
+int64_t scalar(EchoDatabase& db, const std::string& sql) {
+    auto q = db.execute_query(sql, 1);
+    REQUIRE(q.has_value());
+    REQUIRE(q->rows.size() == 1);
+    return std::stoll(q->rows[0][0]);
+}
+
+// Hourly rows of a source stamped at or after the 48 h floor: the ones that must survive.
+int64_t hourly_recent(EchoDatabase& db, const std::string& source) {
+    return scalar(db, std::format("SELECT COUNT(*) FROM {}_hourly WHERE hour_ts >= {}", source,
+                                  kHourlyFloor));
+}
+
+const auto kAlwaysTime = [] { return true; };
+
+// The ruled literals, pinned independently of the constants the engine derives them from: a
+// changed floor, batch or budget is a changed product promise, and must show up as a failing
+// test here rather than silently moving every expectation with it (hourly roll-up rows are
+// never evicted inside 48 h, 1,000 rows per batch, 2 s per pass, a 250 MiB default budget with
+// a 32 MiB minimum). There is no raw tier to take first: the fold stores roll-ups only.
+static_assert(kBudgetHourlyFloorSec == 172800);
+static_assert(kBudgetBatchRows == 1000);
+static_assert(kBudgetPassDeadlineMs == 2000);
+static_assert(kEchoDbBudgetBytesDefault == 250 * 1024 * 1024);
+static_assert(kEchoDbBudgetBytesMin == 32 * 1024 * 1024);
+// procperf_hourly is re-read by the daily app-perf sync for two completed UTC days plus today
+// (agents/core/src/sync_source_app_perf.cpp), and the server overwrites those days from what it
+// receives: evicting an hour inside that window shrinks an already-correct aggregate. 5 d covers
+// the 3 UTC days at any time of day with slack.
+static_assert(kBudgetProcPerfHourlyFloorSec == 432000);
+static_assert(kBudgetProcPerfHourlyFloorSec >= 4 * 86400);
+
+} // namespace
+
+TEST_CASE("run_budget: evicts the largest hourly table first and the oldest rows first "
+          "outside the 48 h floor",
+          "[echo][aggregator][budget]") {
+    yuzu::test::TempDbFile tmp{"yuzu_test_echo_budget_main_"};
+    auto db = open_budget_db(tmp);
+    seed_hourly_span(db, "tcp", 12000, kBudgetNow - 120 * 3600, kBudgetNow);
+    seed_hourly_span(db, "module", 3000, kBudgetNow - 120 * 3600, kBudgetNow);
+    seed_hourly_span(db, "process", 3000, kBudgetNow - 120 * 3600, kBudgetNow);
+
+    const int64_t tcp_recent_before = hourly_recent(db, "tcp");
+    const int64_t data_before = db.storage_bytes().data_bytes();
+    const int64_t target = data_before - 64 * 1024;
+
+    const auto res = run_budget(db, kBudgetNow, target, kAlwaysTime);
+    REQUIRE_FALSE(res.failed);
+    CHECK_FALSE(res.deadline_hit);
+    CHECK_FALSE(res.exhausted);
+    CHECK(res.evicted_hourly > 0);
+    CHECK(res.data_bytes_after <= target);
+    CHECK(res.data_bytes_after == db.storage_bytes().data_bytes());
+
+    // tcp_hourly was the largest, so it is the only table touched ...
+    CHECK(scalar(db, "SELECT COUNT(*) FROM tcp_hourly") == 12000 - res.evicted_hourly);
+    CHECK(scalar(db, "SELECT COUNT(*) FROM module_hourly") == 3000);
+    CHECK(scalar(db, "SELECT COUNT(*) FROM process_hourly") == 3000);
+    // ... oldest first (ids ascend with the bucket), never anything newer than 48 h ...
+    CHECK(scalar(db, "SELECT MIN(id) FROM tcp_hourly_r") == 1 + res.evicted_hourly);
+    CHECK(hourly_recent(db, "tcp") == tcp_recent_before);
+    // ... and the persisted counter equals what the batches returned. The retired raw-row
+    // counter is never written.
+    CHECK(db.get_config("budget_evicted_hourly_rows_total", "") == std::to_string(res.evicted_hourly));
+    CHECK(db.get_config("budget_evicted_raw_rows_total", "none") == "none");
+}
+
+TEST_CASE("run_budget: with nothing else to take it empties exactly the eligible hourly rows",
+          "[echo][aggregator][budget]") {
+    yuzu::test::TempDbFile tmp{"yuzu_test_echo_budget_exhaust_"};
+    auto db = open_budget_db(tmp);
+    seed_hourly_span(db, "tcp", 6000, kBudgetNow - 120 * 3600, kBudgetNow);
+    seed_hourly_span(db, "process", 2000, kBudgetNow - 120 * 3600, kBudgetNow);
+    const int64_t tcp_recent = hourly_recent(db, "tcp");
+    const int64_t process_recent = hourly_recent(db, "process");
+    REQUIRE(tcp_recent > 0); // not vacuous: the floor really protects rows
+
+    const auto res = run_budget(db, kBudgetNow, /*target=*/0, kAlwaysTime);
+    REQUIRE_FALSE(res.failed);
+    CHECK(res.exhausted);
+    CHECK_FALSE(res.deadline_hit);
+    CHECK(res.data_bytes_after > 0);
+    CHECK(budget_over_bytes(res.data_bytes_after, 0, 0) > 0); // still over: reported, not hidden
+
+    CHECK(scalar(db, "SELECT COUNT(*) FROM tcp_hourly") == tcp_recent); // only the newest 48 h left
+    CHECK(scalar(db, "SELECT COUNT(*) FROM process_hourly") == process_recent);
+}
+
+TEST_CASE("run_budget: already within target does nothing", "[echo][aggregator][budget]") {
+    yuzu::test::TempDbFile tmp{"yuzu_test_echo_budget_noop_"};
+    auto db = open_budget_db(tmp);
+    seed_hourly_span(db, "tcp", 3000, kBudgetNow - 120 * 3600, kBudgetNow);
+    const auto res = run_budget(db, kBudgetNow, db.storage_bytes().data_bytes() + 1, kAlwaysTime);
+    CHECK(res.evicted_hourly == 0);
+    CHECK_FALSE(res.exhausted);
+    CHECK_FALSE(res.failed);
+    CHECK(scalar(db, "SELECT COUNT(*) FROM tcp_hourly") == 3000);
+}
+
+TEST_CASE("run_budget: daily and monthly tiers and the plain tables are never evicted",
+          "[echo][aggregator][budget]") {
+    yuzu::test::TempDbFile tmp{"yuzu_test_echo_budget_tiers_"};
+    auto db = open_budget_db(tmp);
+    seed_hourly_span(db, "process", 3000, kBudgetNow - 120 * 3600, kBudgetNow);
+    seed_hourly_span(db, "module", 1000, kBudgetNow - 120 * 3600, kBudgetNow);
+    seed_tier_at(db, "process", "daily", kBudgetNow - 200 * 86400, 500);
+    seed_tier_at(db, "process", "monthly", kBudgetNow - 200 * 86400, 500);
+    // The usage tables and netqual_boot are plain tables the budget does not know about: old
+    // and numerous, and still all there afterwards.
+    REQUIRE(db.execute_sql(std::format(
+        "WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i+1 FROM n WHERE i < 1999) "
+        "INSERT INTO usage_live (ts,snapshot_id,action,pid,exe_key,user,start_ts) "
+        "SELECT {} + i, 1, 'open', i, 'exe' || i, 'u', {} FROM n",
+        kBudgetNow - 72 * 3600, kBudgetNow - 72 * 3600)));
+    REQUIRE(db.execute_sql(std::format(
+        "WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i+1 FROM n WHERE i < 199) "
+        "INSERT INTO netqual_boot (ts,boot_ts,window_s) SELECT {} + i, {} + i, 60 FROM n",
+        kBudgetNow - 72 * 3600, kBudgetNow - 72 * 3600)));
+    const int64_t proc_recent = hourly_recent(db, "process");
+    const int64_t module_recent = hourly_recent(db, "module");
+
+    const auto res = run_budget(db, kBudgetNow, 0, kAlwaysTime);
+    REQUIRE_FALSE(res.failed);
+    CHECK(res.exhausted);
+    CHECK(res.evicted_hourly > 0);
+    CHECK(scalar(db, "SELECT COUNT(*) FROM process_hourly") == proc_recent);
+    CHECK(scalar(db, "SELECT COUNT(*) FROM module_hourly") == module_recent);
+    CHECK(scalar(db, std::format("SELECT COUNT(*) FROM process_hourly WHERE hour_ts < {}", kHourlyFloor)) == 0);
+    CHECK(scalar(db, "SELECT COUNT(*) FROM process_daily") == 500);
+    CHECK(scalar(db, "SELECT COUNT(*) FROM process_monthly") == 500);
+    CHECK(scalar(db, "SELECT COUNT(*) FROM usage_live") == 2000);
+    CHECK(scalar(db, "SELECT COUNT(*) FROM netqual_boot") == 200);
+    CHECK(db.get_config("budget_evicted_hourly_rows_total", "") == std::to_string(res.evicted_hourly));
+}
+
+TEST_CASE("run_budget: paused and errored sources keep their hourly rows and an enabled "
+          "one gives them up",
+          "[echo][aggregator][budget]") {
+    yuzu::test::TempDbFile tmp{"yuzu_test_echo_budget_exempt_"};
+    auto db = open_budget_db(tmp);
+    seed_hourly_span(db, "tcp", 3000, kBudgetNow - 120 * 3600, kBudgetNow);
+    seed_hourly_span(db, "module", 2000, kBudgetNow - 120 * 3600, kBudgetNow);
+    seed_hourly_span(db, "process", 1000, kBudgetNow - 120 * 3600, kBudgetNow);
+    const int64_t process_recent = hourly_recent(db, "process");
+
+    // tcp paused, module errored (a value written outside the plugin), process enabled.
+    REQUIRE(db.set_config("tcp_enabled", "false"));
+    REQUIRE(db.set_config("module_enabled", "maybe"));
+    REQUIRE(db.set_config("module_paused_at", std::to_string(kBudgetNow - 100))); // paused first
+
+    const auto res = run_budget(db, kBudgetNow, 0, kAlwaysTime);
+    REQUIRE_FALSE(res.failed);
+    CHECK(res.exhausted);
+    CHECK(scalar(db, "SELECT COUNT(*) FROM tcp_hourly") == 3000);    // paused: untouched
+    CHECK(scalar(db, "SELECT COUNT(*) FROM module_hourly") == 2000); // errored while paused
+    CHECK(scalar(db, "SELECT COUNT(*) FROM process_hourly") == process_recent); // enabled: taken
+}
+
+TEST_CASE("run_budget: an errored source that was never paused is evictable (#1572)",
+          "[echo][aggregator][budget][issue1572]") {
+    yuzu::test::TempDbFile tmp{"yuzu_test_echo_budget_errored_unpaused_"};
+    auto db = open_budget_db(tmp);
+    seed_hourly_span(db, "module", 2000, kBudgetNow - 120 * 3600, kBudgetNow);
+    const int64_t recent = hourly_recent(db, "module");
+    REQUIRE(db.set_config("module_enabled", "maybe"));
+
+    const auto res = run_budget(db, kBudgetNow, 0, kAlwaysTime);
+    REQUIRE_FALSE(res.failed);
+    CHECK(scalar(db, "SELECT COUNT(*) FROM module_hourly") == recent);
+}
+
+TEST_CASE("run_budget: the largest hourly table is taken first", "[echo][aggregator][budget]") {
+    yuzu::test::TempDbFile tmp{"yuzu_test_echo_budget_hourly_order_"};
+    auto db = open_budget_db(tmp);
+    seed_hourly_span(db, "process", 3000, kBudgetNow - 120 * 3600, kBudgetNow - 60 * 3600);
+    seed_hourly_span(db, "module", 1000, kBudgetNow - 120 * 3600, kBudgetNow - 60 * 3600);
+    const auto res = run_budget(db, kBudgetNow, db.storage_bytes().data_bytes() - 32 * 1024, kAlwaysTime);
+    REQUIRE_FALSE(res.failed);
+    CHECK(res.evicted_hourly > 0);
+    CHECK(scalar(db, "SELECT COUNT(*) FROM module_hourly") == 1000); // the smaller table is spared
+    CHECK(scalar(db, "SELECT COUNT(*) FROM process_hourly") < 3000);
+}
+
+TEST_CASE("run_budget: the deadline is checked between batches", "[echo][aggregator][budget]") {
+    yuzu::test::TempDbFile tmp{"yuzu_test_echo_budget_deadline_"};
+    auto db = open_budget_db(tmp);
+    seed_hourly_span(db, "tcp", 8000, kBudgetNow - 120 * 3600, kBudgetNow - 60 * 3600);
+    int calls = 0;
+    const auto res = run_budget(db, kBudgetNow, 0, [&] { return ++calls <= 2; });
+    REQUIRE_FALSE(res.failed);
+    CHECK(res.deadline_hit);
+    CHECK_FALSE(res.exhausted);
+    CHECK(res.evicted_hourly == 2 * kBudgetBatchRows);
+    CHECK(scalar(db, "SELECT COUNT(*) FROM tcp_hourly") == 8000 - 2 * kBudgetBatchRows);
+}
+
+TEST_CASE("budget_catch_up_after: only a deadline-limited pass over target arms, and it carries "
+          "the clock it was admitted with",
+          "[echo][aggregator][budget][chaos]") {
+    // The plugin cannot arm a catch-up deterministically through the C ABI (arming needs a real
+    // 2 s deadline hit and a free-function clock), so the decision is this pure function.
+    constexpr int64_t kTarget = 1000;
+    // A reading <= 0 is the legitimate dead-CMOS case: it must travel like any other, which is
+    // why `armed` is a separate field and not "admitted_now != 0".
+    for (const int64_t admitted : {int64_t{-5}, int64_t{0}, kBudgetNow, kEchoMaxPlausibleNow}) {
+        // bit 0 deadline_hit, bit 1 exhausted, bit 2 failed, bit 3 data above target.
+        // Exactly one row arms: deadline hit, not exhausted, not failed, over target.
+        for (int bits = 0; bits < 16; ++bits) {
+            INFO("admitted = " << admitted << ", bits = " << bits);
+            BudgetPassResult res;
+            res.deadline_hit = (bits & 1) != 0;
+            res.exhausted = (bits & 2) != 0;
+            res.failed = (bits & 4) != 0;
+            res.data_bytes_after = (bits & 8) != 0 ? kTarget + 1 : kTarget;
+            const auto next = budget_catch_up_after(res, kTarget, admitted);
+            if (bits == 0b1001) {
+                CHECK(next.armed);
+                CHECK(next.admitted_now == admitted); // the arming reading, unchanged
+            } else {
+                CHECK_FALSE(next.armed);
+                CHECK(next.admitted_now == 0);
+            }
+        }
+    }
+}
+
+TEST_CASE("budget_slice_clock: a slice keeps the arming reading unless the clock stepped backward",
+          "[echo][aggregator][budget][chaos]") {
+    // #6889 review B1: a catch-up slice runs with the reading its arming pass was admitted with.
+    // A fresh reading BELOW it means the clock stepped backward, so the admitted reading's floors
+    // now sit above rows written since the step; the slice must disarm, not delete them.
+    for (const int64_t admitted : {int64_t{-5}, int64_t{0}, kBudgetNow, kEchoMaxPlausibleNow}) {
+        INFO("admitted = " << admitted);
+        const BudgetCatchUp armed{true, admitted};
+        // Equal and ahead keep the ARMING reading (a forward step widens nothing).
+        CHECK(budget_slice_clock(armed, admitted) == admitted);
+        CHECK(budget_slice_clock(armed, admitted + 1) == admitted);
+        CHECK(budget_slice_clock(armed, kEchoMaxPlausibleNow) == admitted);
+        // One second behind is a backward step: disarm.
+        CHECK_FALSE(budget_slice_clock(armed, admitted - 1).has_value());
+        CHECK_FALSE(budget_slice_clock(armed, std::numeric_limits<int64_t>::min()).has_value());
+        // Never armed: no slice, whatever the clock says.
+        CHECK_FALSE(budget_slice_clock(BudgetCatchUp{false, admitted}, admitted).has_value());
+        CHECK_FALSE(budget_slice_clock(BudgetCatchUp{}, kBudgetNow).has_value());
+    }
+}
+
+TEST_CASE("run_budget: a catch-up slice keeps the arming clock, so a later forward step widens no floor",
+          "[echo][aggregator][budget][chaos]") {
+    yuzu::test::TempDbFile tmp{"yuzu_test_echo_budget_carry_"};
+    auto db = open_budget_db(tmp);
+    constexpr int64_t kStep = kEchoMinBigStepSec + 86400; // a forward step the guard would refuse
+    // 2,500 hourly rows 49-82 h old (past the 48 h floor), two 47 h old (inside it).
+    seed_hourly_span(db, "tcp", 2500, kBudgetNow - 82 * 3600, kBudgetNow - 49 * 3600);
+    seed_hourly_span(db, "tcp", 2, kBudgetNow - 47 * 3600, kBudgetNow - 47 * 3600);
+
+    // The arming pass ran out of time with rows left, admitted at kBudgetNow.
+    int calls = 0;
+    const auto first = run_budget(db, kBudgetNow, 0, [&] { return ++calls <= 1; });
+    REQUIRE_FALSE(first.failed);
+    const auto latch = budget_catch_up_after(first, 0, kBudgetNow);
+    REQUIRE(latch.armed);
+    REQUIRE(latch.admitted_now == kBudgetNow);
+
+    // The wall clock then steps forward; the slice runs with the carried reading, not that one.
+    const int64_t fresh = kBudgetNow + kStep;
+    REQUIRE(latch.admitted_now != fresh);
+    REQUIRE(budget_slice_clock(latch, fresh) == kBudgetNow);
+    const auto slice = run_budget(db, latch.admitted_now, 0, kAlwaysTime);
+    REQUIRE_FALSE(slice.failed);
+    CHECK(slice.exhausted); // everything past the arming clock's 48 h floor is gone ...
+    CHECK(scalar(db, "SELECT COUNT(*) FROM tcp_hourly") == 2); // ... and the 47 h rows are kept
+    CHECK_FALSE(budget_catch_up_after(slice, 0, latch.admitted_now).armed); // the drain ended
+
+    // Positive control: the same rows go under the stepped clock, because its floor has moved on.
+    const auto stepped = run_budget(db, fresh, 0, kAlwaysTime);
+    REQUIRE_FALSE(stepped.failed);
+    CHECK(stepped.evicted_hourly == 2);
+    CHECK(scalar(db, "SELECT COUNT(*) FROM tcp_hourly") == 0);
+}
+
+TEST_CASE("run_budget: a failing table is skipped and reported, the others still evict",
+          "[echo][aggregator][budget]") {
+    yuzu::test::TempDbFile tmp{"yuzu_test_echo_budget_fail_"};
+    auto db = open_budget_db(tmp);
+    seed_hourly_span(db, "tcp", 3000, kBudgetNow - 120 * 3600, kBudgetNow);
+    seed_hourly_span(db, "module", 1000, kBudgetNow - 120 * 3600, kBudgetNow);
+    const int64_t tcp_recent = hourly_recent(db, "tcp");
+    const int64_t module_recent = hourly_recent(db, "module");
+
+    SECTION("a candidate table that is gone") {
+        REQUIRE(db.execute_sql("DROP TABLE module_hourly_r"));
+        const auto res = run_budget(db, kBudgetNow, 0, kAlwaysTime);
+        CHECK(res.failed);
+        CHECK_FALSE(res.exhausted); // the dropped table may still have held eligible rows
+        CHECK_FALSE(res.deadline_hit);
+        // One broken table must not stop eviction from the healthy one.
+        CHECK(res.evicted_hourly > 0);
+        CHECK(scalar(db, "SELECT COUNT(*) FROM tcp_hourly") == tcp_recent);
+    }
+    SECTION("a delete that errors part-way") {
+        REQUIRE(db.execute_sql(
+            "CREATE TRIGGER yuzu_test_block BEFORE DELETE ON tcp_hourly_r WHEN OLD.remote_port = 7 "
+            "BEGIN SELECT RAISE(ABORT, 'blocked'); END"));
+        const auto res = run_budget(db, kBudgetNow, 0, kAlwaysTime);
+        CHECK(res.failed);
+        CHECK_FALSE(res.exhausted);
+        CHECK(scalar(db, "SELECT COUNT(*) FROM tcp_hourly") == 3000); // the failed batch rolled back
+        // module carried on; the persisted counter is exactly what its batches returned.
+        CHECK(res.evicted_hourly > 0);
+        CHECK(scalar(db, "SELECT COUNT(*) FROM module_hourly") == module_recent);
+        CHECK(db.get_config("budget_evicted_hourly_rows_total", "none") == std::to_string(res.evicted_hourly));
+    }
+    SECTION("nothing wrong") { // the positive control for the two sections above
+        const auto res = run_budget(db, kBudgetNow, 0, kAlwaysTime);
+        CHECK_FALSE(res.failed);
+        CHECK(res.exhausted);
+        CHECK(scalar(db, "SELECT COUNT(*) FROM tcp_hourly") == tcp_recent);
+        CHECK(scalar(db, "SELECT COUNT(*) FROM module_hourly") == module_recent);
+    }
+}
+
+TEST_CASE("run_budget: a clock excursion leaves no state that weakens a floor",
+          "[echo][aggregator][budget][chaos]") {
+    yuzu::test::TempDbFile tmp{"yuzu_test_echo_budget_clock_"};
+    auto db = open_budget_db(tmp);
+    seed_hourly_span(db, "tcp", 3000, kBudgetNow - 72 * 3600, kBudgetNow);
+    const int64_t rows = scalar(db, "SELECT COUNT(*) FROM tcp_hourly");
+
+    SECTION("an implausible clock fails the pass and evicts nothing") {
+        const int64_t crazy = std::numeric_limits<int64_t>::max() / 4 + 1;
+        REQUIRE(crazy > kEchoMaxPlausibleNow);
+        const auto res = run_budget(db, crazy, 0, kAlwaysTime);
+        CHECK(res.failed);
+        CHECK_FALSE(res.exhausted);
+        CHECK(res.evicted_hourly == 0);
+        CHECK(scalar(db, "SELECT COUNT(*) FROM tcp_hourly") == rows);
+        // Positive control: the same data under a sane clock evicts.
+        CHECK(run_budget(db, kBudgetNow, 0, kAlwaysTime).evicted_hourly > 0);
+    }
+    SECTION("the largest plausible clock is still honoured") {
+        CHECK_FALSE(run_budget(db, kEchoMaxPlausibleNow, 0, kAlwaysTime).failed);
+    }
+}
+
+TEST_CASE("run_budget: procperf_hourly keeps the hours the app-perf sync still re-sends",
+          "[echo][aggregator][budget][chaos]") {
+    yuzu::test::TempDbFile tmp{"yuzu_test_echo_budget_procperf_"};
+    auto db = open_budget_db(tmp);
+    // Hourly rows 3 d old (outside the 48 h floor every other source gets) for tcp and
+    // procperf, plus procperf rows 6 d old, which are past its own 5 d floor.
+    const int64_t three_days = kBudgetNow - 3 * 86400;
+    const int64_t six_days = kBudgetNow - 6 * 86400;
+    seed_hourly_span(db, "tcp", 24, three_days - 23 * 3600, three_days);
+    seed_hourly_span(db, "procperf", 24, three_days - 23 * 3600, three_days);
+    seed_hourly_span(db, "procperf", 20, six_days - 19 * 3600, six_days);
+
+    const auto res = run_budget(db, kBudgetNow, /*target=*/0, kAlwaysTime);
+    REQUIRE_FALSE(res.failed);
+    CHECK(res.exhausted);
+    CHECK(scalar(db, "SELECT COUNT(*) FROM tcp_hourly") == 0); // 3 d old: past the 48 h floor
+    CHECK(scalar(db, std::format("SELECT COUNT(*) FROM procperf_hourly WHERE hour_ts >= {}",
+                                 kBudgetNow - kBudgetProcPerfHourlyFloorSec)) == 24);
+    CHECK(scalar(db, std::format("SELECT COUNT(*) FROM procperf_hourly WHERE hour_ts < {}",
+                                 kBudgetNow - kBudgetProcPerfHourlyFloorSec)) == 0);
+}
+
+TEST_CASE("run_budget: eviction counters accumulate across passes batch by batch",
+          "[echo][aggregator][budget]") {
+    yuzu::test::TempDbFile tmp{"yuzu_test_echo_budget_counters_"};
+    auto db = open_budget_db(tmp);
+    seed_hourly_span(db, "tcp", 12000, kBudgetNow - 120 * 3600, kBudgetNow);
+    const int64_t d0 = db.storage_bytes().data_bytes();
+    const auto a = run_budget(db, kBudgetNow, d0 - 32 * 1024, kAlwaysTime);
+    REQUIRE_FALSE(a.failed);
+    const auto b = run_budget(db, kBudgetNow, db.storage_bytes().data_bytes() - 32 * 1024, kAlwaysTime);
+    REQUIRE_FALSE(b.failed);
+    REQUIRE(a.evicted_hourly > 0);
+    REQUIRE(b.evicted_hourly > 0);
+    CHECK(db.get_config("budget_evicted_hourly_rows_total", "") == std::to_string(a.evicted_hourly + b.evicted_hourly));
+    CHECK(scalar(db, "SELECT COUNT(*) FROM tcp_hourly") == 12000 - a.evicted_hourly - b.evicted_hourly);
+}
+
+TEST_CASE("wal_file_bytes: absent is 0; a file is its size; anything unreadable is a "
+          "failed measurement",
+          "[echo][aggregator][budget][chaos]") {
+    // #6889 review B6: an unreadable log used to count as zero bytes, which reads as "within budget".
+    yuzu::test::TempDir dir{"yuzu_test_echo_wal_size_"};
+    std::error_code ec;
+    fs::create_directories(dir.path, ec);
+    const auto main = dir.path / "e.db";
+    const auto wal = fs::path{main.string() + "-wal"};
+    CHECK(wal_file_bytes(main) == std::optional<std::int64_t>{0}); // no log at all
+    {
+        std::ofstream out(wal, std::ios::binary);
+        out << "abc";
+    }
+    CHECK(wal_file_bytes(main) == std::optional<std::int64_t>{3});
+    fs::remove(wal, ec);
+    REQUIRE(fs::create_directory(wal)); // present, but not a file
+    CHECK_FALSE(wal_file_bytes(main).has_value());
+}
+
+#ifndef _WIN32
+TEST_CASE("storage_bytes and run_budget: an unreadable log fails the measurement and "
+          "never reads as empty",
+          "[echo][aggregator][budget][chaos]") {
+    yuzu::test::TempDbFile tmp{"yuzu_test_echo_budget_walfail_"};
+    auto db = open_budget_db(tmp);
+    seed_hourly_span(db, "tcp", 3000, kBudgetNow - 120 * 3600, kBudgetNow);
+    const auto wal = fs::path{tmp.path.string() + "-wal"};
+    const auto away = fs::path{wal.string() + ".away"};
+    REQUIRE(fs::exists(wal));
+    CHECK(db.storage_bytes().ok);
+
+    // The open connection keeps the log through its descriptor; put a directory at the path.
+    fs::rename(wal, away);
+    REQUIRE(fs::create_directory(wal));
+    CHECK_FALSE(db.storage_bytes().ok);
+    const auto res = run_budget(db, kBudgetNow, /*target=*/0, kAlwaysTime);
+    CHECK(res.failed);
+    CHECK(res.evicted_hourly == 0);
+    CHECK(scalar(db, "SELECT COUNT(*) FROM tcp_hourly") == 3000);
+
+    fs::remove(wal);
+    fs::rename(away, wal);
+    CHECK(db.storage_bytes().ok);
+    CHECK(run_budget(db, kBudgetNow, 0, kAlwaysTime).evicted_hourly > 0); // positive control
+}
+#endif
+
+TEST_CASE("budget_rank_probe_sql ranks by two index searches, never a scan", "[echo][aggregator][budget]") {
+    yuzu::test::TempDbFile tmp{"yuzu_test_echo_budget_plan_"};
+    auto db = open_budget_db(tmp);
+    for (const char* table : {"tcp_hourly_r", "process_hourly_r"}) {
+        auto plan = db.execute_query("EXPLAIN QUERY PLAN " + budget_rank_probe_sql(table), 50);
+        REQUIRE(plan.has_value());
+        REQUIRE_FALSE(plan->rows.empty());
+        bool searched = false;
+        for (const auto& row : plan->rows) {
+            const std::string& detail = row.back();
+            INFO(table << ": " << detail);
+            // The outer SELECT has no FROM and plans as "SCAN CONSTANT ROW"; a scan of the
+            // table itself would plan as "SCAN <table>".
+            CHECK(detail.find(std::string{"SCAN "} + table) == std::string::npos);
+            CHECK((detail.find("SCAN") == std::string::npos || detail == "SCAN CONSTANT ROW"));
+            searched = searched || detail.find(std::string{"SEARCH "} + table) != std::string::npos;
+        }
+        CHECK(searched);
+    }
+    // An empty table ranks 0, not NULL.
+    CHECK(scalar(db, budget_rank_probe_sql("tcp_hourly_r")) == 0);
+    seed_hourly_span(db, "tcp", 10, 1000, 2000);
+    CHECK(scalar(db, budget_rank_probe_sql("tcp_hourly_r")) == 10);
+}
+
+TEST_CASE("budget: a reader that pins the WAL makes the checkpoint report busy, and the overage clears after it",
+          "[echo][aggregator][budget]") {
+    yuzu::test::TempDbFile tmp{"yuzu_test_echo_budget_pinned_"};
+    auto db = open_budget_db(tmp);
+    seed_hourly_span(db, "tcp", 100, 1000, 2000);
+    (void)db.checkpoint(CheckpointMode::kTruncate);
+
+    yuzu::test::SqliteHandleOwner<sqlite3> reader;
+    REQUIRE(sqlite3_open(tmp.path.string().c_str(), &reader.db) == SQLITE_OK);
+    // An explicit read transaction: it holds its WAL snapshot until it ends.
+    REQUIRE(sqlite3_exec(reader.db, "BEGIN; SELECT COUNT(*) FROM tcp_hourly;", nullptr, nullptr, nullptr) ==
+            SQLITE_OK);
+
+    // A write burst larger than the WAL allowance lands while the reader is pinned. The disk
+    // cost is the point of the case: the WAL has to outgrow the production 16 MiB allowance for
+    // "busy, not reclaimed" to mean anything. Twenty ~1 MiB rows get there with the fewest rows.
+    REQUIRE(db.execute_sql(
+        "WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i+1 FROM n WHERE i < 19) "
+        "INSERT INTO echo_config (key, value) SELECT 'yuzu_test_pad' || i, hex(zeroblob(524288)) FROM n"));
+    const auto pinned = db.storage_bytes();
+    REQUIRE(pinned.wal_bytes > kEchoWalAllowanceBytes);
+
+    // Busy comes back instead of a wait: the pass must not sleep out the 5 s busy timeout with
+    // the database lock held. The deterministic proof is the result plus the timeout being put
+    // back after the call (it is dropped to 0 inside), not a clock reading.
+    CHECK(db.checkpoint(CheckpointMode::kTruncate) == CheckpointResult::kBusy);
+    CHECK(scalar(db, "PRAGMA busy_timeout") == 5000);
+    CHECK(db.storage_bytes().wal_bytes >= pinned.wal_bytes); // nothing was reclaimed
+
+    // The budget is hard for data pages and soft for the WAL: with the WAL pinned, data + WAL is
+    // over a budget between the two, and the overage is reported, not hidden.
+    const int64_t budget = pinned.data_bytes() + kEchoWalAllowanceBytes;
+    CHECK(budget_over_bytes(pinned.data_bytes(), pinned.wal_bytes, budget) > 0);
+
+    // An eviction pass must not keep committing batches the pinned log cannot recycle: it stops
+    // after the batch that observed the WAL over its allowance -- not exhausted, no deadline, so
+    // no catch-up is armed -- and the next maintenance pass retries once the reader is gone.
+    seed_hourly_span(db, "tcp", 8000, kBudgetNow - 120 * 3600, kBudgetNow - 60 * 3600);
+    const auto paused = run_budget(db, kBudgetNow, /*target=*/0, kAlwaysTime);
+    CHECK_FALSE(paused.failed);
+    CHECK_FALSE(paused.exhausted);
+    CHECK_FALSE(paused.deadline_hit);
+    CHECK(paused.evicted_hourly == kBudgetBatchRows);
+
+    // After the reader ends, the next pass truncates the WAL and the overage returns to 0.
+    REQUIRE(sqlite3_exec(reader.db, "ROLLBACK", nullptr, nullptr, nullptr) == SQLITE_OK);
+    CHECK(db.checkpoint(CheckpointMode::kTruncate) == CheckpointResult::kOk);
+    CHECK(scalar(db, "PRAGMA busy_timeout") == 5000);
+    const auto after = db.storage_bytes();
+    CHECK(after.wal_bytes == 0);
+    CHECK(budget_over_bytes(after.data_bytes(), after.wal_bytes, budget) == 0);
+}
+
+namespace {
+
+constexpr int64_t kMiB = 1024 * 1024;
+
+// A database that should convert: not yet incremental, under target, a large freelist, plenty of
+// free disk, no deferral recorded. Each case below changes ONE named input.
+VacuumInputs vacuum_base() {
+    return VacuumInputs{.auto_vacuum = 0,
+                        .data_bytes = 200 * kMiB,
+                        .target_bytes = 234 * kMiB,
+                        .freelist_bytes = 500 * kMiB,
+                        .file_bytes = 1000 * kMiB,
+                        .free_disk_bytes = 400 * kMiB, // exactly 2x the used data
+                        .deferred_at = 0,
+                        .now = 1'700'000'000,
+                        .eviction_exhausted = false};
+}
+
+VacuumAction vacuum_with(const std::function<void(VacuumInputs&)>& change) {
+    VacuumInputs in = vacuum_base();
+    change(in);
+    return vacuum_decision(in);
+}
+
+} // namespace
+
+TEST_CASE("vacuum_decision: run only when every condition holds", "[echo][aggregator][budget]") {
+    const auto base = vacuum_base();
+    CHECK(vacuum_decision(base) == VacuumAction::kRun);
+    CHECK(vacuum_with([](auto& v) { v.auto_vacuum = 2; }) == VacuumAction::kSkip); // already incremental
+    CHECK(vacuum_with([&](auto& v) { v.data_bytes = v.target_bytes + 1; }) == VacuumAction::kSkip); // not yet under target
+    CHECK(vacuum_with([](auto& v) { v.freelist_bytes = 10 * kMiB; }) == VacuumAction::kSkip);  // small freelist
+    CHECK(vacuum_with([](auto& v) { v.freelist_bytes = 200 * kMiB; }) == VacuumAction::kSkip); // < a quarter of the file
+    CHECK(vacuum_with([](auto& v) { v.freelist_bytes = 250 * kMiB; }) == VacuumAction::kRun);  // exactly a quarter
+    CHECK(vacuum_with([](auto& v) { v.free_disk_bytes -= 1; }) == VacuumAction::kDefer);       // free disk < 2x data
+    CHECK(vacuum_with([&](auto& v) { v.deferred_at = v.now - 3600; }) == VacuumAction::kSkip); // deferred < 24 h ago
+    CHECK(vacuum_with([&](auto& v) {
+              v.deferred_at = v.now - 3600;
+              v.free_disk_bytes -= 1;
+          }) == VacuumAction::kSkip); // still short: retry daily
+    CHECK(vacuum_with([&](auto& v) { v.deferred_at = v.now - 86400; }) == VacuumAction::kRun); // a day later
+    CHECK(vacuum_with([&](auto& v) {
+              v.deferred_at = v.now - 86400;
+              v.free_disk_bytes -= 1;
+          }) == VacuumAction::kDefer);
+    CHECK(vacuum_with([&](auto& v) { v.deferred_at = v.now - 86399; }) == VacuumAction::kSkip); // one second short
+    // A small file needs the 32 MiB freelist floor, not a quarter.
+    const auto small_file = [](int64_t freelist, int64_t file) {
+        return vacuum_with([&](auto& v) {
+            v.data_bytes = 10 * kMiB;
+            v.target_bytes = 100 * kMiB;
+            v.freelist_bytes = freelist;
+            v.file_bytes = file;
+            v.free_disk_bytes = 1000 * kMiB;
+        });
+    };
+    CHECK(small_file(20 * kMiB, 40 * kMiB) == VacuumAction::kSkip);
+    CHECK(small_file(32 * kMiB, 100 * kMiB) == VacuumAction::kRun);
+}
+
+TEST_CASE("vacuum_decision: a deferral marker ahead of the clock is stale, not recent",
+          "[echo][aggregator][budget][chaos]") {
+    // A marker written during a forward clock excursion has a NEGATIVE age once the clock
+    // corrects; read as "deferred recently" it would hold the conversion off until the clock
+    // catches up to it (up to a year, or for ever at INT64_MAX).
+    const auto decide = [&](int64_t deferred_at, int64_t free_disk) {
+        return vacuum_with([&](auto& v) {
+            v.deferred_at = deferred_at;
+            v.free_disk_bytes = free_disk;
+        });
+    };
+    const auto now = vacuum_base().now;
+    constexpr int64_t kDisk = 400 * kMiB;
+    for (const int64_t at : {int64_t{0}, now - 86401, now + 1, now + 365 * 86400,
+                             std::numeric_limits<int64_t>::max()}) {
+        INFO("deferred_at = " << at);
+        CHECK(decide(at, kDisk) == VacuumAction::kRun);
+        CHECK(decide(at, kDisk - 1) == VacuumAction::kDefer); // still gated by the disk check
+    }
+    CHECK(decide(now - 86399, kDisk) == VacuumAction::kSkip); // a genuinely recent marker holds
+    CHECK(decide(now, kDisk) == VacuumAction::kSkip);         // recorded this very second
+}
+
+TEST_CASE("deferred_marker_reading: a failed-write copy outranks an older stored marker",
+          "[echo][aggregator][budget][chaos]") {
+    // After a failed marker write the persisted value can only be older than the in-memory
+    // attempt time. A stale positive stored marker must not hide it, or a database that cannot
+    // store the marker repeats a failed conversion every maintenance pass instead of daily.
+    constexpr int64_t kT = 1'700'000'000;
+    const auto decide = [&](int64_t stored, int64_t copy, int64_t now) {
+        return vacuum_with([&](auto& v) {
+            v.deferred_at = deferred_marker_reading(stored, copy);
+            v.now = now;
+        });
+    };
+    // The attempt at kT failed to persist over an expired stored marker; the next pass is 900 s on.
+    CHECK(decide(kT - 86401, kT, kT + 900) == VacuumAction::kSkip);
+    // Controls: the expired stored marker alone re-admits; a stored marker of kT holds.
+    CHECK(decide(kT - 86401, 0, kT + 900) == VacuumAction::kRun);
+    CHECK(decide(kT, 0, kT + 900) == VacuumAction::kSkip);
+    // A stored marker AHEAD of the clock (a forward excursion) must not outrank a sane copy:
+    // max() would pick it, vacuum_decision would discard it as stale, and every pass would run.
+    CHECK(decide(kT + 365 * 86400, kT, kT + 900) == VacuumAction::kSkip);
+    CHECK(decide(kT + 365 * 86400, 0, kT + 900) == VacuumAction::kRun);
+    // The copy is held for a day, then the conversion is retried.
+    CHECK(decide(kT - 86401, kT, kT + 86400) == VacuumAction::kRun);
+    // The precedence itself.
+    CHECK(deferred_marker_reading(0, 0) == 0);
+    CHECK(deferred_marker_reading(5, 0) == 5);
+    CHECK(deferred_marker_reading(0, 7) == 7);
+    CHECK(deferred_marker_reading(5, 7) == 7);
+    CHECK(deferred_marker_reading(9, 7) == 7);
+}
+
+TEST_CASE("vacuum_decision: exhausted eviction above target no longer blocks the conversion",
+          "[echo][aggregator][budget][chaos]") {
+    // 300 MiB of used data against a 234 MiB target, none of it evictable (the newest 48 h, the
+    // paused sources): waiting for the data to drop under target waits for ever, so the file keeps
+    // its 2 GiB freelist. Once eviction reports it has nothing left, the conversion may run.
+    const auto decide = [&](int64_t av, int64_t free_disk, bool exhausted) {
+        return vacuum_with([&](auto& v) {
+            v.auto_vacuum = av;
+            v.data_bytes = 300 * kMiB;
+            v.freelist_bytes = 2048 * kMiB;
+            v.file_bytes = 2355 * kMiB;
+            v.free_disk_bytes = free_disk;
+            v.eviction_exhausted = exhausted;
+        });
+    };
+    constexpr int64_t kDisk = 10240 * kMiB;
+    CHECK(decide(0, kDisk, false) == VacuumAction::kSkip);          // eviction may still shrink it
+    CHECK(decide(0, kDisk, true) == VacuumAction::kRun);            // nothing left to evict
+    CHECK(decide(0, 500 * kMiB, true) == VacuumAction::kDefer);     // the 2x free-disk gate stands
+    CHECK(decide(2, kDisk, true) == VacuumAction::kSkip);           // already incremental
+    // Under target the flag is irrelevant.
+    CHECK(vacuum_with([](auto& v) {
+              v.freelist_bytes = 2048 * kMiB;
+              v.file_bytes = 2355 * kMiB;
+          }) == VacuumAction::kRun);
+}
+
+TEST_CASE("parse_budget_bytes accepts whole bytes at or above the minimum only",
+          "[echo][aggregator][budget]") {
+    CHECK_FALSE(parse_budget_bytes("33554431").has_value());
+    CHECK_FALSE(parse_budget_bytes("-1").has_value());
+    CHECK_FALSE(parse_budget_bytes("1e9").has_value());
+    CHECK_FALSE(parse_budget_bytes("32MiB").has_value());
+    CHECK_FALSE(parse_budget_bytes("").has_value());
+    CHECK_FALSE(parse_budget_bytes("+33554432").has_value());
+    CHECK_FALSE(parse_budget_bytes(" 33554432").has_value());
+    CHECK_FALSE(parse_budget_bytes("33554432.0").has_value());
+    CHECK_FALSE(parse_budget_bytes("99999999999999999999").has_value()); // overflows int64
+    CHECK_FALSE(parse_budget_bytes("9223372036854775808").has_value());
+    REQUIRE(parse_budget_bytes("33554432").has_value());
+    CHECK(*parse_budget_bytes("33554432") == 33554432);
+    REQUIRE(parse_budget_bytes("262144000").has_value());
+    CHECK(*parse_budget_bytes("262144000") == kEchoDbBudgetBytesDefault);
+    CHECK(*parse_budget_bytes("9223372036854775807") == INT64_MAX);
+    CHECK(kEchoDbBudgetBytesMin == 33554432);
+}
+
+TEST_CASE("budget_from_config: an unreadable or unusable setting is unknown and never the default",
+          "[echo][aggregator][budget][chaos]") {
+    using Stored = std::expected<std::optional<std::string>, std::string>;
+    const auto present = [](std::string v) { return Stored{std::optional<std::string>{std::move(v)}}; };
+    // The read FAILED: the caller must skip the pass, because substituting 250 MiB for a raised
+    // budget would delete down to the smaller target.
+    const Stored failed{std::unexpected(std::string{"disk I/O error"})};
+    CHECK_FALSE(budget_from_config(failed).has_value());
+    CHECK_FALSE(budget_setting_invalid(failed)); // a failed read is not an invalid setting
+    // Read fine, nothing stored (never configured): the default.
+    const Stored absent{std::optional<std::string>{}};
+    REQUIRE(budget_from_config(absent).has_value());
+    CHECK(*budget_from_config(absent) == kEchoDbBudgetBytesDefault);
+    CHECK_FALSE(budget_setting_invalid(absent));
+    // Stored, but edited outside the plugin into something unusable (#6900): unknown as well. A
+    // row damaged or hand-edited says nothing about the operator's intent, so the pass is skipped
+    // rather than deleting down to a default nobody chose.
+    for (const char* bad : {"abc", "33554431", "", "-1", "1e9", "32MiB", " 33554432", "33554432 ",
+                            "+33554432", "9223372036854775808"}) {
+        INFO("stored = '" << bad << "'");
+        CHECK_FALSE(budget_from_config(present(bad)).has_value());
+        CHECK(budget_setting_invalid(present(bad)));
+    }
+    // A valid stored value is itself.
+    REQUIRE(budget_from_config(present("1073741824")).has_value());
+    CHECK(*budget_from_config(present("1073741824")) == 1073741824);
+    CHECK(*budget_from_config(present("33554432")) == kEchoDbBudgetBytesMin);
+    CHECK_FALSE(budget_setting_invalid(present("1073741824")));
+    CHECK_FALSE(budget_setting_invalid(present("33554432")));
+}
+
+TEST_CASE("budget eligibility: the evictable source set is pinned so a new source is a decision",
+          "[echo][aggregator][budget]") {
+    // Drift guard, like the #538 diff_state_key guard: eligibility is derived from the roll-up
+    // declarations, so a new capture source with an hourly tier would become evictable the day it
+    // is registered. Pin the set to a literal so adding one fails here and forces the choice. The
+    // usage tables are the usage fold's own state, not a roll-up tier, and are never listed.
+    const auto sorted = [](std::vector<std::string> v) {
+        std::sort(v.begin(), v.end());
+        return v;
+    };
+    CHECK(sorted(budget_hourly_eligible_sources()) ==
+          sorted({"process", "tcp", "service", "user", "perf", "procperf", "netqual", "module",
+                  "software", "arp", "dns", "netconn", "mapdrive", "power", "removable",
+                  "registry"}));
+}
+
+// ── #3864: the process baseline holds no command line ─────────────────────────
+
+namespace {
+
+yuzu::agent::ProcessInfo make_proc(uint32_t pid, uint32_t ppid, std::string name, std::string cmdline,
+                                   std::string user) {
+    yuzu::agent::ProcessInfo p;
+    p.pid = pid;
+    p.ppid = ppid;
+    p.name = std::move(name);
+    p.cmdline = std::move(cmdline);
+    p.user = std::move(user);
+    return p;
+}
+
+// Synthetic credential-bearing command line.
+constexpr const char* kSecretCmdline = "psql postgresql://user:S3cret@db";
+
+// What an earlier build wrote: the same array plus a `cmdline` key per entry.
+const std::string kLegacyBaseline =
+    R"([{"pid":10,"ppid":1,"name":"psql","cmdline":"psql postgresql://user:S3cret@db","user":"svc"},)"
+    R"({"pid":11,"ppid":1,"name":"sshd","cmdline":"sshd -D","user":"root"}])";
+
+} // namespace
+
+TEST_CASE("process baseline: encode carries neither the command line nor a cmdline key",
+          "[echo][aggregator][process-baseline]") {
+    const auto json = encode_process_baseline({make_proc(10, 1, "psql", kSecretCmdline, "svc")});
+    CHECK(json.find("S3cret") == std::string::npos);
+    CHECK(json.find("cmdline") == std::string::npos);
+    CHECK(json.find("psql") != std::string::npos); // the name is kept
+}
+
+TEST_CASE("process baseline: round trip keeps pid, ppid, name and user, with an empty cmdline",
+          "[echo][aggregator][process-baseline]") {
+    const auto back = decode_process_baseline(
+        encode_process_baseline({make_proc(10, 1, "psql", kSecretCmdline, "svc")}));
+    REQUIRE(back.size() == 1);
+    CHECK(back[0].pid == 10);
+    CHECK(back[0].ppid == 1);
+    CHECK(back[0].name == "psql");
+    CHECK(back[0].user == "svc");
+    CHECK(back[0].cmdline.empty());
+}
+
+TEST_CASE("process baseline: decode never reads the cmdline of a legacy row",
+          "[echo][aggregator][process-baseline]") {
+    const auto back = decode_process_baseline(kLegacyBaseline);
+    REQUIRE(back.size() == 2);
+    CHECK(back[0].name == "psql");
+    CHECK(back[0].cmdline.empty());
+    CHECK(back[1].cmdline.empty());
+    CHECK(decode_process_baseline("").empty());
+    CHECK(decode_process_baseline("not json").empty());
+}
+
+TEST_CASE("process baseline: the diff over a decoded baseline matches the diff over the original",
+          "[echo][aggregator][process-baseline]") {
+    const std::vector<yuzu::agent::ProcessInfo> previous{make_proc(10, 1, "psql", kSecretCmdline, "svc"),
+                                                         make_proc(11, 1, "sshd", "sshd -D", "root"),
+                                                         make_proc(12, 1, "old", "old --x", "u")};
+    const std::vector<yuzu::agent::ProcessInfo> current{make_proc(10, 1, "psql", kSecretCmdline, "svc"),
+                                                        make_proc(11, 1, "sshd", "sshd -D", "root"),
+                                                        make_proc(13, 1, "new", "new --y", "u")};
+
+    const auto direct = compute_process_events(previous, current, 100, 1);
+    const auto via_baseline =
+        compute_process_events(decode_process_baseline(encode_process_baseline(previous)), current, 100, 1);
+
+    const auto key = [](const std::vector<ProcessEvent>& evs) {
+        std::set<std::pair<std::string, uint32_t>> k;
+        for (const auto& e : evs)
+            k.emplace(e.action, e.pid);
+        return k;
+    };
+    CHECK(key(direct) == key(via_baseline));
+    CHECK(key(via_baseline) ==
+          std::set<std::pair<std::string, uint32_t>>{{"started", 13u}, {"stopped", 12u}});
+}
+
+TEST_CASE("process baseline: scrub rewrites a legacy row once and is then a no-op",
+          "[echo][aggregator][process-baseline]") {
+    yuzu::test::TempDbFile tmp{std::string_view{"yuzu_test_echo_pbscrub_"}};
+    auto opened = yuzu::test::open_echo_db(tmp.path);
+    REQUIRE(opened.has_value());
+    EchoDatabase db = std::move(*opened);
+
+    // No row: nothing written.
+    CHECK_FALSE(scrub_process_baseline(db));
+    CHECK(db.get_state("process").empty());
+
+    REQUIRE(db.set_state("process", kLegacyBaseline));
+    CHECK(scrub_process_baseline(db));
+    const auto cleaned = db.get_state("process");
+    CHECK(cleaned.find("S3cret") == std::string::npos);
+    CHECK(cleaned.find("cmdline") == std::string::npos);
+    CHECK(decode_process_baseline(cleaned).size() == 2);
+
+    // Second call: already clean, row byte-identical.
+    CHECK_FALSE(scrub_process_baseline(db));
+    CHECK(db.get_state("process") == cleaned);
+}
+
+TEST_CASE("process baseline: a scrub that cannot write leaves the row and succeeds on a later start",
+          "[echo][aggregator][process-baseline]") {
+    yuzu::test::TempDbFile tmp{std::string_view{"yuzu_test_echo_pbscrub_fault_"}};
+    auto opened = yuzu::test::open_echo_db(tmp.path);
+    REQUIRE(opened.has_value());
+    EchoDatabase db = std::move(*opened);
+    REQUIRE(db.set_state("process", kLegacyBaseline));
+
+    // A store fault from a second connection: writes to echo_state fail at step, reads still work.
+    const auto exec = [&](const char* sql) {
+        yuzu::test::SqliteHandleOwner<sqlite3> owner;
+        REQUIRE(sqlite3_open(tmp.path.string().c_str(), &owner.db) == SQLITE_OK);
+        sqlite3_busy_timeout(owner.db, 5000);
+        REQUIRE(sqlite3_exec(owner.db, sql, nullptr, nullptr, nullptr) == SQLITE_OK);
+    };
+    exec("CREATE TRIGGER yuzu_test_state_fault BEFORE INSERT ON echo_state "
+         "BEGIN SELECT RAISE(FAIL, 'store fault'); END;");
+    CHECK_FALSE(scrub_process_baseline(db));
+    CHECK(db.get_state("process") == kLegacyBaseline); // the disclosed residual: unchanged
+
+    exec("DROP TRIGGER yuzu_test_state_fault;");
+    CHECK(scrub_process_baseline(db)); // the next start
+    CHECK(db.get_state("process").find("S3cret") == std::string::npos);
+}
+
+TEST_CASE("scrub_wire_strings(ProcessInfo) scrubs the command line too (fleet snapshot)",
+          "[echo][aggregator][process-baseline]") {
+    auto p = make_proc(1, 0, "n\xff", "a\xff", "u\xff");
+    scrub_wire_strings(p);
+    CHECK(p.name == "n?");
+    CHECK(p.user == "u?");
+    CHECK(p.cmdline == "a?");
+}
+
+// F16: a process name is attacker-chosen bytes. Strict nlohmann dump() throws type_error 316 on
+// invalid UTF-8, which aborted every collect_fast tick; the baseline must serialise regardless.
+TEST_CASE("process baseline: invalid UTF-8 in a name does not throw on encode (F16)",
+          "[echo][aggregator][process-baseline]") {
+    const auto bad = make_proc(10, 1, std::string("ev\xFF\xC3il"), "", "svc");
+    std::string json;
+    REQUIRE_NOTHROW(json = encode_process_baseline({bad}));
+    CHECK_FALSE(decode_process_baseline(json).empty());
+}
+
+#if defined(__linux__) || defined(__APPLE__)
+TEST_CASE("parse_proc_status: a non-UTF-8 process name is scrubbed at collection (F16)",
+          "[echo][aggregator][process-baseline]") {
+    std::istringstream in(std::string("Name:\tev\xFF\xC3il\nPPid:\t1\nUid:\t0\t0\t0\t0\n"));
+    yuzu::agent::ProcessInfo pi;
+    yuzu::agent::detail::parse_proc_status(in, pi);
+    CHECK(pi.name == "ev??il");
+}
+#endif
+
+// ── F16 follow-up: an invalid byte must not fabricate events every tick ──────────────────────
+// Baselines are stored via dump(replace) (bad byte -> U+FFFD) but the next enumeration holds the
+// RAW bytes, so a name-keyed diff never matched and emitted a pair per tick. Scrubbing the
+// enumerated set at collection makes the dump lossless; each source must then diff to ZERO.
+namespace {
+constexpr const char* kBadName = "ev\xFF\xC3il";
+} // namespace
+
+TEST_CASE("echo no-phantom: process names round-trip to zero events (F16)",
+          "[echo][aggregator][process-baseline][phantom]") {
+    auto cur = std::vector{make_proc(10, 1, kBadName, "", "svc")};
+    // The failure mode this guards: the decoded baseline (U+FFFD) vs the RAW current.
+    CHECK_FALSE(compute_process_events(decode_process_baseline(encode_process_baseline(cur)), cur,
+                                       1, 1).empty());
+    scrub_wire_strings(cur); // what collection does
+    CHECK(compute_process_events(decode_process_baseline(encode_process_baseline(cur)), cur, 1, 1)
+              .empty());
+    CHECK(cur[0].name.find('?') != std::string::npos);
+}
+
+TEST_CASE("echo no-phantom: software baseline round-trips to zero events (F16)",
+          "[echo][aggregator][software][phantom]") {
+    std::vector<SoftwareInfo> raw{{kBadName, "1.0", "pub", "20260101"}};
+    const auto seed = software_collect_core("", raw, 1, 1);
+    REQUIRE(seed.kind == SoftwareCollectResult::Kind::kColdStartSeed);
+    const auto next = software_collect_core(seed.new_state_json, raw, 2, 2);
+    REQUIRE(next.kind == SoftwareCollectResult::Kind::kSteady);
+    CHECK(next.events.empty());
+}
+
+TEST_CASE("echo no-phantom: every keyed source's strings survive dump(replace) unchanged (F16)",
+          "[echo][aggregator][phantom]") {
+    const auto lossless = [](const std::string& s) {
+        // strict dump() throws on invalid UTF-8; replace would alter it. Both must be a no-op.
+        std::string strict;
+        REQUIRE_NOTHROW(strict = nlohmann::json(s).dump());
+        return strict == nlohmann::json(s).dump(-1, ' ', false,
+                                               nlohmann::json::error_handler_t::replace);
+    };
+    const std::string bad = kBadName;
+    std::vector<NetConnection> net(1);
+    net[0].proto = net[0].local_addr = net[0].remote_addr = net[0].state = net[0].process_name = bad;
+    std::vector<ServiceInfo> svc(1);
+    svc[0].name = svc[0].display_name = svc[0].status = svc[0].startup_type = bad;
+    std::vector<UserSession> usr(1);
+    usr[0].user = usr[0].domain = usr[0].logon_type = usr[0].session_id = bad;
+    std::vector<ArpEntry> arp(1);
+    arp[0].iface = arp[0].ip_address = arp[0].mac_address = arp[0].entry_type = bad;
+    std::vector<DnsEntry> dns(1);
+    dns[0].name = dns[0].record_type = dns[0].data = dns[0].source = bad;
+    std::vector<MapDriveEntry> md(1);
+    md[0].direction = md[0].local_mount = md[0].remote_path = md[0].remote_host = md[0].username =
+        md[0].provider = bad;
+    scrub_wire_strings(net);
+    scrub_wire_strings(svc);
+    scrub_wire_strings(usr);
+    scrub_wire_strings(arp);
+    scrub_wire_strings(dns);
+    scrub_wire_strings(md);
+    for (const auto* f : {&net[0].proto, &net[0].local_addr, &net[0].remote_addr, &net[0].state,
+                          &net[0].process_name, &svc[0].name, &svc[0].display_name, &svc[0].status,
+                          &svc[0].startup_type, &usr[0].user, &usr[0].domain, &usr[0].logon_type,
+                          &usr[0].session_id, &arp[0].iface, &arp[0].ip_address,
+                          &arp[0].mac_address, &arp[0].entry_type, &dns[0].name,
+                          &dns[0].record_type, &dns[0].data, &dns[0].source, &md[0].direction,
+                          &md[0].local_mount, &md[0].remote_path, &md[0].remote_host,
+                          &md[0].username, &md[0].provider}) {
+        CHECK(lossless(*f));
+        CHECK(*f == "ev??il");
+    }
+    // And the diffs of an unchanged set are empty (previous == the lossless baseline).
+    CHECK(compute_service_events(svc, svc, 1, 1).empty());
+    CHECK(compute_user_events(usr, usr, 1, 1).empty());
+    CHECK(compute_arp_events(arp, arp, 1, 1).empty());
+    CHECK(compute_dns_events(dns, dns, 1, 1).empty());
+    CHECK(compute_mapdrive_events(md, md, 1, 1).empty());
+}
+
+// =============================================================================
+// Dictionary sweep schedule
+// =============================================================================
+
+TEST_CASE("dictionary sweep plan: a starved pass waits a day before the next attempt",
+          "[echo][aggregator][dictionary]") {
+    constexpr int64_t kNow = 2'000'000'000;
+    CHECK_FALSE(dict_gc_plan(kNow, 0, kNow - 3600, 1).due);
+    CHECK_FALSE(dict_gc_plan(kNow, 0, kNow - (kDictGcStarvedRetrySec - 1), 1).due);
+    CHECK(dict_gc_plan(kNow, 0, kNow - kDictGcStarvedRetrySec, 1).due);
+    CHECK(dict_gc_plan(kNow, 0, 0, 1).due); // never attempted: unset reads as due
+}
+
+TEST_CASE("dictionary sweep plan: the deadline doubles per starved pass and stops at eight seconds",
+          "[echo][aggregator][dictionary]") {
+    constexpr int64_t kNow = 2'000'000'000;
+    const auto deadline = [&](int64_t streak) {
+        return dict_gc_plan(kNow, 0, 0, streak).deadline.count();
+    };
+    CHECK(deadline(0) == 2);
+    CHECK(deadline(1) == 4);
+    CHECK(deadline(2) == 8);
+    CHECK(deadline(3) == 8);
+    CHECK(deadline(1'000'000) == 8);
+}
+
+TEST_CASE("dictionary sweep plan: a finished pass resets the streak and waits a week",
+          "[echo][aggregator][dictionary]") {
+    constexpr int64_t kNow = 2'000'000'000;
+    // Streak 0 reads only the done marker; a stale attempt marker means nothing.
+    CHECK_FALSE(dict_gc_plan(kNow, kNow - 86400, kNow, 0).due);
+    CHECK_FALSE(dict_gc_plan(kNow, kNow - (kDictGcIntervalSec - 1), 0, 0).due);
+    CHECK(dict_gc_plan(kNow, kNow - kDictGcIntervalSec, 0, 0).due);
+    CHECK(dict_gc_plan(kNow, 0, 0, 0).due); // first ever pass
+}
+
+TEST_CASE("dictionary sweep plan: markers ahead of the clock never postpone a pass",
+          "[echo][aggregator][dictionary]") {
+    constexpr int64_t kNow = 2'000'000'000;
+    CHECK(dict_gc_plan(kNow, kNow + 86400, 0, 0).due);
+    CHECK(dict_gc_plan(kNow, 0, kNow + 86400, 2).due);
 }

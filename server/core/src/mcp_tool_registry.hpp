@@ -286,5 +286,6 @@ std::span<const ToolRecord> discovery_tool_records();
 std::span<const ToolRecord> hardware_tool_records();
 std::span<const ToolRecord> containment_tool_records();
 std::span<const ToolRecord> crypto_tool_records();
+std::span<const ToolRecord> dex_tool_records();
 
 } // namespace yuzu::server::mcp

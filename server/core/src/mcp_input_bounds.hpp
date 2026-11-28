@@ -12,10 +12,12 @@
 #include "bundle_service.hpp"        // kMaxParamCountPerStep / kMaxParamKeyLen / kMaxParamValueLen
                                      // (also kMaxBundleSteps, which the sizing test reaches
                                      // through this header)
+#include "command_capability.hpp"    // parameter_key_well_formed (sg10, UP-1)
 #include "dispatch_target_shape.hpp" // BoundViolation + check_targeting_shape: the
                                      // omitted-vs-supplied rule, shared with the REST
                                      // twins (#2500) because it was never MCP-specific
 #include "mcp_jsonrpc.hpp"           // kMcpMaxRequestBodyBytes, for the sizing static_asserts below
+#include "result_set_matcher.hpp"    // the three matcher field bounds, shared with the REST twin
 
 /// @file mcp_input_bounds.hpp
 /// The ONE home for MCP request-size bounds (#2437) — transport and handler.
@@ -66,10 +68,12 @@ inline constexpr std::size_t kExecInstrParamKeyMaxLen = kMaxParamKeyLen;      //
 /// `docs/user-manual/metrics.md`. The boot pre-seed follows automatically; the
 /// docs copy does not, and a test asserts this array's size so the third copy
 /// cannot be forgotten quietly.
-inline constexpr std::array<std::string_view, 14> kExecInstrBoundReasons{
+inline constexpr std::array<std::string_view, 15> kExecInstrBoundReasons{
     // Length/count bounds.
     "ident_len",       "scope_len",       "param_count",     "param_key_len",
     "param_value_len", "agent_ids_count", "agent_id_len",
+    // sg10 / UP-1: a params key with a control byte or invalid UTF-8, or a NUL value.
+    "param_key_invalid",
     // Targeting shape (#2437 split 3): a type-confused or supplied-but-empty
     // target is REJECTED, never silently dropped and never widened to
     // `__all__`. `ident_empty` subsumes the handler's old bare
@@ -88,9 +92,10 @@ inline constexpr std::array<std::string_view, 14> kExecInstrBoundReasons{
 // approval-gated path - `mcp_server.cpp`'s sole `compiled_input_schemas()
 // .at(tool_name).validate(args)` call site sits inside `requires_approval()`
 // (mcp_policy.hpp), which itself returns false immediately for an EMPTY
-// `mcp_tier` - and `/mcp/v1/`'s `auth_fn` (`require_auth`) admits a plain
+// `mcp_tier` - and `/mcp/v1/`'s `auth_fn` (`require_auth`) then admitted a plain
 // RBAC session or a non-MCP-tiered API token the same way any REST route
-// does, so that caller class never reaches C8 at all, on ANY tool. 11 of the
+// does, so that caller class never reached C8 at all, on ANY tool (since #4309
+// admission refuses an empty tier, mcp_admission.hpp). 11 of the
 // 19 are ALSO never approval-gated even at a non-empty tier; 3
 // (`create_result_set_from_echo_query`, `create_result_set_from_instruction_result`,
 // `reevaluate_result_set`) are approval-gated at supervised tier only, so an
@@ -129,9 +134,11 @@ inline constexpr std::size_t kInventoryQueryFieldMaxLen = 128;    // inventory-q
 inline constexpr std::size_t kInventoryQueryOpMaxLen = 32;        // inventory-query `conditions[].op`
 inline constexpr std::size_t kInventoryQueryValueMaxLen = 512;    // inventory-query `conditions[].value`
 inline constexpr std::size_t kInstructionIdMaxLen = 256;          // from-instruction-result `instruction_id`
-inline constexpr std::size_t kMatcherColumnMaxLen = 128;          // from-instruction-result `matcher.column`
-inline constexpr std::size_t kMatcherOpMaxLen = 32;               // from-instruction-result `matcher.op`
-inline constexpr std::size_t kMatcherValueMaxLen = 512;           // from-instruction-result `matcher.value`
+// from-instruction-result `matcher.column`, `.op` and `.value` (128, 32, 512): the shared admission
+// check's own constants, so the REST twin and this tool's served schema state one set of numbers.
+inline constexpr std::size_t kMatcherColumnMaxLen = rs_matcher::kMatcherColumnMaxBytes;
+inline constexpr std::size_t kMatcherOpMaxLen = rs_matcher::kMatcherOpMaxBytes;
+inline constexpr std::size_t kMatcherValueMaxLen = rs_matcher::kMatcherValueMaxBytes;
 
 /// The 19 of #4353's 20 tools whose schema `maxLength` needed a handler-side
 /// twin (see block above; `unlock_account` is the exception). Single source
@@ -300,6 +307,8 @@ check_exec_instruction_shape(const nlohmann::json& args) {
             return BoundViolation{"param_count",
                                   std::format("params must have at most {} keys",
                                               kExecInstrParamCountMax)};
+        if (auto bad = yuzu::server::check_params_key_shape(p))
+            return bad;
         for (const auto& [k, v] : p.items()) {
             (void)v;
             if (k.size() > kExecInstrParamKeyMaxLen)

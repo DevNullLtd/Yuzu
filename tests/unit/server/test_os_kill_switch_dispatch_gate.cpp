@@ -383,6 +383,28 @@ TEST_CASE("send_to / send_to_all: a per-OS OFF set is enforced at send time for 
     CHECK(registry.drain_gateway_pending().size() == 2);
 }
 
+// #5685 hp-1: send_via_directory now also serves a local session with no delivery path, so the
+// send-time per-OS enforcement `send_to` applies must hold on it too.
+TEST_CASE("send_via_directory enforces the per-OS kill switch for a local session and still "
+          "queues a session-less id (#5685 hp-1 / #5294)",
+          "[server][dispatch][os_kill_switch][ha]") {
+    EventBus bus;
+    yuzu::MetricsRegistry metrics;
+    AgentRegistry registry(bus, metrics);
+    (void)registry.register_agent(make_info("win", "windows"));
+    (void)registry.register_agent(make_info("lin", "linux"));
+
+    const auto off = classified_with_os_off({"windows"});
+    CHECK_FALSE(registry.send_via_directory("win", off, "cluster-b"));
+    CHECK(registry.drain_gateway_pending().empty());
+    CHECK(registry.send_via_directory("lin", off, "cluster-b"));
+    CHECK(registry.send_via_directory("ghost", off, "cluster-b")); // no local session: no local OS
+    const auto pending = registry.drain_gateway_pending();
+    REQUIRE(pending.size() == 2);
+    CHECK(pending[0].agent_id == "lin");
+    CHECK(pending[1].agent_id == "ghost");
+}
+
 TEST_CASE("wire_and_dispatch_confined: an OS-withheld id's per-device claim is released, and a "
           "dispatch after the switch is cleared reaches it",
           "[pg][server][dispatch][os_kill_switch][integration]") {

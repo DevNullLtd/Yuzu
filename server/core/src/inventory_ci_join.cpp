@@ -25,7 +25,38 @@ void attach_device_ci(std::vector<InventoryDeviceRow>& rows,
         row.ci_arch = ci.arch;
         row.ci_domain = ci.domain;
         row.ci_primary_mac = ci.primary_mac;
+        row.ci_chassis_asset_tag = ci.chassis_asset_tag;
+        row.ci_chassis_serial = ci.chassis_serial;
+        row.ci_board_serial = ci.board_serial;
     }
+}
+
+void apply_ci_read(InventoryDevicesResult& result, const CiKeyedReadFn& read) {
+    if (!read) {
+        result.ci_degraded = true; // an unwired store reads as a failed one (CiDetailFn contract)
+        return;
+    }
+    if (result.rows.empty())
+        return; // nothing to enrich: no read, and no degrade to report
+    std::vector<std::string> ids;
+    ids.reserve(result.rows.size());
+    for (const auto& row : result.rows)
+        ids.push_back(row.agent_id);
+    auto records = read(ids);
+    if (!records) {
+        result.ci_degraded = true;
+        return;
+    }
+    std::unordered_map<std::string, DeviceCiRecord> ci_by_agent;
+    ci_by_agent.reserve(records->size());
+    for (auto& rec : *records) {
+        // The key is copied from `rec.agent_id` before `std::move(rec)` empties it (a pair's
+        // members initialise in declaration order). Nothing reads the map VALUE's own
+        // `.agent_id` afterwards; `attach_device_ci` never does.
+        std::string key = rec.agent_id;
+        ci_by_agent.emplace(std::move(key), std::move(rec));
+    }
+    attach_device_ci(result.rows, ci_by_agent);
 }
 
 } // namespace yuzu::server

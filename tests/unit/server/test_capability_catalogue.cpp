@@ -36,6 +36,8 @@
 #include "capability_decls/plugin_action_catalogue_update_source_trust.hpp"
 #include "capability_decls/plugin_action_catalogue_app_control.hpp"
 #include "capability_decls/plugin_action_catalogue_firmware_posture.hpp"
+#include "capability_decls/plugin_action_catalogue_middleware.hpp"
+#include "capability_decls/plugin_action_catalogue_component_inventory.hpp"
 #include "capability_decls/plugin_action_catalogue_runtimes.hpp"
 #include "capability_decls/plugin_action_catalogue_platform_security.hpp"
 #include "capability_decls/plugin_action_catalogue_browser_inventory.hpp"
@@ -45,9 +47,14 @@
 #include "capability_decls/plugin_action_catalogue_pkg_inventory.hpp"
 #include "capability_decls/plugin_action_catalogue_mgmt_posture.hpp"
 #include "capability_decls/plugin_action_catalogue_shares.hpp"
+#include "capability_decls/plugin_action_catalogue_virtualization.hpp"
 #include "capability_decls/plugin_action_catalogue_remote_access_audit.hpp"
+#include "capability_decls/plugin_action_catalogue_process_introspect.hpp"
+#include "capability_decls/plugin_action_catalogue_file_search.hpp"
+#include "approval_continuation.hpp"
 #include "command_capability.hpp"
 #include "forensics_plugin_set.hpp"
+#include "sensitive_instruction_params.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -160,6 +167,7 @@ struct LabeledSpan {
         {"update_source_trust", capdecls::plugin_action_catalogue_update_source_trust(), false},
         {"app_control", capdecls::plugin_action_catalogue_app_control(), false},
         {"firmware_posture", capdecls::plugin_action_catalogue_firmware_posture(), false},
+        {"component_inventory", capdecls::plugin_action_catalogue_component_inventory(), false},
         {"runtimes", capdecls::plugin_action_catalogue_runtimes(), false},
         {"platform_security", capdecls::plugin_action_catalogue_platform_security(), false},
         {"browser_inventory", capdecls::plugin_action_catalogue_browser_inventory(), false},
@@ -170,6 +178,10 @@ struct LabeledSpan {
         {"mgmt_posture", capdecls::plugin_action_catalogue_mgmt_posture(), false},
         {"shares", capdecls::plugin_action_catalogue_shares(), false},
         {"remote_access_audit", capdecls::plugin_action_catalogue_remote_access_audit(), false},
+        {"process_introspect", capdecls::plugin_action_catalogue_process_introspect(), false},
+        {"file_search", capdecls::plugin_action_catalogue_file_search(), false},
+        {"middleware", capdecls::plugin_action_catalogue_middleware(), false},
+        {"virtualization", capdecls::plugin_action_catalogue_virtualization(), false},
         {"core", capdecls::core_dispatch_capabilities(), true},
     };
 }
@@ -178,7 +190,7 @@ struct LabeledSpan {
     // CommandCapabilityRegistry's constructor only accepts a brace-enclosed
     // std::initializer_list (see command_capability.hpp), so this can't be
     // built from the vector programmatically — it mirrors all_labeled_sources()
-    // literally, twenty-nine sources exactly as a live composition site would use.
+    // literally, thirty-four sources exactly as a live composition site would use.
     return CommandCapabilityRegistry{
         capdecls::plugin_action_catalogue_content_dist(),
         capdecls::plugin_action_catalogue_a(),
@@ -198,6 +210,7 @@ struct LabeledSpan {
         capdecls::plugin_action_catalogue_update_source_trust(),
         capdecls::plugin_action_catalogue_app_control(),
         capdecls::plugin_action_catalogue_firmware_posture(),
+        capdecls::plugin_action_catalogue_component_inventory(),
         capdecls::plugin_action_catalogue_runtimes(),
         capdecls::plugin_action_catalogue_platform_security(),
         capdecls::plugin_action_catalogue_browser_inventory(),
@@ -208,6 +221,10 @@ struct LabeledSpan {
         capdecls::plugin_action_catalogue_mgmt_posture(),
         capdecls::plugin_action_catalogue_shares(),
         capdecls::plugin_action_catalogue_remote_access_audit(),
+        capdecls::plugin_action_catalogue_process_introspect(),
+        capdecls::plugin_action_catalogue_file_search(),
+        capdecls::plugin_action_catalogue_middleware(),
+        capdecls::plugin_action_catalogue_virtualization(),
         capdecls::core_dispatch_capabilities(),
     };
 }
@@ -250,12 +267,18 @@ TEST_CASE("capability catalogue: every securable and operation is one rbac_store
 /// explicit allowlist so a NEW Destructive+Reversible row still fails loudly
 /// and has to be justified here, which is the property the original assertion
 /// was really providing.
-constexpr std::array<std::pair<std::string_view, std::string_view>, 1> kReversibleDestructive{{
+constexpr std::array<std::pair<std::string_view, std::string_view>, 2> kReversibleDestructive{{
     {"power_health.set_power_plan",
      "switching the active Windows power scheme is undone by setting the previous scheme back; "
      "the action captures and emits previous_guid precisely so the operator can. It is "
      "Destructive (not Mutating) because it must inherit the destructive-targeting gate — "
      "explicit device IDs, no unapproved broadcast — not because the effect is unrecoverable."},
+    {"firewall.quarantine",
+     "undo of the rules and the enable state on all three legs: release restores the captured "
+     "Windows profile policy and re-enables every rule quarantine disabled, deletes the nft "
+     "table / iptables chain, and empties the pf anchor and releases its enable token. The "
+     "macOS state flush at apply time is one-way (connections are not restored). Destructive "
+     "only for the destructive-targeting gate."},
 }};
 // `printing.clear_queue` is deliberately NOT allowlisted here: it is
 // Destructive+Irreversible. Cancelling a job has no compensating Yuzu
@@ -306,6 +329,64 @@ TEST_CASE("capability catalogue: system_hardening.posture pins its exact classif
     CHECK(row.risk_tier == authz::RiskTier::Low);
     CHECK_FALSE(row.system_reserved);
     CHECK(row.execute_gate == ExecuteGate::None);
+}
+
+/// Exact-row pin for the four `firewall` containment actions (PRQ.1). Literals, not derived
+/// from the fragment, so a change to any of the seven classification fields fails here; the
+/// allowlist above and the Destructive-count tests pin only the Reversible class of
+/// `quarantine` and an aggregate. Checked on the fragment AND as the composed registry
+/// classifies it. `quarantine` is the one Destructive row (explicit targets, no broadcast);
+/// `release` and `quarantine_allow` mutate and are each other's undo; `quarantine_status`
+/// only reads and carries no execute gate.
+TEST_CASE("capability catalogue: firewall containment rows pin their exact classification",
+          "[server][dispatch][capability]") {
+    struct Expect {
+        std::string_view action;
+        DispatchClass dispatch_class;
+        Mutability mutability;
+        authz::Operation operation;
+        authz::RiskTier risk_tier;
+        ExecuteGate execute_gate;
+    };
+    const Expect expected[] = {
+        {"quarantine", DispatchClass::Destructive, Mutability::Reversible,
+         authz::Operation::Execute, authz::RiskTier::Critical, ExecuteGate::AdminOrApproval},
+        {"release", DispatchClass::Mutating, Mutability::Reversible, authz::Operation::Execute,
+         authz::RiskTier::High, ExecuteGate::AdminOrApproval},
+        {"quarantine_allow", DispatchClass::Mutating, Mutability::Reversible,
+         authz::Operation::Execute, authz::RiskTier::High, ExecuteGate::AdminOrApproval},
+        {"quarantine_status", DispatchClass::ReadOnly, Mutability::None, authz::Operation::Read,
+         authz::RiskTier::Low, ExecuteGate::None},
+    };
+    const auto check_row = [](const CommandCapability& r, const Expect& e) {
+        CHECK(r.plugin == "firewall");
+        CHECK(r.action == e.action);
+        CHECK(r.dispatch_class == e.dispatch_class);
+        CHECK(r.mutability == e.mutability);
+        CHECK(r.securable == "Security");
+        CHECK(r.operation == e.operation);
+        CHECK(r.risk_tier == e.risk_tier);
+        CHECK_FALSE(r.system_reserved);
+        CHECK(r.execute_gate == e.execute_gate);
+    };
+
+    const auto rows = capdecls::plugin_action_catalogue_c();
+    auto registry = build_registry(all_labeled_sources());
+    for (const auto& e : expected) {
+        INFO("action=" << e.action);
+        const auto it = std::find_if(rows.begin(), rows.end(), [&](const CommandCapability& r) {
+            return r.plugin == "firewall" && r.action == e.action;
+        });
+        REQUIRE(it != rows.end());
+        check_row(*it, e);
+        const auto classified = registry.classify("firewall", e.action);
+        REQUIRE(classified.has_value());
+        check_row(*classified, e);
+    }
+    // the fragment's firewall rows are exactly `state`, `rules` and these four: a fifth action
+    // lands with its own classification decision, not by default
+    CHECK(std::count_if(rows.begin(), rows.end(),
+                        [](const CommandCapability& r) { return r.plugin == "firewall"; }) == 6);
 }
 
 /// Exact-row pin for `autoruns` (P15 Arbiter action). Both its actions are
@@ -402,9 +483,9 @@ TEST_CASE("capability catalogue: mgmt_posture.posture pins its exact classificat
 }
 
 /// Exact-row pin for `shares.list`. A read-only listing of the shares the host serves (as
-/// configured on Linux, live Server-service state on Windows) under `Infrastructure`:Read with
-/// no execute gate. Pinning it directly means a silent drift to a mutating class, a different
-/// securable, or a gate on a facts-only read fails here.
+/// configured on Linux and macOS, live Server-service state on Windows) under
+/// `Infrastructure`:Read with no execute gate. Pinning it directly means a silent drift to a
+/// mutating class, a different securable, or a gate on a facts-only read fails here.
 TEST_CASE("capability catalogue: shares.list pins its exact classification",
           "[server][dispatch][capability]") {
     const auto rows = capdecls::plugin_action_catalogue_shares();
@@ -419,6 +500,85 @@ TEST_CASE("capability catalogue: shares.list pins its exact classification",
     CHECK(row.risk_tier == authz::RiskTier::Low);
     CHECK(row.system_reserved == false);
     CHECK(row.execute_gate == ExecuteGate::None);
+}
+
+/// Exact-row pin for `virtualization.host`. A read-only device-facts read (VM or not, which
+/// hypervisor, container membership) under `Inventory`:Read with no execute gate, checked on the
+/// fragment AND as the composed registry classifies it, so neither a fragment edit nor a
+/// composition change can drift a facts-only read into a mutating class or behind a gate.
+TEST_CASE("capability catalogue: virtualization.host pins its exact classification",
+          "[server][dispatch][capability]") {
+    const auto rows = capdecls::plugin_action_catalogue_virtualization();
+    REQUIRE(rows.size() == 3);
+    const auto& row = rows[0];
+    CHECK(row.plugin == "virtualization");
+    CHECK(row.action == "host");
+    CHECK(row.dispatch_class == DispatchClass::ReadOnly);
+    CHECK(row.mutability == Mutability::None);
+    CHECK(row.securable == "Inventory");
+    CHECK(row.operation == authz::Operation::Read);
+    CHECK(row.risk_tier == authz::RiskTier::Low);
+    CHECK(row.system_reserved == false);
+    CHECK(row.execute_gate == ExecuteGate::None);
+
+    const auto registry = build_registry(all_labeled_sources());
+    const auto classified = registry.classify("virtualization", "host");
+    REQUIRE(classified.has_value());
+    CHECK(classified->securable == "Inventory");
+    CHECK(classified->execute_gate == ExecuteGate::None);
+}
+
+/// Exact-row pin for `virtualization.wsl`. A per-user, read-only list of WSL distributions (the
+/// offline arm mounts a logged-off profile's hive through the shared helper), classified exactly
+/// like `installed_apps.list_per_user`: `Inventory`:Read behind `AdminOrApproval`, checked on the
+/// fragment AND as the composed registry classifies it.
+TEST_CASE("capability catalogue: virtualization.wsl pins its exact classification",
+          "[server][dispatch][capability]") {
+    const auto rows = capdecls::plugin_action_catalogue_virtualization();
+    REQUIRE(rows.size() == 3);
+    const auto& row = rows[1];
+    CHECK(row.plugin == "virtualization");
+    CHECK(row.action == "wsl");
+    CHECK(row.dispatch_class == DispatchClass::ReadOnly);
+    CHECK(row.mutability == Mutability::None);
+    CHECK(row.securable == "Inventory");
+    CHECK(row.operation == authz::Operation::Read);
+    CHECK(row.risk_tier == authz::RiskTier::Low);
+    CHECK(row.system_reserved == false);
+    CHECK(row.execute_gate == ExecuteGate::AdminOrApproval);
+
+    const auto registry = build_registry(all_labeled_sources());
+    const auto classified = registry.classify("virtualization", "wsl");
+    REQUIRE(classified.has_value());
+    CHECK(classified->securable == "Inventory");
+    CHECK(classified->execute_gate == ExecuteGate::AdminOrApproval);
+}
+
+/// Exact-row pin for `virtualization.runtime_posture`. Linux-only container-runtime posture read
+/// (an opt-in, operator-provided read-only socket; four fixed GET requests) under `Security`:Read
+/// like `system_hardening`, no execute gate (owner decision 2026-11-08), checked on the fragment
+/// AND as the composed registry classifies it so neither a fragment edit nor a composition change
+/// can move it to a broader reader set or behind a gate silently.
+TEST_CASE("capability catalogue: virtualization.runtime_posture pins its exact classification",
+          "[server][dispatch][capability]") {
+    const auto rows = capdecls::plugin_action_catalogue_virtualization();
+    REQUIRE(rows.size() == 3);
+    const auto& row = rows[2];
+    CHECK(row.plugin == "virtualization");
+    CHECK(row.action == "runtime_posture");
+    CHECK(row.dispatch_class == DispatchClass::ReadOnly);
+    CHECK(row.mutability == Mutability::None);
+    CHECK(row.securable == "Security");
+    CHECK(row.operation == authz::Operation::Read);
+    CHECK(row.risk_tier == authz::RiskTier::Low);
+    CHECK(row.system_reserved == false);
+    CHECK(row.execute_gate == ExecuteGate::None);
+
+    const auto registry = build_registry(all_labeled_sources());
+    const auto classified = registry.classify("virtualization", "runtime_posture");
+    REQUIRE(classified.has_value());
+    CHECK(classified->securable == "Security");
+    CHECK(classified->execute_gate == ExecuteGate::None);
 }
 
 /// Exact-row pin for `remote_access_audit.list` (Wave 11, Forensics-class): per-account SSH key
@@ -445,6 +605,95 @@ TEST_CASE("capability catalogue: remote_access_audit.list pins its exact classif
     const auto classified = registry.classify("remote_access_audit", "list");
     REQUIRE(classified.has_value());
     check_row(*classified);
+}
+
+/// Exact-row pin for `process_introspect.inspect` (Forensics-class): the security posture of one
+/// named process on one named machine, the same Forensics/AdminOrApproval boundary as
+/// remote_access_audit, checked on the fragment AND as the composed registry classifies it. One
+/// row covers every facet at the top tier; data above that contract is a new action, not a facet.
+TEST_CASE("capability catalogue: process_introspect.inspect pins its exact classification",
+          "[server][dispatch][capability]") {
+    const auto rows = capdecls::plugin_action_catalogue_process_introspect();
+    REQUIRE(rows.size() == 1);
+    const auto check_row = [](const CommandCapability& r) {
+        CHECK(r.plugin == "process_introspect");
+        CHECK(r.action == "inspect");
+        CHECK(r.dispatch_class == DispatchClass::ReadOnly);
+        CHECK(r.mutability == Mutability::None);
+        CHECK(r.securable == "Forensics");
+        CHECK(r.operation == authz::Operation::Read);
+        CHECK(r.risk_tier == authz::RiskTier::High);
+        CHECK(r.execute_gate == ExecuteGate::AdminOrApproval);
+        CHECK_FALSE(r.system_reserved);
+    };
+    check_row(rows.front());
+    auto registry = build_registry(all_labeled_sources());
+    const auto classified = registry.classify("process_introspect", "inspect");
+    REQUIRE(classified.has_value());
+    check_row(*classified);
+}
+
+/// Exact-row pin for `file_search.search`: dispatched under the existing `FileRetrieval` securable
+/// with AdminOrApproval (NOT the single-target Forensics securable, so a search stays launchable at
+/// a group or the fleet), High risk, and its stored rows in the Forensics read tier through the
+/// catalogue flag. The generic invariants accept ANY seeded securable and ANY stored-row tier, so
+/// without this pin a silent re-typing, or a dropped flag that would make the stored file names
+/// readable at Response:Read, ships green. Checked on the fragment AND as the composed registry
+/// classifies it. One row covers the action at the top tier; contents or a hash would be a new action.
+TEST_CASE("capability catalogue: file_search.search pins its exact classification",
+          "[server][dispatch][capability]") {
+    const auto rows = capdecls::plugin_action_catalogue_file_search();
+    REQUIRE(rows.size() == 1);
+    const auto check_row = [](const CommandCapability& r) {
+        CHECK(r.plugin == "file_search");
+        CHECK(r.action == "search");
+        CHECK(r.dispatch_class == DispatchClass::ReadOnly);
+        CHECK(r.mutability == Mutability::None);
+        CHECK(r.securable == "FileRetrieval");
+        CHECK(r.securable != kForensicsSecurable);
+        CHECK(r.operation == authz::Operation::Read);
+        CHECK(r.risk_tier == authz::RiskTier::High);
+        CHECK(r.execute_gate == ExecuteGate::AdminOrApproval);
+        CHECK(r.stored_rows == StoredRowTier::ForensicsRead);
+        // The resume parameter that lets ONE approval cover every slice of a search.
+        CHECK(r.continuation_param == "cursor");
+        CHECK(approval_continuation::covered_param(r) == "cursor");
+        CHECK_FALSE(r.system_reserved);
+    };
+    check_row(rows.front());
+    auto registry = build_registry(all_labeled_sources());
+    const auto classified = registry.classify("file_search", "search");
+    REQUIRE(classified.has_value());
+    check_row(*classified);
+}
+
+/// The continuation declaration is an authority: a row that declares one lets a single approval
+/// admit more than one dispatch. It is therefore pinned to exactly the one row that needs it (a new
+/// declaring row must be acknowledged HERE), every declaring row must be one `covered_param`
+/// actually honours (a read gated None or AdminOrApproval: a declaration on a mutating or
+/// AlwaysApproval row would be dead text that reads as a promise), and every declared parameter
+/// must be one the server never retains (`kUnretainedInstructionParamKeys`), so a request copy
+/// never holds a resume token.
+TEST_CASE("capability catalogue: only file_search.search declares a continuation parameter, and every "
+          "declaring row is one the cover honours and the server never retains",
+          "[server][dispatch][capability]") {
+    std::size_t declaring = 0;
+    for (const auto& source : all_labeled_sources()) {
+        for (const auto& row : source.rows) {
+            if (row.continuation_param.empty())
+                continue;
+            ++declaring;
+            INFO("source=" << source.label << " plugin=" << row.plugin << " action=" << row.action
+                           << " continuation_param=" << row.continuation_param);
+            CHECK(row.plugin == "file_search");
+            CHECK(row.action == "search");
+            CHECK(approval_continuation::covered_param(row) == row.continuation_param);
+            CHECK(is_unretained_instruction_param_key(row.continuation_param));
+            // Never a secret key: a resume token must not make a form mask its field.
+            CHECK_FALSE(is_redacted_instruction_param_key(row.continuation_param));
+        }
+    }
+    CHECK(declaring == 1);
 }
 
 TEST_CASE("capability catalogue: classify() resolves every declared plugin.action across every "
@@ -587,12 +836,12 @@ TEST_CASE("capability catalogue: firmware_posture classifies `firmware` and refu
 /// class, so without this pin a silent change to `Mutating` or `Security`
 /// ships green (an orchestrator probe confirmed it). Appended at the end of
 /// the file so sibling plugins' pins do not collide textually.
-TEST_CASE("capability catalogue: runtimes.dotnet and runtimes.jvm pin their exact "
+TEST_CASE("capability catalogue: runtimes.dotnet, runtimes.jvm and runtimes.python pin their exact "
           "classification",
           "[server][dispatch][capability]") {
     const auto rows = capdecls::plugin_action_catalogue_runtimes();
-    REQUIRE(rows.size() == 2);
-    for (const auto action : {"dotnet", "jvm"}) {
+    REQUIRE(rows.size() == 3);
+    for (const auto action : {"dotnet", "jvm", "python"}) {
         const auto it =
             std::find_if(rows.begin(), rows.end(), [&](const auto& r) { return r.action == action; });
         REQUIRE(it != rows.end());
@@ -604,6 +853,31 @@ TEST_CASE("capability catalogue: runtimes.dotnet and runtimes.jvm pin their exac
         CHECK(it->risk_tier == authz::RiskTier::Low);
         CHECK_FALSE(it->system_reserved);
         CHECK(it->execute_gate == ExecuteGate::None);
+    }
+}
+
+/// Exact-row pin for `component_inventory.scan`, `.native`, `.python` and `.node`, the four rows of
+/// its fragment. `Inventory` (a software-inventory fact), not `Infrastructure`: all four are seeded
+/// securables, so the generic invariants accept either and only this pin catches a silent
+/// re-typing. `native` ships off through an action-level kill-switch seed, so its gate stays None:
+/// a gate here would be a second, different off-switch. `python` and `node` ship enabled, gate None.
+TEST_CASE("capability catalogue: component_inventory's four rows pin their exact classification",
+          "[server][dispatch][capability]") {
+    const auto rows = capdecls::plugin_action_catalogue_component_inventory();
+    REQUIRE(rows.size() == 4);
+    const char* const kActions[] = {"scan", "native", "python", "node"};
+    for (std::size_t i = 0; i < 4; ++i) {
+        const auto& row = rows[i];
+        INFO("action " << kActions[i]);
+        CHECK(row.plugin == "component_inventory");
+        CHECK(row.action == kActions[i]);
+        CHECK(row.dispatch_class == DispatchClass::ReadOnly);
+        CHECK(row.mutability == Mutability::None);
+        CHECK(row.securable == "Inventory");
+        CHECK(row.operation == authz::Operation::Read);
+        CHECK(row.risk_tier == authz::RiskTier::Low);
+        CHECK_FALSE(row.system_reserved);
+        CHECK(row.execute_gate == ExecuteGate::None);
     }
 }
 
@@ -742,17 +1016,38 @@ TEST_CASE("capability catalogue: every Forensics-securable plugin is in the resp
     // The row count is pinned too: a new Forensics ACTION on an existing plugin changes no plugin
     // name, so the set below would not notice it, but it widens what the tier's audit and error
     // handling must cover. Update this number in the same change that adds the row.
-    CHECK(forensics_rows == 10);
+    CHECK(forensics_rows == 11);
 
     // A NEW Forensics plugin must be acknowledged HERE (and in test_response_tier_filter.cpp):
     // its stored rows become Forensics-tier on every operator read, which is a user-visible
     // change for anyone who holds Response:Read but not Forensics:Read.
     // Plus the unresolved-provenance sentinel (#4990): a response whose command id has no server
     // dispatch record is stored under it and is Forensics-tier everywhere.
+    // `file_search` is Forensics-tier through the stored-row flag on its row (its dispatch securable
+    // is FileRetrieval, so it is not one of the `forensics_rows` counted above).
     CHECK(set->names() == std::vector<std::string>{"app_usage", "browser_inventory",
-                                                   "execution_artifacts", "privacy_permissions",
+                                                   "execution_artifacts", "file_search",
+                                                   "privacy_permissions", "process_introspect",
                                                    "remote_access_audit", "~unverified"});
     CHECK(set->contains(kUnverifiedProvenanceLabel));
+
+    // Every plugin whose row asks for the Forensics read tier is in the set too, and its dispatch
+    // securable is not the single-target one (that is what the flag is for).
+    std::size_t flagged_rows = 0;
+    for (const auto& source : all_labeled_sources()) {
+        for (const auto& row : source.rows) {
+            if (row.stored_rows != StoredRowTier::ForensicsRead)
+                continue;
+            ++flagged_rows;
+            INFO("source=" << source.label << " plugin=" << row.plugin << " action=" << row.action);
+            CHECK(row.securable != kForensicsSecurable);
+            std::string lower(row.plugin);
+            for (auto& c : lower)
+                c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            CHECK(std::ranges::binary_search(set->names(), lower));
+        }
+    }
+    CHECK(flagged_rows == 1);
 }
 
 // #4990: the unresolved-provenance sentinel "~unverified" is safe as a stored plugin label only
@@ -771,4 +1066,50 @@ TEST_CASE("capability catalogue: no plugin name can collide with the unverified 
     }
     CHECK(rows > 0);
     CHECK(kUnverifiedProvenanceLabel.front() == '~');
+}
+
+/// Exact-row pin for `middleware.ibm_mq`: ReadOnly/None on the `Inventory` securable (an
+/// installed-software fact, not a posture fact). The generic invariants accept ANY seeded
+/// securable and ANY dispatch class, so without this pin a silent re-typing ships green.
+TEST_CASE("capability catalogue: middleware.ibm_mq pins its exact classification",
+          "[server][dispatch][capability]") {
+    const auto rows = capdecls::plugin_action_catalogue_middleware();
+    REQUIRE(rows.size() == 1);
+    const auto& row = rows.front();
+    CHECK(row.plugin == "middleware");
+    CHECK(row.action == "ibm_mq");
+    CHECK(row.dispatch_class == DispatchClass::ReadOnly);
+    CHECK(row.mutability == Mutability::None);
+    CHECK(row.securable == "Inventory");
+    CHECK(row.operation == authz::Operation::Read);
+    CHECK(row.risk_tier == authz::RiskTier::Low);
+    CHECK(row.system_reserved == false);
+    CHECK(row.execute_gate == ExecuteGate::None);
+}
+
+/// Exact-row pin for `msi_packages.installer_records` (SAM-46): a read-only report of what
+/// Windows Installer recorded per product (registry values and the cached package's Property
+/// table; nothing is executed), `Inventory`:Read with no execute gate, checked on the fragment
+/// AND as the composed registry classifies it, so a re-typing cannot drift it into a mutating
+/// class or behind a gate unnoticed.
+TEST_CASE("capability catalogue: msi_packages.installer_records pins its exact classification",
+          "[server][dispatch][capability]") {
+    const auto rows = capdecls::plugin_action_catalogue_d();
+    const auto it = std::find_if(rows.begin(), rows.end(), [](const auto& r) {
+        return r.plugin == "msi_packages" && r.action == "installer_records";
+    });
+    REQUIRE(it != rows.end());
+    CHECK(it->dispatch_class == DispatchClass::ReadOnly);
+    CHECK(it->mutability == Mutability::None);
+    CHECK(it->securable == "Inventory");
+    CHECK(it->operation == authz::Operation::Read);
+    CHECK(it->risk_tier == authz::RiskTier::Low);
+    CHECK(it->system_reserved == false);
+    CHECK(it->execute_gate == ExecuteGate::None);
+
+    const auto registry = build_registry(all_labeled_sources());
+    const auto classified = registry.classify("msi_packages", "installer_records");
+    REQUIRE(classified.has_value());
+    CHECK(classified->securable == "Inventory");
+    CHECK(classified->execute_gate == ExecuteGate::None);
 }

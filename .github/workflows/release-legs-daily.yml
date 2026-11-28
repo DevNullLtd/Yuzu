@@ -1,0 +1,201 @@
+name: Release legs (daily dispatch)
+
+# Daily release/LTO coverage of `dev` (docs/ci-architecture.md, Tier 2b).
+#
+# A push to `dev` no longer builds ci.yml's release legs (Linux gcc-15 release
+# LTO, Linux clang-21 release, Windows MSVC release LTO, macOS release LTO):
+# they cost 9-23 min of self-hosted runner time per leg per push and gate nothing (no
+# release leg is a required check). This workflow puts them back on a daily
+# cadence instead: it dispatches ci.yml against dev's tip with `legs=release`,
+# which expands to the release legs only (the debug legs normally already ran
+# on that commit's push). This is the only place the test suite runs in
+# release/NDEBUG mode between promotions: release.yml builds with
+# -Dbuild_tests=false. A push to `main` (release promotion) still runs the whole
+# matrix, so every release candidate is built in release mode before it tags.
+# (The Windows and macOS legs build the agent only, as release.yml does since
+# ADR-0035 ladder step 2; the server is built and released on Linux only.)
+#
+# It skips when dev's tip already has a ci.yml dispatch run (legs=release or
+# all) that succeeded or is still in flight, so a quiet day costs nothing; a
+# failed or cancelled run does not count, so a red tip is retried the next day.
+# While a bot-opened release-legs-broken issue is open, only an IN-FLIGHT run
+# counts, so the tip is re-checked daily until a green run closes the issue.
+# The covered check keys on the DISPATCHED commit. The legs check out the dev
+# branch when they start (not a pinned SHA: see ci.yml's trusted_inputs), so
+# if dev moves while they queue they build a later commit; each leg's
+# "Record built commit (dispatch)" step names the commit it really built.
+#
+# Failure signal, because a run started by github-actions[bot] emails nobody:
+#   - a failing dispatched CI run opens (or comments on) a
+#     `release-legs-broken` issue, and the next fully green one closes it
+#     (release-legs-alert.yml, a workflow_run listener — the fast path);
+#   - the `reconcile` job below re-judges the last completed dispatch run with
+#     the same script every day, before that day's dispatch (the backstop);
+#   - a failure of THIS workflow (reconcile or dispatch) opens the same issue
+#     from the `alert` job below, worded by which job failed.
+# A cron that never fires at all is not detected (no dead-man signal); the
+# Tier 2b runbook says how to check.
+#
+# LIVE ONLY FROM `main`: `schedule:` and `workflow_run:` triggers are read from
+# the default branch alone, and `gh workflow run <file>` needs the file there,
+# so this cron (and the alert listener) start at the first dev -> main
+# promotion carrying them. Until then, dispatch ci.yml directly:
+#   gh workflow run ci.yml --ref dev -f legs=release
+# (ci.yml is already on main; that works once the `workflow_dispatch:` trigger
+# itself has reached main too — unverified until the first dev -> main promotion).
+#
+# 02:30 UTC is NOMINAL: GitHub starts scheduled runs late under load (hours,
+# per codeql.yml's notes), so a run can overlap the nightly/CodeQL window, or
+# with a long queue even reach the next day's 01:00 Big Tam Postgres restart
+# (a false red, reported by the alert). The dispatched run lands in ci.yml's
+# own `-dispatch` concurrency group, so it never displaces a queued dev push
+# run.
+#
+# The dispatch uses GITHUB_TOKEN: a workflow_dispatch event is one of the two
+# events a GITHUB_TOKEN may create that DOES start a new run.
+
+on:
+  schedule:
+    - cron: '30 2 * * *'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-legs-daily
+  cancel-in-progress: false
+
+jobs:
+  # Backstop for the workflow_run listener (release-legs-alert.yml): judge the
+  # most recent completed, non-cancelled dispatch run on dev with the same
+  # script, opening the issue if it failed and none is open, or closing open
+  # issues it predates if it was fully green. Catches a dropped/failed/
+  # never-fired listener run and a run that never started.
+  reconcile:
+    name: "Reconcile release-legs-broken with the last dispatch"
+    # Same group as the listener's job, so the two never act on one run at
+    # the same moment (both seeing no open issue and both opening one).
+    concurrency:
+      group: release-legs-alert
+      cancel-in-progress: false
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      actions: read    # list CI runs and read one
+      contents: read   # check out the script
+      issues: write    # open/close the release-legs-broken issue
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          sparse-checkout: scripts/ci/release-legs-issue.sh
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+      - name: Reconcile
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          run_id=$(gh run list -R "$REPO" --workflow ci.yml --event workflow_dispatch --branch dev \
+                     --status completed --limit 20 --json databaseId,conclusion \
+                     --jq '[.[] | select(.conclusion != "cancelled" and .conclusion != "skipped")][0].databaseId // empty')
+          if [[ -z "$run_id" ]]; then echo "no completed dispatch run on dev yet"; exit 0; fi
+          bash scripts/ci/release-legs-issue.sh reconcile "$run_id"
+
+  dispatch:
+    name: "Dispatch release legs on dev"
+    # After reconcile (so it judges the previous run first), but not gated on
+    # it: a reconcile failure must not stop the day's dispatch.
+    needs: [reconcile]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      actions: write   # gh workflow run (dispatch ci.yml) + gh run list
+      contents: read   # read dev's tip commit
+      issues: read     # an open release-legs-broken issue forces a re-check
+    steps:
+      - name: Dispatch ci.yml (legs=release) unless dev's tip is already covered
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          sha=$(gh api "repos/$REPO/commits/dev" --jq .sha)
+          [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::could not resolve dev's tip (got '$sha')"; exit 1; }
+          echo "dev tip: $sha"
+          # Covered = a ci.yml workflow_dispatch run on this exact commit that
+          # succeeded or has not finished. A failed/cancelled one is retried.
+          covered=$(gh run list -R "$REPO" --workflow ci.yml --event workflow_dispatch \
+                      --commit "$sha" --limit 20 --json status,conclusion \
+                      --jq '[.[] | select(.status != "completed" or .conclusion == "success")] | length')
+          # While a bot-opened release-legs-broken issue is open, a green run on
+          # this tip does not count as covered: re-dispatch so a fresh green run
+          # can close it. Otherwise an issue opened after the last green run
+          # (e.g. a reconcile/dispatch failure) would never close on a quiet dev.
+          open_issue=$(gh issue list -R "$REPO" --label release-legs-broken --state open \
+                         --author "app/github-actions" --json number --jq '.[0].number // empty')
+          if [[ -n "$open_issue" ]]; then
+            covered=$(gh run list -R "$REPO" --workflow ci.yml --event workflow_dispatch \
+                        --commit "$sha" --limit 20 --json status \
+                        --jq '[.[] | select(.status != "completed")] | length')
+            echo "release-legs-broken #$open_issue is open — only an in-flight run counts as covered."
+          fi
+          if (( covered > 0 )); then
+            echo "dev tip $sha already has a release-legs run (success or in flight) - nothing to do." | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          gh workflow run ci.yml -R "$REPO" --ref dev -f legs=release
+          echo "Dispatched ci.yml legs=release on dev ($sha)." | tee -a "$GITHUB_STEP_SUMMARY"
+
+  # Failure of this workflow (reconcile or dispatch: gh API error, refused
+  # dispatch, a dev-side ci.yml that no longer accepts `legs`) → the same
+  # alert issue, worded by which job failed. Only open issues authored by
+  # github-actions[bot] are matched, never a PR or a hand-labelled issue.
+  alert:
+    name: "Open release-legs-broken when this workflow fails"
+    needs: [reconcile, dispatch]
+    if: ${{ failure() }}
+    # Serialised with the listener and reconcile, so two writers never both
+    # see "no open issue" and both open one.
+    concurrency:
+      group: release-legs-alert
+      cancel-in-progress: false
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      issues: write   # open/comment the release-legs-broken issue
+    steps:
+      - name: Open or update release-legs-broken issue
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          RECONCILE: ${{ needs.reconcile.result }}
+          DISPATCH: ${{ needs.dispatch.result }}
+        run: |
+          set -euo pipefail
+          label=release-legs-broken
+          if [[ "$DISPATCH" == success ]]; then
+            what="Its \`reconcile\` step failed (result \`$RECONCILE\`), so the previous dispatch run was not re-judged; today's release-legs run WAS dispatched."
+            title="Release legs broken on dev: daily reconcile failed"
+          else
+            what="Its \`dispatch\` step did not succeed (result \`$DISPATCH\`; reconcile \`$RECONCILE\`), so no release-legs run was started on \`dev\` today."
+            title="Release legs broken on dev: dispatcher failed"
+          fi
+          body=$(printf '%s\n\n%s\n\n%s\n\n%s\n' \
+            "The daily release-legs workflow failed: $RUN_URL" \
+            "$what" \
+            "This is a workflow or API problem, not a code regression. Triage: docs/ci-architecture.md, Tier 2b." \
+            "(auto-posted by .github/workflows/release-legs-daily.yml; closed by the next fully green release-legs dispatch.)")
+          first=$(gh issue list -R "$REPO" --label "$label" --state open \
+                    --author "app/github-actions" --json number --jq '.[0].number // empty')
+          if [[ -n "$first" ]]; then
+            gh issue comment "$first" -R "$REPO" --body "$body"
+          else
+            # gh resolves --label by name and refuses an absent one (idempotent).
+            gh label create "$label" -R "$REPO" --color ededed --force \
+              --description "Daily release/LTO legs on dev failed (docs/ci-architecture.md Tier 2b)"
+            gh issue create -R "$REPO" --title "$title" --label "$label" --body "$body"
+          fi

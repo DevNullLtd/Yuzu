@@ -1,0 +1,1 @@
+This file is not a Windows Installer database. It is a test fixture whose only job is to make MsiOpenDatabaseW refuse it.

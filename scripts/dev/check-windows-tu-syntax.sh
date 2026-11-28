@@ -63,12 +63,27 @@ tus=(
     agents/plugins/update_source_trust/src/update_source_trust_win.cpp
     agents/plugins/mgmt_posture/src/mgmt_posture_win.cpp
     agents/plugins/shares/src/shares_win.cpp
+    agents/plugins/virtualization/src/virtualization_win.cpp
+    agents/plugins/firewall/src/firewall_plugin.cpp # the containment legs' Windows COM block (WinLeg)
     agents/plugins/remote_access_audit/src/remote_access_audit_win.cpp
     agents/plugins/runtimes/src/runtimes_win.cpp
     agents/plugins/runtimes/src/runtimes_linux.cpp # empty on Windows: checks the portable half of the Linux walk header
+    agents/plugins/middleware/src/middleware_win.cpp
+    agents/plugins/middleware/src/middleware_linux.cpp # empty on Windows: checks the portable half
+    agents/plugins/component_inventory/src/component_inventory_plugin.cpp # the Windows branch of execute and the portable scan headers
+    agents/plugins/component_inventory/src/component_fs_win.cpp
+    agents/plugins/process_introspect/src/process_introspect_plugin.cpp # Windows answers planned; checks the portable parsers and seam headers
+    agents/plugins/file_search/src/file_search_plugin.cpp # the Windows descriptor and pin; checks the portable driver, plan and row headers
+    agents/plugins/file_search/src/file_search_shell.cpp # the OS-neutral shell (slot, worker runner, live slice), compiled on every OS
+    agents/plugins/file_search/src/file_search_win.cpp # the Windows leg: volume, handle-relative leg, the two ioctls, name rule, key, profile roots
+    agents/core/src/confined_fs_win.cpp # the handle-relative primitive the Windows leg stands on (ReparseDirs, open_file_attributes_at, the id class)
     agents/core/src/dism_bounded_call.cpp
     agents/plugins/windows_optional_features/src/windows_optional_features_plugin.cpp
+    agents/core/src/msi_database_read.cpp
+    agents/plugins/msi_packages/src/msi_packages_plugin.cpp
     agents/plugins/firmware_posture/src/firmware_posture_win.cpp
+    agents/plugins/hardware/src/hardware_plugin.cpp
+    agents/plugins/hardware/src/hardware_estate_win.cpp
     agents/plugins/app_control/src/app_control_plugin.cpp
     agents/plugins/app_control/src/app_control_win.cpp
     agents/plugins/platform_security/src/platform_security_win.cpp
@@ -77,6 +92,8 @@ tus=(
     agents/plugins/privacy_permissions/src/privacy_permissions_win.cpp
     agents/plugins/privacy_permissions/src/privacy_permissions_plugin.cpp
      agents/plugins/license_scan/src/licensing_win.cpp agents/plugins/registry/src/registry_plugin.cpp agents/plugins/registry/src/registry_win.cpp agents/plugins/installed_apps/src/installed_apps_plugin.cpp agents/plugins/echo/src/echo_mapdrive_collector.cpp agents/plugins/users/src/users_plugin.cpp
+    agents/plugins/ioc/src/ioc_plugin.cpp # DnsCacheTableOwner / once-per-command resolver-cache read (WP12)
+    agents/plugins/network_config/src/network_config_plugin.cpp # do_dns_cache's Windows block (WP12)
 )
 [ "$#" -gt 0 ] && tus+=("$@")
 
@@ -127,6 +144,12 @@ for tu in "${tus[@]}"; do
         fi
         extra_inc+=(-I "$nlohmann_include")
     fi
+    # file_search compiles the walker of component_inventory into itself (one recorded lateral
+    # include, see agents/plugins/file_search/meson.build), so its portable headers include
+    # component_walk.hpp from that directory.
+    case "$tu" in
+        agents/plugins/file_search/*) extra_inc+=(-I agents/plugins/component_inventory/src) ;;
+    esac
     if grep -lq "libxml/parser.h" "$src_dir"/*.hpp "$src_dir"/*.cpp 2>/dev/null; then
         if [ -z "$libxml2_include" ]; then
             echo "  SKIP  $tu (needs libxml/parser.h — bootstrap vcpkg_installed to check it)"

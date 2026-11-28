@@ -26,6 +26,7 @@
 /// Wave-4 SQLite components — `InstructionDbPool` is deleted once this
 /// store moves.
 
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <expected>
@@ -34,6 +35,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "dispatch_position.hpp"    // DispatchPosition (#3678)
 #include "response_provenance.hpp" // CommandRecord
 
 namespace yuzu::server::pg {
@@ -78,7 +80,10 @@ struct ExecutionQuery {
     std::string definition_id;
     std::string status;
     /// #1634: restricts to executions dispatched by this exact principal.
-    /// Empty (the default) is unrestricted. Used by MCP `list_executions`
+    /// Empty (the default) is unrestricted. The value is the ExecutionOwnerKey-derived key
+    /// (`owner_only_filter`, `execution_scope_rules.hpp`), never a raw session `username`:
+    /// a service-scoped session's key is EMPTY, which here would mean "no filter", so such a
+    /// session is admitted through `ExecutionListScope` instead. Used by MCP `list_executions`
     /// for a management-group-confined caller — executions carry no single
     /// `agent_id` to filter by (they fan out to many), so "own dispatches
     /// only" is the cheap, provably-safe confinement until a real per-row
@@ -112,13 +117,17 @@ struct ExecutionQuery {
 /// `visible_agents` empty means "visible to nobody" (every row excluded),
 /// matching `response_store.cpp`'s `append_scope_clause` engaged-empty
 /// convention. This is a plain data type with no authz dependency — the
-/// route layer derives it from `authz::VisibleSet`/the session username.
+/// route layer derives it with `confined_list_scope` (`execution_scope_rules.hpp`) from
+/// `authz::VisibleSet` and the session's `ExecutionOwnerKey`: `owner` is that key, EMPTY
+/// for a service-scoped session (whose `username` is its minting account), so such a
+/// session is admitted only through `visible_agents`.
 struct ExecutionListScope {
     std::string owner;
     std::vector<std::string> visible_agents;
 };
-/// `nullopt` = unrestricted (TOP, no pushdown) — every existing caller of
-/// `query_executions`/`query_executions_checked`'s default keeps this.
+/// `nullopt` = unrestricted (TOP, no pushdown). `query_executions` keeps it;
+/// `query_executions_checked` takes the scope as a REQUIRED argument (#5557), so an omitted
+/// scope is a compile error.
 using ExecutionScope = std::optional<ExecutionListScope>;
 
 struct ExecutionSummary {
@@ -147,6 +156,11 @@ struct AgentExecStatus {
     /// sdk/include/yuzu/plugin.h). 0 (PLUGIN_RESULT_UNDECLARED) for legacy
     /// rows and for any response whose plugin never reported a typed status.
     int plugin_result_status{0};
+    /// True when the frame this status came from was NOT kept by the response store (an ingest-time
+    /// failure, or a cap refusal of a non-terminal frame). Written in the same upsert as the
+    /// status and STICKY: the stored value is the OR of every write, so no later write clears it.
+    /// Not part of the event payload.
+    bool response_dropped{false};
 };
 
 // ── Execution statistics (capability 1.9) ────────────────────────────
@@ -340,12 +354,33 @@ public:
     void set_forensics_plugin_set(const ForensicsPluginSet* plugins) { forensics_plugins_ = plugins; }
 
     /// ADR-1007 — optional observability sink for the per-device
-    /// concurrency-claim path (skip counts, force-releases). nullptr (the
-    /// default) means no metrics — matches every sibling store's `set_metrics`
-    /// idiom (a post-construction setter, not a constructor parameter, so
-    /// this costs zero changes to any existing `ExecutionTracker(pg::PgPool&)`
-    /// call site).
+    /// concurrency-claim path (skip counts, force-releases) and, since #3834,
+    /// the read-degrade counter of the five `_checked` readers
+    /// (`yuzu_server_execution_tracker_read_degrade_total{method,reason}`).
+    /// nullptr (the default) means no metrics — matches every sibling store's
+    /// `set_metrics` idiom (a post-construction setter, not a constructor
+    /// parameter, so this costs zero changes to any existing
+    /// `ExecutionTracker(pg::PgPool&)` call site).
     void set_metrics(yuzu::MetricsRegistry* m) noexcept { metrics_ = m; }
+
+    /// #3834 — register (describe) and pre-seed to 0 every `(method, reason)` series of
+    /// `yuzu_server_execution_tracker_read_degrade_total` (5 methods x 3 reasons = 15), so a healthy
+    /// store reads "wired, nothing degraded" on a dashboard instead of "series absent" and
+    /// `increase()` has a baseline (docs/observability-conventions.md). The label sets live in
+    /// `execution_tracker.cpp`, and the constants the emit sites use are indexed out of the very
+    /// arrays this function reads, so an emitted label value is a seeded one as long as every emit
+    /// site uses those constants (a convention: `note_read_degrade` accepts any string). Call once
+    /// at boot, next to `set_metrics()`. Static: it needs no store.
+    ///
+    /// The five readers it covers: `query_executions_checked`, `get_execution_checked`,
+    /// `get_agent_statuses_checked`, `get_agent_statuses_for_executions_checked`,
+    /// `get_children_checked`. The counter is bumped INSIDE those bodies, so the unchecked wrappers
+    /// that delegate to them (`query_executions`, `get_agent_statuses`,
+    /// `get_agent_statuses_for_executions`, `get_children`) are counted too; the unchecked
+    /// `get_execution()` has its own body and is NOT counted. A success-empty read (including an
+    /// empty execution-id list) is not a degrade. `store_not_open` can only occur in a harness: a
+    /// running server refuses to boot when the tracker did not open.
+    static void seed_read_degrade_metrics(yuzu::MetricsRegistry& metrics);
 
     // Query
     std::vector<Execution> query_executions(const ExecutionQuery& q = {}) const;
@@ -362,8 +397,7 @@ public:
     /// `ExecutionQuery::dispatched_by`'s doc comment above rejects (one
     /// statement, planner-optimizable to a semi-join).
     std::optional<std::vector<Execution>>
-    query_executions_checked(const ExecutionQuery& q = {},
-                             const ExecutionScope& scope = std::nullopt) const;
+    query_executions_checked(const ExecutionQuery& q, const ExecutionScope& scope) const;
     std::optional<Execution> get_execution(const std::string& id) const;
     /// #3789: degrade-distinguishable twin of `get_execution`. That method
     /// collapses "row absent" and "read degraded" to the same `nullopt`
@@ -377,6 +411,12 @@ public:
     [[nodiscard]] std::expected<std::optional<Execution>, std::string>
     get_execution_checked(const std::string& id) const;
     ExecutionSummary get_summary(const std::string& id) const;
+    /// Agents of `execution_id` whose response the response store did not fully keep (their status
+    /// row says `response_dropped`: a terminal answer or a streamed frame is missing). Their answer
+    /// is missing from every stored-response read, so a consumer building membership from stored
+    /// rows must treat each as unanswered. `nullopt` when the count could not be read (store not
+    /// open, no connection, query failure): the caller must not read that as zero.
+    [[nodiscard]] std::optional<int64_t> count_response_dropped(const std::string& execution_id) const;
     std::vector<AgentExecStatus> get_agent_statuses(const std::string& execution_id) const;
     /// #1634 (Doomgoose review finding, important) — degrade-distinguishable
     /// twin of `get_agent_statuses`, for the #1634 visibility/audit call
@@ -479,8 +519,9 @@ public:
     /// not re-reduce a value equal to the persisted text, so a caller that passes raw Forensics
     /// text publishes it to the outbox and the bus on its first write. A lexical gate
     /// (`tests/test_forensics_tier_wiring_lexical.py`) pins exactly one caller; a second caller
-    /// needs a reviewed edit there.
-    void update_agent_status(const std::string& execution_id, const AgentExecStatus& status);
+    /// needs a reviewed edit there. True when the status row was written (false when the tracker
+    /// is closed or the upsert failed twice).
+    bool update_agent_status(const std::string& execution_id, const AgentExecStatus& status);
     void refresh_counts(const std::string& execution_id);
 
     /// PR 2: set agents_targeted post-creation. Used by the workflow execute
@@ -497,8 +538,28 @@ public:
     /// return would reintroduce the exact bug this fix closes.
     [[nodiscard]] bool set_agents_targeted(const std::string& execution_id, int agents_targeted);
 
+    /// LEGACY rerun (`/api/executions/{id}/rerun`). Reads the original with the UNCHECKED
+    /// `get_execution` / `get_agent_statuses`, so a degraded store collapses into "original
+    /// execution not found" (and `failed_only` into a zero-device record). That behaviour is
+    /// kept for the legacy handler, whose text the source tripwires pin; every NEW caller uses
+    /// `create_rerun_checked`, which cannot mask a storage fault.
     std::expected<std::string, std::string> create_rerun(const std::string& original_id,
                                                          const std::string& user, bool failed_only);
+
+    /// Why `create_rerun_checked` produced no record. A closed enum, so a caller maps it with a
+    /// `switch` rather than by comparing error text.
+    enum class RerunError {
+        kOriginalNotFound, ///< the original was read successfully and does not exist.
+        kStoreDegraded,    ///< the original (or, for `failed_only`, its agent rows) could not be
+                           ///< READ: pool exhausted, tracker not open, query failed. Unknown
+                           ///< whether the original exists; nothing was written.
+        kWriteFailed,      ///< the reads succeeded but inserting the new record failed.
+    };
+    /// Same record `create_rerun` creates, but every read goes through the degrade-aware
+    /// `get_execution_checked` / `get_agent_statuses_checked`, so an unreadable store is
+    /// `kStoreDegraded`, never a not-found and never a silently zero-sized `failed_only` record.
+    [[nodiscard]] std::expected<std::string, RerunError>
+    create_rerun_checked(const std::string& original_id, const std::string& user, bool failed_only);
 
     /// Returns false on a pool/query failure (governance PR review,
     /// 2026-08-31) — the execution was NOT actually cancelled; callers must
@@ -601,6 +662,30 @@ public:
     [[nodiscard]] bool record_command_dispatch(
         const std::string& command_id, const std::string& plugin, const std::string& execution_id,
         std::optional<std::chrono::milliseconds> lease_timeout = std::nullopt);
+
+    /// #3678: the two counters the WS-3 command outbox measures its redelivery horizon on
+    /// (`dispatch_position.hpp`): the SHARED `dispatch_seq` (advanced once per recorded dispatch
+    /// call; common to every replica) and this process's own count of dispatches whose record was
+    /// NOT written (`note_unrecorded_dispatch`). They are returned separately because they are on
+    /// different scales: only readings taken by the SAME process can be differenced on the local
+    /// term. The shared term can move BACKWARD on a restore or a lost-WAL failover, and the outbox
+    /// dead-letters on that.
+    ///
+    /// Returns nullopt when the store is closed or the read degraded. NEVER treat nullopt as zero:
+    /// the outbox refuses to send on an unreadable position. Failures on a replica other than the
+    /// one reading, or in an earlier process lifetime of the same one, are not counted (that is
+    /// the first of several under-count cases): see `common/include/yuzu/command_replay_horizon.hpp`.
+    [[nodiscard]] std::optional<DispatchPosition> current_dispatch_position() const;
+
+    /// #3678: count one dispatch whose `record_command_dispatch` write did not happen -- failed,
+    /// refused, or skipped by a tripped `DispatchRecordLatch`. The command was still sent, so it
+    /// may have consumed an agent dedup-ring slot. (A dispatch made while NO tracker is wired is
+    /// not counted: there is nothing to count into, and the outbox's reader is then unreadable, so
+    /// the outbox holds.) Lock-free; called from the dispatch path. Over-counting is the safe
+    /// direction.
+    void note_unrecorded_dispatch() noexcept {
+        unrecorded_dispatches_.fetch_add(1, std::memory_order_relaxed);
+    }
 
     /// Resolves a previously recorded dispatch. Returns nullopt for an unknown command id (a
     /// forged or never-issued id, a failed record write, a reaped record) AND for a degraded read;
@@ -1031,6 +1116,10 @@ private:
 
     pg::PgPool& pool_;
     bool open_{false};
+    /// #3678: dispatches this process sent without a recorded `dispatch_seq` advance (see
+    /// `note_unrecorded_dispatch`). Process-local on purpose: it exists only for the failure case
+    /// where the shared database cannot be written.
+    std::atomic<std::int64_t> unrecorded_dispatches_{0};
     /// HA WS-2a-2: this process's outbox instance identity (a boot-time random
     /// hex string). Stamped as `origin_replica` on every durable append so the
     /// cross-replica poll loop can SKIP this replica's own rows (already

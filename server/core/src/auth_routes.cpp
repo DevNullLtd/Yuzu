@@ -24,6 +24,7 @@
 #include "http_route_sink.hpp"
 #include "legacy_self_service_allow.hpp"
 #include "mcp_policy.hpp"
+#include "mfa_entropy_signal.hpp" // #6995 — the MFA CSPRNG-failure counter (not a store outage)
 #include "mfa_qr.hpp"
 #include "mfa_step_up.hpp"
 #include "step_up_gate.hpp"
@@ -35,6 +36,7 @@
 #include "saml_principal.hpp"  // saml_principal_id / is_valid_saml_component — ADR-2001 PR4a
 #include "saml_scim_link.hpp"  // link_saml_login_to_scim — ADR-2001 PR4a login-site orchestration
 #include "service_scope_policy.hpp" // authz::service_scope_global_safe — #2298 PR 3 default-deny table
+#include "session_store.hpp" // LocalMfaProof: the verified {generation, instant} a mint or stamp carries (#6079)
 #include "web_utils.hpp" // audit_token — CWE-117 neutralisation for the audit-failure warn
 
 #include <yuzu/version.hpp> // kVersionString — the version on the landing page's slim bar
@@ -62,6 +64,11 @@ constexpr std::size_t kMaxJustificationLength = 1024;
 // pre-seeded in server.cpp. Any error that is not is_store_unavailable() must
 // never reach a 503 degrade site, so the default ("query_error") is a
 // belt-and-braces fallback, not an expected path.
+//
+// #6995: `AuthDBError::EntropyUnavailable` MUST NEVER be passed here. It is inside
+// is_store_unavailable() (so it stays a fail-closed 503) but is not a store outage, and the
+// default arm would silently label it `query_error` -- the misattribution that change removed.
+// The one caller tests is_entropy_failure() first and counts the fault elsewhere.
 [[nodiscard]] const char* degrade_reason(AuthDBError e) noexcept {
     switch (e) {
     case AuthDBError::StoreBusy:
@@ -71,6 +78,31 @@ constexpr std::size_t kMaxJustificationLength = 1024;
     default:
         return "query_error";
     }
+}
+
+// The audit `cause=` token for a refused local-session mint (#6079). `kNone` with an empty token
+// and `kPersistFailed` are the two the pre-binding code already reported as one "undifferentiated"
+// cause; the rest name what the mint's own recheck or write found, so the evidence says whether
+// the account changed under the login or the verification instant was unusable.
+[[nodiscard]] const char* mint_denial_cause(auth::AuthManager::MintDenial d) noexcept {
+    using D = auth::AuthManager::MintDenial;
+    switch (d) {
+    case D::kPersistFailed:
+        return "persist_failed";
+    case D::kVerificationFutureDated:
+        return "verification_future_dated";
+    case D::kRoleChanged:
+        return "role_changed";
+    case D::kCredentialChanged:
+        return "credential_changed";
+    case D::kFactorChanged:
+        return "factor_changed";
+    case D::kRecheckUnavailable:
+        return "recheck_unavailable";
+    case D::kNone:
+        break;
+    }
+    return "undifferentiated";
 }
 
 // Max stored length of a single sanitised detail value (e.g. an OIDC
@@ -184,6 +216,62 @@ struct AuditProbeScope {
     AuditProbeScope& operator=(const AuditProbeScope&) = delete;
 };
 
+// The remediation for a supervised-tier token refused on a non-MCP transport. The generic text
+// names the flow; a pair with a named MCP tool also names the tool and what it needs, because
+// the contract (a required idempotency_key, the approval_id on the repeat call) cannot be
+// guessed from "ticket-then-recall". A route with NO MCP twin must not be pointed at a ticket
+// flow that does not exist for it: it says the route needs a credential without an MCP tier or a
+// browser session. That is why the REQUEST PATH is an input: the pair alone cannot tell the
+// definition tools' REST twins from the response-templates routes, which share the pair and have
+// no tool. EXTEND this function when a pair gains a tool, never fork.
+std::string approval_gated_remediation(std::string_view securable_type, std::string_view operation,
+                                       std::string_view path) {
+    if (securable_type == "Workflow" && operation == "Execute")
+        return "this operation is approval-gated for the supervised MCP tier; call the MCP "
+               "execute_workflow tool (POST /mcp/v1/) with an idempotency_key: the first call "
+               "returns an approval_id, and once an administrator approves it, repeat the same "
+               "call with that approval_id. A person can also run it from the dashboard";
+    // Pairs and routes with no MCP tool: product pack install and uninstall, and the
+    // response-templates routes of a definition (the other InstructionDefinition:Write routes
+    // are twinned by the definition authoring tools below).
+    const bool no_mcp_tool =
+        securable_type == "ProductPack" ||
+        (securable_type == "InstructionDefinition" && operation == "Write" &&
+         path.find("/response-templates") != std::string_view::npos);
+    if (no_mcp_tool)
+        return "this operation is approval-gated for the supervised MCP tier and this route has "
+               "no MCP tool to take an approval ticket; use a credential without an MCP tier or "
+               "a signed-in browser session";
+    if (securable_type == "InstructionDefinition" && operation == "Write")
+        return "this operation is approval-gated for the supervised MCP tier; call the matching "
+               "MCP tool (create_definition, update_definition, import_definition or "
+               "save_definition_yaml, POST /mcp/v1/): the first call returns an approval_id, and "
+               "once an administrator approves it, repeat the same call with that approval_id. "
+               "update_definition and an id-bearing save_definition_yaml must also carry the "
+               "version you read (expected_updated_at / updated_at)";
+    if (securable_type == "InstructionDefinition" && operation == "Delete")
+        return "this operation is approval-gated for the supervised MCP tier; call the MCP "
+               "delete_definition tool (POST /mcp/v1/): the first call returns an approval_id, "
+               "and once an administrator approves it, repeat the same call with that "
+               "approval_id";
+    return "this operation is approval-gated for the supervised MCP tier; use the MCP "
+           "ticket-then-recall flow (POST /mcp/v1/) or the dashboard";
+}
+
+// The ONE place a CredentialReadMode is interpreted: true == read the durable row, false == a
+// cache may answer. There is deliberately NO `default:`, so a new enumerator is a -Wswitch
+// diagnostic here instead of a silent fall-through to the weaker (cached) read. A value outside
+// the enumerators (reachable only through a cast) takes the durable read, the stronger one.
+bool reads_durable_row(auth::CredentialReadMode mode) noexcept {
+    switch (mode) {
+    case auth::CredentialReadMode::kCached:
+        return false;
+    case auth::CredentialReadMode::kAuthoritative:
+        return true;
+    }
+    return true;
+}
+
 } // namespace
 
 namespace detail {
@@ -192,9 +280,12 @@ namespace detail {
 // `detail` namespace (not the anonymous one above) so unit tests can link
 // against it directly — mirrors the rest_a4_envelope.hpp pattern.
 std::string sanitize_detail_value(std::string_view v) {
+    // log_key_token first: it folds UTF-8 C1 controls (U+0080-U+009F) and the Unicode line
+    // separators (U+2028/U+2029), which the byte loop below cannot see (WP04).
+    const std::string folded = ::yuzu::log_key_token(v);
     std::string out;
-    out.reserve(std::min(v.size(), kMaxDetailValueLength));
-    for (char c : v) {
+    out.reserve(std::min(folded.size(), kMaxDetailValueLength));
+    for (char c : folded) {
         const auto uc = static_cast<unsigned char>(c);
         out.push_back((c == ';' || c == '=' || c == '\r' || c == '\n' || uc < 0x20 || uc == 0x7F)
                           ? '_'
@@ -214,6 +305,10 @@ std::string sanitize_detail_value(std::string_view v) {
         }
     }
     return out;
+}
+
+std::string neutralise_saml_error(std::string_view err) {
+    return sanitize_detail_value(::yuzu::log_key_token(err));
 }
 
 } // namespace detail
@@ -246,6 +341,33 @@ std::string AuthRoutes::extract_session_cookie(const httplib::Request& req) {
     pos += prefix.size();
     auto end = cookie.find(';', pos);
     return cookie.substr(pos, end == std::string::npos ? end : end - pos);
+}
+
+auth::DurableMfaProof AuthRoutes::durable_mfa_proof_for(const httplib::Request& req,
+                                                        const auth::Session& session) const {
+    // Only a local cookie session has a stored proof; every other principal class is "no such
+    // session" here, so a bearer or federated caller never reaches the session store. The cookie
+    // is the one `resolve_session_unbound` validated for a local session (a bearer credential
+    // resolves to an API-token session, never a local one).
+    if (session.auth_source != "local")
+        return auth::DurableMfaProof{.source = auth::DurableMfaProof::Source::kAbsent};
+    const auto durable =
+        auth_mgr_.read_durable_mfa_proof(extract_session_cookie(req), session.username);
+    // A local binding decision needs the stored generation to be trustworthy; while the rebind
+    // guard is not observed in force the row is unavailable, never a bound proof. Not applied
+    // in `read_durable_mfa_proof` itself: the OIDC approver reads that directly and a binding
+    // does not apply to an SSO session.
+    if (durable.source == auth::DurableMfaProof::Source::kRow &&
+        !auth_mgr_.stored_binding_trustworthy())
+        return auth::DurableMfaProof{.source = auth::DurableMfaProof::Source::kUnavailable,
+                                     .binding_untrusted = true};
+    // A validation that could not run: the read is unavailable and TRANSIENT (the approver
+    // gate keeps its retry hint; the central gate's text says to check the runbook if retrying
+    // does not clear it); the next read validates afresh.
+    if (durable.source == auth::DurableMfaProof::Source::kRow &&
+        !auth_mgr_.stored_binding_read_confirmed(durable))
+        return auth::DurableMfaProof{.source = auth::DurableMfaProof::Source::kUnavailable};
+    return durable;
 }
 
 std::string AuthRoutes::session_correlator(const httplib::Request& req) {
@@ -339,7 +461,8 @@ std::optional<auth::Session> AuthRoutes::synthesize_token_session(const ApiToken
             "synthesize_token_session: token principal_id='{}' has out-of-allowlist "
             "principal_kind='{}' — refusing to synthesize a session (DB corruption or a "
             "bypassed CHECK constraint)",
-            api_token.principal_id, api_token.principal_kind);
+            ::yuzu::log_key_token(api_token.principal_id),
+            ::yuzu::log_key_token(api_token.principal_kind));
         return std::nullopt;
     }
 
@@ -391,6 +514,13 @@ std::optional<auth::Session> AuthRoutes::synthesize_token_session(const ApiToken
             // admin). get_user_role() queries the current role on every call, so
             // a creator who's been demoted since the token was issued will
             // produce a user-role session.
+            //
+            // #4068: both NotFound and DbError floor to Role::user HERE ON
+            // PURPOSE - flooring only lowers privilege, so it is safe in either
+            // case, and a 503 on every token request during a PG blip is a much
+            // larger behaviour change. A DbError is still signalled by
+            // `yuzu_auth_get_user_role_store_error_total` (incremented inside
+            // get_user_role()).
             auto legacy_role = auth_mgr_.get_user_role(api_token.principal_id);
             synth.role = legacy_role.value_or(auth::Role::user);
         }
@@ -510,7 +640,8 @@ std::optional<auth::Session> AuthRoutes::resolve_session_unbound(const httplib::
     return std::nullopt;
 }
 
-auth::CredentialCheck AuthRoutes::engine_credential_state(const ApiToken& token) const {
+auth::CredentialCheck AuthRoutes::engine_credential_state(const ApiToken& token,
+                                                          auth::CredentialReadMode mode) const {
     using R = auth::CredentialCheck;
 
     // Mirrors the two gates synthesize_token_session applies AFTER the token row
@@ -534,11 +665,35 @@ auth::CredentialCheck AuthRoutes::engine_credential_state(const ApiToken& token)
     if (!engine_principal_store_) {
         return R::kRevoked;
     }
-    // The ONE cached-lookup site (#2367). This function is only ever reached
-    // from revalidate_stream — the per-tick liveness re-check of an ALREADY
-    // authenticated stream — never from session synthesis or an on-behalf-of
-    // target check, both of which call get_for_auth and read through to
-    // Postgres every time (which is why this method is private).
+    // The ONE cached-lookup site (#2367). This function is only ever reached from
+    // revalidate_stream, which two kinds of caller ask: the held-open MCP stream's per-tick
+    // liveness re-check (kCached, below) and the workflow run's per-step boundary check
+    // (kAuthoritative, next). Session synthesis and the on-behalf-of target check never come
+    // here: they call get_for_auth and read through to Postgres every time (which is why this
+    // method is private).
+    if (reads_durable_row(mode)) {
+        // A boundary check, not a timer tick: ask Postgres, never the 15 s liveness cache. Same
+        // three-way mapping as below; nothing is reported stale because nothing was cached.
+        // This also bypasses get_for_auth_revalidate's 5-10 s failure backoff (#2367), so under a
+        // pool brownout every check pays for its own lease attempts. The bound (measured): a check makes at
+        // most three reads (two token candidates and this row). A saturated pool makes each
+        // wait at most 0.5 s, so about 4 s per boundary (the run asks twice when the first
+        // answer is indeterminate, one second apart). A database that accepts connections but
+        // does not answer costs the 10 s connect timeout on the first read of each attempt, about
+        // 21 s per boundary. A read on a connection already leased to a database that stopped
+        // answering did not return in 150 s in a test: no pool timeout bounds it and the run
+        // deadline is re-tested only after the retry wait. It fails closed (kIndeterminate)
+        // whenever a read returns.
+        switch (engine_principal_store_->get_for_auth(token.principal_id).status) {
+        case EngineLookupStatus::Active:
+            return R::kValid;
+        case EngineLookupStatus::MissingOrRevoked:
+            return R::kRevoked;
+        case EngineLookupStatus::StoreUnreachable:
+            return R::kIndeterminate;
+        }
+        return R::kRevoked; // unreachable: fail closed on a future enum value
+    }
     const auto engine = engine_principal_store_->get_for_auth_revalidate(token.principal_id);
     switch (engine.status) {
     case EngineLookupStatus::Active:
@@ -563,7 +718,8 @@ auth::CredentialCheck AuthRoutes::engine_credential_state(const ApiToken& token)
 }
 
 auth::CredentialCheck AuthRoutes::revalidate_stream(const httplib::Request& req,
-                                                    const std::string& expected_principal) {
+                                                    const std::string& expected_principal,
+                                                    auth::CredentialReadMode mode) {
     using R = auth::CredentialCheck;
 
     // The invariant: a stream lives iff a FRESH request carrying these same headers
@@ -574,8 +730,11 @@ auth::CredentialCheck AuthRoutes::revalidate_stream(const httplib::Request& req,
     // to also carry a stale cookie from a browser jar or a cookie-injecting proxy.
     // It failed closed, but it was still wrong.
 
-    // 1. Session cookie. AuthManager's session table is in-memory, so a "no" here is
-    //    always DEFINITIVE — there is no backend that could be unavailable.
+    // 1. Session cookie. `validate_session` answers from the cache of the durable session
+    //    store, whose generation it polls at most once per second (and distrusts past 30 s of
+    //    failed polls, going to the store). A "no" here is treated as DEFINITIVE even when it
+    //    came from a degraded store read: that fails closed (kRevoked), it never grants. The
+    //    mode does not change this arm: there is no per-credential cache to bypass.
     const auto cookie = extract_session_cookie(req);
     if (cookie.size() > auth::kMaxSessionTokenLength) {
         // resolve_session hard-rejects an oversized cookie rather than falling through,
@@ -610,7 +769,9 @@ auth::CredentialCheck AuthRoutes::revalidate_stream(const httplib::Request& req,
     for (const auto& raw : candidates) {
         if (raw.empty() || raw.size() > auth::kMaxApiTokenLength || !api_token_store_)
             continue;
-        const auto checked = api_token_store_->validate_token_checked(raw);
+        const auto checked = api_token_store_->validate_token_checked(
+            raw, reads_durable_row(mode) ? ApiTokenStore::TokenReadMode::kAuthoritative
+                                         : ApiTokenStore::TokenReadMode::kCached);
         switch (checked.status) {
         case ApiTokenStore::TokenCheck::kValid:
             if (checked.token && checked.token->principal_id == expected_principal) {
@@ -623,12 +784,14 @@ auth::CredentialCheck AuthRoutes::revalidate_stream(const httplib::Request& req,
                 // Returned verbatim, including kValidStale (#2367): the engine
                 // gate is the only staleness this function models today, and
                 // flattening it to kValid here would undo the whole point of
-                // the distinction. NOTE the token half above is NOT modelled —
-                // `validate_token_checked` is served from its own 60 s cache
-                // and reports a hit as plain kValid, so a token-authenticated
-                // stream still carries the additive window this closes for
-                // engine principals. Pre-existing; tracked as #2447.
-                return engine_credential_state(*checked.token);
+                // the distinction. NOTE the token half above is NOT modelled
+                // under kCached: `validate_token_checked` is served from its
+                // own 60 s cache and reports a hit as plain kValid, so a
+                // token-authenticated stream still carries the additive window
+                // this closes for engine principals. Pre-existing; tracked as
+                // #2447. Under kAuthoritative the token row was just read from
+                // Postgres, so there is no cache residency to model.
+                return engine_credential_state(*checked.token, mode);
             }
             break; // a valid token for SOMEONE ELSE is not authority for this stream
         case ApiTokenStore::TokenCheck::kUnavailable:
@@ -796,7 +959,9 @@ bool AuthRoutes::require_permission(const httplib::Request& req, httplib::Respon
                                     const std::string& securable_type,
                                     const std::string& operation) {
     // Every route keeps ADR-0041's documented answer: an RBAC read that could not be completed
-    // is a 403 (deny-on-degrade). Only the Forensics-tier resolver opts into the 503 mapping.
+    // is a 403 (deny-on-degrade). Only the callers of probe_permission_unavailable_aware (the
+    // Forensics-tier resolver, the software collection settings per-group routes) opt into the 503
+    // mapping.
     return require_permission_impl(req, res, securable_type, operation,
                                    RbacDegradeMapping::DenyAs403);
 }
@@ -1030,8 +1195,8 @@ bool AuthRoutes::require_permission_impl(const httplib::Request& req, httplib::R
         const auto checked =
             rbac_store_->check_permission_checked(session->username, securable_type, operation);
         if (!checked && degrade == RbacDegradeMapping::UnavailableAs503) {
-            // Opt-in only (the Forensics-tier resolver): a read that could not be completed is a
-            // retryable outage, not a missing grant. Every other route takes the 403 below.
+            // Opt-in only (probe_permission_unavailable_aware): a read that could not be completed
+            // is a retryable outage, not a missing grant. Every other route takes the 403 below.
             respond_rbac_unavailable(req, res, securable_type, operation, "RBAC");
             return false;
         }
@@ -1154,13 +1319,13 @@ bool AuthRoutes::require_tier_policy(const httplib::Request& req, httplib::Respo
         // false), keep `.remediation` unconditionally (it correctly steers to
         // the ticket-then-recall flow regardless of whether an RBAC grant
         // would separately admit the caller).
+        // Named local: the A4 options hold views, so the text must outlive the a4_denial call.
+        const std::string remediation =
+            approval_gated_remediation(securable_type, operation, req.path);
         res.set_content(
             detail::a4_denial(
                 res, 403, "operation requires approval for this MCP tier on this transport",
-                detail::A4ErrorOpts{.remediation = "this operation is approval-gated "
-                                             "for the supervised MCP tier; use the MCP "
-                                             "ticket-then-recall flow (POST /mcp/v1/) or "
-                                             "the dashboard",
+                detail::A4ErrorOpts{.remediation = remediation,
                             .permission = actionable_permission ? std::string_view(perm)
                                                                 : std::string_view{}}),
             "application/json");
@@ -1178,13 +1343,14 @@ TierPolicyFn AuthRoutes::gateless_tier_policy_fn() {
     };
 }
 
-bool AuthRoutes::require_scoped_permission(const httplib::Request& req, httplib::Response& res,
-                                           const std::string& securable_type,
-                                           const std::string& operation,
-                                           const std::string& agent_id) {
+ScopedGateOutcome AuthRoutes::require_scoped_permission_outcome(const httplib::Request& req,
+                                                                httplib::Response& res,
+                                                                const std::string& securable_type,
+                                                                const std::string& operation,
+                                                                const std::string& agent_id) {
     auto session = require_auth(req, res);
     if (!session)
-        return false;
+        return ScopedGateOutcome::Unauthenticated;
 
     // JIT admin elevation grants full admin (across all management groups) for
     // its window — cookie-session-only, so unreachable by MCP/service tokens.
@@ -1197,7 +1363,7 @@ bool AuthRoutes::require_scoped_permission(const httplib::Request& req, httplib:
     // that invariant ever changes. Do NOT read its presence as evidence
     // elevation is reachable for service tokens today; it is not.
     if (auth::is_elevated(*session) && session->token_scope_service.empty())
-        return true;
+        return ScopedGateOutcome::Admitted;
 
     // Engine principals have NO legacy or service-scoped authority — their only
     // authority is an explicit RBAC assignment (design §4.2 default-deny). The
@@ -1214,7 +1380,7 @@ bool AuthRoutes::require_scoped_permission(const httplib::Request& req, httplib:
                                               detail::A4ErrorOpts{.permission = securable_type + ":" +
                                                                         operation}),
                             "application/json");
-            return false;
+            return ScopedGateOutcome::Unavailable;
         }
         if (!rbac_store_->is_rbac_enabled() ||
             !rbac_store_->check_scoped_permission(session->username, securable_type, operation,
@@ -1226,7 +1392,7 @@ bool AuthRoutes::require_scoped_permission(const httplib::Request& req, httplib:
             res.set_content(detail::a4_denial(res, 403, "permission denied: " + perm,
                                               detail::A4ErrorOpts{.permission = perm}),
                             "application/json");
-            return false;
+            return ScopedGateOutcome::Denied;
         }
         // Belt-and-braces (#2298 PR 3, mirrors require_permission's identical
         // guard): engine-token mint already rejects a non-empty
@@ -1248,9 +1414,9 @@ bool AuthRoutes::require_scoped_permission(const httplib::Request& req, httplib:
             // "MUST NOT name a permission that wouldn't actually admit").
             res.set_content(detail::a4_denial(res, 403, "permission denied: " + perm),
                             "application/json");
-            return false;
+            return ScopedGateOutcome::Denied;
         }
-        return true;
+        return ScopedGateOutcome::Admitted;
     }
 
     // MCP-tier tokens: enforce the tier policy then fall through to the standard
@@ -1268,7 +1434,7 @@ bool AuthRoutes::require_scoped_permission(const httplib::Request& req, httplib:
             res.set_content(detail::a4_denial(res, 403, "MCP token tier does not allow " + perm,
                                               detail::A4ErrorOpts{.permission = perm}),
                             "application/json");
-            return false;
+            return ScopedGateOutcome::Denied;
         }
         // On the MCP JSON-RPC transport (`/mcp/v1/`) the C8 gate in
         // mcp_server.cpp is the authoritative approval gate (ticket-then-recall,
@@ -1287,16 +1453,15 @@ bool AuthRoutes::require_scoped_permission(const httplib::Request& req, httplib:
                       "MCP token tier '" + session->mcp_tier + "' requires approval for " +
                           securable_type + ":" + operation + " on a non-MCP transport");
             res.status = 403;
+            const std::string remediation =
+                approval_gated_remediation(securable_type, operation, req.path);
             res.set_content(
                 detail::a4_denial(
                     res, 403,
                     "operation requires approval for this MCP tier on this transport",
-                    detail::A4ErrorOpts{.remediation = "this operation is approval-gated for the "
-                                               "supervised MCP tier; use the MCP ticket-then-recall "
-                                               "flow (POST /mcp/v1/) or the dashboard",
-                                .permission = perm}),
+                    detail::A4ErrorOpts{.remediation = remediation, .permission = perm}),
                 "application/json");
-            return false;
+            return ScopedGateOutcome::Denied;
         }
     }
 
@@ -1316,7 +1481,7 @@ bool AuthRoutes::require_scoped_permission(const httplib::Request& req, httplib:
             res.set_content(detail::a4_denial(res, 403,
                                               "service-scoped tokens require RBAC to be enabled"),
                             "application/json");
-            return false;
+            return ScopedGateOutcome::Denied;
         }
         // Check that the ITServiceOwner role grants this permission type
         // Shared ceiling helper (authz::service_ceiling_check). A Degraded verdict (a failed
@@ -1329,7 +1494,7 @@ bool AuthRoutes::require_scoped_permission(const httplib::Request& req, httplib:
                                      "service-scoped token blocked: RBAC read degraded "
                                      "resolving the ITServiceOwner ceiling",
                                      ceiling);
-            return false;
+            return ScopedGateOutcome::Unavailable;
         }
         // Everything that is not an explicit Admit is refused: a Deny verdict, and any
         // out-of-range value, which must never fall through to the admit.
@@ -1345,7 +1510,7 @@ bool AuthRoutes::require_scoped_permission(const httplib::Request& req, httplib:
                               " (requires ITServiceOwner AND the target agent's service tag "
                               "to match the token's scope)";
             res.set_content(detail::a4_denial(res, 403, msg), "application/json");
-            return false;
+            return ScopedGateOutcome::Denied;
         }
         // Verify the target agent's service tag matches the token's scope
         if (!tag_store_) {
@@ -1356,7 +1521,7 @@ bool AuthRoutes::require_scoped_permission(const httplib::Request& req, httplib:
             res.set_content(detail::a4_denial(res, 503, "tag store unavailable, cannot verify scope",
                                               detail::A4ErrorOpts{.retry_after_ms = 5000}),
                             "application/json");
-            return false;
+            return ScopedGateOutcome::Unavailable;
         }
         // #2298 PR 3 (§3b): an empty agent_id used to skip the ONLY
         // comparison that could deny and fall through to an unconditional
@@ -1377,7 +1542,7 @@ bool AuthRoutes::require_scoped_permission(const httplib::Request& req, httplib:
             res.set_content(detail::a4_denial(res, 400, "agent_id is required",
                                               detail::A4ErrorOpts{.permission = perm}),
                             "application/json");
-            return false;
+            return ScopedGateOutcome::Denied;
         }
         // ADR-0050 typed read: a degraded store is a 503 (retryable),
         // never conflated with "agent has no service tag" — the
@@ -1393,7 +1558,7 @@ bool AuthRoutes::require_scoped_permission(const httplib::Request& req, httplib:
                                               "tag store unavailable, cannot verify scope",
                                               detail::A4ErrorOpts{.retry_after_ms = 5000}),
                             "application/json");
-            return false;
+            return ScopedGateOutcome::Unavailable;
         }
         const std::string agent_service = service_tag->value_or(std::string{});
         if (agent_service != session->token_scope_service) {
@@ -1408,9 +1573,9 @@ bool AuthRoutes::require_scoped_permission(const httplib::Request& req, httplib:
                                                   session->token_scope_service + "'",
                                               detail::A4ErrorOpts{.permission = perm}),
                             "application/json");
-            return false;
+            return ScopedGateOutcome::Denied;
         }
-        return true;
+        return ScopedGateOutcome::Admitted;
     }
 
     // #1717 (ADR-0017 ship-now HIGH): gate on `rbac_enforcement_in_effect`, NOT
@@ -1419,18 +1584,37 @@ bool AuthRoutes::require_scoped_permission(const httplib::Request& req, httplib:
     // `check_scoped_permission` on the dead handle rather than falling through to
     // the legacy Read-allow.
     if (rbac_store_ && rbac_enforcement_in_effect(rbac_store_)) {
-        if (!rbac_store_->check_scoped_permission(session->username, securable_type, operation,
-                                                  agent_id, mgmt_group_store_)) {
-            audit_log(req, "auth.scoped_permission_required", "denied", agent_id,
-                      "RBAC denied " + securable_type + ":" + operation);
+        // #3739: the checked variant tells a degrade-driven deny (a store read failed) from a
+        // definitive one, so the durable audit row can too. The RESPONSE is unchanged either way:
+        // a degraded scoped check is still a fail-closed 403 (ADR-0041 deny-on-degrade), not a 503.
+        // The detail keeps the `RBAC denied` prefix (a denial either way) and adds a greppable
+        // `read degraded:` token that does NOT reuse the 503 forms' "RBAC read degraded resolving
+        // the ITServiceOwner ceiling" phrase (upgrading.md's runbook keys on that phrase). The
+        // same store label is returned as the outcome class (MgmtGroupReadDegraded or
+        // RbacReadDegraded), so a typed caller learns what the audit row says.
+        const auto scoped = rbac_store_->check_scoped_permission_checked(
+            session->username, securable_type, operation, agent_id, mgmt_group_store_);
+        if (!scoped.has_value() || !*scoped) {
+            std::string denial_detail = "RBAC denied " + securable_type + ":" + operation;
+            ScopedGateOutcome refused = ScopedGateOutcome::Denied;
+            if (!scoped.has_value()) {
+                refused = scoped.error() == kRbacErrMgmtGroupReadDegraded
+                              ? ScopedGateOutcome::MgmtGroupReadDegraded
+                              : ScopedGateOutcome::RbacReadDegraded;
+                denial_detail += " (read degraded: " + std::string(degraded_store(refused)) + ")";
+            }
+            // target_type/target_id/detail spelled out: passing the id and the message
+            // positionally lands the id in `target_type` and the message in `target_id` (#3219).
+            audit_log(req, "auth.scoped_permission_required", "denied", "Agent", agent_id,
+                      denial_detail);
             res.status = 403;
             const std::string perm = securable_type + ":" + operation;
             res.set_content(detail::a4_denial(res, 403, "permission denied: " + perm,
                                               detail::A4ErrorOpts{.permission = perm}),
                             "application/json");
-            return false;
+            return refused;
         }
-        return true;
+        return ScopedGateOutcome::Admitted;
     }
 
     // Legacy fallback: write/delete/execute/approve require admin (effective_role
@@ -1473,14 +1657,44 @@ bool AuthRoutes::require_scoped_permission(const httplib::Request& req, httplib:
                                           detail::A4ErrorOpts{.permission = securable_type + ":" +
                                                                     operation}),
                         "application/json");
-        return false;
+        return ScopedGateOutcome::Denied;
     }
-    return true;
+    return ScopedGateOutcome::Admitted;
+}
+
+bool AuthRoutes::require_scoped_permission(const httplib::Request& req, httplib::Response& res,
+                                           const std::string& securable_type,
+                                           const std::string& operation,
+                                           const std::string& agent_id) {
+    return require_scoped_permission_outcome(req, res, securable_type, operation, agent_id) ==
+           ScopedGateOutcome::Admitted;
 }
 
 ListReadGate AuthRoutes::require_list_read(const httplib::Request& req, httplib::Response& res,
                                            const std::string& securable_type,
                                            const std::string& operation) {
+    // Postcondition on EVERY admit, in one place so a branch added to the body later cannot miss
+    // it: a service-scoped session is never admitted unrestricted (the same predicate and
+    // responder as require_fleet_read). The engine branch refuses it earlier; this is the backstop.
+    // An admit that carries no session cannot be checked, so it is refused too (fail CLOSED).
+    ListReadGate gate = require_list_read_unchecked(req, res, securable_type, operation);
+    if (gate.admitted &&
+        !(gate.session && authz::service_scope_authority_ok(*gate.session, gate.scope))) {
+        gate.admitted = false;
+        gate.scope.reset();
+        const auth::Session no_session{};
+        refuse_service_scoped_unrestricted(req, res, gate.session ? *gate.session : no_session,
+                                           securable_type + ":" + operation,
+                                           authz::UnrestrictedRefusalGate::kListRead,
+                                           authz::UnrestrictedRefusalSite::kPostcondition);
+    }
+    return gate;
+}
+
+ListReadGate AuthRoutes::require_list_read_unchecked(const httplib::Request& req,
+                                                     httplib::Response& res,
+                                                     const std::string& securable_type,
+                                                     const std::string& operation) {
     ListReadGate gate;
     const std::string perm = securable_type + ":" + operation;
 
@@ -1523,6 +1737,15 @@ ListReadGate AuthRoutes::require_list_read(const httplib::Request& req, httplib:
     // otherwise hand an engine credential fleet-wide read the moment RBAC is
     // disabled; resolve engine sessions here, RBAC-only, or deny.
     if (session->is_engine()) {
+        // A service-scoped engine session (a corrupted row: minting refuses it) is refused
+        // FIRST, before any store read, so grant and RBAC state do not matter. Inside the engine
+        // branch, so the order elevated, engine, mcp_tier, service, RBAC is unchanged.
+        if (!session->token_scope_service.empty()) {
+            refuse_service_scoped_unrestricted(req, res, *session, perm,
+                                               authz::UnrestrictedRefusalGate::kListRead,
+                                               authz::UnrestrictedRefusalSite::kEngineEntry);
+            return gate;
+        }
         if (!rbac_store_ || !rbac_store_->is_open()) {
             audit_log(req, "auth.permission_required", "denied", "", "",
                       "engine principal denied: RBAC store unavailable");
@@ -1807,6 +2030,20 @@ AuthRoutes::AuditAsSessionFn AuthRoutes::audit_as_session_fn() {
     };
 }
 
+AuthRoutes::AuditEventForSessionFn AuthRoutes::audit_event_for_session_fn() {
+    return [this](const httplib::Request& req, const auth::Session& session,
+                  const std::string& principal_role, const std::string& action,
+                  const std::string& result, const std::string& target_type,
+                  const std::string& target_id) {
+        // The same arguments, in the same order, `audit_log_for_session` hands
+        // `audit_log_for_principal` (which builds its row with this very builder).
+        return make_audit_event_for_principal(req, action, result, session.username,
+                                              principal_role, target_type, target_id,
+                                              /*detail=*/{},
+                                              session.is_engine() ? "engine" : std::string{});
+    };
+}
+
 void AuthRoutes::record_enroll_credential_changed(const httplib::Request& req,
                                                   const std::string& username, auth::Role role) {
     audit_log_for_principal(req, "mfa.enroll.failed", "error", username,
@@ -1923,10 +2160,15 @@ void AuthRoutes::emit_event(const std::string& event_type, const httplib::Reques
 }
 
 // Pick the striped login mutex for a username (account-lockout race close).
-// Any hash is fine — same-stripe collisions across distinct usernames just
-// serialize harmlessly. See the header for the full rationale.
-std::mutex& AuthRoutes::login_lock_for(const std::string& username) {
-    return login_locks_[std::hash<std::string>{}(username) % login_locks_.size()];
+// Same-stripe collisions across distinct usernames serialize harmlessly, but an attacker who can
+// COMPUTE a collision could keep a victim's stripe hot through another name, so the index is
+// salted with a per-process random value (stripe_salt_) that never leaves the process (salted, not
+// keyed: std::hash is not a keyed hash, so this raises the bar rather than promising secrecy).
+std::size_t AuthRoutes::login_stripe_index(const std::string& username) const {
+    return std::hash<std::string>{}(stripe_salt_ + username) % login_locks_.size();
+}
+std::timed_mutex& AuthRoutes::login_lock_for(const std::string& username) {
+    return login_locks_[login_stripe_index(username)];
 }
 
 // ---------------------------------------------------------------------------
@@ -1943,20 +2185,98 @@ PasswordCheckResult AuthRoutes::verify_password_with_lockout(const std::string& 
                                                              const PasswordCheckOptions& opts) {
     const bool lockout_active = cfg_.auth_lockout_threshold > 0 && !opts.lockout_exempt;
 
+    // 1. The caller's pre-verify gate (the sso-only local-login gate) runs FIRST, before any
+    // stripe or slot: a refused attempt never hashes, so it must never consume (or be refused
+    // for lack of) shared capacity. Under sso-only every name except the armed break-glass
+    // account is rejected here with the one generic 401. The gate's only database read (the
+    // break-glass arm state) is cached and single-flight (see the gate), so this position
+    // cannot park workers.
+    if (opts.pre_verify_gate && !opts.pre_verify_gate())
+        return {PasswordCheckOutcome::kGateRejected, std::nullopt, {}};
+
+    // 2. The armed break-glass account (lockout-exempt on /login) keeps no lockout counter, so it
+    // takes no stripe; its CONCURRENT guesses are bounded by its budget lane: a NON-blocking
+    // slot, ONE per TCP peer address, in a lane of min(4, cap/4) slots (1 on pools of 10-15).
+    // The slot is taken for EVERY attempt, including an over-length password whose hash is
+    // skipped (that request still does database and audit work). A refusal is answered with
+    // the generic 401 by the /login handler (never a distinguishable 429), so the busy lane
+    // does not tell a caller which name is the break-glass user.
+    const bool break_glass_attempt = opts.lockout_exempt && opts.metric_route == "login";
+    std::optional<Pbkdf2Budget::Slot> pbkdf2_slot;
+    if (break_glass_attempt) {
+        pbkdf2_slot.emplace(acquire_pbkdf2(Pbkdf2Class::kBreakGlass, req, opts.metric_route));
+        if (!pbkdf2_slot->ok())
+            return {PasswordCheckOutcome::kBusy, std::nullopt, {}};
+    }
+
     // Serialize concurrent attempts for THIS username across the whole
     // lockout-critical section below (pre-check → verify_password →
     // record/clear), so a synchronized burst cannot all pass the stale
     // pre-check and verify more than `threshold` passwords before the lock
-    // arms (adversarial C1). Held only when lockout is enabled, and released
-    // when this function returns — before the caller's MFA branching, which
-    // does not touch lockout state. Striped per-username (login_lock_for) so
-    // unrelated usernames log in fully in parallel — only a burst against one
-    // account is serialized, which is the intended throttle. (Taken whenever
-    // the threshold is on, INCLUDING for a lockout-exempt break-glass attempt,
-    // exactly as the pre-extraction /login did.)
-    std::unique_lock<std::mutex> login_lk;
-    if (cfg_.auth_lockout_threshold > 0) {
-        login_lk = std::unique_lock<std::mutex>(login_lock_for(username));
+    // arms (adversarial C1). Held only when lockout accounting applies to THIS attempt
+    // (threshold above 0 and the name is not lockout-exempt), and released when this function
+    // returns. The hash cannot move out of the stripe without a DB-atomic reservation of the
+    // attempt (the HA-correct follow-up noted at the stripe's declaration): the pre-check and the
+    // failure record must see each other. A lockout-exempt name (the break-glass account under
+    // sso-only) keeps NO lockout counter, so the stripe protects nothing for it and it never
+    // takes it: a flood of its name, or of a name that collides onto its stripe, cannot deny it.
+    // For an ordinary KNOWN name, hammering it with wrong passwords arms the lockout after
+    // `threshold` hashes, after which each request holds the stripe only for the cheap
+    // pre-check, so a targeted denial is bounded by the existing time-boxed lockout, not new.
+    // The wait is BOUNDED (kLoginStripeWait) and the number of WAITERS is capped
+    // (stripe_waiter_cap_, a fraction of the worker pool): a waiter pins an httplib worker, and
+    // a flood of logins for ONE unknown name (which never locks) would otherwise queue and
+    // starve the pool, invisibly to the slot budget. The lock is tried FIRST, so only a request
+    // that would actually WAIT counts against the cap and an unrelated name is never refused
+    // because of someone else's flood. A refusal (cap or timeout) is the existing 429 (kBusy),
+    // uniform for any name. A flood from many addresses can still occupy that many workers for
+    // up to kLoginStripeWait each; the database-atomic reservation (#8215) removes the stripe.
+    std::unique_lock<std::timed_mutex> login_lk;
+    if (lockout_active) {
+        login_lk = std::unique_lock<std::timed_mutex>(login_lock_for(username), std::defer_lock);
+        if (!login_lk.try_lock()) {
+            // Per-stripe first (a flood on one stripe cannot use up the global ceiling), then the
+            // global ceiling (the pinned-worker bound across all stripes).
+            StripeWaiterGuard stripe_waiter(stripe_waiters_per_[login_stripe_index(username)]);
+            const bool login_route = opts.metric_route == "login";
+            const char* cls = !login_route ? "authenticated" : "unauthenticated";
+            if (stripe_waiter.prior() >= kStripeWaitersPerStripe) {
+                count_budget_refusal(opts.metric_route, cls, "stripe_cap");
+                return {PasswordCheckOutcome::kBusy, std::nullopt, {}};
+            }
+            BoundedWaiterGuard waiter(stripe_waiters_,
+                                      stripe_waiter_cap_.load(std::memory_order_relaxed));
+            if (!waiter.admitted()) {
+                count_budget_refusal(opts.metric_route, cls, "stripe_cap");
+                return {PasswordCheckOutcome::kBusy, std::nullopt, {}};
+            }
+            if (!login_lk.try_lock_for(kLoginStripeWait)) {
+                count_budget_refusal(opts.metric_route, cls, "stripe_busy");
+                return {PasswordCheckOutcome::kBusy, std::nullopt, {}};
+            }
+        }
+    }
+
+    // WP03 perf-F1: verify_password spends a PBKDF2 even for an unknown username (F38), so bound
+    // the concurrent hashing process-wide, by class and per source. Taken AFTER the stripe (so a
+    // slot is never held while only waiting on another request for the same name) but BEFORE the
+    // lockout pre-check, so a full budget answers 429 the same for a locked and an unlocked
+    // account (no lock-state oracle). The slot IS then held across the pre-check's one DB read
+    // and the hash, which is the work it bounds. Full => no hash, no strike. The break-glass
+    // account (lockout_exempt under sso-only) has its own capped lane that may use the reserved
+    // slots, so an unauthenticated flood on the ordinary lane cannot lock the escape hatch out.
+    // The slot is taken even when the password is over-length (its hash is skipped): the request
+    // still takes a stripe, a database read and, for a known name, a failure write, so it counts
+    // against the lane (a flood of unique unknown names with over-length passwords must not
+    // escape the cap).
+    if (!break_glass_attempt) {
+        const bool login_route = opts.metric_route == "login";
+        pbkdf2_slot.emplace(acquire_pbkdf2(!login_route         ? Pbkdf2Class::kAuthenticated
+                                                                 : Pbkdf2Class::kUnauthenticated,
+                                           req, opts.metric_route,
+                                           login_route ? std::string{} : "u:" + username));
+        if (!pbkdf2_slot->ok())
+            return {PasswordCheckOutcome::kBusy, std::nullopt, {}};
     }
 
     // ── Account-lockout pre-check (SOC 2 CC6.3) ──────────────────────
@@ -1997,8 +2317,8 @@ PasswordCheckResult AuthRoutes::verify_password_with_lockout(const std::string& 
                     if (auto* m = auth_mgr_.metrics_registry()) {
                         m->counter("yuzu_auth_lockout_blocked_total").increment();
                     }
-                    spdlog::warn("Login blocked: account '{}' is locked (source {})", username,
-                                 req.remote_addr);
+                    spdlog::warn("Login blocked: account '{}' is locked (source {})",
+                                 ::yuzu::log_key_token(username), req.remote_addr);
                     return {PasswordCheckOutcome::kLocked, std::nullopt, {}};
                 }
             } else {
@@ -2010,13 +2330,11 @@ PasswordCheckResult AuthRoutes::verify_password_with_lockout(const std::string& 
                 lockout_read_failed = true;
                 spdlog::warn("lockout_status read failed for '{}' (error={}) — pre-check "
                              "fail-open; brute-force throttle degraded for this attempt",
-                             username, static_cast<int>(st.error()));
+                             ::yuzu::log_key_token(username), static_cast<int>(st.error()));
             }
         }
     }
 
-    if (opts.pre_verify_gate && !opts.pre_verify_gate())
-        return {PasswordCheckOutcome::kGateRejected, std::nullopt, {}};
 
     // #5342: an over-max password can never match a stored hash (no setting
     // site accepts one), so it is answered exactly like a wrong password — same
@@ -2049,7 +2367,7 @@ PasswordCheckResult AuthRoutes::verify_password_with_lockout(const std::string& 
         }
         spdlog::warn("password verification for '{}' could not complete ({}) - transient, not "
                      "counted toward lockout (source {})",
-                     username,
+                     ::yuzu::log_key_token(username),
                      verified.error() == auth::VerifyFailure::kStoreUnavailable
                          ? "auth store unavailable"
                          : "credential changed concurrently",
@@ -2083,7 +2401,7 @@ PasswordCheckResult AuthRoutes::verify_password_with_lockout(const std::string& 
                                 " window_secs=" + std::to_string(cfg_.auth_lockout_window_secs))) {
                         spdlog::error("audit emission FAILED for auth.lockout.applied user='{}' "
                                       "— CC6.3 lock-event evidence lost",
-                                      username);
+                                      ::yuzu::log_key_token(username));
                     }
                     emit_event("auth.lockout.applied", req,
                                {{"source_ip", req.remote_addr}, {"username", username}}, {},
@@ -2091,11 +2409,11 @@ PasswordCheckResult AuthRoutes::verify_password_with_lockout(const std::string& 
                     if (auto* m = auth_mgr_.metrics_registry()) {
                         m->counter("yuzu_auth_lockout_applied_total").increment();
                     }
-                    spdlog::warn("Account '{}' locked after {} failed login attempts", username,
-                                 cfg_.auth_lockout_threshold);
+                    spdlog::warn("Account '{}' locked after {} failed login attempts",
+                                 ::yuzu::log_key_token(username), cfg_.auth_lockout_threshold);
                 } else if (!rec) {
-                    spdlog::warn("record_failed_login failed for '{}': error={}", username,
-                                 static_cast<int>(rec.error()));
+                    spdlog::warn("record_failed_login failed for '{}': error={}",
+                                 ::yuzu::log_key_token(username), static_cast<int>(rec.error()));
                     if (is_store_unavailable(rec.error())) {
                         // ★ Hermes p2 MEDIUM: the counter could not be
                         // persisted — the caller must refuse fail-closed (503),
@@ -2133,14 +2451,14 @@ PasswordCheckResult AuthRoutes::verify_password_with_lockout(const std::string& 
     if (cfg_.auth_lockout_threshold > 0 && (prior_failed_count > 0 || lockout_read_failed)) {
         if (auto* db = auth_mgr_.auth_db_ptr()) {
             if (auto cl = db->clear_failed_logins(username); !cl) {
-                spdlog::warn("clear_failed_logins failed for '{}': error={}", username,
+                spdlog::warn("clear_failed_logins failed for '{}': error={}", ::yuzu::log_key_token(username),
                              static_cast<int>(cl.error()));
             } else {
                 if (!audit_log_for_principal(req, "auth.lockout.cleared", "ok", username,
                                              auth::role_to_string(verified->role), "User",
                                              username, opts.cleared_detail)) {
                     spdlog::warn("audit emission failed for auth.lockout.cleared user='{}'",
-                                 username);
+                                 ::yuzu::log_key_token(username));
                 }
                 emit_event("auth.lockout.cleared", req,
                            {{"source_ip", req.remote_addr}, {"username", username}});
@@ -2149,6 +2467,106 @@ PasswordCheckResult AuthRoutes::verify_password_with_lockout(const std::string& 
     }
     // Lockout-critical section complete; the stripe releases on return.
     return {PasswordCheckOutcome::kVerified, verified->role, std::move(verified->hash_hex)};
+}
+
+void AuthRoutes::count_budget_refusal(const std::string& route, const char* cls,
+                                      const char* reason) {
+    if (auto* m = auth_mgr_.metrics_registry())
+        m->counter("yuzu_auth_pbkdf2_budget_rejected_total",
+                   {{"route", route}, {"class", cls}, {"reason", reason}})
+            .increment();
+}
+
+Pbkdf2Budget::Slot AuthRoutes::acquire_pbkdf2(Pbkdf2Class cls, const httplib::Request& req,
+                                              const std::string& route,
+                                              const std::string& principal) {
+    auto slot = pbkdf2_budget_.try_acquire(cls, req.remote_addr, principal);
+    if (!slot.ok()) {
+        if (auto* m = auth_mgr_.metrics_registry())
+            m->counter("yuzu_auth_pbkdf2_budget_rejected_total",
+                       {{"route", route},
+                        {"class", cls == Pbkdf2Class::kUnauthenticated ? "unauthenticated"
+                                    : cls == Pbkdf2Class::kBreakGlass   ? "break_glass"
+                                                                        : "authenticated"},
+                        {"reason", to_string(slot.refusal())}})
+                .increment();
+    }
+    return slot;
+}
+
+namespace {
+/// Exactly 6 ASCII digits is a TOTP code; anything else takes the recovery-code (PBKDF2) path.
+bool mfa_code_is_totp_shape(const std::string& code) {
+    if (code.size() != 6)
+        return false;
+    for (char c : code)
+        if (c < '0' || c > '9')
+            return false;
+    return true;
+}
+} // namespace
+
+void AuthRoutes::refuse_pbkdf2_busy(httplib::Response& res) {
+    res.status = 429;
+    res.set_header("Retry-After", "2");
+    res.set_content(detail::a4_error(res, "too many concurrent authentication attempts, retry shortly",
+                                     {.retry_after_ms = 2000}),
+                    "application/json");
+}
+
+int AuthRoutes::mfa_budget_threshold() const {
+    return cfg_.auth_lockout_threshold > 0 ? cfg_.auth_lockout_threshold
+                                           : kMfaBudgetDefaultThreshold;
+}
+int AuthRoutes::mfa_budget_window() const {
+    return cfg_.auth_lockout_window_secs > 0 ? cfg_.auth_lockout_window_secs
+                                             : kMfaBudgetDefaultWindowSecs;
+}
+
+AuthRoutes::MfaReserved AuthRoutes::mfa_budget_reserve(const std::string& username) {
+    auto* db = auth_mgr_.auth_db_ptr();
+    if (!db)
+        return {MfaBudget::kStoreUnavailable, false};
+    auto r = db->reserve_mfa_attempt(username, mfa_budget_threshold(), mfa_budget_window());
+    if (!r) {
+        spdlog::error("reserve_mfa_attempt failed for '{}' (error={}) - refusing before "
+                      "verification (fail-closed)",
+                      username, static_cast<int>(r.error()));
+        if (auto* m = auth_mgr_.metrics_registry())
+            m->counter("yuzu_auth_mfa_budget_unavailable_total").increment();
+        return {MfaBudget::kStoreUnavailable, false};
+    }
+    if (!r->reserved) {
+        if (auto* m = auth_mgr_.metrics_registry())
+            m->counter("yuzu_auth_mfa_lockout_blocked_total").increment();
+        return {MfaBudget::kLocked, false};
+    }
+    return {MfaBudget::kOpen, r->just_locked};
+}
+
+void AuthRoutes::mfa_budget_note_failure(const httplib::Request& req, const std::string& username,
+                                         const std::string& role_str, const MfaReserved& r) {
+    if (!r.just_locked)
+        return;
+    if (!audit_log_for_principal(req, "auth.mfa.lockout.applied", "ok", username, role_str,
+                                 "User", username,
+                                 "threshold=" + std::to_string(mfa_budget_threshold()) +
+                                     " window_secs=" + std::to_string(mfa_budget_window()))) {
+        spdlog::error("audit emission FAILED for auth.mfa.lockout.applied user='{}'", username);
+    }
+    emit_event("auth.mfa.lockout.applied", req,
+               {{"source_ip", req.remote_addr}, {"username", username}}, {}, Severity::kWarn);
+    if (auto* m = auth_mgr_.metrics_registry())
+        m->counter("yuzu_auth_mfa_lockout_applied_total").increment();
+}
+
+void AuthRoutes::mfa_budget_refund(const std::string& username) {
+    if (auto* db = auth_mgr_.auth_db_ptr()) {
+        // A failed refund errs toward counting (the reservation stays spent): logged, not fatal.
+        if (auto rf = db->refund_mfa_attempt(username, mfa_budget_threshold()); !rf)
+            spdlog::warn("refund_mfa_attempt failed for '{}': error={} (attempt stays counted)",
+                         username, static_cast<int>(rf.error()));
+    }
 }
 
 PasswordVerifyFn AuthRoutes::password_change_verify_fn() {
@@ -2160,14 +2578,14 @@ PasswordVerifyFn AuthRoutes::password_change_verify_fn() {
         opts.lockout_exempt = cfg_.auth_mode == "sso-only" && !cfg_.break_glass_user.empty() &&
                               username == cfg_.break_glass_user;
         // #5342 Gate 7 (C8): the SAME hardened-mode gate /login runs, at the
-        // same point (after the lockout pre-check, before PBKDF2). Under
+        // same point (before any PBKDF2 slot and before the lockout pre-check). Under
         // sso-only only an ARMED break-glass account may have its password
         // evaluated; once disarmed, a still-live break-glass session cannot
         // use this route as a guessing oracle (no PBKDF2) or to lock the
         // account (no record_failed_login). The route answers kGateRejected
         // with 403 sso_only_local_disabled; this lambda writes nothing.
         opts.pre_verify_gate = [this, &username]() {
-            return sso_only_local_password_gate(username) != SsoOnlyLocalGate::kRefused;
+            return sso_only_local_password_gate(username).admits_password_evaluation();
         };
         opts.metric_route = "password_change";
         opts.cleared_detail = "reset_on_password_change";
@@ -2175,20 +2593,254 @@ PasswordVerifyFn AuthRoutes::password_change_verify_fn() {
     };
 }
 
-SsoOnlyLocalGate AuthRoutes::sso_only_local_password_gate(const std::string& username) {
-    if (cfg_.auth_mode != "sso-only")
-        return SsoOnlyLocalGate::kOpen;
-    if (!cfg_.break_glass_user.empty() && username == cfg_.break_glass_user) {
-        if (auto* db = auth_mgr_.auth_db_ptr()) {
-            // Fail CLOSED on a read error: unlike lockout (which guards against
-            // wrong passwords and so fails open), this gate is the credential
-            // path itself — a transient read error must not become a free pass
-            // to the disabled local-login path.
-            if (auto bg = db->break_glass_status(username); bg && bg->armed)
-                return SsoOnlyLocalGate::kBreakGlassArmed;
+void AuthRoutes::count_arm_gate(const char* result) {
+    if (auto* m = auth_mgr_.metrics_registry())
+        m->counter("yuzu_auth_break_glass_arm_gate_total", {{"result", result}}).increment();
+}
+
+// The MFA step's second re-check reads the arm state ITSELF. It runs after a code was verified
+// (for a recovery code: consumed), so it must not be refused because another request holds the
+// shared refresh or because the shared cache is old. It is reached only by a caller holding the
+// password and a valid second factor, so it cannot be driven by a flood. Because this read can
+// overlap the shared refresher's, everything it writes to shared state is on the refusing side:
+//  - it NEVER writes the armed cache (no other request is told "armed" by it);
+//  - "not armed" drops the cache (the next caller reads again) and records the last-not-armed
+//    time as the END of this read, never earlier than what is already recorded;
+//  - "armed" records only the arm id (so a transient answer after a re-arm carries the new window);
+//  - a failed read, or an armed read older than the cap, writes NOTHING.
+// The two "last" facts are copied into the answer AFTER the read, under the mutex, so a
+// not-armed read another request recorded while this one was in flight is in the answer.
+SsoOnlyGateResult AuthRoutes::break_glass_arm_own_read(const std::string& username) {
+    SsoOnlyGateResult out;
+    std::function<BreakGlassArmRead()> hook;
+    {
+        std::lock_guard lk(bg_arm_mu_);
+        hook = bg_arm_read_hook_for_test_;
+    }
+    BreakGlassArmRead read;
+    read.ok = false;
+    const auto started = arm_clock_now(); // BEFORE the read (see the gate)
+    if (hook) {
+        read = hook();
+    } else if (auto* db = auth_mgr_.auth_db_ptr()) {
+        if (auto bg = db->break_glass_status(username)) {
+            read.ok = true;
+            read.armed = bg->armed;
+            read.armed_until = bg->armed_until;
+            read.remaining_ms = bg->remaining_ms;
         }
     }
-    return SsoOnlyLocalGate::kRefused;
+    const auto finished = arm_clock_now();
+    const auto deadline = started + std::chrono::milliseconds(read.remaining_ms);
+    const bool armed_now = read.ok && read.armed && read.remaining_ms > 0 && finished < deadline;
+    const bool too_old = armed_now && !arm_observation_fresh(started, finished);
+    if (!read.ok)
+        spdlog::warn("break-glass arm-state read failed; the arm state is unknown and the gate "
+                     "admits nothing on it until a read succeeds");
+    {
+        std::lock_guard lk(bg_arm_mu_);
+        if (read.ok && !armed_now) {
+            bg_arm_valid_ = false;
+            if (!bg_last_not_armed_at_ || *bg_last_not_armed_at_ < finished)
+                bg_last_not_armed_at_ = finished;
+        } else if (armed_now && !too_old) {
+            bg_last_armed_id_ = read.armed_until;
+        }
+        out.arm_id = bg_last_armed_id_;
+        out.last_not_armed_at = bg_last_not_armed_at_;
+    }
+    if (!read.ok) {
+        out.state = SsoOnlyLocalGate::kTransient;
+        out.cause = SsoOnlyTransientCause::kReadFailed;
+        count_arm_gate("read_failed");
+        return out;
+    }
+    if (too_old) {
+        out.state = SsoOnlyLocalGate::kTransient;
+        out.cause = SsoOnlyTransientCause::kStaleRead;
+        count_arm_gate("stale_read");
+        return out;
+    }
+    if (armed_now) {
+        out.state = SsoOnlyLocalGate::kBreakGlassArmed;
+        out.arm_id = read.armed_until;
+        out.deadline = deadline;
+        out.read_at = started;
+        return out;
+    }
+    out.state = SsoOnlyLocalGate::kRefused;
+    out.why = read.armed_until.empty() ? SsoOnlyRefusedWhy::kDisarmed : SsoOnlyRefusedWhy::kWindowEnded;
+    return out;
+}
+
+SsoOnlyGateResult AuthRoutes::sso_only_local_password_gate(const std::string& username,
+                                                           SsoOnlyArmRead read_mode) {
+    SsoOnlyGateResult out;
+    if (cfg_.auth_mode != "sso-only") {
+        out.state = SsoOnlyLocalGate::kOpen;
+        return out;
+    }
+    if (cfg_.break_glass_user.empty() || username != cfg_.break_glass_user)
+        return out; // kRefused / kNotBreakGlass: every other name, no database read at all
+    if (read_mode == SsoOnlyArmRead::kOwnFreshRead)
+        return break_glass_arm_own_read(username);
+    // The break-glass name: the arm state is a database read, and this gate runs for EVERY
+    // request naming that user, before any slot. So the answer is cached and refreshed by ONE
+    // request at a time (single flight); every other request is answered at once. The gate
+    // FAILS CLOSED and says which kind of answer it gives:
+    //  - kBreakGlassArmed only from a read that said armed, while the cache is younger than
+    //    kBreakGlassArmCacheTtl, the LOCAL monotonic deadline derived from the database clock's
+    //    remaining arm time has not passed (never the replica's wall clock), AND the read
+    //    STARTED at most kArmSnapshotMaxAge ago (the cap; it holds for a cache hit and for this
+    //    call's own read, however long that read took);
+    //  - kRefused only for a definitive answer: a read that said not armed, or the local
+    //    deadline passing (an arm window that ends is enforced locally with no refresh at all);
+    //  - kTransient when the arm state could not be established: a refresh is in flight and the
+    //    cache is older than the TTL (refresh_busy), the bounded read failed or there is no auth
+    //    store (read_failed), or an armed read is older than the cap (stale_read). A transient
+    //    answer is never cached and is never recorded as "not armed".
+    // The refresh itself is bounded in time (break_glass_status caps the pool acquire, the lock
+    // wait and the statement). Two facts are kept across failed reads for the MFA step's second
+    // re-check: the id of the last definitive armed read and the newest "not armed" time (an
+    // own read's end, a shared refresh's start; it never moves back).
+    auto* metrics = auth_mgr_.metrics_registry();
+    const auto count = [metrics](const char* result) {
+        if (metrics)
+            metrics->counter("yuzu_auth_break_glass_arm_gate_total", {{"result", result}})
+                .increment();
+    };
+    const auto now = arm_clock_now();
+    std::function<BreakGlassArmRead()> hook;
+    std::function<void()> after_cache_miss; // test seam, empty in production
+    {
+        std::lock_guard lk(bg_arm_mu_);
+        out.last_not_armed_at = bg_last_not_armed_at_;
+        // An armed snapshot is not served once this server holds a not-armed read at or after that
+        // snapshot's start: a shared refresh that began before an own read saw "not armed" can
+        // finish "armed" after it. The entry is then treated as expired, and this call reads again
+        // (or answers refresh_busy while another refresh is in flight).
+        const bool superseded =
+            bg_arm_armed_ && bg_last_not_armed_at_ && *bg_last_not_armed_at_ >= bg_arm_started_;
+        if (bg_arm_valid_ && now - bg_arm_at_ < kBreakGlassArmCacheTtl && !superseded) {
+            if (!bg_arm_armed_) {
+                out.state = SsoOnlyLocalGate::kRefused;
+                out.why = bg_arm_id_.empty() ? SsoOnlyRefusedWhy::kDisarmed
+                                             : SsoOnlyRefusedWhy::kWindowEnded;
+                return out;
+            }
+            if (now >= bg_arm_deadline_) {
+                out.state = SsoOnlyLocalGate::kRefused;
+                out.why = SsoOnlyRefusedWhy::kWindowEnded;
+                return out;
+            }
+            if (!arm_observation_fresh(bg_arm_started_, now)) {
+                out.state = SsoOnlyLocalGate::kTransient;
+                out.cause = SsoOnlyTransientCause::kStaleRead;
+                out.arm_id = bg_last_armed_id_;
+                count("stale_read");
+                return out;
+            }
+            out.state = SsoOnlyLocalGate::kBreakGlassArmed;
+            out.arm_id = bg_arm_id_;
+            out.deadline = bg_arm_deadline_;
+            out.read_at = bg_arm_started_;
+            out.read_wall_at = bg_arm_started_wall_;
+            return out;
+        }
+        out.arm_id = bg_last_armed_id_; // what a transient answer carries
+        hook = bg_arm_read_hook_for_test_;
+        after_cache_miss = bg_arm_after_cache_miss_hook_for_test_;
+    }
+    if (after_cache_miss)
+        after_cache_miss();
+    bool expected = false;
+    if (!bg_arm_refreshing_.compare_exchange_strong(expected, true)) {
+        // A refresh is in flight and the cache is older than the TTL (a stale arm is never
+        // served; this is not a "not armed" answer either). The two "last" facts are read AGAIN
+        // here: between this call's cache check and now, another request may have completed a
+        // whole refresh and recorded "not armed", and the MFA step's second re-check must see it.
+        {
+            std::lock_guard lk(bg_arm_mu_);
+            out.arm_id = bg_last_armed_id_;
+            out.last_not_armed_at = bg_last_not_armed_at_;
+        }
+        out.state = SsoOnlyLocalGate::kTransient;
+        out.cause = SsoOnlyTransientCause::kRefreshBusy;
+        count("refresh_busy");
+        return out;
+    }
+    struct Done {
+        std::atomic<bool>& f;
+        ~Done() { f.store(false); }
+    } done{bg_arm_refreshing_};
+    BreakGlassArmRead read;
+    read.ok = false;
+    // BEFORE the read: the database snapshot it sees is at or after this instant, so the arm
+    // deadline and the age of the observation both count from the conservative side.
+    const auto started = arm_clock_now();
+    const auto started_wall = arm_wall_clock_now(); // the same instant, for a suspend between this read and the first MFA check
+    if (hook) {
+        read = hook();
+    } else if (auto* db = auth_mgr_.auth_db_ptr()) {
+        if (auto bg = db->break_glass_status(username)) {
+            read.ok = true;
+            read.armed = bg->armed;
+            read.armed_until = bg->armed_until;
+            read.remaining_ms = bg->remaining_ms;
+        }
+    }
+    const auto finished = arm_clock_now();
+    const auto deadline = started + std::chrono::milliseconds(read.remaining_ms);
+    const bool armed_now = read.ok && read.armed && read.remaining_ms > 0 && finished < deadline;
+    if (!read.ok) // logged before the lock every request naming the user takes
+        spdlog::warn("break-glass arm-state read failed; the arm state is unknown and the gate "
+                     "admits nothing on it until a read succeeds");
+    std::lock_guard lk(bg_arm_mu_);
+    out.arm_id = bg_last_armed_id_;
+    out.last_not_armed_at = bg_last_not_armed_at_;
+    if (!read.ok) {
+        // A failed read (or no auth store) caches nothing, so the next call reads again.
+        bg_arm_valid_ = false;
+        out.state = SsoOnlyLocalGate::kTransient;
+        out.cause = SsoOnlyTransientCause::kReadFailed;
+        count("read_failed");
+        return out;
+    }
+    if (armed_now && !arm_observation_fresh(started, finished)) {
+        // The read said armed but took longer than the cap: too old to honour, and not evidence
+        // that the account is not armed. Treated like a failed read (nothing cached or recorded).
+        bg_arm_valid_ = false;
+        out.state = SsoOnlyLocalGate::kTransient;
+        out.cause = SsoOnlyTransientCause::kStaleRead;
+        count("stale_read");
+        return out;
+    }
+    bg_arm_valid_ = true;
+    bg_arm_armed_ = armed_now;
+    bg_arm_at_ = finished;
+    bg_arm_started_ = started;
+    bg_arm_started_wall_ = started_wall;
+    bg_arm_deadline_ = deadline;
+    bg_arm_id_ = read.armed_until;
+    if (armed_now) {
+        bg_last_armed_id_ = read.armed_until;
+        out.state = SsoOnlyLocalGate::kBreakGlassArmed;
+        out.arm_id = read.armed_until;
+        out.deadline = deadline;
+        out.read_at = started;
+        out.read_wall_at = started_wall;
+        return out;
+    }
+    // A definitive "not armed". The last armed id is left in place on purpose. The time is this
+    // read's START, and it only ever moves forward: an own read that ended later may already have
+    // recorded a newer time, which a slow shared read must not lower (SG-1).
+    if (!bg_last_not_armed_at_ || *bg_last_not_armed_at_ < started)
+        bg_last_not_armed_at_ = started;
+    out.last_not_armed_at = bg_last_not_armed_at_;
+    out.state = SsoOnlyLocalGate::kRefused;
+    out.why = read.armed_until.empty() ? SsoOnlyRefusedWhy::kDisarmed
+                                       : SsoOnlyRefusedWhy::kWindowEnded;
+    return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -2313,9 +2965,12 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         // while armed — an out-of-band host operator ran --break-glass-arm
         // within the window. A non-exempt or un-armed attempt is rejected with
         // the SAME generic 401 as a bad password (no "disabled"/"sso-only"
-        // wording, no Retry-After), so the response BODY/STATUS/HEADERS carry no
-        // enumeration/mode/arm-state oracle, and verify_password (PBKDF2) is
-        // skipped. The one residue is response TIMING: an armed break-glass user
+        // wording, no Retry-After), so status, body and headers do not tell them apart. A busy
+        // break-glass lane is answered with the same generic 401 (below), so the status does
+        // not depend on the name either. A TIMING difference remains and is NOT closed: the
+        // first request naming the break-glass user after each cache expiry pays the arm-state
+        // read (the cache is 1 s, single flight). verify_password (PBKDF2) is skipped for the rejected names. The one other
+        // residue is response TIMING: an armed break-glass user
         // runs PBKDF2 (slow) while every other username short-circuits (fast),
         // so timing can reveal that the break-glass account is currently armed
         // (and, separately, that the deployment is in sso-only mode) —
@@ -2328,17 +2983,20 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         // ~100 ms of server CPU — for a residue that leaks only operational
         // state, never a secret. Same trade-off the shipped lockout pre-check
         // already makes (see docs/auth-architecture.md "Account lockout").
-        // Runs AFTER the lockout pre-check (a locked account answers first,
-        // exactly as before the extraction) and BEFORE PBKDF2.
+        // Runs inside verify_password_with_lockout BEFORE any PBKDF2 slot is taken and BEFORE
+        // the lockout pre-check (a refused attempt never hashes, so it never needs a slot;
+        // the 401 is the same generic body either way).
         // The arm-state decision itself is the shared, response-free
         // sso_only_local_password_gate (#5342 Gate 7, C8 — the self-service
         // password change runs the SAME gate); the 401, metric and log line
         // below stay HERE, at the /login site.
         check_opts.pre_verify_gate = [&]() -> bool {
             const auto gate = sso_only_local_password_gate(username);
-            if (gate == SsoOnlyLocalGate::kOpen)
+            if (gate.state == SsoOnlyLocalGate::kOpen)
                 return true;
-            break_glass_login = gate == SsoOnlyLocalGate::kBreakGlassArmed;
+            // Not open, so the one admit set leaves exactly "armed": a definitive refusal and
+            // an unreadable arm state are both refused below.
+            break_glass_login = gate.admits_password_evaluation();
             if (!break_glass_login) {
                 res.status = 401;
                 res.set_content(detail::a4_error(res, "Invalid username or password"),
@@ -2361,14 +3019,17 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                         .increment();
                 }
                 spdlog::warn("Local-password login blocked (auth-mode=sso-only){} from source {}",
-                             probed_break_glass ? " [break-glass account, not armed]" : "",
+                             !probed_break_glass ? ""
+                             : gate.state == SsoOnlyLocalGate::kTransient
+                                 ? " [break-glass account, arm state unreadable]"
+                                 : " [break-glass account, not armed]",
                              req.remote_addr);
                 return false;
             }
             // break_glass_login stays true → the success audit + metric + warn
             // fire only AFTER verify_password below confirms the credential, so a
             // wrong-password attempt against the armed account audits as a normal
-            // auth.login_failed (and counts toward lockout), never a spurious
+            // auth.login_failed (the break-glass account keeps no lockout counter), never a spurious
             // "ok" break-glass row.
             return true;
         };
@@ -2397,6 +3058,19 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
             res.status = 401;
             res.set_content(detail::a4_error(res, "Invalid username or password"),
                             "application/json");
+            return;
+        case PasswordCheckOutcome::kBusy:
+            if (break_glass_lockout_exempt) {
+                // The break-glass lane refused (a second request from this address or a full
+                // lane): answer the SAME generic 401 as a bad password, so the answer does not
+                // depend on whether the name is the break-glass user (no name oracle). The
+                // refusal is counted in yuzu_auth_pbkdf2_budget_rejected_total{class="break_glass"}.
+                res.status = 401;
+                res.set_content(detail::a4_error(res, "Invalid username or password"),
+                                "application/json");
+                return;
+            }
+            refuse_pbkdf2_busy(res);
             return;
         case PasswordCheckOutcome::kGateRejected:
             return; // the sso-only gate above wrote the 401
@@ -2497,7 +3171,7 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                            Severity::kCritical);
                 spdlog::error("mfa_status failed for '{}' (error={}) — refusing login "
                               "(fail-closed, architect BLOCK)",
-                              username, static_cast<int>(status.error()));
+                              ::yuzu::log_key_token(username), static_cast<int>(status.error()));
                 return;
             }
         }
@@ -2548,7 +3222,7 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                           "refusing to offer enrollment (would defeat the second factor). "
                           "Re-enroll it per the break-glass section of "
                           "docs/ops-runbooks/auth-db-recovery.md.",
-                          username, req.remote_addr);
+                          ::yuzu::log_key_token(username), req.remote_addr);
             return;
         }
 
@@ -2572,7 +3246,7 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
             }
             spdlog::warn("BREAK-GLASS login proceeding for '{}' (source {}) under "
                          "auth-mode=sso-only — a second factor is still required",
-                         username, req.remote_addr);
+                         ::yuzu::log_key_token(username), req.remote_addr);
         }
 
         // PR3 enforcement (SOC 2 CC6.6). Under `required` (every role) or
@@ -2604,7 +3278,7 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                                         "auth_db unavailable (fail-closed)");
                 spdlog::error(
                     "MFA enforcement={} but auth_db unavailable — refusing login for '{}'",
-                    cfg_.mfa_enforcement, username);
+                    cfg_.mfa_enforcement, ::yuzu::log_key_token(username));
                 return;
             }
             // #5342 Gate 8 (F4): anchor the provisional secret to the hash this
@@ -2629,6 +3303,12 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                 // never a generic 500 that could be confused with a
                 // harmless one-off. No session is minted either way.
                 const bool store_unavailable = is_store_unavailable(init.error());
+                // #6995: a CSPRNG fault is still a fail-closed 503, but no query FAILED, so it is
+                // counted in yuzu_secure_random_failure_total and NOT in the store-outage
+                // counters below. The response itself (503, Retry-After: 2, retry_after_ms) is
+                // deliberately UNCHANGED from #4763 so callers see no new status or header; the
+                // 2 s hint is store-derived and is not tuned for a possibly persistent fault.
+                const bool entropy_unavailable = is_entropy_failure(init.error());
                 res.status = store_unavailable ? 503 : 500;
                 if (store_unavailable)
                     res.set_header("Retry-After", "2"); // #2396 honest backoff hint (503 only)
@@ -2638,7 +3318,9 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                                            {.retry_after_ms = 2000})
                         : detail::a4_error(res, "Could not initiate MFA enrollment"),
                     "application/json");
-                if (store_unavailable) {
+                if (entropy_unavailable) {
+                    mfa_entropy::count(auth_mgr_.metrics_registry(), mfa_entropy::kSiteEnroll);
+                } else if (store_unavailable) {
                     if (auto* m = auth_mgr_.metrics_registry()) {
                         m->counter("yuzu_auth_secret_unavailable_total", {{"route", "login"}})
                             .increment();
@@ -2651,7 +3333,10 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                 }
                 audit_log_for_principal(req, "mfa.enroll.required", "error", username,
                                         auth::role_to_string(*role_opt), "User", username,
-                                        store_unavailable
+                                        entropy_unavailable
+                                            ? "csprng_unavailable: mfa_enroll (mfa_init_enrollment, "
+                                              "fail-closed)"
+                                        : store_unavailable
                                             ? "mfa_init_enrollment: secret/store unavailable "
                                               "(fail-closed)"
                                             : "mfa_init_enrollment failed");
@@ -2724,8 +3409,7 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         }
 
         if (!mfa_enrolled) {
-            auto token =
-                auth_mgr_.create_local_session(username, *role_opt, false, verified_hash_hex);
+            auto token = auth_mgr_.create_local_session(username, *role_opt, verified_hash_hex);
             if (token.empty()) {
                 // #4107 Gate 8 finding (security-guardian): create_local_
                 // session's empty-token sentinel (durable-persist failure,
@@ -2792,6 +3476,7 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                 entry.username = username;
                 entry.role = *role_opt;
                 entry.hash_hex = verified_hash_hex;
+                entry.break_glass = break_glass_login;
                 entry.expires_at = std::chrono::steady_clock::now() +
                                    std::chrono::seconds(cfg_.mfa_login_pending_secs);
                 mfa_pending_[pending_token] = std::move(entry);
@@ -2896,9 +3581,117 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
             return;
         }
 
+        // Recovery-code verification scans PBKDF2 hashes: take the process-wide slot BEFORE the
+        // lock check and the reservation, so a full budget is a 429 for locked and unlocked
+        // accounts alike (no lock-state oracle), and nothing needs refunding.
+        std::optional<Pbkdf2Budget::Slot> recovery_slot;
+        if (!mfa_code_is_totp_shape(code)) {
+            recovery_slot.emplace(acquire_pbkdf2(Pbkdf2Class::kUnauthenticated, req, "mfa_recovery"));
+            if (!recovery_slot->ok()) {
+                // Nothing was verified or counted: give the pending token back (if still within
+                // its TTL) so the Retry-After hint is honest.
+                if (std::chrono::steady_clock::now() < entry.expires_at) {
+                    std::lock_guard lock(mfa_pending_mu_);
+                    mfa_pending_[pending] = std::move(entry);
+                }
+                refuse_pbkdf2_busy(res);
+                return;
+            }
+        }
+        // A break-glass login is authorised by the ARM WINDOW, not just by the password step: the
+        // pending token outlives that step (mfa_login_pending_secs), so the arm state is checked
+        // again here, before anything is spent, and once more before the mint. Every refusal is
+        // the SAME generic 401 as any other failure here and spends nothing (no attempt counted,
+        // no code verified or consumed):
+        //  - a definitive "not armed" (the arm was removed or its window ended) ends the login;
+        //  - an arm state that could not be read is not evidence of either, so the pending token
+        //    is put back (inside its TTL, attempts unchanged) and the caller may retry.
+        // An armed answer is kept in `arm1` for the second re-check.
+        struct ArmSnapshot {
+            std::string arm_id;
+            std::chrono::steady_clock::time_point deadline;
+            std::chrono::steady_clock::time_point read_at;
+            std::chrono::system_clock::time_point wall_at; ///< wall time when that read STARTED
+        };
+        std::optional<ArmSnapshot> arm1;
+        bool admitted_under_transient = false;
+        const auto count_bg_refused = [this](const char* reason, const char* stage) {
+            if (auto* m = auth_mgr_.metrics_registry())
+                m->counter("yuzu_auth_break_glass_pending_refused_total",
+                           {{"reason", reason}, {"stage", stage}})
+                    .increment();
+        };
+        if (entry.break_glass) {
+            const SsoOnlyGateResult gate1 = sso_only_local_password_gate(entry.username);
+            // The request that performed the shared refresh can be given an "armed" answer whose read
+            // started at or before a not-armed read this server holds (another login's own read
+            // finished inside it). That answer is superseded: refuse it here, as a disarm, before
+            // anything is verified or spent.
+            const bool superseded1 = gate1.state == SsoOnlyLocalGate::kBreakGlassArmed &&
+                                     gate1.last_not_armed_at && *gate1.last_not_armed_at >= gate1.read_at;
+            if (gate1.state == SsoOnlyLocalGate::kBreakGlassArmed && !superseded1) {
+                arm1 = ArmSnapshot{gate1.arm_id, gate1.deadline, gate1.read_at, gate1.read_wall_at};
+            } else if (gate1.state == SsoOnlyLocalGate::kTransient) {
+                const std::string uname = entry.username;
+                const auto urole = entry.role;
+                if (std::chrono::steady_clock::now() < entry.expires_at) {
+                    std::lock_guard lock(mfa_pending_mu_);
+                    mfa_pending_[pending] = std::move(entry);
+                }
+                res.status = 401;
+                res.set_content(kFailureBody(res), "application/json");
+                audit_log_for_principal(req, "mfa.login.failed", "error", uname,
+                                        auth::role_to_string(urole), "User", uname,
+                                        "break-glass arm state unreadable (nothing verified or "
+                                        "spent)");
+                count_bg_refused("transient", "pre_verify");
+                return;
+            } else {
+                const bool window_ended = gate1.why == SsoOnlyRefusedWhy::kWindowEnded;
+                res.status = 401;
+                res.set_content(kFailureBody(res), "application/json");
+                audit_log_for_principal(req, "mfa.login.failed", "error", entry.username,
+                                        auth::role_to_string(entry.role), "User", entry.username,
+                                        window_ended ? "break-glass no longer armed: window ended"
+                                                     : "break-glass no longer armed: disarmed");
+                count_bg_refused(window_ended ? "window_ended" : "disarmed", "pre_verify");
+                return;
+            }
+        }
+
+        // WP03 F15: RESERVE a durable per-account attempt BEFORE verifying (one DB statement:
+        // lock check + increment). A locked account gets the SAME uniform 401 as a wrong code
+        // (no lock oracle; the pending entry is already consumed); an attempt that cannot be
+        // counted is never verified (503, fail closed).
+        const auto reservation = mfa_budget_reserve(entry.username);
+        if (reservation.budget == MfaBudget::kStoreUnavailable) {
+            res.status = 503;
+            res.set_header("Retry-After", "2");
+            res.set_content(detail::a4_error(res, "authentication store is temporarily unavailable",
+                                             {.retry_after_ms = 2000}),
+                            "application/json");
+            audit_log_for_principal(req, "mfa.login.failed", "error", entry.username,
+                                    auth::role_to_string(entry.role), "User", entry.username,
+                                    "mfa attempt could not be counted (fail-closed, nothing "
+                                    "verified, no session minted)");
+            return;
+        }
+        if (reservation.budget == MfaBudget::kLocked) {
+            res.status = 401;
+            res.set_content(kFailureBody(res), "application/json");
+            audit_log_for_principal(req, "mfa.login.failed", "error", entry.username,
+                                    auth::role_to_string(entry.role), "User", entry.username,
+                                    "mfa locked (failure budget exhausted)");
+            return;
+        }
+
         bool matched = false;
         bool used_recovery = false;
         bool store_unavailable = false;
+        // #6079: what the verifier proved, carried unchanged to the mint below: the factor
+        // generation read under the users row lock and the database instant its loading
+        // statement captured before any cryptographic check (never the mint's own now()).
+        LocalMfaProof proof{};
         // Strict shape gate (Gate 4 consistency N2 + unhappy UP-14/UP-20):
         //   - TOTP: exactly 6 ASCII digits
         //   - Recovery: any other shape goes through normalisation +
@@ -2918,7 +3711,9 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         if (is_totp) {
             auto r = db->mfa_verify_login_code(entry.username, code);
             if (r) {
-                matched = *r;
+                matched = r->ok;
+                if (matched)
+                    proof = {r->factor_gen, r->verified_ms};
             } else if (is_store_unavailable(r.error())) {
                 // ★ SECURITY (architect BLOCK): a decrypt/store failure must
                 // NEVER be treated as "wrong code" — that would silently
@@ -2933,15 +3728,17 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
             }
         } else {
             auto r = db->mfa_consume_recovery_code(entry.username, code);
-            if (r && *r) {
+            if (r && r->ok) {
                 matched = true;
                 used_recovery = true;
+                proof = {r->factor_gen, r->verified_ms};
             } else if (!r && is_store_unavailable(r.error())) {
                 store_unavailable = true; // outage → 503, never a burned attempt
             }
         }
 
         if (store_unavailable) {
+            mfa_budget_refund(entry.username); // an outage proved nothing: not a spent guess
             res.status = 503;
             res.set_content(detail::a4_error(res, "authentication store is temporarily unavailable"),
                             "application/json");
@@ -2960,6 +3757,12 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                        {}, Severity::kCritical);
             return;
         }
+
+        if (!matched)
+            mfa_budget_note_failure(req, entry.username, auth::role_to_string(entry.role),
+                                    reservation);
+        else
+            mfa_budget_refund(entry.username);
 
         if (!matched) {
             // Bump attempts counter and re-insert if still under the cap.
@@ -3034,20 +3837,92 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         // Mint the real session marked as MFA-verified.
         // #5342 Gate 7 (B4): the step-1 credential anchor — a password reset
         // or change committed since the pending /login denies this mint.
-        auto token =
-            auth_mgr_.create_local_session(entry.username, entry.role, true, entry.hash_hex);
+        if (mfa_verify_barrier_for_test_) // test seam, empty in production
+            mfa_verify_barrier_for_test_("/login/mfa", proof);
+        // Re-check the arm state once more at the mint (the code verification took time). A code
+        // may already be spent here, so the three answers are kept apart:
+        //  - armed: mint, unless the "not armed" time this server holds is at or after this
+        //    read started (then it is a disarm, refused);
+        //  - a definitive "not armed": refuse (the refusal is honest about a spent code);
+        // This check reads the arm state ITSELF (no shared cache, no single flight), so a refresh
+        // held by another request, or an old cache, cannot refuse a login whose code is spent.
+        //  - unreadable: mint ONLY inside the bound the first re-check's read gives: before that
+        //    window's own end, at most kArmSnapshotMaxAge after that read STARTED, the same arm
+        //    window, and no "not armed" read on this server since. Otherwise refuse.
+        // `now2` is sampled ONCE, AFTER the gate call returns (that call can itself take as long
+        // as a bounded read), and both time checks use it. A login with no snapshot from the
+        // first re-check never mints, whatever the gate says now.
+        // The monotonic clock does not advance while the host is suspended, so those checks cannot
+        // see a suspend after the first snapshot's read started. The wall clock is sampled with
+        // `now2`, and was sampled when that read started, ONLY to refuse: if more than
+        // kArmSnapshotMaxAge of wall time passed since then, an unreadable arm state is not admitted. A wall clock that moved backward
+        // changes nothing; it is never evidence for admitting.
+        if (entry.break_glass) {
+            const SsoOnlyGateResult gate2 =
+                sso_only_local_password_gate(entry.username, SsoOnlyArmRead::kOwnFreshRead);
+            const auto now2 = arm_clock_now();
+            const auto wall2 = arm_wall_clock_now();
+            const bool transient_ok =
+                arm1.has_value() && gate2.state == SsoOnlyLocalGate::kTransient &&
+                now2 < arm1->deadline && arm_observation_fresh(arm1->read_at, now2) &&
+                wall2 - arm1->wall_at <= kArmSnapshotMaxAge &&
+                !arm1->arm_id.empty() && gate2.arm_id == arm1->arm_id &&
+                !(gate2.last_not_armed_at && *gate2.last_not_armed_at >= arm1->read_at);
+            // An armed own read is honoured only if the "not armed" time this server holds is
+            // before it STARTED; a time at or after that is the newer fact (C-01, PR #8626
+            // review). An own read records that time at its END, a shared refresh at its START,
+            // so a shared "not armed" read that started before this read but finished during it
+            // does not refuse it (a documented residual, auth-architecture.md arm-gate
+            // invariant (2)).
+            const bool armed_ok =
+                gate2.state == SsoOnlyLocalGate::kBreakGlassArmed &&
+                !(gate2.last_not_armed_at && *gate2.last_not_armed_at >= gate2.read_at);
+            const bool admit = arm1.has_value() && (armed_ok || transient_ok);
+            if (!admit) {
+                const char* reason = "transient";
+                const char* detail = "reason=break_glass_arm_state_unreadable_before_mint";
+                const bool seen_removed =
+                    arm1.has_value() && gate2.last_not_armed_at &&
+                    *gate2.last_not_armed_at >= arm1->read_at;
+                if ((arm1.has_value() && now2 >= arm1->deadline) ||
+                    (gate2.state == SsoOnlyLocalGate::kRefused &&
+                     gate2.why == SsoOnlyRefusedWhy::kWindowEnded)) {
+                    reason = "window_ended";
+                    detail = "reason=break_glass_window_ended_before_mint";
+                } else if (gate2.state == SsoOnlyLocalGate::kRefused || seen_removed) {
+                    reason = "disarmed";
+                    detail = "reason=break_glass_disarmed_before_mint";
+                }
+                res.status = 401;
+                res.set_content(kFailureBody(res), "application/json");
+                audit_log_for_principal(req, "auth.login", "failure", entry.username,
+                                        auth::role_to_string(entry.role), "User", entry.username,
+                                        std::string(detail) +
+                                            (used_recovery ? ";method=password+recovery"
+                                                           : ";method=password+totp"));
+                count_bg_refused(reason, "pre_mint");
+                return;
+            }
+            admitted_under_transient = gate2.state == SsoOnlyLocalGate::kTransient;
+        }
+        auth::AuthManager::MintDenial denial = auth::AuthManager::MintDenial::kNone;
+        auto token = auth_mgr_.create_local_session(entry.username, entry.role, entry.hash_hex,
+                                                    proof, &denial);
         if (token.empty()) {
             // #4107 Gate 8 finding (security-guardian) - see the plain-
             // password-login call site's identical comment above (also
             // covers why the audit reason below doesn't assert
-            // post_mint_recheck=true - cpp-expert Gate 8).
+            // post_mint_recheck=true - cpp-expert Gate 8). #6079: the cause is the mint's own
+            // (a factor, role or credential change, an unusable verification instant); the
+            // client still sees the same uniform 401.
             res.status = 401;
             res.set_content(kFailureBody(res), "application/json");
-            audit_log_for_principal(req, "auth.login", "failure", entry.username,
-                                    auth::role_to_string(entry.role), "User", entry.username,
-                                    "reason=session_mint_failed;cause=undifferentiated;method=" +
-                                        std::string(used_recovery ? "password+recovery"
-                                                                   : "password+totp"));
+            audit_log_for_principal(
+                req, "auth.login", "failure", entry.username, auth::role_to_string(entry.role),
+                "User", entry.username,
+                std::string("reason=session_mint_failed;cause=") + mint_denial_cause(denial) +
+                    ";method=" +
+                    std::string(used_recovery ? "password+recovery" : "password+totp"));
             emit_event("auth.login", req,
                        {{"source_ip", req.remote_addr},
                         {"username", entry.username},
@@ -3065,9 +3940,17 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         // stay correct (Gate 4 architect S2 + happy-path S1 + S2).
         audit_log_for_principal(req, "auth.login", "ok", entry.username,
                                 auth::role_to_string(entry.role), "User", entry.username,
-                                used_recovery ? "method=password+recovery"
-                                              : "method=password+totp");
+                                std::string(used_recovery ? "method=password+recovery"
+                                                          : "method=password+totp") +
+                                    (admitted_under_transient ? ";arm_recheck=transient_admitted"
+                                                              : ""));
+        if (admitted_under_transient)
+            spdlog::warn("break-glass login for '{}' completed while the arm state could not be "
+                         "re-read (inside the bound from the read made before verification)",
+                         ::yuzu::log_key_token(entry.username));
         if (auto* m = auth_mgr_.metrics_registry()) {
+            if (admitted_under_transient)
+                m->counter("yuzu_auth_break_glass_pending_transient_admitted_total").increment();
             m->counter("yuzu_auth_mfa_logins_total",
                        {{"method", used_recovery ? "recovery" : "totp"},
                         {"result", "success"}})
@@ -3159,10 +4042,13 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         }
 
         std::vector<std::string> recovery_codes;
+        LocalMfaProof proof{}; // #6079: the enrolment's generation and pre-crypto database instant
         bool verified = false;
         bool store_unavailable = false;
+        bool entropy_unavailable = false; // #6995: store_unavailable, but a CSPRNG fault
         bool already_enrolled = false;
         bool credential_changed = false;
+        bool enrollment_cancelled = false;
         if (is_totp) {
             // #5342 Gate 8 (F2): bind the enrolment to the credential this
             // pending login PROVED (the B4 hash carry) — a password change or
@@ -3171,7 +4057,8 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
             // password can never complete.
             auto r = db->mfa_verify_enrollment(entry.username, code, entry.hash_hex);
             if (r) {
-                recovery_codes = std::move(*r);
+                recovery_codes = std::move(r->recovery_codes);
+                proof = {r->factor_gen, r->verified_ms};
                 verified = true;
             } else if (r.error() == AuthDBError::CredentialChanged) {
                 credential_changed = true;
@@ -3180,10 +4067,18 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                 // race (or it was enrolled before this pending token committed).
                 // NOT a wrong code and NOT an outage — handled distinctly below so
                 // it neither burns a pending attempt nor emits a false
-                // store-unavailable signal (#3777, CC7.2). (A bare disable+re-init
-                // WITHOUT a subsequent winning verify leaves mfa_enrolled_at NULL,
-                // so it does NOT reach here — it stays fail-closed WriteFailed→503.)
+                // store-unavailable signal (#3777, CC7.2).
                 already_enrolled = true;
+            } else if (r.error() == AuthDBError::MfaEnrollmentCancelled) {
+                // The provisional secret this code was verified against is no longer
+                // the stored one (#3808): cleared or replaced by a disable, a
+                // re-init, the stale-provisional sweep, `--mfa-reset` or a KEK
+                // rewrap. The database cannot tell those apart, so nothing below
+                // may name a cause. Benign: nothing was enrolled. NOT a store
+                // outage — MfaEnrollmentCancelled is outside is_store_unavailable(),
+                // so no 503 / degrade counter — and NOT a wrong code. Handled
+                // distinctly below.
+                enrollment_cancelled = true;
             } else if (is_store_unavailable(r.error())) {
                 // ★ SECURITY (architect BLOCK): a decrypt/store failure must
                 // NEVER be treated as "wrong code" here either — same
@@ -3191,6 +4086,7 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                 // this only routes to a distinct fail-closed 503 below
                 // instead of burning an attempt on a transient outage.
                 store_unavailable = true;
+                entropy_unavailable = is_entropy_failure(r.error());
             }
         }
 
@@ -3225,22 +4121,49 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
             return;
         }
 
+        if (enrollment_cancelled) {
+            // The provisional enrollment changed under this verify. The pending
+            // token was move-erased on take-ownership above and is NOT
+            // re-inserted: its provisional secret is gone or replaced, so it is
+            // spent and the operator must sign in again to start over. No session
+            // is minted. Audited as its own benign outcome — never mfa.enroll.failed
+            // (a bad code) nor the kCritical store-unavailable event. The detail
+            // states only the observed fact, in the key=value style of
+            // `step_up_proof=...`: a SIEM or auditor reading a named cause would
+            // look for a matching mfa.disabled row that may never have existed.
+            audit_log_for_principal(req, "mfa.enroll.cancelled", "ok", entry.username,
+                                    auth::role_to_string(entry.role), "User", entry.username,
+                                    "reason=provisional_secret_changed; nothing enrolled");
+            res.status = 409;
+            res.set_content(detail::a4_error(res, "MFA enrollment was cancelled or replaced; "
+                                                  "sign in again to start over"),
+                            "application/json");
+            return;
+        }
+
         if (store_unavailable) {
             res.status = 503;
             res.set_content(detail::a4_error(res, "authentication store is temporarily unavailable"),
                             "application/json");
-            if (auto* m = auth_mgr_.metrics_registry()) {
+            if (entropy_unavailable) {
+                // #6995: the recovery-code draw faulted and the enrolment rolled back.
+                mfa_entropy::count(auth_mgr_.metrics_registry(), mfa_entropy::kSiteRecovery);
+            } else if (auto* m = auth_mgr_.metrics_registry()) {
                 m->counter("yuzu_auth_secret_unavailable_total", {{"route", "mfa_enroll"}})
                     .increment();
             }
             audit_log_for_principal(req, "mfa.enroll.failed", "error", entry.username,
                                     auth::role_to_string(entry.role), "User", entry.username,
-                                    "mfa_verify_enrollment: secret/store unavailable "
-                                    "(fail-closed, no session minted)");
+                                    entropy_unavailable
+                                        ? "csprng_unavailable: mfa_recovery (mfa_verify_enrollment, "
+                                          "fail-closed, enrollment rolled back, no session minted)"
+                                        : "mfa_verify_enrollment: secret/store unavailable "
+                                          "(fail-closed, no session minted)");
             emit_event("mfa.enroll.failed", req,
                        {{"source_ip", req.remote_addr},
                         {"username", entry.username},
-                        {"reason", "store_unavailable"}},
+                        {"reason", entropy_unavailable ? "csprng_unavailable"
+                                                       : "store_unavailable"}},
                        {}, Severity::kCritical);
             return;
         }
@@ -3318,8 +4241,11 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         // the one-time reveal.
         // #5342 Gate 7 (B4): the step-1 credential anchor — a password reset
         // or change committed since the pending /login denies this mint.
-        auto token =
-            auth_mgr_.create_local_session(entry.username, entry.role, true, entry.hash_hex);
+        if (mfa_verify_barrier_for_test_) // test seam, empty in production
+            mfa_verify_barrier_for_test_("/login/mfa/enroll", proof);
+        auth::AuthManager::MintDenial denial = auth::AuthManager::MintDenial::kNone;
+        auto token = auth_mgr_.create_local_session(entry.username, entry.role, entry.hash_hex,
+                                                    proof, &denial);
         if (token.empty()) {
             // #4107 Gate 8 finding (security-guardian) - see the plain-
             // password-login call site's identical comment. Enrollment
@@ -3333,8 +4259,8 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
             res.set_content(kFailureBody(res), "application/json");
             audit_log_for_principal(req, "auth.login", "failure", entry.username,
                                     auth::role_to_string(entry.role), "User", entry.username,
-                                    "reason=session_mint_failed;cause=undifferentiated;"
-                                    "method=password+totp-enroll");
+                                    std::string("reason=session_mint_failed;cause=") +
+                                        mint_denial_cause(denial) + ";method=password+totp-enroll");
             emit_event("auth.login", req,
                        {{"source_ip", req.remote_addr}, {"username", entry.username}}, {},
                        Severity::kWarn);
@@ -3469,13 +4395,50 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                 }
             }
         }
+        // Recovery-code verification scans PBKDF2 hashes: take the process-wide slot BEFORE the
+        // lock check and the reservation, so a full budget is a 429 for locked and unlocked
+        // accounts alike (no lock-state oracle), and nothing needs refunding.
+        std::optional<Pbkdf2Budget::Slot> recovery_slot;
+        if (!mfa_code_is_totp_shape(code)) {
+            recovery_slot.emplace(acquire_pbkdf2(Pbkdf2Class::kAuthenticated, req, "mfa_recovery",
+                                                   "u:" + session->username));
+            if (!recovery_slot->ok()) {
+                refuse_pbkdf2_busy(res);
+                return;
+            }
+        }
+        // WP03 F8: the same reserve-before-verify per-account budget as /login/mfa, so a
+        // hijacked cookie session cannot guess step-up codes online. Uniform 401 when locked;
+        // 503 (fail closed, nothing verified) when the attempt cannot be counted.
+        const auto reservation = mfa_budget_reserve(session->username);
+        if (reservation.budget != MfaBudget::kOpen) {
+            const bool locked = reservation.budget == MfaBudget::kLocked;
+            res.status = locked ? 401 : 503;
+            if (!locked)
+                res.set_header("Retry-After", "2");
+            res.set_content(locked ? kFailureBody(res)
+                                   : detail::a4_error(
+                                         res, "authentication store is temporarily unavailable",
+                                         {.retry_after_ms = 2000}),
+                            "application/json");
+            audit_log_for_principal(req, "mfa.step_up.failed", "error", session->username,
+                                    auth::role_to_string(session->role), "User",
+                                    session->username,
+                                    locked ? "mfa locked (failure budget exhausted)"
+                                           : "mfa attempt could not be counted (fail-closed, "
+                                             "nothing verified)");
+            return;
+        }
         bool matched = false;
         bool used_recovery = false;
         bool store_unavailable = false;
+        LocalMfaProof proof{}; // #6079: the verifier's generation and pre-crypto database instant
         if (is_totp) {
             auto r = db->mfa_verify_login_code(session->username, code);
             if (r) {
-                matched = *r;
+                matched = r->ok;
+                if (matched)
+                    proof = {r->factor_gen, r->verified_ms};
             } else if (is_store_unavailable(r.error())) {
                 // ★ SECURITY (architect BLOCK): never collapse a decrypt/
                 // store failure into "wrong code" — no session mutation
@@ -3485,15 +4448,17 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
             }
         } else {
             auto r = db->mfa_consume_recovery_code(session->username, code);
-            if (r && *r) {
+            if (r && r->ok) {
                 matched = true;
                 used_recovery = true;
+                proof = {r->factor_gen, r->verified_ms};
             } else if (!r && is_store_unavailable(r.error())) {
                 store_unavailable = true; // outage → 503, never a burned attempt
             }
         }
 
         if (store_unavailable) {
+            mfa_budget_refund(session->username); // an outage proved nothing
             res.status = 503;
             res.set_content(detail::a4_error(res, "authentication store is temporarily unavailable"),
                             "application/json");
@@ -3513,6 +4478,12 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                        {}, Severity::kCritical);
             return;
         }
+
+        if (!matched)
+            mfa_budget_note_failure(req, session->username, auth::role_to_string(session->role),
+                                    reservation);
+        else
+            mfa_budget_refund(session->username);
 
         if (!matched) {
             res.status = 401;
@@ -3534,22 +4505,64 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
             return;
         }
 
-        // Success — stamp `mfa_verified_at = system_clock::now()` on the
-        // existing session row (wall-clock since HA WS-1/1a). The cookie itself
-        // does NOT rotate — the
+        // Success: stamp the proof on the existing session row. The stamp stores the verifier's
+        // own carried database instant and factor generation, not `system_clock::now()`
+        // (HA WS-1/1a, #6079). The cookie itself does NOT rotate: the
         // step-up refreshes a session attribute, it does not mint a new
         // session (which would break in-flight HTMX requests from the
         // same browser tab).
         auto token = extract_session_cookie(req);
-        if (!auth_mgr_.mark_session_mfa_verified(token)) {
-            // Defensive — require_auth succeeded so the token resolves to
-            // a session; if mark_session_mfa_verified can't find it, the
-            // session was concurrently invalidated. Fail closed.
-            res.status = 401;
-            res.set_content(kFailureBody(res), "application/json");
+        if (mfa_verify_barrier_for_test_) // test seam, empty in production
+            mfa_verify_barrier_for_test_("/login/mfa/stepup", proof);
+        // #6079: the stamp stores the verifier's own generation and instant. Anything but
+        // kStamped admits nothing new (the clear, where one was needed, is the primitive's): a
+        // kFutureDated stamp left no proof (mark_mfa wrote 0); after kFactorChanged the
+        // recheck clears the proof, and if that clear fails the row keeps a proof bound to the
+        // OLD generation, which equality refuses. The answer is the uniform 401 (503 for a
+        // store error), and the audit detail says why. kNoSession keeps the pre-binding wording.
+        const auto stamp = auth_mgr_.stamp_session_mfa_proof(token, proof);
+        if (stamp != auth::AuthManager::MfaStampOutcome::kStamped) {
+            using O = auth::AuthManager::MfaStampOutcome;
+            const char* why = "session vanished during step-up";
+            switch (stamp) {
+            case O::kFutureDated:
+                why = "verification_future_dated";
+                break;
+            case O::kFactorChanged:
+                why = "factor_changed_during_step_up";
+                break;
+            case O::kStoreError:
+                why = "step_up_proof_store_error";
+                break;
+            case O::kInvalidProof:
+                why = "step_up_proof_invalid";
+                break;
+            case O::kNoSession:
+            case O::kStamped:
+                break;
+            }
+            if (stamp == O::kStoreError) {
+                // The code was valid and is ALREADY consumed (the TOTP counter or recovery code
+                // is spent), but the stamp could not be confirmed: the store write failed, or the
+                // factor recheck could not read the generation and the proof was cleared (a
+                // failed clear in that double fault leaves a genuine proof for the current
+                // generation). An outage, not a bad credential, yet a retry with the SAME code is a
+                // 401 replay: so no retry_after_ms (an immediate retry cannot succeed) and a
+                // message that tells the operator to wait for the next code.
+                res.status = 503;
+                res.set_content(
+                    detail::a4_denial(res, 503,
+                                      "Your code was accepted but could not be recorded. Wait for "
+                                      "the next code and try again.",
+                                      detail::A4ErrorOpts{}),
+                    "application/json");
+            } else {
+                res.status = 401;
+                res.set_content(kFailureBody(res), "application/json");
+            }
             audit_log_for_principal(req, "mfa.step_up.failed", "error", session->username,
-                                    auth::role_to_string(session->role), "User",
-                                    session->username, "session vanished during step-up");
+                                    auth::role_to_string(session->role), "User", session->username,
+                                    why);
             return;
         }
         res.set_content(R"({"status":"ok"})", "application/json");
@@ -3865,7 +4878,7 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                                                                    claims.sub, link_claim_value);
             decision.denied) {
             spdlog::warn("OIDC login denied for '{}': linked SCIM resource is deprovisioned",
-                        username);
+                        ::yuzu::log_key_token(username));
             std::string deny_detail = decision.scim_id
                                           ? "reason=linked_scim_resource_inactive;scim_id=" +
                                                 *decision.scim_id
@@ -3924,8 +4937,8 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
             if (!oidc::groups_claim_reconcilable(claims)) {
                 const std::string reason =
                     claims.groups_overage ? "groups_overage" : "groups_absent";
-                spdlog::info("OIDC group provisioning skipped for '{}': reason={}", username,
-                            reason);
+                spdlog::info("OIDC group provisioning skipped for '{}': reason={}",
+                             ::yuzu::log_key_token(username), reason);
                 audit_log_for_principal(
                     req, "auth.sso_group_provision", "skipped", username, "user", "", "",
                     "reason=" + reason + ";source=entra" +
@@ -3939,7 +4952,7 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
             } else if (claims.groups.size() > RbacStore::kMaxIdpGroupsPerLogin) {
                 spdlog::warn(
                     "OIDC group provisioning denied for '{}': {} asserted groups exceeds cap {}",
-                    username, claims.groups.size(), RbacStore::kMaxIdpGroupsPerLogin);
+                    ::yuzu::log_key_token(username), claims.groups.size(), RbacStore::kMaxIdpGroupsPerLogin);
                 audit_log_for_principal(
                     req, "auth.sso_group_provision", "error", username, "user", "", "",
                     "reason=group_count_exceeded;count=" +
@@ -3977,8 +4990,9 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                 auto reconciled =
                     rbac_store_->reconcile_idp_memberships(username, "entra", asserted);
                 if (!reconciled) {
-                    spdlog::warn("OIDC group provisioning failed for '{}': {}", username,
-                                reconciled.error());
+                    spdlog::warn("OIDC group provisioning failed for '{}': {}",
+                                 ::yuzu::log_key_token(username),
+                                 ::yuzu::log_key_token(reconciled.error()));
                     audit_log_for_principal(
                         req, "auth.sso_group_provision", "error", username, "user", "", "",
                         "reason=" + reconciled.error() + ";source=entra" +
@@ -4174,7 +5188,7 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
             decision.denied) {
             spdlog::warn("OIDC login denied for '{}' on post-mint re-check: linked SCIM resource "
                         "is deprovisioned (concurrent deprovision race)",
-                        username);
+                        ::yuzu::log_key_token(username));
             auto revoke_result = auth_mgr_.invalidate_user_sessions(username);
             // Governance U6 fix: a store-unavailable DENY (`scim_id` absent)
             // is audited as `scim_store_unavailable`, never as
@@ -4457,10 +5471,13 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         try {
             auto result = saml_provider_->validate_response(saml_response_b64, binding_cookie);
             if (!result) {
-                spdlog::warn("SAML ACS validation failed: {}", result.error());
-                audit_log(req, "auth.saml_login_failed", "error", {}, {}, result.error());
+                // The error text embeds IdP-document attribute values (unsigned StatusCode,
+                // Assertion ID): neutralise for the log, bound + fold for the audit detail.
+                const std::string saml_err_safe = detail::neutralise_saml_error(result.error());
+                spdlog::warn("SAML ACS validation failed: {}", ::yuzu::log_key_token(result.error()));
+                audit_log(req, "auth.saml_login_failed", "error", {}, {}, saml_err_safe);
                 emit_event("auth.saml_login_failed", req,
-                           {{"source_ip", req.remote_addr}, {"error", result.error()}}, {},
+                           {{"source_ip", req.remote_addr}, {"error", saml_err_safe}}, {},
                            Severity::kWarn);
                 if (auto* m = auth_mgr_.metrics_registry()) {
                     m->counter("yuzu_auth_saml_login_total", {{"result", "error"}, {"role", "none"}}).increment();
@@ -4537,7 +5554,7 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                     saml::saml_login_denied_deprovisioned(scim_store_, saml_entity_id, saml_name_id);
                 decision.denied) {
                 spdlog::warn("SAML login denied for '{}': linked SCIM resource is deprovisioned",
-                            saml_principal);
+                            ::yuzu::log_key_token(saml_principal));
                 std::string deny_detail = decision.scim_id
                                               ? "reason=linked_scim_resource_inactive;scim_id=" +
                                                     *decision.scim_id
@@ -4593,7 +5610,7 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                 const auto& asserted_groups = result.value().groups;
                 if (asserted_groups.empty()) {
                     spdlog::info("SAML group provisioning skipped for '{}': no groups asserted",
-                                saml_principal);
+                                ::yuzu::log_key_token(saml_principal));
                     audit_log_for_principal(
                         req, "auth.sso_group_provision", "skipped", saml_principal, "user", "User",
                         saml_principal, "reason=groups_absent;source=saml");
@@ -4611,7 +5628,7 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                     // group_count_exceeded branch.
                     spdlog::warn(
                         "SAML group provisioning denied for '{}': asserted groups exceeded cap {}",
-                        saml_principal, saml::kMaxGroupValues);
+                        ::yuzu::log_key_token(saml_principal), saml::kMaxGroupValues);
                     audit_log_for_principal(
                         req, "auth.sso_group_provision", "error", saml_principal, "user", "User",
                         saml_principal, "reason=group_count_exceeded;source=saml");
@@ -4642,8 +5659,9 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                     auto reconciled =
                         rbac_store_->reconcile_idp_memberships(saml_principal, "saml", asserted);
                     if (!reconciled) {
-                        spdlog::warn("SAML group provisioning failed for '{}': {}", saml_principal,
-                                    reconciled.error());
+                        spdlog::warn("SAML group provisioning failed for '{}': {}",
+                                     ::yuzu::log_key_token(saml_principal),
+                                     ::yuzu::log_key_token(reconciled.error()));
                         audit_log_for_principal(
                             req, "auth.sso_group_provision", "error", saml_principal, "user",
                             "User", saml_principal,
@@ -4766,7 +5784,7 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                 decision.denied) {
                 spdlog::warn("SAML login denied for '{}' on post-mint re-check: linked SCIM "
                             "resource is deprovisioned (concurrent deprovision race)",
-                            saml_principal);
+                            ::yuzu::log_key_token(saml_principal));
                 auto revoke_result = auth_mgr_.invalidate_user_sessions(saml_principal);
                 // Mirrors the OIDC side's U6 fix: a store-unavailable DENY
                 // (`scim_id` absent) is audited as `scim_store_unavailable`,
@@ -4948,8 +5966,12 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                                          auth_mgr_.metrics_registry());
             return false;
         }
+        const DurableProofFn durable = [this](const httplib::Request& r, const auth::Session& s) {
+            return durable_mfa_proof_for(r, s);
+        };
         return require_mfa_step_up(req, res, session, *db, window_secs, audit, label,
-                                   cfg_.mfa_enforcement, auth_mgr_.metrics_registry());
+                                   cfg_.mfa_enforcement, auth_mgr_.metrics_registry(), &durable,
+                                   nullptr);
     };
     // Step-up window for the elevation surfaces: the global window when it is
     // positive, else 300 s. So disabling the global gate (<= 0) does not disable
@@ -5092,11 +6114,14 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                             "application/json");
             return;
         }
-        // Revoking eligibility must terminate any in-flight elevation
-        // immediately (governance UP-1) — symmetric with the session
-        // wipe on demote/delete, so an incident-response "revoke now"
-        // actually drops the operator's admin access rather than
-        // leaving it standing for up to the window.
+        // Revoking eligibility must terminate any in-flight elevation (governance UP-1):
+        // at once on this replica, and on the others at their next session-generation poll
+        // (about 1 s, up to about 30 s while that read is failing or slow; neither bound holds
+        // after a database restore or a failover to a lagging standby, which can bring a cleared
+        // elevation back: restart every replica, see docs/ops-runbooks/auth-db-recovery.md,
+        // "Sessions are durable"). Symmetric with the
+        // session wipe on demote/delete, so an incident-response "revoke now" actually drops
+        // the operator's admin access rather than leaving it standing for up to the window.
         int cleared = 0;
         if (!eligible) {
             auto rv = auth_mgr_.revoke_user_elevations(target);
@@ -5108,7 +6133,7 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                 // responder the access was dropped (adversarial C2). The
                 // eligibility flip is durable, so a retry re-runs only the clear.
                 spdlog::error("elevation-eligibility: durable elevation clear failed for '{}': {}",
-                              target, rv.error());
+                              ::yuzu::log_key_token(target), ::yuzu::log_key_token(rv.error()));
                 audit_log(req, "user.elevation_eligibility.set", "error", "User", target,
                           "eligible=false elevation_clear_failed=true detail=" + rv.error());
                 res.status = 503;
@@ -5184,17 +6209,19 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         // governance round (UP-6/UP-7/cons-N2) — source-scope the eligibility
         // grant: `is_elevation_eligible` above keyed on the raw principal
         // STRING alone, so a session whose principal happens to collide
-        // with an eligible row's username (a crafted SAML NameID equal to
-        // `oidc:<iss>#<sub>`, or a legacy `identity_source='local'` row
-        // literally named `oidc:x#y` that somehow has
-        // `elevation_eligible=1`) would otherwise borrow that row's grant.
+        // with an eligible row's username (a legacy `identity_source='local'`
+        // row literally named `oidc:x#y` that somehow has
+        // `elevation_eligible=1`, or any future source that mints a principal
+        // string another source also uses) would otherwise borrow that row's
+        // grant. SAML principals always begin `saml:` (saml_principal_id), so
+        // a SAML NameID alone cannot produce an `oidc:` or local name; this is
+        // defence in depth, not a closed SAML attack.
         // Require the row's `identity_source` to MATCH the session's own
-        // `auth_source`: an OIDC session may only elevate an
-        // `identity_source='oidc'` row; every other session (local,
-        // and — until SAML provisioning exists — saml) requires
-        // `identity_source='local'`. Read fresh via `get_user` rather than
-        // trusting anything cached on `session` (SQLite is the source of
-        // truth for identity_source).
+        // `auth_source`: a direct mapping (`local` to `local`, `oidc` to
+        // `oidc`, `saml` to `saml`), never an "oidc or else local" fallback
+        // (see the comparison below). Read fresh via `get_user` rather than
+        // trusting anything cached on `session` (the auth store, Postgres,
+        // is the source of truth for identity_source).
         auto row = db->get_user(session->username);
         if (!row) {
             audit_log_for_principal(req, "role.elevation.denied", "denied", session->username,
@@ -5206,13 +6233,15 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         }
         // The eligible row's `identity_source` must equal the session's own
         // `auth_source` — a DIRECT mapping (`local`↔`local`, `oidc`↔`oidc`,
-        // `saml`↔`saml`), NOT "oidc-or-else-local". A SAML session therefore
-        // expects `identity_source=="saml"`, which no row carries today (SAML
-        // is not provisioned — #1852 fast-follow), so SAML is fail-closed at
-        // this gate; and a SAML NameID crafted to collide with a `local` (or
-        // `oidc`) row can no longer satisfy it. This keeps the guard correct
-        // when SAML provisioning + SAML-MFA land, without a rework (Hermes
-        // cyber-review finding, #1852 hardening).
+        // `saml`↔`saml`), NOT "oidc-or-else-local". A SAML session expects
+        // `identity_source=="saml"`, which no row carries today (SAML is not
+        // provisioned; #1852 fast-follow). Today a SAML session never gets
+        // this far: it has no `auth.users` row, so `is_elevation_eligible`
+        // above answers "not eligible" and it is refused there. This gate is
+        // what stays correct when SAML provisioning + SAML-MFA land: a SAML
+        // session can only ever spend a row whose `identity_source` is
+        // `saml`, never a `local` or `oidc` one (Hermes cyber-review finding,
+        // #1852 hardening).
         //
         // An `engine_token` session (design doc §6/§9) never reaches this
         // comparison at all: `POST /api/v1/elevate` is COOKIE-session only
@@ -5260,7 +6289,7 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         // enforced structurally, plus the `!row` deny two branches up). Were
         // it ever to arrive here, `session->auth_source == "oidc"` is false
         // for "engine_token", so it takes the local-session `else` branch
-        // below (line ~2840), which requires local TOTP enrollment the
+        // below, which requires local TOTP enrollment the
         // engine principal's non-existent `users` row can never satisfy —
         // denied either way.
         const bool oidc_amr_proof = session->auth_source == "oidc" &&
@@ -5423,6 +6452,61 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
             res.set_content(detail::a4_denial(res, 401, "unauthorized"), "application/json");
             return;
         }
+        // Re-read eligibility AFTER the elevation has committed, fail CLOSED. The eligibility revoke flips the flag BEFORE it clears the user's durable
+        // elevations, so either this re-read sees the flipped flag (and this branch rolls the
+        // elevation back), or the flip comes after this re-read, which means the revoke's clear
+        // runs after the elevation committed and ends it. The check before elevate_session
+        // alone leaves a window in which the clear matches no row and the elevation then
+        // commits. No `role.elevation.granted` row is written in any of the three outcomes (403,
+        // 503, 500). In the first two the elevation was rolled back; in the third (the
+        // compensating revoke failed) it may still be live.
+        if (auto post = db->is_elevation_eligible(session->username); !post || !*post) {
+            auto undo = auth_mgr_.revoke_elevation(token); // same compensation as the audit arm
+            if (!undo) {
+                // The compensating revoke itself failed durably: the elevation is LIVE for an
+                // account that is no longer eligible (or whose eligibility is unreadable).
+                spdlog::critical("elevation for '{}' committed but eligibility {} AND the "
+                                 "compensating revoke FAILED ({}) - elevation is LIVE; manual "
+                                 "revocation required",
+                                 ::yuzu::log_key_token(session->username),
+                                 post ? "was revoked" : "could not be re-read", undo.error());
+                audit_log_for_principal(req, "role.elevation.denied", "error", session->username,
+                                        auth::role_to_string(session->role), "User",
+                                        session->username,
+                                        "eligibility recheck after grant failed; "
+                                        "rollback_failed=true");
+                res.status = 500;
+                res.set_content(
+                    detail::error_json_a4(
+                        500, "elevation could not be rolled back; it may be active", cid,
+                        "end it with POST /api/v1/elevate/revoke from this session, or have an "
+                        "administrator send POST /api/v1/users/{name}/elevation-eligibility with "
+                        "{\"eligible\": false}; then check the auth + session stores"),
+                    "application/json");
+                return;
+            }
+            audit_log_for_principal(req, "role.elevation.denied", post ? "denied" : "error",
+                                    session->username, auth::role_to_string(session->role), "User",
+                                    session->username,
+                                    post ? "eligibility revoked during elevation"
+                                         : "eligibility read failed after elevation");
+            if (!post) {
+                res.status = 503;
+                res.set_content(detail::error_json_a4(503, "eligibility could not be confirmed "
+                                                           "after the elevation; the elevation "
+                                                           "was rolled back",
+                                                      cid, "retry shortly or contact an "
+                                                           "administrator"),
+                                "application/json");
+                return;
+            }
+            res.status = 403;
+            res.set_content(detail::error_json_a4(403, "not authorized to elevate", cid,
+                                                  "ask an administrator to grant you elevation "
+                                                  "eligibility"),
+                            "application/json");
+            return;
+        }
         // `until` may be CLAMPED to the session's own absolute expiry
         // (follow-up B, security review 2026-06-30) — report the TRUE
         // remaining time, not the requested/capped `duration`. A live window
@@ -5474,7 +6558,7 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                 spdlog::critical("role.elevation.granted audit FAILED for '{}' AND the compensating "
                                  "revoke ALSO FAILED ({}) — elevation is LIVE and UNRECORDED; "
                                  "manual revocation required",
-                                 session->username, rollback.error());
+                                 ::yuzu::log_key_token(session->username), rollback.error());
                 res.status = 500;
                 res.set_header("Sec-Audit-Failed", "true");
                 res.set_content(
@@ -5486,7 +6570,7 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                 return;
             }
             spdlog::error("role.elevation.granted audit FAILED for '{}' — elevation rolled back",
-                          session->username);
+                          ::yuzu::log_key_token(session->username));
             res.status = 500;
             res.set_header("Sec-Audit-Failed", "true");
             res.set_content(detail::error_json_a4(500, "could not record the elevation; not granted",
@@ -5527,13 +6611,14 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                       res.set_content(detail::a4_denial(res, 401, "unauthorized"), "application/json");
                       return;
                   }
-                  auto rev = auth_mgr_.revoke_elevation(token);
+                  bool lookup_degraded = false;
+                  auto rev = auth_mgr_.revoke_elevation(token, &lookup_degraded);
                   if (!rev) {
                       // Durable clear failed — the elevation may still be LIVE.
                       // Fail CLOSED (503 + error audit) rather than auditing a
                       // false `role.elevation.revoked ok` (adversarial C2).
                       spdlog::error("elevate/revoke: durable clear failed for '{}': {}",
-                                    session->username, rev.error());
+                                    ::yuzu::log_key_token(session->username), rev.error());
                       audit_log_for_principal(req, "role.elevation.revoked", "error",
                                               session->username,
                                               auth::role_to_string(session->role), "User",
@@ -5546,10 +6631,15 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                       return;
                   }
                   const bool was_elevated = *rev;
+                  // A degraded pre-clear lookup means the clear succeeded but whether the
+                  // session WAS elevated is unknown (`*rev` is then only "a row existed"):
+                  // never claim an elevation was ended.
                   audit_log_for_principal(req, "role.elevation.revoked", "ok", session->username,
                                           auth::role_to_string(session->role), "User",
                                           session->username,
-                                          was_elevated ? "was_elevated=true" : "was_elevated=false");
+                                          lookup_degraded ? "was_elevated=unknown"
+                                          : was_elevated  ? "was_elevated=true"
+                                                          : "was_elevated=false");
                   res.set_content(R"({"status":"ok"})", "application/json");
               });
 }

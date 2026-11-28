@@ -3,11 +3,19 @@
  * loads the ACTUAL built installed_apps plugin (installed_apps.dylib/.so, the
  * same artifact the agent daemon loads in production) via PluginHandle::load
  * and drives it through yuzu::agent::LocalDispatcher, same pattern as
- * test_users_posix_actions.cpp -- this proves the migrated argv (probe_tool_path
- * + run_bounded_subprocess, replacing popen()/command_exists()) actually
- * reaches a real dpkg-query/rpm/pacman/system_profiler binary on the test
- * host, end to end, not just that the pure parsers in
- * installed_apps_parsers.hpp accept a fixture string.
+ * test_users_posix_actions.cpp -- this proves the migrated acquisition actually
+ * reaches the real package source on the test host, end to end, not just that
+ * the pure parsers in installed_apps_parsers.hpp accept a fixture string: the
+ * argv (probe_tool_path + run_bounded_subprocess, replacing
+ * popen()/command_exists()) for pacman/system_profiler, and, on Linux, the
+ * in-process dpkg status / rpm database read (SAM-45; no dpkg-query or rpm
+ * process runs any more -- the readers themselves are pinned over real
+ * captures in test_installed_apps_pkgdb.cpp). The rows on the Linux leg are
+ * the same under the old and the new acquisition (parity is the design), so
+ * no assertion here can tell them apart; that the Linux actions stopped
+ * running dpkg-query and rpm, and the lifecycle of the bounded read, are pinned
+ * by tests/test_installed_apps_pkgdb_wiring_lexical.py (a lexical gate: the
+ * Linux block is `#ifdef __linux__` and a unit test never spawns the tool).
  *
  * `list` is the fast, local, always-available action (no params; on macOS one
  * bounded in-process CFBundle pass for all listed apps for bundle_id, inside the noise
@@ -152,7 +160,7 @@ std::vector<std::string> split_fields_escape_aware(const std::string& row) {
 
 } // namespace
 
-TEST_CASE("installed_apps plugin: list executes real dpkg-query/rpm/pacman/system_profiler argv",
+TEST_CASE("installed_apps plugin: list reads the real package source (dpkg/rpm database, pacman/system_profiler argv)",
           "[installed_apps][posix_actions]") {
     auto plugin = load_installed_apps_plugin();
     if (!plugin) {
@@ -169,9 +177,10 @@ TEST_CASE("installed_apps plugin: list executes real dpkg-query/rpm/pacman/syste
 
     // rc==0 is the real signal here: a wrong/reverted argv (a stale
     // popen()/command_exists() call, a wrong tool path, or a malformed
-    // format string the real tool rejects) would surface as a non-zero rc
-    // or garbage output -- this call proves the migrated argv actually
-    // reached a real tool on this host, not just that it compiles.
+    // format string the real tool rejects) or, on Linux, an unreadable
+    // package database would surface as a non-zero rc or garbage output --
+    // this call proves the migrated acquisition actually reached the real
+    // package source on this host, not just that it compiles.
     CHECK(result.rc == 0);
     CHECK_FALSE(result.captured.empty());
 
@@ -292,7 +301,7 @@ TEST_CASE("installed_apps plugin: list_inventory emits enriched macOS app rows a
     if (result.rc != 0) {
         CHECK(result.rc == 1);
         // The whole point of the degraded path: nothing is published, so the
-        // daily sync skips the cycle rather than committing a partial set.
+        // daily sync sends a status-only section rather than committing a partial set.
         CHECK(result.captured.empty());
         // SKIP, not return. This is the ONLY test of the enrichment + receipt
         // integration, so a degraded run leaves that integration UNVERIFIED --
@@ -311,6 +320,8 @@ TEST_CASE("installed_apps plugin: list_inventory emits enriched macOS app rows a
     std::size_t bad_prefix = 0, bad_field_count = 0, bad_sig_value = 0;
     std::size_t pkg_bad_ecosystem = 0, pkg_non_numeric_date = 0;
     std::size_t publisher_without_signature = 0;
+    std::size_t apps_with_location = 0;
+    std::size_t relative_locations = 0;
 
     std::istringstream iss(result.captured);
     std::string line;
@@ -321,7 +332,7 @@ TEST_CASE("installed_apps plugin: list_inventory emits enriched macOS app rows a
             ++bad_prefix;
             continue;
         }
-        // ADR-0016 blob v2: "inv" + exactly 12 fields. Splitting manually
+        // ADR-0016 blob: "inv" + the 12 blob fields + install_location. Splitting manually
         // (not on a parser helper) keeps this a genuine wire-shape check.
         std::vector<std::string> f;
         std::size_t start = 0;
@@ -334,7 +345,7 @@ TEST_CASE("installed_apps plugin: list_inventory emits enriched macOS app rows a
             f.push_back(line.substr(start, bar - start));
             start = bar + 1;
         }
-        if (f.size() != 13) { // "inv" + 12 fields
+        if (f.size() != 14) { // "inv" + 12 fields + install_location
             ++bad_field_count;
             continue;
         }
@@ -349,6 +360,13 @@ TEST_CASE("installed_apps plugin: list_inventory emits enriched macOS app rows a
 
         if (kind == "app") {
             ++app_rows;
+            // A macOS app row carries its .app path as install_location when system_profiler
+            // reported a Location (a pkgutil receipt has none).
+            if (!f[13].empty()) {
+                ++apps_with_location;
+                if (f[13].front() != '/')
+                    ++relative_locations;
+            }
             if (signature == "signed")
                 ++signed_apps;
             else if (signature == "unsigned")
@@ -375,6 +393,17 @@ TEST_CASE("installed_apps plugin: list_inventory emits enriched macOS app rows a
     CHECK(bad_field_count == 0);
     CHECK(bad_sig_value == 0);
     CHECK(publisher_without_signature == 0);
+    // How many rows carry a location depends on the host (the sync writer later keeps it only
+    // under a machine root); the shape every one must have is the contract.
+    INFO("apps with an install_location: " << apps_with_location);
+    // The parser's Location capture (test_installed_apps_parsers.cpp) and the 14th-token layout
+    // (test_installed_apps_inventory.cpp, format_inv_row) are fixture-pinned. The one line between
+    // them, the plugin's copy of the parsed path into the record (row 1.4), is only reachable
+    // through a real dispatch, so it is asserted here: a healthy system_profiler run (anything
+    // else SKIPped above) lists at least one bundle with a Location. Unconditional on purpose:
+    // `app_rows == 0` is already red at the CHECK below, so a gate here would only hide this one.
+    CHECK(apps_with_location >= 1);
+    CHECK(relative_locations == 0);
 
     // The #2273 enrichment actually ran and populated the previously
     // always-empty fields.

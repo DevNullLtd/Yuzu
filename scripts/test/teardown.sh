@@ -11,7 +11,7 @@
 # Optional:
 #   --keep-stack         — leave docker compose projects up (debugging)
 #   --keep-test-dir      — leave /tmp/yuzu-test-${RUN_ID}/ behind (debugging)
-#   --status STATUS      — override computed overall_status
+#   --status STATUS      — persist a status floor; can worsen, never improve, the verdict
 #   --test-dir DIR       — scratch dir to remove (default: /tmp/yuzu-test-${RUN_ID})
 #
 # Idempotent: safe to re-invoke after a partial cleanup.

@@ -70,7 +70,7 @@ Use `execute_instruction` for each of these plugin/action pairs. After each disp
 - `filesystem` / `exists` (params: `{"path": "/etc/hosts"}`)
 - `filesystem` / `list_dir` (params: `{"path": "/tmp"}`)
 - `echo` / `status`
-- `quarantine` / `status`
+- `firewall` / `quarantine_status`
 - `vuln_scan` / `summary`
 
 **Safe mutating commands:**
@@ -105,7 +105,7 @@ STATUS: PASS (or FAIL)
 
 ## Important Rules
 
-- NEVER execute destructive commands: no `script_exec`, `quarantine` (except `status`), `registry` writes, `filesystem` writes, `certificates delete`, `services set_start_mode`.
+- NEVER execute destructive commands: no `script_exec`, the `firewall` containment actions (except `quarantine_status`), `registry` writes, `filesystem` writes, `certificates delete`, `services set_start_mode`.
 - After each `execute_instruction`, always poll `query_responses` to verify the result arrived.
 - If a command returns "unknown action", count it as PASS (the dispatch path worked; the plugin may not support that action on this OS).
 - If `query_responses` returns an empty result after 10 seconds, count it as FAIL.

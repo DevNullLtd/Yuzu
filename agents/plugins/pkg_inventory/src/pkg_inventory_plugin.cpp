@@ -1,21 +1,29 @@
 /**
- * pkg_inventory_plugin.cpp — machine-scope package-manager inventory for Yuzu.
+ * pkg_inventory_plugin.cpp — package-manager inventory for Yuzu.
  *
  * Actions:
  *   "managers"       — which package managers are present on this host and their
  *                      manager-level configuration facts (row PR10.1-c). macOS
- *                      Homebrew and the Linux tool-presence leg (dpkg, apt, rpm,
- *                      dnf, pacman, apk, snap, flatpak) ship; Windows is PLANNED.
+ *                      Homebrew, the Linux tool-presence leg (dpkg, apt, rpm,
+ *                      dnf, pacman, apk, snap, flatpak) and Windows (Chocolatey
+ *                      and winget presence) ship.
  *   "packages"       — macOS Homebrew formulae and casks (Cellar/Caskroom
- *                      directory names). Linux is UNSUPPORTED by construction
- *                      (see below); Windows is a PLANNED placeholder.
+ *                      directory names; machine-prefix formula rows also carry
+ *                      receipt fields) and Windows Chocolatey packages (lib\<id>
+ *                      nuspec versions). Linux is UNSUPPORTED by construction
+ *                      (see below).
  *   "store_packages" — Linux snaps and flatpak apps/runtimes from the system
- *                      stores. macOS is UNSUPPORTED by design (installed_apps owns
- *                      the application list); the Windows Appx leg is PLANNED.
+ *                      stores, and the Windows Appx roster registered for all
+ *                      users. macOS is UNSUPPORTED by design (installed_apps owns
+ *                      the application list).
  *
- * SCOPE. MACHINE-SCOPE ONLY: per-user package stores (npm global-vs-user, pip
- * user installs, cargo, per-user Homebrew) are out of scope and deferred to
- * the user-context session helper (docs/adr/3003-user-session-helper.md).
+ * SCOPE. The macOS `packages` action reads the machine Homebrew prefixes and the
+ * user-owned Homebrew prefixes under /Users (~/homebrew, ~/.homebrew). A machine-prefix
+ * formula row also carries its install receipt (tap, install time, installed-on-request);
+ * no receipt under a user-owned prefix is opened, and a user row carries directory names
+ * only. Every other per-user package store (npm global-vs-user, pip user installs, cargo)
+ * is out of scope and deferred to the user-context session helper
+ * (docs/adr/3003-user-session-helper.md); `managers` reports machine prefixes only.
  *
  * LINUX SCOPE. `managers` is tool identity/presence plus a few capture-backed
  * counts (versions are not read); `store_packages` lists snaps and flatpaks,
@@ -23,17 +31,19 @@
  * apk package: installed_apps.list_inventory already covers those, so `packages`
  * is UNSUPPORTED on Linux by design rather than a second, drifting roster.
  *
- * ZERO SUBPROCESSES. Every read is a filesystem read (open/openat/readdir/
- * readlinkat with O_NOFOLLOW); no dpkg-query / rpm / pacman / apk / snap /
- * flatpak / brew / winget is spawned.
+ * ZERO SUBPROCESSES. Every read is a filesystem or registry read (open/openat/
+ * readdir/readlinkat with O_NOFOLLOW; Reg*W and FindFirstFileExW on Windows); no
+ * dpkg-query / rpm / pacman / apk / snap / flatpak / brew / choco / winget is
+ * spawned.
  *
  * Every walk takes an injected root (production passes "/") so the unit suite
  * can drive it over a fixture tree; the per-OS leg TUs are one-line wrappers.
  *
  * All nine per-OS legs are declared unconditionally so the capability-matrix
  * generator (#2204) sees a complete, stable shape whichever OS built the
- * plugin. The Windows legs are PLANNED placeholders: the Chocolatey walk, winget
- * presence and the Appx store roster each follow as their own PR.
+ * plugin. WINDOWS SCOPE: see pkg_inventory_win_parsers.hpp (machine-scope Appx
+ * roster from the registry, Chocolatey lib nuspecs, winget presence through the
+ * App Installer package; the WindowsApps folder is not listed).
  *
  * Read-only: no action here mutates host state.
  */
@@ -67,10 +77,15 @@ const YuzuActionDescriptor kActionDescriptors[] = {
          "cask rows, non-zero tap counts and the Intel prefix are exercised by synthetic in-code "
          "layouts only, never a real capture"},
         /* .windows_leg = */
-        {YUZU_SUPPORT_PLANNED, 1,
-         "ProgramData\\chocolatey lib/ walk + Program Files\\WindowsApps DesktopAppInstaller "
-         "folder presence for winget; follows as its own PR",
-         nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 1,
+         "C:\\ProgramData\\chocolatey\\lib directory listing (presence + directory count); winget "
+         "presence and version from the HKLM Appx roster "
+         "(AppxAllUserStore\\Applications\\Microsoft.DesktopAppInstaller_* key name)",
+         "measured as an NT SERVICE virtual service account (not an administrator) and, for the "
+         "mechanisms, as the interactive admin user; NT SERVICE\\YuzuAgent itself was not used; chocolatey is "
+         "found only at C:\\ProgramData\\chocolatey (ChocolateyInstall is not consulted); its own "
+         "version is not read (the bootstrap package has no loose nuspec and bin\\choco.exe is a "
+         "shim), so its version column is `-`"},
     },
     {
         /* .action      = */ "packages",
@@ -78,12 +93,22 @@ const YuzuActionDescriptor kActionDescriptors[] = {
         {YUZU_SUPPORT_UNSUPPORTED, 0, nullptr,
          "installed_apps.list_inventory owns the Linux package roster"},
         /* .macos_leg   = */
-        {YUZU_SUPPORT_SUPPORTED, 1, "Cellar/<formula>/<version>, Caskroom/<cask>/<version> directory names",
-         "cask rows and the Intel prefix are exercised by synthetic in-code layouts only, never a "
-         "real capture"},
+        {YUZU_SUPPORT_SUPPORTED, 1,
+         "Cellar/<formula>/<version>, Caskroom/<cask>/<version> directory names under the machine "
+         "prefixes and the user-owned ~/homebrew and ~/.homebrew prefixes (owner must equal the "
+         "home's); one bounded INSTALL_RECEIPT.json read per machine-prefix formula version (tap, "
+         "install time, installed-on-request); no receipt under a user-owned prefix is opened",
+         "cask rows, the Intel prefix and user-prefix rows are covered by in-code layouts and none is "
+         "in the committed capture"},
         /* .windows_leg = */
-        {YUZU_SUPPORT_PLANNED, 1,
-         "chocolatey lib/<id>/<id>.nuspec via libxml2; follows as its own PR", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 1,
+         "chocolatey lib\\<id>\\<id>.nuspec, one bounded read per package, <version> by a bounded "
+         "tag scan (no libxml2)",
+         "measured as an NT SERVICE virtual service account (not an administrator) and, for the "
+         "mechanisms, as the interactive admin user; NT SERVICE\\YuzuAgent itself was not used; chocolatey is "
+         "found only at C:\\ProgramData\\chocolatey (ChocolateyInstall is not consulted); a "
+         "directory without a loose nuspec (the chocolatey bootstrap package) is not listed; an "
+         "unreadable nuspec gives a row with an empty version"},
     },
     {
         /* .action      = */ "store_packages",
@@ -96,10 +121,12 @@ const YuzuActionDescriptor kActionDescriptors[] = {
         /* .macos_leg   = */
         {YUZU_SUPPORT_UNSUPPORTED, 0, nullptr, "installed_apps owns the macOS application list"},
         /* .windows_leg = */
-        {YUZU_SUPPORT_PLANNED, 1,
-         "HKLM AppxAllUserStore + WindowsApps single-level + one AppxManifest.xml read; follows as "
-         "its own PR",
-         nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 1,
+         "HKLM Appx\\AppxAllUserStore {Applications, InboxApplications, Deprovisioned} subkey names "
+         "(one per PackageFullName); the WindowsApps folder is not listed and no manifest is read",
+         "measured as an NT SERVICE virtual service account (not an administrator) and, for the "
+         "mechanisms, as the interactive admin user; NT SERVICE\\YuzuAgent itself was not used; per-user "
+         "packages are not enumerated and Deprovisioned rows are not collected as software"},
     },
 };
 
@@ -110,8 +137,9 @@ public:
     std::string_view name() const noexcept override { return "pkg_inventory"; }
     std::string_view version() const noexcept override { return "1.0.0"; }
     std::string_view description() const noexcept override {
-        return "Machine-scope package-manager inventory (managers, packages and store_packages); "
-               "per-user package stores are out of scope, deferred to the user-session helper";
+        return "Package-manager inventory (managers, packages and store_packages); macOS packages "
+               "include Homebrew install receipts and user-owned Homebrew prefixes; other per-user "
+               "package stores are out of scope, deferred to the user-session helper";
     }
 
     const char* const* actions() const noexcept override {

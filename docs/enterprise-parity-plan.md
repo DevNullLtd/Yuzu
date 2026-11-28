@@ -79,7 +79,7 @@ These commercial-peer features have functional equivalents in Yuzu that are as g
 | Audit trail | AuditStore (365-day retention, structured events) |
 | Device tagging | TagStore + agent-side tags plugin |
 | Custom properties | CustomPropertiesStore (typed, schema-validated) |
-| Quarantine | `quarantine` plugin + QuarantineStore |
+| Quarantine | `firewall` plugin containment actions + QuarantineStore |
 | IOC checking | `ioc` plugin (IPs, domains, hashes, ports) |
 | Certificate mgmt | `certificates` plugin (list/details/delete) |
 | Device discovery | `discovery` plugin + DiscoveryStore |

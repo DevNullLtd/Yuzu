@@ -2,7 +2,7 @@
  * runner_status.hpp — the ONE mapping from a bounded-runner outcome to the
  * ABI4 plugin→host result seam (ADR-3002 acquisition-ladder migration).
  * Consumers: every Wave-2 runner-migration plugin package (users, certificates,
- * discovery, network_actions, wol, quarantine, services, interaction) — the
+ * discovery, network_actions, wol, services, interaction) — the
  * first forwarders of a bounded-runner outcome through this seam.
  *
  * Lives in agents/core (not agents/shared): classify_runner_failure takes a

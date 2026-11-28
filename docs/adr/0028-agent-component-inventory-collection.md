@@ -44,6 +44,13 @@ supersedes: >-
 
 # 0028 — Agent-Side Component Inventory Collection (Bundled & Filesystem-Resident Dependencies)
 
+> **Update (2026-11-14, against dev @ 2c49b4ea0): Partial.** The banner below is stale. The wire
+> contract and server ingest exist: the v3 `component_inventory` facet and `SwComponent` record
+> (`agents/core/src/installed_software_v3.hpp`), `kComponentInventoryFacet` in
+> `server/core/src/inventory_blob_v3.hpp`, and ingestion in `inventory_ingestion.cpp`. No agent
+> producer exists yet ("No plugin produces component rows yet", `installed_software_v3.hpp`), so
+> no endpoint reports components.
+
 > **Implementation status (2026-09-07 ADR reconciliation):** Accepted — deferred, not started. Zero `sync_source_component*` files in `agents/core/src`. Deferred, not started; agent-side mechanism — stays core under ADR-1005, not use-case-engine scope (#4099).
 
 > **Naming note (resolved during grill-with-docs review, 2026-07-07):** this capability is called
@@ -1485,3 +1492,189 @@ on its own terms.
 
 Route via the normal review / `/governance` path. Record the accepting reviewer(s) + date here on
 acceptance.
+
+## Update (2026-11-14) — first slice shipped: Java archives on Linux and macOS, machine roots only
+
+**What shipped.** A `component_inventory` plugin with one action, `scan` (no parameters), and the
+definition `crossplatform.components.scan`. Kind: `java` — archives ending `.jar`, `.war` or `.ear`,
+plus the libraries nested one level inside them (`BOOT-INF/lib/`, `WEB-INF/lib/`, `lib/`), listed from
+the archive's central directory alone. OSes: Linux and macOS. Roots, machine-wide only, per Decision 1
+(the root list holds no per-user location), walked in this order because one entry budget is shared by
+all roots: Linux `/usr/lib/jvm`, `/usr/share/java`, `/usr/share/maven`, `/usr/local/lib`,
+`/usr/local/share`, `/opt`; macOS `/Library/Java`, `/usr/local`, `/opt/homebrew`, `/Applications`.
+Only the residual generic walk of Decision 1 shipped: the dpkg/rpm file-list anchoring and the
+`InstallLocation` anchoring it describes did not. No link is followed at any path component, and a root on a network mount is dropped.
+This slice follows no link at all, which supersedes Decision 1's "ordinary in-root version symlinks are
+followed and resolved normally" for now: a link inside a tree is not entered and a link to an archive is
+not listed, and the answer says so (`link_skipped`, below) instead of skipping it silently. Following
+in-root links, scoped to escapes of the anchored root as Decision 1 describes, is a later change. The
+action runs on demand; the daily sync does not carry it yet.
+
+The version is the file name's, with pre-release and build qualifiers kept in it
+(`my-app-1.0.0-rc1.jar` reads `1.0.0-rc1`); other trailing words are classifiers. The archive is asked
+when the name gives no version or is ambiguous (a word follows the version that is not a known
+qualifier, such as a classifier, or the name holds more than one version-like part), and its value replaces the name's split only when the
+file name carries it (`<name>-<version>`, or `<name>_<version>` for a `Bundle-Version`). A `pom` version
+is read from the archive's only `pom.properties`, or, when it holds several, from the one whose artifact
+segment equals the archive's name (never by directory order). Known limits: an archive that has no pom
+of its own but bundles exactly one dependency's reads that dependency's version when its name has no
+version, and a renamed archive (`app.jar`) has no pom named for it, so a name match would leave it
+without a version; the sole pom is trusted for that reason, and the row says `pom`. A nested row, and an
+archive with no pom or manifest, take the file name's word, and a qualifier word the parser does not
+know reads as a classifier (nested `guava-31.1-jre.jar` reads `31.1`).
+
+**Bounds as built.** 400,000 directory entries and 45 seconds per scan (one deadline covering the walk,
+the archive reads and the parsing, checked between directories and between archives, so one blocked
+read is not interrupted), 32 directory levels, 50,000 entries per directory listing, 3,000 rows per
+application folder, 20,000 rows per scan. Per archive: a 16 MiB central directory, 1,024-byte entry
+names, and the `pom.properties` and `MANIFEST.MF` entries read only up to 64 KiB compressed and 64 KiB
+inflated. ZIP64 archives are not enumerated.
+
+**Completeness rule as built (Decision 4).** The answer is `supported` (typed result OK/FULL) only when
+no bound was reached and every directory and archive it opened was read in full. It is `constrained`
+(CONSTRAINED/PARTIAL), with the first cause as an `<os>:component_inventory:<cause>` token, for: `budget_entries`, `budget_time`, `section_rows`,
+`anchor_rows`, `depth`, `dir_unreadable`, `dir_truncated`, `archive_unenumerated` (an archive that could
+not be opened, read or parsed, ZIP64 included), `archive_changed` (an archive that changed while it was
+read) and `mount_table_unreadable` (nothing is walked, because a network mount could not be told from a
+local one). The rows already read are returned at both levels, but when time runs out archives not yet
+read give no rows, and a walk that used the whole budget returns none (reading candidates after the
+deadline would break the one-deadline bound). Reported but not blocking
+(informational tokens on a `supported` row): `root_link_skipped` (a root dropped for a link),
+`link_skipped` (a link met inside a tree, not entered and not listed), `network_fs_skipped` and
+`version_unreadable` (a row whose version no source gives is listed with `version_source` `unreadable`).
+A missing root is skipped silently (on Linux and macOS; see *Correction, 2026-11-26* under the Windows update). A `constrained` answer names its cause alone; the informational
+tokens ride a `supported` row only.
+
+**Fuzz harness.** `tests/fuzz/fuzz_component_zip.cpp` drives the ZIP central-directory reader
+(`zip_directory.hpp`: the end-record search, the directory walk and the local-header offset) with
+arbitrary bytes. It is registered in `tests/fuzz/meson.build` and `.clusterfuzzlite/build.sh` and runs
+in ClusterFuzzLite on pull requests (`cflite-pr.yml`) and in the batch run (`cflite-batch.yml`), both
+path-filtered to `zip_directory*`. The Java file-name, manifest and `pom.properties` parsers and the
+capped inflate are covered by unit tests only, not by a fuzz target.
+
+**Still open.**
+- The Windows leg (answered `windows:planned` when this slice shipped; it shipped with the 2026-11-21
+  update below). It also brings the name-based exclusion of OS-owned trees (`\WindowsApps`,
+  `\Windows Kits`, `\WinSxS`, `\Windows`, `\System32`, `\SysWOW64`; the 2026-11-21 update records
+  which of these the Windows leg excludes). The Linux and macOS roots above hold no OS-owned tree, so
+  this slice excludes no directory by name.
+- The hard per-cycle time bound (the sync assembler's bounded wait) arrives with the daily-report
+  section. Until then the 45 second budget is checked between directories and between archives, so one
+  blocked read inside a listing or a file read is not interrupted.
+- Python and Node kinds; the daily-report section and the amendment to Decision 3 that goes with it;
+  the permanent customer opt-out (Decision 2 and Decision 8; the per-plugin kill switch
+  `component_inventory/scan` exists today, #7737 tracks the rest); and the
+  `component_inventory.future_dated_rejected` audit event, which belongs to the store that does not
+  exist yet.
+
+## Update (2026-11-17) — second action: native libraries on Linux and macOS, switched off by default
+
+**What shipped.** A second action on the `component_inventory` plugin, `native` (no parameters),
+definition `crossplatform.components.native`, plugin version 1.1.0. Kind: `native`: shared libraries
+(ELF `.so` and `.so.<version>` on Linux, Mach-O `.dylib` on macOS), one row per library, 5,000 rows at
+most. The walk, the one deadline, the one open per file and the completeness rule are `scan`'s; the
+row is `comp|native|name|version|version_source|path|size|mtime|anchor_app`, and the status row names
+`native`. Windows answered `windows:planned` at this point: the plugin had no Windows filesystem leg,
+and a Windows walk (reparse-point safe, network-drive aware) was its own change (the 2026-11-21 update).
+
+**Roots and exclusions (Decision 1, Decision 4).** Linux `/opt` and `/usr/local/lib`; macOS
+`/Applications`, `/usr/local` and `/opt/homebrew`. The package-owned and OS trees are excluded: on
+Linux by not being roots at all (`/usr/lib` and its siblings are never walked), on macOS by name
+(`/usr/local/Cellar` and `/opt/homebrew/Cellar`, which held most of the native libraries a measured
+host listed). An excluded directory is counted and reported on a `supported` status row by the
+informational token `package_tree_skipped`: never a silent skip. This is the answer to the open
+question of whether package-owned trees are excluded: yes.
+
+**Readers.** The ELF SONAME and the Mach-O `LC_ID_DYLIB` are read by the shared, bounded, fuzz-tested
+readers `read_elf` and `read_macho` (`agents/shared/binary_header_elf.hpp`, `binary_header_macho.hpp`,
+over `binary_header_reader.hpp`), not by parsers of the plugin's own (they landed in PR #8284). The plugin keeps a thin adapter
+(`component_native_parsers.hpp`) that turns a file's read function into the shared source and maps the
+result to three outcomes: `not_this_format` is not a library (no row); `io`, `truncated`, `malformed`
+and `limit_exceeded` are unreadable (a row from the file name, `version_source` `unreadable`, an
+item-level gap; the scan stays complete). An ELF is a library only when its type is `ET_DYN`; a Mach-O
+file only through the first slice that has no error and is an `MH_DYLIB`, and a slice that could not be
+read is never an answer (narrowed by *Correction, 2026-11-26* below). The consumer obligations of the shared readers are met here: the file's
+`unchanged()` is checked after every parse (`archive_changed`), each read is wrapped in the scan
+deadline, one `catch(...)` per file read keeps every exception inside the plugin, and every string
+taken from a reader passes the name sanitiser before it reaches a row. A name or version a file
+declares is the file's own claim, with no signature check. The readers carry their own fuzz targets;
+`tests/fuzz/fuzz_component_native.cpp` fuzzes the adapter and the naming rules.
+
+**Default off, at the dispatch gate.** `component_inventory.native` ships switched off through an
+action-level kill-switch row that the server seeds at boot (`seed_action_kill_switch_default_off`,
+`ON CONFLICT DO NOTHING`, a failed seed refuses to start). The decision layers compose, so
+`component_inventory.scan` stays on; an operator enables `native` with
+`PUT /api/v1/plugin-config/component_inventory/kill-switch` and `action=native`. Its capability row is
+ReadOnly, `Inventory:Read`, gate `None`: the off-switch is the kill-switch row, not a second gate.
+
+**Cost data.** `native` publishes no heartbeat keys: `scan` already uses six of the eight keys a plugin
+may publish. The fleet cost evidence wanted before the action is ever on by default is therefore not
+collected by this plugin yet.
+
+**Still open.** The daily-report section and the permanent customer opt-out (above); extension-less
+macOS framework binaries; a hard per-cycle time bound. (The Windows leg of both actions shipped with
+the 2026-11-21 update below.)
+
+## Update (2026-11-21) — Windows leg for `scan` and `native`
+
+**What shipped.** Both actions now run on Windows; neither answers `windows:planned` any more. The leg
+is a Windows binding of the existing filesystem seam and nothing else: the walk, the limits, the
+archive reads and the answer assembly are the portable code the Linux and macOS legs already use. It
+is declared `supported` on the measured scope (one host, Windows 11 build 26200, an elevated
+administrator session, `docs/samples/windows.txt`) and answers `constrained` when a directory is refused
+or a bound is reached; the descriptor says so.
+
+*Capture, 2026-11-24.* The measured scope was captured on 2026-11-24, after this update was first
+written. `scan` answered `constrained` with `dir_unreadable` at a refused system directory; `native`
+returned exactly 5,000 rows, the row limit.
+
+*Capture, 2026-11-26.* On the same host, elevated, with the `IMAGE_FILE_DLL` filter of the correction
+below: `native` answered 4,992 rows (4,159 with a `pe` version), `constrained` with `dir_unreadable`.
+Of 10,138 `.dll` files under the two trees, 14 were not marked as DLLs and none of them was listed.
+The committed Windows sample is the 2026-11-24 capture and predates the filter.
+
+**Roots (Decision 1).** The 64-bit and 32-bit Program Files directories, named by the shell's
+known-folder lookup and never by an environment variable, on fixed local drives only. A root on a UNC
+path, a mapped network drive, removable or optical media or a RAM drive is dropped and counted in
+`network_fs_skipped`. A drive whose type cannot be told, or a known-folder path that names no walkable
+directory (empty, relative or a bare drive root), is dropped and answers `constrained` with
+`mount_table_unreadable`: no candidate is dropped silently, and a tree that was never read never reads as
+an empty one. A lookup that fails walks nothing and answers the same: a failed read is never an empty
+host. The drive type is asked again before every directory and every file is opened, not only when the
+roots are planned, so a drive that stops being a fixed local disk during a scan is refused from then on.
+Per-user locations are not read. Python and Node components on Windows are a later change.
+
+*Correction, 2026-11-26.* The Windows leg skips no root silently: a root it names but cannot list, or
+one that is a reparse point, answers `constrained` with `dir_unreadable`.
+
+**No reparse point is followed (Decision 4).** Every directory and file is opened relative to its
+volume root in one kernel name resolution that refuses a reparse point at any path component
+(`NtCreateFile` with `OBJ_DONT_REPARSE`, in `agents/shared/win_no_reparse_open.hpp`, shared with the
+`runtimes` plugin). An entry that is itself a reparse point (a junction, a symbolic link, a mount
+point, a cloud placeholder) is counted in `link_skipped` and never opened; a file is read through the
+handle that was opened and checked, never by path again.
+
+**Exclusions (Decision 4).** The `WindowsApps` directory directly under each root, matched by exact
+path without regard to case, is not entered by either action. It is counted and reported on a
+`supported` status row by `package_tree_skipped`, as the macOS Cellar trees are for `native`; this is
+the one name-based exclusion of the Windows leg. `\Windows Kits`, which sits under Program Files
+(x86), is not excluded by this change; `\WinSxS`, `\Windows`, `\System32` and `\SysWOW64` are not
+under either root and need no exclusion.
+
+**`native` on Windows.** A candidate is a file whose leaf ends `.dll`, compared without regard to case
+(`.dll.mui` is not one). The version is the fixed file version of the PE's `VS_VERSIONINFO` resource,
+read by the shared bounded PE reader (`agents/shared/binary_header_pe.hpp`) through the same file view;
+`version_source` is `pe`. A DLL with no version resource, or a fixed version of 0.0.0.0, is a row with
+an empty version and `version_source` `unreadable`; a file named `.dll` without the MZ and PE
+signatures gives no row. The 5,000-row cap and the default-off kill switch are unchanged.
+
+*Correction, 2026-11-26.* A candidate whose COFF header is read and does not set `IMAGE_FILE_DLL`
+gives no row (a renamed executable, or a .NET application entry assembly built without the flag, such as `pwsh.dll`), whatever fails after
+that header; it still counts toward the section caps. One cut short before its COFF header is a
+file-name row with `unreadable`. The same rule holds on the other legs: an ELF `e_type` other than
+`ET_DYN`, or a thin Mach-O `filetype` other than `MH_DYLIB`, gives no row once the whole file header has stated
+it; a universal file still gets a file-name row when an unreadable slice is, or may be, a dylib.
+
+**Known limits.** The open, listing and read calls carry no deadline of their own, so the 45 second
+budget is checked between operations and a dead fixed volume can park one call, as it can for the
+`runtimes` plugin's read of the same primitive.

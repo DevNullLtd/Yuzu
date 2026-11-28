@@ -583,9 +583,8 @@ private:
 #ifdef _WIN32
 /**
  * Whole-branch review round 3 (BR3-001): the Windows system directory,
- * resolved via GetSystemDirectoryW and cached for the process's lifetime --
- * same rationale, and the same pattern, as quarantine_plugin.cpp's
- * netsh_path(). Both this runner's own Windows default working_dir (A6,
+ * resolved via GetSystemDirectoryW and cached for the process's lifetime.
+ * Both this runner's own Windows default working_dir (A6,
  * below) and any caller that needs an absolute path to a well-known
  * System32 tool (e.g. script_exec's PowerShell launch) must resolve
  * through here rather than trusting a hard-coded "C:\Windows\System32"

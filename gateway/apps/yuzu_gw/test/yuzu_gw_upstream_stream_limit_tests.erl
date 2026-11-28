@@ -19,6 +19,8 @@
 %%%     lower ceiling never revokes a held permit but stops new grants until the
 %%%     held count is below it, and it is published as
 %%%     yuzu_gw_upstream_server_max_streams;
+%%%   - a permit is never granted before the held count it implies is
+%%%     published (#6945);
 %%%   - a call gun refuses locally with too_many_streams is local backpressure:
 %%%     the caller waits again for a permit and retries, until its deadline
 %%%     (then UNAVAILABLE, `deadline'), and the circuit breaker does not move.
@@ -30,12 +32,13 @@
 -module(yuzu_gw_upstream_stream_limit_tests).
 -include_lib("eunit/include/eunit.hrl").
 
--export([forward/4]).
+-export([forward/4, slow_permit_wait/4]).
 
 -define(SVC, 'yuzu.agent.v1.AgentService').
 -define(HEARTBEAT, <<"/yuzu.agent.v1.AgentService/Heartbeat">>).
 -define(CHANNEL, default_channel).
 -define(HANDLER, {?MODULE, server_max_streams}).
+-define(SLOW_HANDLER, {?MODULE, slow_permit_wait}).
 -define(WAIT_MS, 5000).
 -define(CONFIGURED, #{register => 48, replay => 24, inventory => 8}).
 -define(RESERVED, 61).
@@ -148,7 +151,10 @@ regulator_test_() ->
      fun cleanup_regulator/1,
      [fun(S) -> {"the ceilings follow the server's declared limit; a lower one revokes nothing "
                  "and holds new grants until the held count is below it",
-                 {timeout, 60, fun() -> regulator_follows_the_server(S) end}} end]}.
+                 {timeout, 60, fun() -> regulator_follows_the_server(S) end}} end,
+      fun(_) -> {"a permit is never granted before the held count it implies is published "
+                 "(#6945: snapshot/0 read straight after a grant saw the old count)",
+                 {timeout, 30, fun grant_publishes_held_before_it_replies/0}} end]}.
 
 setup_regulator() ->
     start_apps(),
@@ -156,6 +162,7 @@ setup_regulator() ->
     stop_regulator(),
     ok = yuzu_gw_test_listener:stop_channel(?CHANNEL),
     catch telemetry:detach(?HANDLER),
+    catch telemetry:detach(?SLOW_HANDLER),
     Saved = yuzu_gw_test_upstream:save_env([upstream_register_concurrency,
                                             upstream_replay_concurrency,
                                             upstream_inventory_concurrency]),
@@ -164,6 +171,7 @@ setup_regulator() ->
 
 cleanup_regulator(#{listeners := Tab, saved := Saved} = S) ->
     catch telemetry:detach(?HANDLER),
+    catch telemetry:detach(?SLOW_HANDLER),
     [Pid ! stop || Pid <- maps:get(holders, S, [])],
     stop_regulator(),
     ok = yuzu_gw_test_listener:stop_channel(?CHANNEL),
@@ -214,6 +222,49 @@ regulator_follows_the_server(S) ->
     ok = wait(fun() -> limits() =:= {48, 24, 8} end),
     ok = wait(fun() -> last_server_max_streams() =:= 0 end),
     [P ! stop || P <- [Waiter | Keep1]],
+    ok.
+
+%% The waiter is served from inside the regulator's own process (a holder exits,
+%% the regulator's monitor fires, release frees the permit and grant_next/1
+%% hands it on). snapshot/0 reads an atomics cell the regulator writes when it
+%% takes the permit, so the grant must not reach the waiter before that write:
+%% a caller that has its permit and then reads the count must see it (#6945:
+%% the reply went first, and on a loaded runner the reader won, 15 instead of
+%% 16, on the macOS and Windows CI legs).
+%%
+%% The window is a few microseconds wide, so this test widens it instead of
+%% hoping to hit it: holding a permit emits [yuzu,gw,upstream,permit_wait]
+%% BEFORE the count is published, and a telemetry handler runs in the
+%% regulator's own process, so a handler that sleeps keeps the count unpublished
+%% for as long as it likes. With the reply sent first the waiter is granted at
+%% once and reads the old count every time; with the count published first the
+%% grant is only sent after the sleep and the read is always right.
+grant_publishes_held_before_it_replies() ->
+    Hid = ?SLOW_HANDLER,
+    application:set_env(yuzu_gw, upstream_register_concurrency, 2),
+    {ok, Reg} = yuzu_gw_upstream_regulator:start_link(),
+    unlink(Reg),
+    [H1, H2] = [holder(register), holder(register)],
+    ?assertEqual(2, held(register)),
+    Waiter = asker(register),
+    try
+        ok = wait(fun() -> waiting(register) =:= 1 end),
+        ok = telemetry:attach(Hid, [yuzu, gw, upstream, permit_wait],
+                              fun ?MODULE:slow_permit_wait/4, 300),
+        H1 ! stop,
+        ?assertEqual(ok, granted(Waiter, ?WAIT_MS)),
+        %% granted: the permit is held, so it is counted, and nobody waits
+        ?assertEqual(2, held(register)),
+        ?assertEqual(0, waiting(register))
+    after
+        catch telemetry:detach(Hid),
+        [P ! stop || P <- [H1, H2, Waiter]]
+    end,
+    ok.
+
+%% Runs in the regulator's process, between taking a permit and publishing it.
+slow_permit_wait(_Event, _Measurements, _Meta, DelayMs) ->
+    timer:sleep(DelayMs),
     ok.
 
 %%%===================================================================

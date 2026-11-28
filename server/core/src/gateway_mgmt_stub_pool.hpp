@@ -186,10 +186,67 @@ public:
         std::function<std::shared_ptr<grpc::Channel>(const std::string& address,
                                                        std::shared_ptr<grpc::ChannelCredentials>)>;
 
+    /// HA WS-13 slice 13.7 (#7062): HTTP/2 keepalive for the server->gateway
+    /// management channel. The channel sits idle between commands, and a
+    /// gateway node that stops answering WITHOUT resetting the connection (a
+    /// dropped route, a frozen host, a partition) is otherwise undetectable:
+    /// every forward then runs to its 300 s deadline on a detached thread
+    /// (`forward_gateway_pending`). Pinging detects it in about
+    /// `kKeepaliveTimeMs + kKeepaliveTimeoutMs` (40 s), after which gRPC fails
+    /// the call as UNAVAILABLE and the forwarder's own retry/`gateway_unavailable`
+    /// path takes over.
+    ///
+    /// This does NOT add a second address or any failover: the management
+    /// address is still ONE name, and surviving a dead node still depends on
+    /// that name resolving to a live one (a TCP-passthrough VIP with a
+    /// `/readyz` check, or multi-address DNS: docs/user-manual/gateway.md,
+    /// the "Management address" bullet). It only makes a silent node fail like
+    /// a closed one.
+    ///
+    /// Safe against the gateway's own management listener (:50063): cowboy_http2
+    /// has no minimum ping interval (no `too_many_pings` GOAWAY), only a flood
+    /// limit (`max_received_frame_rate`, `enhance_your_calm`) orders of
+    /// magnitude above one ping per 30 s, and it answers a PING synchronously
+    /// in the connection process (`yuzu_grpc_listener.erl`). Not measured: that
+    /// the PING ACK arrives within `kKeepaliveTimeoutMs` during a large fan-out.
+    static constexpr int kKeepaliveTimeMs = 30000;
+    static constexpr int kKeepaliveTimeoutMs = 10000;
+
+    [[nodiscard]] static grpc::ChannelArguments default_channel_arguments() {
+        grpc::ChannelArguments args;
+        args.SetInt(GRPC_ARG_KEEPALIVE_TIME_MS, kKeepaliveTimeMs);
+        args.SetInt(GRPC_ARG_KEEPALIVE_TIMEOUT_MS, kKeepaliveTimeoutMs);
+        // The channel is idle between commands; without this no ping is sent.
+        args.SetInt(GRPC_ARG_KEEPALIVE_PERMIT_WITHOUT_CALLS, 1);
+        // Client side: never stop pinging because no DATA frame went by.
+        args.SetInt(GRPC_ARG_HTTP2_MAX_PINGS_WITHOUT_DATA, 0);
+        return args;
+    }
+
+    /// The creator `channel_via` calls; `grpc::CreateCustomChannel` in production. A seam so a
+    /// test can observe the arguments a channel is built with (a `grpc::Channel` exposes none).
+    using ChannelCreateFn = std::function<std::shared_ptr<grpc::Channel>(
+        const std::string& address, std::shared_ptr<grpc::ChannelCredentials>,
+        const grpc::ChannelArguments&)>;
+
+    /// Builds a channel with the keepalive arguments (`default_channel_arguments()`) through
+    /// `create`. The ONLY place the arguments are attached to a channel.
+    [[nodiscard]] static std::shared_ptr<grpc::Channel>
+    channel_via(const ChannelCreateFn& create, const std::string& address,
+                std::shared_ptr<grpc::ChannelCredentials> creds) {
+        return create(address, std::move(creds), default_channel_arguments());
+    }
+
     static std::shared_ptr<grpc::Channel>
     default_channel_factory(const std::string& address,
                             std::shared_ptr<grpc::ChannelCredentials> creds) {
-        return grpc::CreateChannel(address, std::move(creds));
+        // One line, checked by inspection: it passes the real creator to `channel_via`.
+        return channel_via(
+            [](const std::string& a, std::shared_ptr<grpc::ChannelCredentials> c,
+               const grpc::ChannelArguments& args) {
+                return grpc::CreateCustomChannel(a, std::move(c), args);
+            },
+            address, std::move(creds));
     }
 
     /// `default_address` is `Config::gateway_command_address` (may be

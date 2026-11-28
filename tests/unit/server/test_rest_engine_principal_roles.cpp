@@ -461,3 +461,95 @@ TEST_CASE("REST engine-principal roles: GET roles (read) PROCEEDS 200 but sets "
     CHECK(res->status == 200); // data still served
     CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// A role name holding a NUL, another control byte or DEL is refused as a client
+// error (400) on BOTH the assign and the unassign route, before any lookup or
+// store call, so assign and unassign accept the same set of names.
+// ═══════════════════════════════════════════════════════════════════════════
+
+TEST_CASE("REST POST /api/v1/engine-principals/{id}/roles: a role name with a control byte is "
+          "refused 400 with a denied row and no grant",
+          "[pg][rest][engine_principal][rbac][validation]") {
+    RestEngineRolesHarness h;
+    REQUIRE(h.rbac_store->create_role({.name = "EngineReader", .description = "d"}).has_value());
+    REQUIRE(h.engine_store->create("Vuln Sync", "alice", "j", "internal", "admin", "engine:vuln")
+               .has_value());
+
+    const std::size_t roles_before = h.rbac_store->list_roles().size();
+
+    for (const char* body : {R"({"role":"Engine\tReader"})", R"({"role":"Engine\u001bReader"})",
+                             R"({"role":"Engine\u0000Reader"})", R"({"role":"Engine\u007fReader"})"}) {
+        INFO(body);
+        h.audit_log.clear();
+        auto res = h.assign("vuln", body);
+        REQUIRE(res);
+        CHECK(res->status == 400);
+
+        // No grant, and no new role either.
+        CHECK(h.rbac_store->get_principal_roles("engine", "engine:vuln").empty());
+        CHECK(h.rbac_store->list_roles().size() == roles_before);
+
+        // Exactly one audit row: the denied one, with a fixed detail that does not echo the input.
+        REQUIRE(h.audit_log.size() == 1);
+        CHECK(h.audit_log[0].action == "engine_principal.role.assigned");
+        CHECK(h.audit_log[0].result == "denied");
+        CHECK(h.audit_log[0].target_id == "engine:vuln");
+        CHECK(h.audit_log[0].detail == "invalid_role_name");
+    }
+
+    // The refusal is about the name: a clean role is still assigned on the same route.
+    h.audit_log.clear();
+    auto ok = h.assign("vuln", R"({"role":"EngineReader"})");
+    REQUIRE(ok);
+    CHECK(ok->status == 201);
+    REQUIRE(h.audit_log.size() == 1);
+    CHECK(h.audit_log[0].result == "success");
+    CHECK(h.rbac_store->get_principal_roles("engine", "engine:vuln").size() == 1);
+}
+
+TEST_CASE("REST DELETE /api/v1/engine-principals/{id}/roles/{role}: a role name with a control "
+          "byte is refused 400, never a store fault, and the existing grant is untouched",
+          "[pg][rest][engine_principal][rbac][validation]") {
+    RestEngineRolesHarness h;
+    REQUIRE(h.rbac_store->create_role({.name = "EngineReader", .description = "d"}).has_value());
+    REQUIRE(
+        h.rbac_store->set_permission({"EngineReader", "Inventory", "Read", "allow"}).has_value());
+    REQUIRE(h.engine_store->create("Vuln Sync", "alice", "j", "internal", "admin", "engine:vuln")
+               .has_value());
+    REQUIRE(h.assign("vuln", R"({"role":"EngineReader"})")->status == 201);
+    REQUIRE(h.rbac_store->check_permission("engine:vuln", "Inventory", "Read"));
+
+    const std::vector<std::string> roles = {
+        std::string("Engine") + '\t' + "Reader",
+        std::string("Engine") + '\x1b' + "Reader",
+        std::string("Engine\0Reader", 13),
+        std::string("Engine") + '\x7f' + "Reader",
+    };
+    for (const auto& role : roles) {
+        INFO("role length " << role.size());
+        h.audit_log.clear();
+        auto res = h.unassign("vuln", role);
+        REQUIRE(res);
+        CHECK(res->status == 400); // not 503: a bad name is a client error
+        CHECK(res->body.find("\"unassigned\":true") == std::string::npos);
+
+        // The grant is still there.
+        CHECK(h.rbac_store->check_permission("engine:vuln", "Inventory", "Read"));
+
+        REQUIRE(h.audit_log.size() == 1);
+        CHECK(h.audit_log[0].action == "engine_principal.role.unassigned");
+        CHECK(h.audit_log[0].result == "denied");
+        CHECK(h.audit_log[0].target_id == "engine:vuln");
+        CHECK(h.audit_log[0].detail == "invalid_role_name");
+    }
+
+    // A clean name on the same route still removes the grant and audits success.
+    h.audit_log.clear();
+    auto ok = h.unassign("vuln", "EngineReader");
+    REQUIRE(ok);
+    CHECK(ok->status == 200);
+    CHECK_FALSE(h.rbac_store->check_permission("engine:vuln", "Inventory", "Read"));
+    REQUIRE(h.audit_log.size() == 1);
+    CHECK(h.audit_log[0].result == "success");
+}

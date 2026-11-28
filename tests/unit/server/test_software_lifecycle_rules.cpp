@@ -1,0 +1,469 @@
+/**
+ * test_software_lifecycle_rules.cpp - the pure lifecycle model (software_lifecycle_rules.hpp):
+ * source precedence, version-prefix specificity, declared-fact currency and supersession, the
+ * conflict flag, the state derivation, the strict rule-file parser and the embedded seed.
+ * No store, no I/O.
+ */
+
+#include "software_lifecycle_rules.hpp"
+#include "software_normalization_pack.hpp"
+
+#include <catch2/catch_test_macros.hpp>
+
+#include <cstdint>
+#include <set>
+#include <string>
+#include <vector>
+
+using namespace yuzu::server;
+
+namespace {
+
+constexpr std::int64_t kNow = 10'000'000;
+constexpr std::int64_t kWindow = 172800;
+constexpr const char* kToday = "2026-11-14";
+const std::string kKey = "product:postgresql:postgresql";
+
+LifecycleRule rule(LifecycleSource src, std::string prefix, LifecycleEvent ev, std::string date,
+                   std::string ref = "ref") {
+    return LifecycleRule{kKey, std::move(prefix), ev, std::move(date), src, std::move(ref), 0};
+}
+
+DeclaredFact fact(std::string version, LifecycleEvent ev, std::string date, std::int64_t seen) {
+    return DeclaredFact{kKey, std::move(version), ev, std::move(date), seen};
+}
+
+LifecycleEvaluation eval(const std::string& version, const std::vector<LifecycleRule>& rules,
+                         const std::vector<DeclaredFact>& declared = {}) {
+    return evaluate_lifecycle(kKey, version, rules, declared, kToday, kNow, kWindow);
+}
+
+constexpr LifecycleEvent kEos = LifecycleEvent::end_of_support;
+constexpr LifecycleEvent kEol = LifecycleEvent::end_of_life;
+
+} // namespace
+
+TEST_CASE("lifecycle: no rule and no fact is unknown, never supported", "[lifecycle][rules]") {
+    const auto e = eval("16.2", {});
+    CHECK(e.state == LifecycleState::unknown);
+    CHECK_FALSE(e.end_of_support.has_value());
+    CHECK_FALSE(e.end_of_life.has_value());
+    CHECK_FALSE(e.conflict);
+    CHECK(e.status == LifecycleStatus::current);
+    CHECK_FALSE(e.declared_collected);
+    // A rule for another product or a version outside its prefix does not count either.
+    LifecycleRule other = rule(LifecycleSource::shipped, "", kEol, "2020-01-01");
+    other.product_key = "product:other";
+    CHECK(eval("16.2", {other, rule(LifecycleSource::shipped, "15", kEol, "2020-01-01")}).state ==
+          LifecycleState::unknown);
+}
+
+TEST_CASE("lifecycle: dates decide the state", "[lifecycle][rules]") {
+    SECTION("a future end of support is supported and the date is reported") {
+        const auto e = eval("16", {rule(LifecycleSource::shipped, "16", kEos, "2027-01-01", "r1")});
+        CHECK(e.state == LifecycleState::supported);
+        REQUIRE(e.end_of_support.has_value());
+        CHECK(e.end_of_support->date == "2027-01-01");
+        CHECK(e.end_of_support->source == LifecycleSource::shipped);
+        CHECK(e.source_ref == "r1");
+    }
+    SECTION("an expired end of support is end_of_support") {
+        const auto e = eval("16", {rule(LifecycleSource::shipped, "16", kEos, "2026-11-14", "r1"),
+                                   rule(LifecycleSource::shipped, "16", kEol, "2030-01-01", "r2")});
+        CHECK(e.state == LifecycleState::end_of_support);
+        CHECK(e.source_ref == "r1");
+    }
+    SECTION("an expired end of life wins over end of support") {
+        const auto e = eval("16", {rule(LifecycleSource::shipped, "16", kEos, "2025-01-01", "r1"),
+                                   rule(LifecycleSource::shipped, "16", kEol, "2026-01-01", "r2")});
+        CHECK(e.state == LifecycleState::end_of_life);
+        CHECK(e.source_ref == "r2");
+    }
+    SECTION("an end of life dated today has arrived") {
+        const auto e = eval("16", {rule(LifecycleSource::shipped, "16", kEol, kToday, "r1")});
+        CHECK(e.state == LifecycleState::end_of_life);
+        CHECK(e.source_ref == "r1");
+    }
+    SECTION("a future end of life alone is supported") {
+        CHECK(eval("16", {rule(LifecycleSource::shipped, "16", kEol, "2030-01-01")}).state ==
+              LifecycleState::supported);
+    }
+}
+
+TEST_CASE("lifecycle: current declared beats external beats imported beats shipped",
+          "[lifecycle][rules]") {
+    const auto shipped = rule(LifecycleSource::shipped, "", kEol, "2026-01-01");
+    const auto imported = rule(LifecycleSource::imported, "", kEol, "2026-02-01");
+    const auto external = rule(LifecycleSource::external, "", kEol, "2026-03-01");
+    const auto declared = fact("16.2", kEol, "2026-04-01", kNow - 10);
+
+    CHECK(eval("16.2", {shipped, imported, external}, {declared}).end_of_life->source ==
+          LifecycleSource::declared);
+    CHECK(eval("16.2", {shipped, imported, external}).end_of_life->source ==
+          LifecycleSource::external);
+    CHECK(eval("16.2", {shipped, imported}).end_of_life->source == LifecycleSource::imported);
+    CHECK(eval("16.2", {shipped}).end_of_life->source == LifecycleSource::shipped);
+
+    SECTION("a stale declared fact loses to any rule") {
+        const auto stale = fact("16.2", kEol, "2026-04-01", kNow - kWindow - 1);
+        const auto e = eval("16.2", {shipped}, {stale});
+        CHECK(e.end_of_life->source == LifecycleSource::shipped);
+        CHECK(e.end_of_life->date == "2026-01-01");
+        CHECK_FALSE(e.conflict); // a superseded stale fact never raises conflict
+        CHECK(e.status == LifecycleStatus::current);
+    }
+    SECTION("a fact repeated exactly at the window edge is still current") {
+        const auto edge = fact("16.2", kEol, "2026-04-01", kNow - kWindow);
+        CHECK(eval("16.2", {shipped}, {edge}).end_of_life->source == LifecycleSource::declared);
+    }
+    SECTION("a declared fact for another version does not apply") {
+        CHECK(eval("16.3", {shipped}, {declared}).end_of_life->source == LifecycleSource::shipped);
+    }
+}
+
+TEST_CASE("lifecycle: sources that disagree are flagged and the losers listed",
+          "[lifecycle][rules]") {
+    const auto e = eval("16", {rule(LifecycleSource::shipped, "", kEol, "2026-01-01", "s"),
+                               rule(LifecycleSource::external, "", kEol, "2027-01-01", "x"),
+                               rule(LifecycleSource::imported, "", kEol, "2027-01-01", "i")});
+    REQUIRE(e.end_of_life.has_value());
+    CHECK(e.end_of_life->source == LifecycleSource::external);
+    CHECK(e.end_of_life->date == "2027-01-01");
+    CHECK(e.conflict);
+    // Only the shipped tier differs from the winning date; imported agrees with it.
+    CHECK(e.conflicting_sources == std::vector<LifecycleSource>{LifecycleSource::shipped});
+    CHECK(e.state == LifecycleState::supported);
+
+    SECTION("sources that agree raise no conflict") {
+        const auto same = eval("16", {rule(LifecycleSource::shipped, "", kEol, "2027-01-01"),
+                                      rule(LifecycleSource::external, "", kEol, "2027-01-01")});
+        CHECK_FALSE(same.conflict);
+        CHECK(same.conflicting_sources.empty());
+    }
+    SECTION("a declared winner against a rule lists the rule's source") {
+        const auto d = eval("16", {rule(LifecycleSource::shipped, "", kEol, "2027-01-01")},
+                            {fact("16", kEol, "2026-06-01", kNow)});
+        CHECK(d.conflict);
+        CHECK(d.conflicting_sources == std::vector<LifecycleSource>{LifecycleSource::shipped});
+        CHECK(d.source_ref.empty());
+    }
+}
+
+TEST_CASE("lifecycle: the longest version prefix wins inside a tier", "[lifecycle][rules]") {
+    const std::vector<LifecycleRule> rules{
+        rule(LifecycleSource::shipped, "", kEol, "2030-01-01", "all"),
+        rule(LifecycleSource::shipped, "3", kEol, "2029-01-01", "major"),
+        rule(LifecycleSource::shipped, "3.8", kEol, "2024-10-07", "minor")};
+    CHECK(eval("3.8.10", rules).end_of_life->source_ref == "minor");
+    CHECK(eval("3.8", rules).end_of_life->source_ref == "minor");
+    CHECK(eval("3.80", rules).end_of_life->source_ref == "major"); // 3.8 does not match 3.80
+    CHECK(eval("3.9.1", rules).end_of_life->source_ref == "major");
+    CHECK(eval("4.0", rules).end_of_life->source_ref == "all");
+    // Specificity inside one tier is not a disagreement.
+    CHECK_FALSE(eval("3.8.10", rules).conflict);
+
+    SECTION("a broader prefix in a higher tier still wins over a longer one in a lower tier") {
+        const auto e = eval("3.8.10", {rule(LifecycleSource::external, "3", kEol, "2031-01-01", "x"),
+                                       rule(LifecycleSource::shipped, "3.8.10", kEol, "2024-01-01",
+                                            "s")});
+        CHECK(e.end_of_life->source == LifecycleSource::external);
+        CHECK(e.conflict);
+    }
+}
+
+TEST_CASE("lifecycle: current declared dates and supersession", "[lifecycle][rules]") {
+    SECTION("two current dates: the earliest wins and hosts disagree") {
+        const auto e = eval("16", {},
+                            {fact("16", kEol, "2026-12-01", kNow - 100),
+                             fact("16", kEol, "2026-08-01", kNow - 200)});
+        CHECK(e.end_of_life->date == "2026-08-01");
+        CHECK(e.conflict);
+        CHECK(e.conflicting_sources == std::vector<LifecycleSource>{LifecycleSource::declared});
+        CHECK(e.state == LifecycleState::end_of_life);
+    }
+    SECTION("a corrected date supersedes the old one once the old one is stale") {
+        const auto old_fact = fact("16", kEol, "2026-08-01", kNow - kWindow - 5);
+        const auto corrected = fact("16", kEol, "2026-12-01", kNow - 5);
+        const auto e = eval("16", {}, {old_fact, corrected});
+        CHECK(e.end_of_life->date == "2026-12-01");
+        CHECK_FALSE(e.conflict);
+        CHECK(e.status == LifecycleStatus::current);
+        CHECK(e.state == LifecycleState::supported);
+        // The old date never wins again, whatever order the rows arrive in.
+        CHECK(eval("16", {}, {corrected, old_fact}) == e);
+    }
+    SECTION("the two events resolve independently") {
+        const auto e = eval("16", {}, {fact("16", kEos, "2026-01-01", kNow),
+                                       fact("16", kEol, "2027-01-01", kNow)});
+        CHECK(e.state == LifecycleState::end_of_support);
+        CHECK(e.end_of_support->date == "2026-01-01");
+        CHECK(e.end_of_life->date == "2027-01-01");
+    }
+}
+
+TEST_CASE("lifecycle: only stale declared facts and no rule is unconfirmed", "[lifecycle][rules]") {
+    const auto older = fact("16", kEol, "2026-01-01", kNow - kWindow - 500);
+    const auto newer = fact("16", kEol, "2026-06-01", kNow - kWindow - 100);
+    const auto e = eval("16", {}, {older, newer});
+    REQUIRE(e.end_of_life.has_value());
+    CHECK(e.end_of_life->date == "2026-06-01"); // the most recently seen wins
+    CHECK(e.end_of_life->source == LifecycleSource::declared);
+    CHECK(e.status == LifecycleStatus::unconfirmed);
+    CHECK_FALSE(e.conflict);
+    CHECK(e.state == LifecycleState::end_of_life);
+
+    SECTION("equal last_seen: the earliest date wins") {
+        const auto a = fact("16", kEol, "2026-09-01", kNow - kWindow - 1);
+        const auto b = fact("16", kEol, "2026-03-01", kNow - kWindow - 1);
+        CHECK(eval("16", {}, {a, b}).end_of_life->date == "2026-03-01");
+    }
+}
+
+TEST_CASE("lifecycle: an input that cannot be compared reads unknown, never supported",
+          "[lifecycle][rules]") {
+    const std::vector<LifecycleRule> expired{rule(LifecycleSource::shipped, "", kEol, "2020-01-01")};
+    CHECK(eval("16", expired).state == LifecycleState::end_of_life); // control: the same rule
+    for (const char* bad_today : {"", "garbage", "2026-02-30", "2026-11-1"})
+        CHECK(evaluate_lifecycle(kKey, "16", expired, {}, bad_today, kNow, kWindow).state ==
+              LifecycleState::unknown);
+    CHECK(evaluate_lifecycle(kKey, "16", expired, {}, kToday, -1, kWindow).state ==
+          LifecycleState::unknown);
+    CHECK(evaluate_lifecycle(kKey, "16", expired, {}, kToday, kNow, -1).state ==
+          LifecycleState::unknown);
+    // The cutoff subtraction cannot overflow: the guard refuses it before any rule is read.
+    CHECK(evaluate_lifecycle(kKey, "16", expired, {}, kToday, INT64_MIN, kWindow).state ==
+          LifecycleState::unknown);
+}
+
+TEST_CASE("lifecycle: dates are strict calendar dates", "[lifecycle][rules]") {
+    CHECK(is_lifecycle_date("2024-02-29"));
+    CHECK_FALSE(is_lifecycle_date("2023-02-29"));
+    CHECK_FALSE(is_lifecycle_date("2023-04-31"));
+    CHECK_FALSE(is_lifecycle_date("2023-13-01"));
+    CHECK_FALSE(is_lifecycle_date("2023-1-01"));
+    CHECK_FALSE(is_lifecycle_date("2023/01/01"));
+    CHECK_FALSE(is_lifecycle_date("1969-12-31"));
+    CHECK_FALSE(is_lifecycle_date(""));
+}
+
+TEST_CASE("lifecycle: keys", "[lifecycle][rules]") {
+    CHECK(product_lifecycle_key("postgresql:postgresql") == "product:postgresql:postgresql");
+    CHECK(product_lifecycle_key("").empty());
+    CHECK(os_lifecycle_key("linux", "Ubuntu") == "os:ubuntu");
+    CHECK(os_lifecycle_key("linux", "").empty());
+    CHECK(os_lifecycle_key("Windows", "") == "os:windows");
+    CHECK(os_lifecycle_key("macos", "ignored") == "os:macos");
+    CHECK(os_lifecycle_key("darwin", "ignored") == "os:macos"); // the family agents report
+    CHECK(os_lifecycle_key("Darwin", "") == "os:macos");
+    CHECK(os_lifecycle_key("plan9", "x").empty());
+}
+
+TEST_CASE("lifecycle: a stored key has the shape the key helpers build", "[lifecycle][rules]") {
+    const auto rule_with = [](std::string key) {
+        return LifecycleRule{std::move(key), "", kEol, "2026-02-01", LifecycleSource::external,
+                             "ref", 0};
+    };
+    const auto fact_with = [](std::string key) {
+        return DeclaredFact{std::move(key), "16", kEol, "2026-02-01", 1};
+    };
+    for (const std::string& key :
+         {product_lifecycle_key("postgresql:postgresql"), os_lifecycle_key("linux", "Ubuntu"),
+          os_lifecycle_key("Windows", ""), std::string{"product:caf\xc3\xa9"}}) {
+        INFO(key);
+        CHECK_FALSE(validate_lifecycle_rule(rule_with(key)).has_value());
+        CHECK_FALSE(validate_declared_fact(fact_with(key)).has_value());
+    }
+    for (const char* key :
+         {"Product:x", "product:X", "os:Ubuntu", "OS:ubuntu", "x", "os:", "product:"}) {
+        INFO(key);
+        const auto r = validate_lifecycle_rule(rule_with(key));
+        REQUIRE(r.has_value());
+        CHECK(r->find("lower-case") != std::string::npos);
+        const auto f = validate_declared_fact(fact_with(key));
+        REQUIRE(f.has_value());
+        CHECK(f->find("lower-case") != std::string::npos);
+    }
+}
+
+TEST_CASE("lifecycle: a lookup is bounded printable text and may have an empty version",
+          "[lifecycle][rules]") {
+    const std::string key_at_cap = "product:" + std::string(kLifecycleFieldMaxBytes - 8, 'x');
+    const std::string version_at_cap(kLifecycleFieldMaxBytes, '1');
+    CHECK_FALSE(validate_lifecycle_lookup(kKey, "").has_value());
+    CHECK_FALSE(validate_lifecycle_lookup(key_at_cap, version_at_cap).has_value());
+    CHECK(validate_lifecycle_lookup(key_at_cap + "x", "1").has_value());
+    CHECK(validate_lifecycle_lookup(kKey, version_at_cap + "1").has_value());
+    CHECK(validate_lifecycle_lookup("", "1").has_value());
+    CHECK(validate_lifecycle_lookup(kKey, "1\x01").has_value());    // control byte
+    CHECK(validate_lifecycle_lookup(kKey, "1\x7f").has_value());    // DEL
+    CHECK(validate_lifecycle_lookup(kKey, "\xc3\x28").has_value()); // invalid UTF-8
+    CHECK(validate_lifecycle_lookup("product:a\x01!", "1").has_value());
+
+    SECTION("an empty version matches only an empty prefix") {
+        CHECK(eval("", {rule(LifecycleSource::shipped, "", kEol, "2020-01-01")}).state ==
+              LifecycleState::end_of_life);
+        CHECK(eval("", {rule(LifecycleSource::shipped, "16", kEol, "2020-01-01")}).state ==
+              LifecycleState::unknown);
+    }
+}
+
+namespace {
+const std::string kHeader{kLifecycleCsvHeader};
+std::string csv(const std::string& rows) { return "# comment\n\n" + kHeader + "\n" + rows; }
+} // namespace
+
+TEST_CASE("lifecycle csv: a well-formed file parses", "[lifecycle][rules][csv]") {
+    const auto r = parse_lifecycle_rules_csv(
+        csv("os:ubuntu,22.04,end_of_life,2027-04-01,https://example.test/a\r\n"
+            "product:x:y,,end_of_support,2026-01-31,\n"),
+        LifecycleSource::imported);
+    REQUIRE(r.has_value());
+    REQUIRE(r->size() == 2);
+    CHECK((*r)[0].product_key == "os:ubuntu");
+    CHECK((*r)[0].version_prefix == "22.04");
+    CHECK((*r)[0].event == kEol);
+    CHECK((*r)[0].source == LifecycleSource::imported);
+    CHECK((*r)[0].source_ref == "https://example.test/a");
+    CHECK((*r)[1].version_prefix.empty());
+    CHECK((*r)[1].event == kEos);
+}
+
+TEST_CASE("lifecycle csv: each defect refuses the whole file with a reason", "[lifecycle][rules][csv]") {
+    const auto refused = [](const std::string& text) {
+        const auto r = parse_lifecycle_rules_csv(text, LifecycleSource::shipped);
+        REQUIRE_FALSE(r.has_value());
+        CHECK_FALSE(r.error().empty());
+        return r.error();
+    };
+    SECTION("bad date") { CHECK(refused(csv("os:a,,end_of_life,2026-02-30,r\n")).find("date") != std::string::npos); }
+    SECTION("unknown event") {
+        CHECK(refused(csv("os:a,,retired,2026-02-01,r\n")).find("event") != std::string::npos);
+    }
+    SECTION("duplicate key") {
+        CHECK(refused(csv("os:a,1,end_of_life,2026-02-01,r\nos:a,1,end_of_life,2027-02-01,r\n"))
+                  .find("duplicate") != std::string::npos);
+    }
+    SECTION("same key with a different event or prefix is not a duplicate") {
+        CHECK(parse_lifecycle_rules_csv(csv("os:a,1,end_of_life,2026-02-01,r\n"
+                                            "os:a,1,end_of_support,2026-01-01,r\n"
+                                            "os:a,2,end_of_life,2026-02-01,r\n"),
+                                        LifecycleSource::shipped)
+                  .has_value());
+    }
+    SECTION("file over the byte cap, one byte past an accepted file") {
+        // A valid file padded with a trailing comment line to an exact size.
+        const auto sized = [](std::size_t total) {
+            const std::string base = csv("os:a,,end_of_life,2026-02-01,r\n");
+            return base + "#" + std::string(total - base.size() - 1, 'x');
+        };
+        const auto at_cap = parse_lifecycle_rules_csv(sized(kLifecycleCsvMaxBytes),
+                                                      LifecycleSource::shipped);
+        REQUIRE(at_cap.has_value());
+        CHECK(at_cap->size() == 1);
+        CHECK(refused(sized(kLifecycleCsvMaxBytes + 1)).find("exceeds") != std::string::npos);
+    }
+    SECTION("rows: the cap is accepted, one more is refused") {
+        const auto rows_of = [](std::size_t n) {
+            std::string rows;
+            for (std::size_t i = 0; i < n; ++i)
+                rows += "os:k" + std::to_string(i) + ",,end_of_life,2026-02-01,r\n";
+            return csv(rows);
+        };
+        const auto at_cap = parse_lifecycle_rules_csv(rows_of(kLifecycleCsvMaxRows),
+                                                      LifecycleSource::shipped);
+        REQUIRE(at_cap.has_value());
+        CHECK(at_cap->size() == kLifecycleCsvMaxRows);
+        CHECK(refused(rows_of(kLifecycleCsvMaxRows + 1)).find("rows") != std::string::npos);
+    }
+    SECTION("control byte") {
+        refused(csv("os:a,,end_of_life,2026-02-01,r\x01x\n"));
+        refused(csv("os:a,,end_of_life,2026-02-01,r\tx\n"));
+        refused(csv(std::string("os:a,,end_of_life,2026-02-01,r") + '\0' + "x\n"));
+    }
+    SECTION("invalid UTF-8") { refused(csv("os:a,,end_of_life,2026-02-01,r\xc3\x28\n")); }
+    SECTION("field over 256 bytes, one byte past an accepted field") {
+        CHECK(parse_lifecycle_rules_csv(
+                  csv("os:a,,end_of_life,2026-02-01," + std::string(kLifecycleFieldMaxBytes, 'r') +
+                      "\n"),
+                  LifecycleSource::shipped)
+                  .has_value());
+        refused(csv("os:a,,end_of_life,2026-02-01," + std::string(kLifecycleFieldMaxBytes + 1, 'r') +
+                    "\n"));
+    }
+    SECTION("wrong column count") {
+        refused(csv("os:a,end_of_life,2026-02-01,r\n"));
+        refused(csv("os:a,,end_of_life,2026-02-01,r,extra\n"));
+    }
+    SECTION("empty product key") { refused(csv(",,end_of_life,2026-02-01,r\n")); }
+    SECTION("a key that could never equal a built lookup key") {
+        for (const char* key : {"Product:x", "product:X", "os:Ubuntu", "x", "os:", "product:"}) {
+            INFO(key);
+            CHECK(refused(csv(std::string{key} + ",,end_of_life,2026-02-01,r\n"))
+                      .find("lower-case") != std::string::npos);
+        }
+        // Non-ASCII bytes are allowed: a normalised title key can carry them.
+        CHECK(parse_lifecycle_rules_csv(csv("product:caf\xc3\xa9,,end_of_life,2026-02-01,r\n"),
+                                        LifecycleSource::shipped)
+                  .has_value());
+    }
+    SECTION("prefix that starts or ends with a dot") {
+        refused(csv("os:a,3.,end_of_life,2026-02-01,r\n"));
+        refused(csv("os:a,.3,end_of_life,2026-02-01,r\n"));
+    }
+    SECTION("wrong or missing header") {
+        refused("product_key,version,event,date,source_reference\nos:a,,end_of_life,2026-02-01,r\n");
+        refused("# only a comment\n");
+        refused("");
+    }
+}
+
+TEST_CASE("lifecycle csv: the embedded seed parses and every row names its policy",
+          "[lifecycle][rules][csv][seed]") {
+    const auto seed = parse_lifecycle_rules_csv(kSoftwareLifecycleSeed, LifecycleSource::shipped);
+    REQUIRE(seed.has_value());
+    CHECK_FALSE(seed->empty());
+    for (const auto& r : *seed) {
+        INFO(r.product_key << " " << r.version_prefix << " " << to_string(r.event));
+        CHECK_FALSE(r.source_ref.empty());
+        CHECK((r.product_key.starts_with("product:") || r.product_key.starts_with("os:")));
+    }
+}
+
+TEST_CASE("lifecycle csv: every seed product key is a canonical key of the alias pack",
+          "[lifecycle][rules][csv][seed]") {
+    // A mistyped key never matches any product, so its rows would sit in the table unused and
+    // every version of that product would read unknown. The pack is where product keys are minted.
+    const auto pack = parse_normalization_pack(kSoftwareNormalizationSeed);
+    REQUIRE(pack.has_value());
+    std::set<std::string> canonical;
+    for (const auto& row : pack->rows)
+        canonical.insert(product_lifecycle_key(row.norm_key));
+    const auto seed = parse_lifecycle_rules_csv(kSoftwareLifecycleSeed, LifecycleSource::shipped);
+    REQUIRE(seed.has_value());
+    std::size_t product_rows = 0;
+    for (const auto& r : *seed) {
+        if (!r.product_key.starts_with("product:"))
+            continue;
+        ++product_rows;
+        INFO(r.product_key << " " << r.version_prefix);
+        CHECK(canonical.contains(r.product_key));
+    }
+    CHECK(product_rows > 0); // the loop above must not pass by finding nothing to check
+}
+
+TEST_CASE("lifecycle csv: the seed ends Python 3.10 on the date its policy page gives",
+          "[lifecycle][rules][csv][seed]") {
+    // One boundary case for the row a date defect was fixed on (PEP 619: 2026-10-01). A golden copy
+    // of the whole file would only restate the CSV.
+    const auto seed = parse_lifecycle_rules_csv(kSoftwareLifecycleSeed, LifecycleSource::shipped);
+    REQUIRE(seed.has_value());
+    const auto at = [&](std::string_view today) {
+        return evaluate_lifecycle("product:python:python", "3.10.1", *seed, {}, today, kNow, kWindow);
+    };
+    CHECK(at("2026-09-30").state == LifecycleState::supported);
+    const auto on = at("2026-10-01");
+    CHECK(on.state == LifecycleState::end_of_life);
+    REQUIRE(on.end_of_life.has_value());
+    CHECK(on.end_of_life->date == "2026-10-01");
+    CHECK(on.end_of_life->source == LifecycleSource::shipped);
+}

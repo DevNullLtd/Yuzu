@@ -209,7 +209,8 @@ void register_approvals_fragment_routes(HttpRouteSink& sink, Deps deps) {
                             html_escape(a.submitted_by) +
                             "</td>"
                             "<td><code>" +
-                            html_escape(a.scope_expression) +
+                            html_escape(truncate_utf8(a.scope_expression,
+                                                      operate_pages::kScopeAttrBytes)) +
                             "</code>";
                     if (!a.request_json.empty()) {
                         // Bound ticket (#6062): the reviewer reads what is being approved.
@@ -236,8 +237,20 @@ void register_approvals_fragment_routes(HttpRouteSink& sink, Deps deps) {
                             if (viewer_is_excluded(a, session->username))
                                 html += "<span class=\"hint\">You are excluded from approving "
                                         "this request. You can still reject it.</span> ";
+                            // A scope clipped to kScopeAttrBytes cannot be read in full
+                            // here either: no Approve, and the notice says where to read it.
+                            if (operate_pages::scope_is_clipped(a.scope_expression))
+                                html += "<span class=\"hint\">Scope clipped: it is " +
+                                        std::to_string(a.scope_expression.size()) +
+                                        " bytes and shown only in part. Approve is unavailable "
+                                        "here. Read the full scope with GET /api/v1/approvals, "
+                                        "then approve with POST /api/approvals/" +
+                                        html_escape(a.id) +
+                                        "/approve from a signed-in session. You can still "
+                                        "reject it.</span> ";
                             if (!viewer_is_excluded(a, session->username) &&
-                                !state_unapprovable(a))
+                                !state_unapprovable(a) &&
+                                !operate_pages::scope_is_clipped(a.scope_expression))
                                 html += "<button class=\"btn btn-primary btn-sm\" "
                                         "hx-post=\"/api/approvals/" +
                                         a.id +

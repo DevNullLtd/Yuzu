@@ -1,7 +1,7 @@
 #include "mcp_stream_bridge.hpp"
 
 #include "background_jobs.hpp"
-
+#include "execution_event_scope.hpp" // classify/sanitize: the bus-consumer confined projection
 #include "mcp_jsonrpc.hpp"
 #include "mcp_session.hpp"
 #include "mcp_stream.hpp"
@@ -332,8 +332,9 @@ void McpStreamBridge::mark_dirty(WakeCore& core, const std::string& key) noexcep
 ExecutionEventBus::Listener McpStreamBridge::make_listener(std::shared_ptr<BridgeRecord> rec,
                                                            std::shared_ptr<WakeCore> core) {
     return [rec = std::move(rec), core = std::move(core)](const ExecutionEvent& ev) noexcept {
-        // Hard constraint 7: strictly copy-only + notify, catch-and-count.
-        // Runs under Channel::mu; touches record mu + WakeCore::mu only.
+        // Hard constraint 7: copy and notify, catch-and-count (a confined terminal also
+        // sanitizes, see below). Runs under Channel::mu; touches record mu + WakeCore::mu
+        // only.
         try {
             if (core->listener_fault.exchange(false, std::memory_order_acq_rel)) {
                 throw std::bad_alloc{};  // inject_listener_fault_for_test
@@ -342,6 +343,25 @@ ExecutionEventBus::Listener McpStreamBridge::make_listener(std::shared_ptr<Bridg
             const bool is_progress = ev.event_type == "execution-progress";
             if (!is_terminal && !is_progress) {
                 return;  // agent-transition et al: not projected (documented)
+            }
+            // Confined-projection rule (header banner): the SAME classifier the REST and
+            // dashboard consumers use, against the dispatching session's scope, which is
+            // immutable on the record (set at reserve(), before any listener exists). An
+            // unrestricted record classifies kPass here for both event types, so its
+            // behaviour is unchanged. The verdict is computed before `rec->mu` is taken
+            // because it reads only the immutable scope. The confined terminal's sanitize
+            // (one small JSON parse and dump, once per execution) runs below, under
+            // Channel::mu and `rec->mu`, inside the existing try/catch: a throw there leaves
+            // the slot untouched and is counted like any other listener failure.
+            bool sanitize_terminal = false;
+            switch (classify_execution_event_for_scope(ev, rec->fleet_read_scope)) {
+            case ExecutionEventVerdict::kDrop:
+                return;  // confined progress: never latched, so never projected
+            case ExecutionEventVerdict::kSanitize:
+                sanitize_terminal = true;
+                break;
+            case ExecutionEventVerdict::kPass:
+                break;
             }
             {
                 std::lock_guard<std::mutex> lk(rec->mu);
@@ -356,7 +376,9 @@ ExecutionEventBus::Listener McpStreamBridge::make_listener(std::shared_ptr<Bridg
                     // Construct fully OUTSIDE the slot, then commit with a
                     // noexcept move: a payload-copy throw leaves the slot
                     // untouched and terminal_accepted unset.
-                    MailboxEntry tmp{ev.id, ev.data};
+                    MailboxEntry tmp{ev.id, sanitize_terminal
+                                                ? sanitize_execution_event_for_scope(ev).data
+                                                : ev.data};
                     rec->terminal_slot = std::move(tmp);
                     rec->terminal_accepted = true;  // sticky from here on
                 } else {
@@ -398,10 +420,11 @@ ExecutionEventBus::Listener McpStreamBridge::make_listener(std::shared_ptr<Bridg
 // ── reserve / subscribe / arm / cancel / abandon / park ────────────────────
 
 McpStreamBridge::ReserveResult McpStreamBridge::reserve(const std::string& session_id,
-                                                        const std::string& principal,
+                                                        McpSessionBinding binding,
                                                         const nlohmann::json& jsonrpc_id,
                                                         std::optional<nlohmann::json> progress_token,
-                                                        bool streamed_intent) {
+                                                        bool streamed_intent,
+                                                        authz::VisibleSet fleet_read_scope) {
     if (bus_ == nullptr) {
         count_reject("disabled");
         return {false, "disabled"};
@@ -423,7 +446,7 @@ McpStreamBridge::ReserveResult McpStreamBridge::reserve(const std::string& sessi
     // last_seen, which is correct here: reserve runs on a client request that
     // already slid the TTL at session-validate. Nothing on the PARKED path
     // touches it again (retention honesty).
-    auto stream = sessions_ != nullptr ? sessions_->stream_for(session_id, principal) : nullptr;
+    auto stream = sessions_ != nullptr ? sessions_->stream_for(session_id, binding) : nullptr;
     if (!stream) {
         count_reject("unknown_session");
         return {false, "unknown_session"};
@@ -435,13 +458,16 @@ McpStreamBridge::ReserveResult McpStreamBridge::reserve(const std::string& sessi
     // to discard on a reject and must not serialize against the map).
     auto rec = std::make_shared<BridgeRecord>();
     rec->session_id = session_id;
-    rec->principal = principal;
+    rec->binding = std::move(binding);
     rec->jsonrpc_id = jsonrpc_id;
     rec->key = make_key(session_id, jsonrpc_id);
     rec->streamed_intent = streamed_intent;
     rec->created = now();
     rec->stream = std::move(stream);
     rec->progress_token = std::move(progress_token);
+    // Only engaged-or-not is kept, never the agent ids: the listener and sweep() test
+    // engagement alone and agent-transition is never latched here (header banner).
+    rec->fleet_read_scope = fleet_read_scope.has_value() ? authz::deny_all() : std::nullopt;
 
     const char* reject = nullptr;
     std::size_t active = 0;
@@ -680,7 +706,8 @@ McpStreamBridge::ReserveResult McpStreamBridge::reserve(const std::string& sessi
                         displaced->orphan
                             ? "orphan pin released to admit a new streamed call on this session"
                             : "pin released to admit a new streamed call on this session",
-                        displaced_detail, AuditResult::kSuccess, principal);
+                        displaced_detail, AuditResult::kSuccess,
+                        rec->binding.principal);
         // Evidence floor, matching this file's teardown convention: the counter
         // and the audit row both route through swallowing guards, so a log line is
         // the one trace that survives an obs/audit sink failure. The release
@@ -941,7 +968,7 @@ McpStreamBridge::ArmOutcome McpStreamBridge::arm(const std::string& session_id,
         // The cancel this may consume came from an authenticated client too, so the
         // row it produces is attributable like the streamed detach is. The session
         // gate guarantees this equals the canceller.
-        rec_principal = rec->principal;
+        rec_principal = rec->binding.principal;
     }
     std::string fallback = build_fallback_final(jsonrpc_id, exec_id);
 
@@ -2201,7 +2228,7 @@ void McpStreamBridge::sweep() {
             // whose final reached the wire still settles kDone rather than
             // parking for a resume nobody needs.
             const bool session_alive =
-                sessions_ != nullptr && sessions_->exists(rec->session_id, rec->principal);
+                sessions_ != nullptr && sessions_->exists(rec->session_id, rec->binding);
             // `created` and `key` are write-once (immutable after reserve, before
             // the record is shared), so both are safe to read lock-free here.
             const bool stale = now() - rec->created > cfg_.streaming_park_after;
@@ -2212,7 +2239,7 @@ void McpStreamBridge::sweep() {
             // Registry leaf, no locks held. Non-touching: a parked record must
             // never extend session life.
             const bool session_alive =
-                sessions_ != nullptr && sessions_->exists(rec->session_id, rec->principal);
+                sessions_ != nullptr && sessions_->exists(rec->session_id, rec->binding);
             if (!session_alive) {
                 claim = true;
                 action = "mcp.bridge.session_dead";
@@ -2440,7 +2467,27 @@ void McpStreamBridge::sweep() {
                                 // Construct fully OUTSIDE the slot, then commit with
                                 // a noexcept move - a copy OOM leaves the slot and
                                 // terminal_accepted untouched (mirror the listener).
-                                MailboxEntry tmp{ev->id, ev->data};
+                                // A confined record's terminal is the sanitized one even here:
+                                // this `ev` is the terminal-flagged execution-progress, whose
+                                // payload carries the counts. The classifier is not reused
+                                // because it would drop an execution-progress-typed event;
+                                // sanitize parses the whole payload and reads `status`. A
+                                // payload with no string `status` latches "unknown", the
+                                // default build_real_final gives an unrestricted record, not
+                                // the sanitizer's fixed "completed". Any throw is the copy-OOM
+                                // defer below.
+                                std::string term_data = ev->data;
+                                if (oldest->fleet_read_scope.has_value()) {
+                                    const auto parsed =
+                                        nlohmann::json::parse(ev->data, nullptr, false);
+                                    const bool has_status = parsed.is_object() &&
+                                                            parsed.contains("status") &&
+                                                            parsed["status"].is_string();
+                                    term_data = has_status
+                                                    ? sanitize_execution_event_for_scope(*ev).data
+                                                    : std::string(R"({"status":"unknown"})");
+                                }
+                                MailboxEntry tmp{ev->id, std::move(term_data)};
                                 oldest->terminal_slot = std::move(tmp);
                                 oldest->terminal_accepted = true;
                             } catch (...) {  // NOLINT(bugprone-empty-catch) - deliberate

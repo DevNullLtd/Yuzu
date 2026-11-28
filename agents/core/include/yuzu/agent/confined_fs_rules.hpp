@@ -196,6 +196,17 @@ struct EntryMeta {
     /// wrong branch; a caller must decide what absence means before it can
     /// compute anything.
     std::optional<std::int64_t> mtime;
+
+    /// Windows only, and only filled by the enumerator for a caller that asked for it
+    /// (`EnumBudget::want_file_ids`); 0 otherwise and on POSIX. The 64-bit file id of the listing record.
+    /// It is a name-independent identity only on a filesystem whose listing ids are stable (NTFS); the
+    /// consumer decides that, the primitive just reports the number.
+    std::uint64_t file_id{0};
+    /// Windows only: the FILE_ATTRIBUTE_* bits of the listing record, 0 elsewhere.
+    std::uint32_t attributes{0};
+    /// Windows only: the reparse tag of the listing record (carried in its EaSize field when the
+    /// reparse-point attribute is set), 0 when the entry is not a reparse point and elsewhere.
+    std::uint32_t reparse_tag{0};
 };
 
 /// Caller-supplied blast-radius caps. Zero-initialized fields are
@@ -289,7 +300,47 @@ struct Decision {
 struct EnumBudget {
     std::uint64_t max_entries{0};
     std::chrono::steady_clock::time_point deadline;
+    /// Windows only: list with the file-id information class and fill `EntryMeta::file_id`. Off by default
+    /// (the default class and every existing consumer are unchanged); POSIX ignores it.
+    bool want_file_ids{false};
 };
+
+// ---- Windows reparse and cloud rules (pure: the values are spelled here, no OS header) ----
+//
+// A directory that carries a reparse tag is refused by the Windows open_dir_at, with ONE opt-in
+// exception: a populated cloud directory (a folder of a cloud-synced root). The decision is this pure
+// rule applied to the attributes and tag read from the OPENED handle, so it is taken before the caller
+// can enumerate. No link tag (symlink, mount point, WSL symlink) and no unknown tag is ever admitted.
+
+inline constexpr std::uint32_t kAttrDirectory = 0x00000010;
+inline constexpr std::uint32_t kAttrReparsePoint = 0x00000400;
+/// FILE_ATTRIBUTE_RECALL_ON_OPEN (0x40000), FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS (0x400000) and
+/// FILE_ATTRIBUTE_OFFLINE (0x1000): any of them marks a placeholder whose content or entries are not
+/// local, and opening-for-use, listing or reading it would ask a provider to bring it back.
+inline constexpr std::uint32_t kAttrRecallOrOffline = 0x00040000 | 0x00400000 | 0x00001000;
+
+/// The cloud reparse FAMILY (IO_REPARSE_TAG_CLOUD and its state variants), by mask and never by one
+/// value: 0x9000001A, 0x9000201A, 0x9000401A, 0x9000601A and 0x9000701A were all observed on a
+/// synthetic sync root (the four state bits sit in nibble 3).
+[[nodiscard]] constexpr bool is_cloud_reparse_tag(std::uint32_t tag) noexcept {
+    return (tag & 0xFFFF0FFFu) == 0x9000001Au;
+}
+
+/// Whether open_dir_at admits a directory that carries a reparse tag.
+enum class ReparseDirs : std::uint8_t {
+    refuse,               ///< every reparse-tagged directory is refused (today's behaviour, the default)
+    allow_populated_cloud ///< a directory of the cloud family with no recall or offline bit is admitted
+};
+
+/// True only under `allow_populated_cloud`, for a DIRECTORY (the directory bit set) of the cloud tag
+/// family with no recall or offline bit. Every link tag, every unknown tag and every cloud directory that
+/// is marked recall or offline (not populated: listing it is what would populate it) is refused under
+/// both policies.
+[[nodiscard]] constexpr bool reparse_dir_open_allowed(ReparseDirs policy, std::uint32_t attributes,
+                                                      std::uint32_t tag) noexcept {
+    return policy == ReparseDirs::allow_populated_cloud && (attributes & kAttrDirectory) != 0 &&
+           is_cloud_reparse_tag(tag) && (attributes & kAttrRecallOrOffline) == 0;
+}
 
 /// One raw directory entry as returned by a platform `enumerate`.
 /// `stat_error != 0` (PLAN-002) means metadata acquisition for this entry

@@ -18,8 +18,8 @@
 namespace yuzu::server {
 
 /// Every quarantine/containment surface on /hardware (row pill + link, degrade banner, Quarantined
-/// devices panel, record banner, Containment tab and lens, and the quarantine plugin's rows in the
-/// Actions lens) is gated on it. This is the DEFAULT of the runtime input `containment_ui` carried by
+/// devices panel, record banner, Containment tab and lens, and the firewall plugin's four
+/// containment actions in the Actions lens) is gated on it. This is the DEFAULT of the runtime input `containment_ui` carried by
 /// HardwareRoutes::Deps, HardwareListPage and HwCiAffordances, so a test can drive both states. The
 /// renderers, the /fragments/hardware/{quarantine,ci/containment} routes, REST and MCP are untouched.
 // ponytail: UI hidden until the approval workflow lands; flip to true to restore
@@ -27,8 +27,10 @@ inline constexpr bool kContainmentUi = false;
 
 /// How far containment has been shown to reach the device — the record alone proves
 /// only `Recorded`. `Applied` = a re-dispatch of the stored whitelist was accepted (NOT
-/// proof); `Confirmed` = a follow-up `quarantine.status` read reported `state|active`.
-enum class ContainmentState { Recorded, Applied, Confirmed };
+/// proof); `Confirmed` = a follow-up `firewall.quarantine_status` read reported the device's rules in
+/// force (`status|active`); `Releasing` = a release was requested and the device has not yet confirmed
+/// it (the record stays listed and keeps the dispatch refusal).
+enum class ContainmentState { Recorded, Applied, Confirmed, Releasing };
 
 [[nodiscard]] ContainmentState containment_state(const QuarantineRecord& r);
 

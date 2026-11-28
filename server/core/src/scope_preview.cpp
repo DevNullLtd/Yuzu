@@ -33,6 +33,10 @@ ScopeEvalError::Kind to_eval_error_kind(ScopeAbortReason r) {
         return ScopeEvalError::Kind::Unresolvable;
     case ScopeAbortReason::PresenceDegraded:
         return ScopeEvalError::Kind::PresenceDegraded;
+    case ScopeAbortReason::ResultSetUnusable:
+        return ScopeEvalError::Kind::ResultSetUnusable;
+    case ScopeAbortReason::ResultSetUnusablePermanent:
+        return ScopeEvalError::Kind::ResultSetUnusablePermanent;
     }
     return ScopeEvalError::Kind::StoreDegraded;
 }
@@ -84,7 +88,8 @@ ScopePreviewOutcome preview_scope_targets(const std::string& expression, const s
                 .abort_kind = ladder.abort_reason
                                   ? std::optional<ScopeEvalError::Kind>(
                                         to_eval_error_kind(*ladder.abort_reason))
-                                  : std::nullopt};
+                                  : std::nullopt,
+                .abort_detail = std::move(ladder.abort_detail)};
     }
 
     // #1788: a scope match is a targeting mechanism, not an authz exemption —

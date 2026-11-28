@@ -42,6 +42,7 @@
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
 
+#include "../scoped_env.hpp"
 #include "../test_helpers.hpp"
 
 namespace {
@@ -199,6 +200,71 @@ TEST_CASE("test_db_is_stale: name-embedded epoch + staleness window", "[template
         // accumulation, not wrap into a bogus epoch (UB)
         CHECK_FALSE(yuzu::test::test_db_is_stale("yuzu_test_99999999999999999999999_x", now));
     }
+}
+
+TEST_CASE("parse_pg_clone_strategy: A/B knob accepts exactly two strategies", "[template]") {
+    using yuzu::test::parse_pg_clone_strategy;
+    SECTION("unset or empty adds nothing (SQL byte-identical to no knob)") {
+        for (const char* raw : {static_cast<const char*>(nullptr), ""}) {
+            const auto s = parse_pg_clone_strategy(raw);
+            CHECK(s.ok);
+            CHECK(s.clause.empty());
+            CHECK(s.error.empty());
+        }
+    }
+    SECTION("both strategies, any case") {
+        CHECK(parse_pg_clone_strategy("wal_log").clause == " STRATEGY WAL_LOG");
+        CHECK(parse_pg_clone_strategy("WAL_LOG").clause == " STRATEGY WAL_LOG");
+        CHECK(parse_pg_clone_strategy("file_copy").clause == " STRATEGY FILE_COPY");
+        CHECK(parse_pg_clone_strategy("File_Copy").clause == " STRATEGY FILE_COPY");
+    }
+    SECTION("anything else fails loudly, naming the variable and the value") {
+        for (const char* raw : {"filecopy", "wal-log", " wal_log", "file_copy;DROP", "1"}) {
+            const auto s = parse_pg_clone_strategy(raw);
+            CHECK_FALSE(s.ok);
+            CHECK(s.clause.empty());
+            CHECK(s.error.find("YUZU_TEST_PG_CLONE_STRATEGY") != std::string::npos);
+            CHECK(s.error.find(raw) != std::string::npos);
+        }
+    }
+}
+
+TEST_CASE("PostgresTestDb: each YUZU_TEST_PG_CLONE_STRATEGY value is accepted by the "
+          "server; an invalid value fails the fixture",
+          "[pg][template]") {
+    if (yuzu::test::pg_admin_dsn_env() == nullptr) {
+        SKIP("YUZU_TEST_POSTGRES_DSN not set - Postgres test skipped");
+    }
+    // The parser test above proves which clause is chosen; this proves the
+    // server ACCEPTS it on a real template clone (STRATEGY needs PostgreSQL
+    // 15+) and that an invalid value fails the fixture rather than being
+    // ignored.
+    const std::string key = "cs" + probe_salt(); // salted: shared-instance safe
+    yuzu::test::PgTestTemplate tpl{key, &probe_setup};
+
+    SECTION("file_copy: the clone comes up") {
+        yuzu::test::ScopedEnv strategy{"YUZU_TEST_PG_CLONE_STRATEGY", "file_copy"};
+        yuzu::test::PostgresTestDb db{tpl};
+        INFO("clone error: " << db.error());
+        CHECK(db.available());
+        CHECK(db.error().empty());
+    }
+
+    SECTION("wal_log: the clone comes up") {
+        yuzu::test::ScopedEnv strategy{"YUZU_TEST_PG_CLONE_STRATEGY", "wal_log"};
+        yuzu::test::PostgresTestDb db{tpl};
+        INFO("clone error: " << db.error());
+        CHECK(db.available());
+    }
+
+    SECTION("an invalid value fails the fixture, naming the variable") {
+        yuzu::test::ScopedEnv strategy{"YUZU_TEST_PG_CLONE_STRATEGY", "filecopy"};
+        yuzu::test::PostgresTestDb db{tpl};
+        CHECK_FALSE(db.available());
+        CHECK(db.error().find("YUZU_TEST_PG_CLONE_STRATEGY") != std::string::npos);
+    }
+
+    yuzu::test::PgTestTemplate::drop_built(key);
 }
 
 TEST_CASE("PgTestTemplate: build, shared-key replay verification, scoped drop", "[pg][template]") {

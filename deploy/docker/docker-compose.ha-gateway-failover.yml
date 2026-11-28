@@ -1,0 +1,228 @@
+## Yuzu - gateway failover rig (HA WS-13 slice 13.0, a measurement rig, NOT a deployment)
+##
+## Server + Postgres + THREE clustered Erlang gateways + real agents, all over real
+## TLS, with an L4 VIP (HAProxy) and a static-zone DNS (CoreDNS) in front of the
+## gateways, so the agents' failover can be measured with both address shapes the
+## WS-13 design allows (a VIP, or a multi-address DNS name).
+##
+## Driven by scripts/ha/ha-gateway-failover-spike.sh, which generates the secrets,
+## builds nothing, starts the rig, ramps the agents, injects faults and records the
+## timings. Run it through the script: this file needs the environment the script
+## sets (image tag, passwords, the agents' server address).
+##
+## Topology (fixed addresses, so the DNS zone can be STATIC):
+##   10.77.12.2 coredns   10.77.12.3 postgres   10.77.12.4 server
+##   10.77.12.11-13 gateway-1..3   10.77.12.20 haproxy   agents 10.77.14.0/23
+## Names the agents may dial (all in the certificate SANs of the FIRST boot):
+##   gw-dns.ha.test  three A records (Corefile.fixed | Corefile.shuffled)
+##   gw-vip.ha.test  HAProxy, agent edge :50051
+##   gw-mgmt.ha.test HAProxy, server->gateway management plane :50063
+##
+## The server reaches the gateways' management plane through ${SPIKE_MGMT_ADDR}:
+## gw-mgmt.ha.test:50063 (the VIP) by default, or a single node (gateway-1:50063)
+## to measure what a production deployment with one --gateway-command-addr sees
+## when that node dies (hypothesis H7).
+##
+## Not release-pinned: it uses locally built `yuzu-spike-*` images and no
+## ghcr.io/<owner>/yuzu-* reference, so it is deliberately NOT in
+## scripts/check-compose-versions.sh FILES (there is no version tag to check).
+##
+## CPU pinning: the infrastructure containers use ${SPIKE_INFRA_CPUS} and the agents ${SPIKE_AGENT_CPUS}
+## (the script sets both from the host's CPU count; the defaults assume 32 logical CPUs). On an SMT host
+## the two halves are usually sibling threads of the same cores, so this separates logical CPUs, not
+## physical cores.
+##
+## Never `down -v` casually: the certs volume holds the CA, and the SANs are fixed on the
+## first boot of a fresh volume.
+name: ${SPIKE_PROJECT:-yuzu-ha-gw-spike}
+
+x-gateway: &gateway
+  image: yuzu-spike-gateway:${SPIKE_TAG:?set SPIKE_TAG (run the script)}
+  stop_grace_period: 40s
+  restart: "no"
+  cpuset: "${SPIKE_INFRA_CPUS:-0-15}"
+  logging:
+    driver: json-file
+    options: { max-size: "50m", max-file: "5" }
+  volumes:
+    - ./reference-gateway-sys.config:/opt/yuzu_gw/releases/0.2.0/sys.config:ro
+    - certs:/etc/yuzu/certs:ro
+  depends_on:
+    server: { condition: service_healthy }
+
+services:
+  coredns:
+    image: coredns/coredns:1.12.0@sha256:40384aa1f5ea6bfdc77997d243aec73da05f27aed0c5e9d65bfa98933c519d97
+    command: ["-conf", "/etc/coredns/Corefile"]
+    restart: "no"
+    volumes:
+      - ./ha-gateway-failover/${SPIKE_COREFILE:-Corefile.fixed}:/etc/coredns/Corefile:ro
+      - ./ha-gateway-failover/db.ha.test:/etc/coredns/db.ha.test:ro
+    networks:
+      spike: { ipv4_address: 10.77.12.2 }
+
+  postgres:
+    image: yuzu-postgres:local
+    restart: "no"
+    cpuset: "${SPIKE_INFRA_CPUS:-0-15}"
+    environment:
+      POSTGRES_PASSWORD: ${YUZU_POSTGRES_PASSWORD:?set by the script}
+      YUZU_DB_PASSWORD: ${YUZU_DB_PASSWORD:?set by the script}
+    volumes:
+      - postgres-data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U yuzu -d yuzu"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    networks:
+      spike: { ipv4_address: 10.77.12.3 }
+
+  server:
+    image: yuzu-spike-server:${SPIKE_TAG:?set SPIKE_TAG (run the script)}
+    restart: "no"
+    cpuset: "${SPIKE_INFRA_CPUS:-0-15}"
+    stop_grace_period: 30s
+    command:
+      - "--listen=0.0.0.0:50051"
+      - "--gateway-upstream=0.0.0.0:50055"
+      - "--gateway-mode"
+      - "--gateway-command-addr=${SPIKE_MGMT_ADDR:-gw-mgmt.ha.test:50063}"
+      - "--web-address=0.0.0.0"
+      - "--https-port=8443"
+      # SANs are fixed on the FIRST boot of a fresh certs volume.
+      - "--cert-san=dns:server"
+      - "--cert-san=dns:gateway"
+      - "--cert-san=dns:gw-dns.ha.test"
+      - "--cert-san=dns:gw-vip.ha.test"
+      - "--cert-san=dns:gw-mgmt.ha.test"
+      - "--cert-san=dns:gateway-1"
+      - "--cert-san=dns:gateway-2"
+      - "--cert-san=dns:gateway-3"
+      - "--cert-group=yuzu-pki"
+      - "--config=/etc/yuzu/yuzu-server.cfg"
+      - "--data-dir=/var/lib/yuzu"
+    environment:
+      YUZU_POSTGRES_DSN: postgresql://yuzu:${YUZU_DB_PASSWORD:?set by the script}@postgres:5432/yuzu
+    depends_on:
+      postgres: { condition: service_healthy }
+    ports:
+      - "127.0.0.1:${SPIKE_REST_PORT:-0}:8443"
+    volumes:
+      - ${SPIKE_SERVER_CFG:?set by the script}:/etc/yuzu/yuzu-server.cfg:ro
+      - certs:/etc/yuzu/certs
+      - server-data:/var/lib/yuzu
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8443"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 10s
+    networks:
+      spike:
+        ipv4_address: 10.77.12.4
+        aliases: [server]
+
+  ca-export:
+    image: yuzu-spike-server:${SPIKE_TAG:?set SPIKE_TAG (run the script)}
+    restart: "no"
+    user: "0:2000"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        test -s /ca-src/default-ca.pem || { echo "ca-export: no default-ca.pem" >&2; exit 1; }
+        install -m 0644 /ca-src/default-ca.pem /ca-dst/default-ca.pem
+    volumes:
+      - certs:/ca-src:ro
+      - ca-public:/ca-dst
+    depends_on:
+      server: { condition: service_healthy }
+    networks: [spike]
+
+  # Three explicit gateway nodes (fixed addresses). Every node carries the
+  # alias `gateway`, the cluster-formation seed name (YUZU_GW_SEED_DNS_NAME's
+  # default), so the DNS-A-record discovery finds all three peers.
+  gateway-1:
+    <<: *gateway
+    hostname: gateway-1
+    environment: &gwenv
+      YUZU_GW_COOKIE: ${YUZU_GW_COOKIE:?set by the script}
+      YUZU_GW_SEED_DNS_NAME: gateway
+    networks:
+      spike: { ipv4_address: 10.77.12.11, aliases: [gateway] }
+
+  gateway-2:
+    <<: *gateway
+    hostname: gateway-2
+    environment: *gwenv
+    networks:
+      spike: { ipv4_address: 10.77.12.12, aliases: [gateway] }
+
+  gateway-3:
+    <<: *gateway
+    hostname: gateway-3
+    environment: *gwenv
+    networks:
+      spike: { ipv4_address: 10.77.12.13, aliases: [gateway] }
+
+  haproxy:
+    image: haproxy:3.2@sha256:de853dd229e0f13e0104b288a487e1e12eb3965618f9b88f49ef8d5a6d83c001
+    restart: "no"
+    cpuset: "${SPIKE_INFRA_CPUS:-0-15}"
+    volumes:
+      - ./ha-gateway-failover/${SPIKE_HAPROXY_CFG:-haproxy.cfg}:/usr/local/etc/haproxy/haproxy.cfg:ro
+    depends_on:
+      - gateway-1
+      - gateway-2
+      - gateway-3
+    networks:
+      # The server and the gateways resolve names through Docker's DNS, not CoreDNS
+      # (CoreDNS is the AGENTS' resolver), so the VIP names are aliases here as well.
+      spike:
+        ipv4_address: 10.77.12.20
+        aliases: [gw-vip.ha.test, gw-mgmt.ha.test]
+
+  # Real agents. Scale with `--scale agent=N`. Each container has its own
+  # tmpfs data dir (so its own agent_id) and its own hostname. The agents resolve
+  # the gateway names through CoreDNS and trust the install CA only.
+  agent:
+    image: yuzu-spike-agent:${SPIKE_TAG:?set SPIKE_TAG (run the script)}
+    restart: "no"
+    cpuset: "${SPIKE_AGENT_CPUS:-16-31}"
+    dns: [10.77.12.2]
+    command:
+      - "--server=${SPIKE_SERVER_ADDR:-gw-dns.ha.test:50051}"
+      - "--cert-dir=/var/lib/yuzu-agent/certs"
+      - "--data-dir=/var/lib/yuzu-agent"
+      - "--plugin-dir=/usr/lib/yuzu/plugins"
+      - "--no-auto-update"
+      - "--dex-disable"
+      - "--inventory-disable"
+      - "--spark-disable"
+      - "--enrollment-token=${SPIKE_ENROLL_TOKEN:?set by the script}"
+    tmpfs:
+      - /var/lib/yuzu-agent:mode=0777,size=64m
+    volumes:
+      - ca-public:/etc/yuzu/certs:ro
+    depends_on:
+      ca-export: { condition: service_completed_successfully }
+    networks: [spike]
+
+networks:
+  spike:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 10.77.12.0/22
+          # dynamic addresses (the scaled agents) come from here, never the statics above
+          ip_range: 10.77.14.0/23
+
+volumes:
+  certs:
+  ca-public:
+  server-data:
+  postgres-data:

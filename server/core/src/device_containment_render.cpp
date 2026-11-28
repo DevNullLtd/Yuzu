@@ -29,6 +29,7 @@ std::string url_enc(const std::string& s) {
 
 const char* state_label(ContainmentState s) {
     switch (s) {
+    case ContainmentState::Releasing: return "Releasing: waiting for the device to confirm";
     case ContainmentState::Confirmed: return "Confirmed on device at the last status read";
     case ContainmentState::Applied: return "Applied, not confirmed";
     case ContainmentState::Recorded: return "Recorded";
@@ -58,6 +59,7 @@ std::string state_pill(const QuarantineRecord& r) {
 } // namespace
 
 ContainmentState containment_state(const QuarantineRecord& r) {
+    if (r.release_requested_at > 0) return ContainmentState::Releasing;
     if (r.last_confirmed_at > 0) return ContainmentState::Confirmed;
     if (r.last_applied_at > 0) return ContainmentState::Applied;
     return ContainmentState::Recorded;
@@ -156,8 +158,8 @@ std::string render_containment_lens(const ContainmentLensView& v) {
         h += "<div class=\"ci-sec\"><h4>Containment</h4>"
              "<div class=\"ci-row\"><span class=\"ci-lab\">State</span><span>No active quarantine "
              "record.</span></div>"
-             "<div class=\"hw-empty\">A released record does not show whether the device's firewall rules "
-             "were removed. Check the quarantine plugin's status action from the Actions tab.</div>"
+             "<div class=\"hw-empty\">A quarantine record normally ends when the device confirms its firewall "
+             "rules were removed. A forced end does not wait for the device, which may still be contained.</div>"
              "<div class=\"hw-tools\">";
         if (v.can_execute)
             h += "<button type=\"button\" class=\"gp-btn accent\" data-act=\"quarantine\"" + data_attrs() +
@@ -182,7 +184,9 @@ std::string render_containment_lens(const ContainmentLensView& v) {
              "</span></div>";
         // Honest progress line: the record is not proof; an offline device is waiting.
         std::string line;
-        if (s == ContainmentState::Confirmed)
+        if (s == ContainmentState::Releasing)
+            line = "Releasing: waiting for the device to confirm.";
+        else if (s == ContainmentState::Confirmed)
             line = "Containment was confirmed on the device by a status read.";
         else if (v.identity_known && !v.online)
             line = "Waiting for device to connect. The quarantine is recorded and is applied when the "
@@ -209,9 +213,8 @@ std::string render_containment_lens(const ContainmentLensView& v) {
     // then dispatches).
     h += "<div class=\"hw-empty\" style=\"margin-top:12px\">Quarantine and release here need the "
          "<b>Security:Execute</b> permission on this device and are refused unless you are an "
-         "administrator (with RBAC on, one who holds it globally), because the console has no approval step. Releasing ends the record only; run the "
-         "plugin's unquarantine action from the <a href=\"/hardware/ci?id=" + url_enc(v.agent_id) +
-         "&amp;lens=actions\">Actions</a> tab to remove the device's firewall rules.</div>";
+         "administrator (with RBAC on, one who holds it globally), because the console has no approval step. Releasing lifts the device's firewall rules; the "
+         "record ends when the device confirms.</div>";
     h += "</div>";
     return h;
 }

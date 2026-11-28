@@ -3,7 +3,11 @@
 # tests" step for every CI tier (ADR-0006 decision 8, #1318). The shipped
 # substrate is PostgreSQL 18 (deploy/docker/Dockerfile.postgres); the server
 # SQL is version-agnostic (13+), so a runner-native cluster on an older major
-# still exercises the suites correctly.
+# still exercises the suites correctly. Exception: ci.yml's Linux test step
+# runs its pg half with YUZU_TEST_PG_CLONE_STRATEGY=file_copy, whose
+# CREATE DATABASE ... STRATEGY clause needs PostgreSQL 15+. It is only faster
+# with durability off (the docker cluster below); on an fsync-on cluster
+# FILE_COPY clones measured about 9x slower than the default.
 #
 # Exports YUZU_TEST_POSTGRES_DSN via $GITHUB_ENV (or prints it when run
 # outside Actions, e.g. by the /test skill or a dev shell). Resolution
@@ -42,7 +46,9 @@ set -euo pipefail
 
 SOFT_EXIT=1   # flipped 0->1 when #1320 PR 1 shipped the [pg] test suites
 
-# Same pinned multi-arch image as deploy/docker/Dockerfile.postgres's base.
+# PostgreSQL 18.4 on bookworm, pinned multi-arch. Deliberately NOT moved with
+# deploy/docker/Dockerfile.postgres's base (18.6 since WP15/S9): this is the
+# persistent CI test server, and moving it is a separate change.
 PG_IMAGE="postgres:18.4-bookworm@sha256:efef99e1558f86089bc84bece29208c0777a185ff717ec7fa288a652ce2d0adf"
 CONTAINER="yuzu-ci-postgres"
 DOCKER_PORT=15432

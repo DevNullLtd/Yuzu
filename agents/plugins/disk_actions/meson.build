@@ -4,7 +4,12 @@
 # for its own target so all four are listed unconditionally.
 disk_actions_deps = [yuzu_sdk_dep, yuzu_agent_core_dep, spdlog_dep]
 
-if host_machine.system() == 'darwin'
+if host_machine.system() == 'windows'
+  # The partitions leg runs three bounded WMI queries (agents/shared/wmi_bounded.hpp).
+  disk_actions_deps += cxx.find_library('wbemuuid')
+  disk_actions_deps += cxx.find_library('ole32')
+  disk_actions_deps += cxx.find_library('oleaut32')
+elif host_machine.system() == 'darwin'
   # IOKit for the block-device walk (identity, capability, IOMedia);
   # CoreFoundation for the property dictionaries those return.
   disk_actions_deps += [

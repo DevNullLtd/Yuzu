@@ -32,6 +32,7 @@
 #include "test_auth_db_pg_helper.hpp" // WS-6 6.2: enrollment state is PG-backed
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 
 #include <grpcpp/grpcpp.h>
 
@@ -44,6 +45,7 @@
 #include "heartbeat_ingestion.hpp"
 #include "offline_endpoint_store.hpp"
 #include "pg/pg_pool.hpp"
+#include "plugin_absence_confirmation.hpp"
 #include "pg/pg_raii.hpp"
 #include <yuzu/metrics.hpp>
 #include <yuzu/server/auth.hpp>
@@ -63,6 +65,8 @@
 #include <functional>
 #include <memory>
 #include <set>
+#include <utility>
+#include <unordered_set>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -383,41 +387,6 @@ TEST_CASE("ProxyRegister: fresh register mints a route row; a second fresh regis
     REQUIRE(row2->has_value());
     CHECK((*row2)->session_id == session2);
     CHECK((*row2)->connection_epoch > epoch1); // strictly greater: new connection wins
-}
-
-// ── ProxyRegister: the upgrade-window legacy plugin-name flag reaches the directory row ───
-
-TEST_CASE("ProxyRegister: an inventory reporting the pre-rename plugin tar writes "
-          "legacy_echo_wire_name=true on the route row; a current echo inventory writes false",
-          "[pg][gateway_route_wiring]") {
-    YUZU_REQUIRE_PG_DB_TPL(db, gwroutewiring_tpl);
-    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
-    GatewayRouteStore store{pool};
-    REQUIRE(store.is_open());
-
-    yuzu::MetricsRegistry metrics;
-    EventBus bus;
-    AgentRegistry registry{bus, metrics};
-    PgAuthManager auth_mgr;
-    yuzu::server::auth::AutoApproveEngine auto_approve;
-    GatewayUpstreamServiceImpl gateway_svc{registry, bus, auth_mgr, auto_approve, &metrics};
-    gateway_svc.set_gateway_route_store(&store);
-
-    for (const auto& [agent_id, plugin, want_legacy] :
-         {std::tuple{"agent-legacy-tar", "tar", true},
-          std::tuple{"agent-current-echo", "echo", false}}) {
-        INFO(agent_id);
-        auto req = make_gw_register(auth_mgr, agent_id);
-        req.mutable_info()->add_plugins()->set_name(plugin);
-        apb::RegisterResponse resp;
-        REQUIRE(gateway_svc.ProxyRegister(/*context=*/nullptr, &req, &resp).ok());
-        REQUIRE(resp.accepted());
-
-        auto row = store.lookup_route(agent_id);
-        REQUIRE(row.has_value());
-        REQUIRE(row->has_value());
-        CHECK((*row)->legacy_echo_wire_name == want_legacy);
-    }
 }
 
 // ── ProxyRegister: the NEW re-announce-vs-fresh decision branch ─────────────
@@ -2791,8 +2760,8 @@ TEST_CASE("ProxyRegister: a session that LOSES its register_fresh epoch race sti
     CHECK(metrics.gauge("yuzu_agents_connected").value() == 1);
 }
 
-TEST_CASE("NotifyStreamStatus: a degraded GatewayRouteStore session_lookup read still "
-          "acknowledges the locally registered CONNECTED and the write stays fail-OPEN",
+TEST_CASE("NotifyStreamStatus: a degraded GatewayRouteStore session_lookup read REFUSES the "
+          "locally registered CONNECTED (#5685 (ii)) and attempts no directory write",
           "[pg][gateway_route_wiring]") {
     // A REAL store is needed first so ProxyRegister (fail-CLOSED on
     // register_fresh) succeeds and mints a session; the store is then SWAPPED
@@ -2826,10 +2795,10 @@ TEST_CASE("NotifyStreamStatus: a degraded GatewayRouteStore session_lookup read 
     gw::StreamStatusAck ack;
     auto notif_status = gateway_svc.NotifyStreamStatus(/*context=*/nullptr, &notif, &ack);
     CHECK(notif_status.ok());
-    // HA WS-5: the degraded session_lookup read is counted; this replica holds
-    // the matching local session, so the CONNECTED proceeds and the
-    // announce_connected write degrades fail-OPEN (counted once).
-    CHECK(ack.acknowledged());
+    // HA WS-5 (#5685 (ii)): the degraded session_lookup read is counted and the
+    // CONNECTED is refused even though this replica holds the matching local
+    // session (the gateway resends it, #5695). Nothing reaches announce_connected.
+    CHECK_FALSE(ack.acknowledged());
     CHECK(metrics
               .counter("yuzu_server_gateway_route_write_failed_total",
                        {{"op", "session_lookup"}, {"reason", "store_unavailable"}})
@@ -2837,11 +2806,11 @@ TEST_CASE("NotifyStreamStatus: a degraded GatewayRouteStore session_lookup read 
     CHECK(metrics
               .counter("yuzu_server_gateway_route_write_failed_total",
                        {{"op", "announce_connected"}, {"reason", "store_unavailable"}})
-              .value() == 1);
+              .value() == 0);
     CHECK(metrics
               .counter("yuzu_server_gateway_route_desync_total",
                        {{"op", "notify_stream_status"}, {"outcome", "connected_unverified"}})
-              .value() == 0);
+              .value() == 1);
 }
 
 TEST_CASE("ProxyRegister: a concurrent FRESH registration completing between a REPLAY's "
@@ -2967,7 +2936,7 @@ gw::BatchHeartbeatResponse batch_hb(GatewayUpstreamServiceImpl& svc,
 bool offline_row_present(yuzu::server::OfflineEndpointStore& s, const std::string& agent_id) {
     const auto roster = s.query_stale_within(std::chrono::hours(1));
     REQUIRE(roster.has_value()); // #5531: the read is typed; a store fault is not "absent"
-    for (const auto& e : *roster)
+    for (const auto& e : roster->rows)
         if (e.agent_id == agent_id)
             return true;
     return false;
@@ -3009,6 +2978,42 @@ TEST_CASE("WS-5 BatchHeartbeat: a NON-OWNING replica resolves a session known on
     CHECK(other.desync("session_lookup", "ambiguous_session") == 0);
     // Only the directory-UNKNOWN id is a desync; the replay-listed one is not.
     CHECK(other.desync("renew_leases", "unknown_session") == 1);
+}
+
+// #6339 (UP-1): this replica's session map names agent Y for session S while the directory row
+// for S names agent X. The row alone used to win, attributing the heartbeat to X.
+TEST_CASE("WS-5 BatchHeartbeat: a session the local map and the directory attribute to DIFFERENT "
+          "agents is refused and listed for replay - never attributed (#6339)",
+          "[pg][gateway_route_wiring][ws5]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, gwroutewiring_tpl);
+    BatchHbFixture owner(db.dsn());
+
+    const std::string sid = owner.register_live("yuzu_test_6339_local");
+    // Control: before any divergence the same heartbeat is acknowledged.
+    {
+        auto ok = owner.heartbeat({sid});
+        REQUIRE(ok.acknowledged_count() == 1);
+        REQUIRE(listed_unknown(ok).empty());
+    }
+    CHECK(owner.desync("session_lookup", "agent_mismatch") == 0);
+
+    // The directory now says a DIFFERENT agent holds S; the local map still says _local.
+    const std::string sql = "UPDATE gateway_route_store.agent_routes SET agent_id = "
+                            "'yuzu_test_6339_row' WHERE agent_id = 'yuzu_test_6339_local'";
+    raw_exec(db.dsn(), sql.c_str());
+
+    auto resp = owner.heartbeat({sid});
+    CHECK(resp.acknowledged_count() == 0); // not attributed to either agent
+    CHECK(listed_unknown(resp) == std::vector<std::string>{sid}); // listed so the gateway replays
+    CHECK(owner.desync("session_lookup", "agent_mismatch") == 1);
+    CHECK(owner.desync("session_lookup", "ambiguous_session") == 0);
+    // Listed for replay, but not ALSO counted as a session the cluster has no record of.
+    CHECK(owner.desync("renew_leases", "unknown_session") == 0);
+    // The harm was attribution: neither agent's row is touched by the refused heartbeat.
+    const auto row = owner.store.lookup_route("yuzu_test_6339_row");
+    REQUIRE(row.has_value());
+    REQUIRE(row->has_value());
+    CHECK((*row)->session_id == std::optional<std::string>{sid});
 }
 
 TEST_CASE("WS-5 BatchHeartbeat: server-only restart reconcile lists the directory-known "
@@ -3069,6 +3074,254 @@ TEST_CASE("WS-5 BatchHeartbeat: a non-owning replica threads the directory-resol
     // the resolved session id, so the session-guarded clear matches it.
     CHECK(offline_row_present(offline, agent));
     CHECK(offline.remove_if_session(agent, sid));
+}
+
+// #5685 follow-up: the arrival mirror. The agent re-registered (new session) but the durable endpoint
+// row still names the previous session, whose published plugin list a replica without the session
+// would keep judging it by. The CONNECTED, handled on ANY replica, drops the previous lists.
+TEST_CASE("WS-5 NotifyStreamStatus: a CONNECTED on a non-owning replica drops the plugin list "
+          "an earlier session published",
+          "[pg][gateway_route_wiring][ws5][plugin_visibility]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, gwroutewiring_tpl);
+    BatchHbFixture owner(db.dsn());
+    NonOwningReplica other(owner.auth_mgr, owner.store);
+    yuzu::server::OfflineEndpointStore offline{owner.pool};
+    REQUIRE(offline.is_open());
+    yuzu::server::HeartbeatIngestion ingestion{other.registry, nullptr, nullptr, &other.metrics,
+                                               &offline};
+    other.svc.set_heartbeat_ingestion(&ingestion);
+
+    const std::string agent = "yuzu_test_ws5_arrival";
+    const std::string new_session = owner.register_live(agent);
+    // Left by the agent's PREVIOUS session: the durable row and a published list lacking "echo".
+    REQUIRE(offline.upsert(agent, "h", "linux", 1, 0, "1", "x", "gw-session-previous"));
+    REQUIRE(offline.publish_plugins(agent, "gw-session-previous", {"os_info"}));
+    {
+        auto r = offline.query_live_ids_without_plugin(std::chrono::hours(1), "echo");
+        REQUIRE(r.has_value());
+        REQUIRE(std::ranges::find(*r, agent, &yuzu::server::PluginAbsence::agent_id) != r->end()); // judged by the old list
+    }
+
+    gw::StreamStatusNotification notif;
+    notif.set_agent_id(agent);
+    notif.set_session_id(new_session);
+    notif.set_event(gw::StreamStatusNotification::CONNECTED);
+    notif.set_cluster_id("cluster-a");
+    notif.set_gateway_node("node-a");
+    gw::StreamStatusAck ack;
+    REQUIRE(other.svc.NotifyStreamStatus(/*context=*/nullptr, &notif, &ack).ok());
+    REQUIRE(ack.acknowledged());
+
+    auto r = offline.query_live_ids_without_plugin(std::chrono::hours(1), "echo");
+    REQUIRE(r.has_value());
+    CHECK(std::ranges::find(*r, agent, &yuzu::server::PluginAbsence::agent_id) == r->end()); // unknown now: fails open
+}
+
+// #5685 follow-up: the confirmation against the REAL directory, through the PRODUCTION factory
+// (`make_route_session_confirmer`, the one server.cpp wires). The owner's heartbeat ingestion is not
+// set, so no arrival mirror runs and every older list stays stored: each outcome below comes from
+// the directory confirmation and from nothing else.
+namespace {
+void connect_session(BatchHbFixture& f, const std::string& agent, const std::string& session) {
+    gw::StreamStatusNotification up;
+    up.set_agent_id(agent);
+    up.set_session_id(session);
+    up.set_event(gw::StreamStatusNotification::CONNECTED);
+    up.set_cluster_id("cluster-a");
+    up.set_gateway_node("node-a");
+    gw::StreamStatusAck ack;
+    REQUIRE(f.svc.NotifyStreamStatus(/*context=*/nullptr, &up, &ack).ok());
+    REQUIRE(ack.acknowledged());
+}
+} // namespace
+
+TEST_CASE("WS-5 plugin visibility: a re-registration stops the previous session's list "
+          "withholding the agent before any heartbeat or arrival mirror",
+          "[pg][gateway_route_wiring][ws5][plugin_visibility]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, gwroutewiring_tpl);
+    BatchHbFixture owner(db.dsn());
+    NonOwningReplica other(owner.auth_mgr, owner.store);
+    yuzu::server::OfflineEndpointStore offline{owner.pool};
+    REQUIRE(offline.is_open());
+    other.registry.configure_presence(&offline, std::chrono::hours(1));
+    other.registry.configure_route_session_reader(
+        yuzu::server::make_route_session_confirmer(owner.store));
+    const auto withheld_ids = [&] {
+        other.registry.expire_presence_cache_for_test(); // re-read the candidate list each time
+        return other.registry.ids_missing_plugin("echo", "sql");
+    };
+    using Ids = std::unordered_set<std::string>;
+
+    const std::string agent = "yuzu_test_ws5_conf_real";
+    const std::string old_session = owner.register_live(agent);
+    connect_session(owner, agent, old_session);
+    REQUIRE(offline.upsert(agent, "h", "linux", 1, 0, "1", "x", old_session));
+    REQUIRE(offline.publish_plugins(agent, old_session, {"os_info"}));
+
+    // Before the restart the list is the truth: the agent lacks "echo" and is withheld.
+    CHECK(withheld_ids() == Ids{agent});
+
+    // The restart: a new session registers. Its row is unplaced (unroutable) and names it.
+    const std::string new_session = owner.register_live(agent);
+    REQUIRE(new_session != old_session);
+    {
+        // The old list is STILL stored and still the endpoint row's current-session list.
+        auto r = offline.query_live_ids_without_plugin(std::chrono::hours(1), "echo");
+        REQUIRE(r.has_value());
+        REQUIRE(std::ranges::find(*r, agent, &yuzu::server::PluginAbsence::agent_id) != r->end());
+    }
+    CHECK(withheld_ids().empty());
+
+    // The new session's stream is established: the row is now ROUTABLE and names the NEW session.
+    // Only the session comparison can exclude the agent here (the routable predicate passes).
+    connect_session(owner, agent, new_session);
+    CHECK(withheld_ids().empty());
+
+    // The same session, once the new session's own list is published: withheld, because the
+    // routable row names the session that published the list...
+    REQUIRE(offline.upsert(agent, "h", "linux", 1, 0, "1", "x", new_session));
+    REQUIRE(offline.publish_plugins(agent, new_session, {"os_info"}));
+    CHECK(withheld_ids() == Ids{agent});
+    // ...until its lease expires: the row still names the same session but is no longer routable,
+    // so only the routable predicate (the lease, on the DB clock) can exclude the agent now.
+    raw_exec(db.dsn(), "UPDATE gateway_route_store.agent_routes SET lease_until = now() - "
+                       "interval '1 hour' WHERE agent_id = 'yuzu_test_ws5_conf_real'");
+    CHECK(withheld_ids().empty());
+}
+
+TEST_CASE("WS-5 plugin visibility: the directory confirms each agent on its own row, and a "
+          "direct agent with no row is never withheld",
+          "[pg][gateway_route_wiring][ws5][plugin_visibility]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, gwroutewiring_tpl);
+    BatchHbFixture owner(db.dsn());
+    NonOwningReplica other(owner.auth_mgr, owner.store);
+    yuzu::server::OfflineEndpointStore offline{owner.pool};
+    REQUIRE(offline.is_open());
+    other.registry.configure_presence(&offline, std::chrono::hours(1));
+    other.registry.configure_route_session_reader(
+        yuzu::server::make_route_session_confirmer(owner.store));
+
+    const std::string kept = "yuzu_test_ws5_conf_kept";
+    const std::string moved = "yuzu_test_ws5_conf_moved";
+    const std::string direct = "yuzu_test_ws5_conf_direct";
+    const std::string kept_session = owner.register_live(kept);
+    connect_session(owner, kept, kept_session);
+    const std::string moved_old = owner.register_live(moved);
+    connect_session(owner, moved, moved_old);
+    for (const auto& [id, session] :
+         {std::pair{kept, kept_session}, std::pair{moved, moved_old},
+          std::pair{direct, std::string{"direct-session"}}}) {
+        REQUIRE(offline.upsert(id, "h", "linux", 1, 0, "1", "x", session));
+        REQUIRE(offline.publish_plugins(id, session, {"os_info"}));
+    }
+    // `moved` restarts and is placed on its new session; `direct` has presence but no route row.
+    const std::string moved_new = owner.register_live(moved);
+    connect_session(owner, moved, moved_new);
+
+    CHECK(other.registry.ids_missing_plugin("echo", "sql") ==
+          std::unordered_set<std::string>{kept});
+    // A protective action is never withheld on inventory grounds, whatever the directory says.
+    CHECK(other.registry.ids_missing_plugin("firewall", "quarantine").empty());
+}
+
+// `confirm_sessions` through the real store: ids that would break a naive array literal (quote,
+// comma, brace, backslash, apostrophe) are matched exactly, the empty claim set short-circuits,
+// and a claim naming another session or an unknown agent is simply not confirmed.
+TEST_CASE("WS-5 plugin visibility: confirm_sessions matches hostile ids exactly and returns only "
+          "the confirmed claims",
+          "[pg][gateway_route_wiring][ws5][plugin_visibility]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, gwroutewiring_tpl);
+    BatchHbFixture owner(db.dsn());
+    using yuzu::server::PluginAbsence;
+    CHECK(owner.store.confirm_sessions({}).value().empty());
+
+    const std::string agent = "yuzu_test_a\"b,c{d}\\e'f";
+    const std::string session = "s\"1,{x}\\'";
+    REQUIRE(owner.store.register_fresh(agent, session).has_value());
+    // Place it: a cluster and a live lease (what CONNECTED does), by direct row surgery so the
+    // hostile ids need not be routed through a gRPC message.
+    {
+        pg::PgConn conn{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        const char* params[2] = {agent.c_str(), session.c_str()};
+        pg::PgResult r{PQexecParams(conn.get(),
+                                    "UPDATE gateway_route_store.agent_routes SET cluster_id='c', "
+                                    "gateway_node='n', lease_until = now() + interval '90 s' "
+                                    "WHERE agent_id=$1 AND session_id=$2",
+                                    2, nullptr, params, nullptr, nullptr, 0)};
+        REQUIRE(r.status() == PGRES_COMMAND_OK);
+        REQUIRE(std::string_view(PQcmdTuples(r.get())) == "1");
+    }
+    const auto confirmed = owner.store.confirm_sessions(std::vector<PluginAbsence>{
+        {agent, session}, {agent, "another-session"}, {"unknown-agent", session}});
+    REQUIRE(confirmed.has_value());
+    CHECK(*confirmed == std::vector<std::string>{agent});
+}
+
+// An older session can be written back into a row only after the row was tombstoned (or deleted):
+// `reclaim_tombstoned_session` is guarded on `session_id IS NULL`. Pin what that leaves behind. The
+// reclaimed row names the OLD session but carries no placement (`deregister` NULLed it and reclaim
+// does not set one), so it is unroutable and the confirmation does not withhold on it.
+TEST_CASE("WS-5 plugin visibility: a reclaimed older session leaves an unplaced row that does not "
+          "withhold",
+          "[pg][gateway_route_wiring][ws5][plugin_visibility]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, gwroutewiring_tpl);
+    BatchHbFixture owner(db.dsn());
+    const std::string agent = "yuzu_test_ws5_conf_reclaim";
+    const std::string old_session = owner.register_live(agent);
+    connect_session(owner, agent, old_session);
+    const std::string new_session = owner.register_live(agent);
+    connect_session(owner, agent, new_session);
+    // The new session's stream ends: its row is tombstoned.
+    REQUIRE(owner.store.deregister(agent, new_session, /*stream_home_id=*/"").has_value());
+    // A late replay of the OLD session reclaims the tombstoned row.
+    auto reclaimed = owner.store.reclaim_tombstoned_session(agent, old_session, 90);
+    REQUIRE(reclaimed.has_value());
+    CHECK(*reclaimed == yuzu::server::ReclaimOutcome::adopted);
+    auto confirmed = owner.store.confirm_sessions(
+        std::vector<yuzu::server::PluginAbsence>{{agent, old_session}});
+    REQUIRE(confirmed.has_value());
+    CHECK(confirmed->empty()); // names the old session, but unplaced: not routable
+}
+
+// A session that LOST its register_fresh epoch race belongs to an older connection; the durable row
+// names the winner. Its CONNECTED must not run the arrival mirror, or `session_id <> loser` would
+// delete the WINNER's published plugin list.
+TEST_CASE("WS-5 NotifyStreamStatus: the CONNECTED of a lost-race session leaves the winning "
+          "session's plugin list alone",
+          "[pg][gateway_route_wiring][ws5][plugin_visibility]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, gwroutewiring_tpl);
+    BatchHbFixture owner(db.dsn());
+    yuzu::server::OfflineEndpointStore offline{owner.pool};
+    REQUIRE(offline.is_open());
+    yuzu::server::HeartbeatIngestion ingestion{owner.registry, nullptr, nullptr, &owner.metrics,
+                                               &offline};
+    owner.svc.set_heartbeat_ingestion(&ingestion);
+
+    const std::string agent = "yuzu_test_ws5_arrival_race";
+    (void)owner.register_live(agent);
+    auto row1 = owner.store.lookup_route(agent);
+    REQUIRE(row1.has_value());
+    REQUIRE(row1->has_value());
+    // A newer connection already won the epoch race.
+    raw_bump_epoch(db.dsn(), agent, (*row1)->connection_epoch + 1000, "gw-session-already-won");
+    const std::string losing_session = owner.register_live(agent);
+    // The winner's published list, which lacks "echo".
+    REQUIRE(offline.upsert(agent, "h", "linux", 1, 0, "1", "x", "gw-session-already-won"));
+    REQUIRE(offline.publish_plugins(agent, "gw-session-already-won", {"os_info"}));
+
+    gw::StreamStatusNotification notif;
+    notif.set_agent_id(agent);
+    notif.set_session_id(losing_session);
+    notif.set_event(gw::StreamStatusNotification::CONNECTED);
+    notif.set_cluster_id("cluster-loser");
+    notif.set_gateway_node("node-loser");
+    gw::StreamStatusAck ack;
+    REQUIRE(owner.svc.NotifyStreamStatus(/*context=*/nullptr, &notif, &ack).ok());
+
+    auto r = offline.query_live_ids_without_plugin(std::chrono::hours(1), "echo");
+    REQUIRE(r.has_value());
+    CHECK(std::ranges::find(*r, agent, &yuzu::server::PluginAbsence::agent_id) != r->end()); // the winner's list is still served
 }
 
 TEST_CASE("WS-5 BatchHeartbeat: a session id carried by TWO directory rows is refused "
@@ -3320,8 +3573,9 @@ TEST_CASE("WS-5 NotifyStreamStatus: a degraded directory read with no local sess
               .value() == 1);
 }
 
-TEST_CASE("WS-5 NotifyStreamStatus: a degraded directory read still acknowledges CONNECTED for "
-          "the session this replica registered and publishes its placement",
+TEST_CASE("WS-5 NotifyStreamStatus: a degraded directory read refuses CONNECTED for the "
+          "session this replica registered and leaves its placement alone then accepts the resend "
+          "once the read recovers (#5685 (ii))",
           "[pg][gateway_route_wiring][ws5]") {
     YUZU_REQUIRE_PG_DB_TPL(db, gwroutewiring_tpl);
     BatchHbFixture owner(db.dsn());
@@ -3339,14 +3593,28 @@ TEST_CASE("WS-5 NotifyStreamStatus: a degraded directory read still acknowledges
     {
         ScopedReadBreak broken(db.dsn());
         REQUIRE(owner.svc.NotifyStreamStatus(/*context=*/nullptr, &notif, &ack).ok());
+        CHECK_FALSE(ack.acknowledged());
+        CHECK(owner.desync("notify_stream_status", "connected_unverified") == 1);
+        CHECK(owner.desync("notify_stream_status", "stale_connected_session") == 0);
+        CHECK(owner.metrics
+                  .counter("yuzu_server_gateway_route_write_failed_total",
+                           {{"op", "session_lookup"}, {"reason", "db_error"}})
+                  .value() == 1);
+        // The refusal published NOTHING: the in-memory placement is untouched.
+        auto sess = owner.registry.get_session(agent);
+        REQUIRE(sess);
+        {
+            std::lock_guard lk(sess->stream_mu);
+            CHECK(sess->gateway_node != "node-ws5-degraded");
+        }
+        CHECK_FALSE(owner.registry.gateway_has_wire_capability(agent, "cap-ws5-degraded"));
     }
+
+    // The read recovered: the same notice (the gateway's resend) is accepted and
+    // the placement lands, in memory and in the directory together.
+    ack.Clear();
+    REQUIRE(owner.svc.NotifyStreamStatus(/*context=*/nullptr, &notif, &ack).ok());
     CHECK(ack.acknowledged());
-    CHECK(owner.desync("notify_stream_status", "connected_unverified") == 0);
-    CHECK(owner.desync("notify_stream_status", "stale_connected_session") == 0);
-    CHECK(owner.metrics
-              .counter("yuzu_server_gateway_route_write_failed_total",
-                       {{"op", "session_lookup"}, {"reason", "db_error"}})
-              .value() == 1);
     auto sess = owner.registry.get_session(agent);
     REQUIRE(sess);
     {
@@ -3354,6 +3622,71 @@ TEST_CASE("WS-5 NotifyStreamStatus: a degraded directory read still acknowledges
         CHECK(sess->gateway_node == "node-ws5-degraded");
     }
     CHECK(owner.registry.gateway_has_wire_capability(agent, "cap-ws5-degraded"));
+    auto row = owner.store.lookup_route(agent);
+    REQUIRE(row.has_value());
+    REQUIRE(row->has_value());
+    CHECK((*row)->gateway_node == "node-ws5-degraded");
+}
+
+TEST_CASE("WS-5 NotifyStreamStatus: a degraded read on a replica whose session was SUPERSEDED on "
+          "another replica refuses a stale CONNECTED and publishes no placement (#5685 (ii))",
+          "[pg][gateway_route_wiring][ws5]") {
+    // The case local acceptance used to get wrong: R1 still holds session S in
+    // its own maps, R2 has since registered the agent afresh (S2) and the
+    // directory row names S2. R1 cannot see that supersede in memory, so on a
+    // degraded read it must not take its own state as evidence.
+    YUZU_REQUIRE_PG_DB_TPL(db, gwroutewiring_tpl);
+    BatchHbFixture r1(db.dsn());
+    NonOwningReplica r2(r1.auth_mgr, r1.store);
+    const std::string agent = "yuzu_test_ws5_conn_superseded";
+    const std::string s1 = r1.register_live(agent);
+
+    auto fresh = make_gw_register(r1.auth_mgr, agent);
+    apb::RegisterResponse fresh_resp;
+    REQUIRE(r2.svc.ProxyRegister(/*context=*/nullptr, &fresh, &fresh_resp).ok());
+    const std::string s2 = fresh_resp.session_id();
+    REQUIRE(s2 != s1);
+    {
+        auto row = r1.store.lookup_route(agent);
+        REQUIRE(row.has_value());
+        REQUIRE(row->has_value());
+        REQUIRE((*row)->session_id.has_value());
+        REQUIRE(*(*row)->session_id == s2);
+    }
+
+    gw::StreamStatusNotification notif;
+    notif.set_agent_id(agent);
+    notif.set_session_id(s1);
+    notif.set_event(gw::StreamStatusNotification::CONNECTED);
+    notif.set_cluster_id("cluster-ws5");
+    notif.set_gateway_node("stale-node");
+    notif.add_wire_capabilities("cap-stale");
+    gw::StreamStatusAck ack;
+    {
+        ScopedReadBreak broken(db.dsn());
+        REQUIRE(r1.svc.NotifyStreamStatus(/*context=*/nullptr, &notif, &ack).ok());
+        CHECK_FALSE(ack.acknowledged());
+        CHECK(r1.desync("notify_stream_status", "connected_unverified") == 1);
+        auto sess = r1.registry.get_session(agent);
+        if (sess) {
+            std::lock_guard lk(sess->stream_mu);
+            CHECK(sess->gateway_node != "stale-node");
+        }
+        CHECK_FALSE(r1.registry.gateway_has_wire_capability(agent, "cap-stale"));
+    }
+
+    // Read recovered, same stale notice: the directory names S2, so it is
+    // rejected as stale and still publishes nothing.
+    ack.Clear();
+    REQUIRE(r1.svc.NotifyStreamStatus(/*context=*/nullptr, &notif, &ack).ok());
+    CHECK_FALSE(ack.acknowledged());
+    CHECK(r1.desync("notify_stream_status", "stale_connected_session") == 1);
+    CHECK_FALSE(r1.registry.gateway_has_wire_capability(agent, "cap-stale"));
+    auto row = r1.store.lookup_route(agent);
+    REQUIRE(row.has_value());
+    REQUIRE(row->has_value());
+    CHECK(*(*row)->session_id == s2);
+    CHECK((*row)->gateway_node != "stale-node");
 }
 
 TEST_CASE("WS-5 NotifyStreamStatus: DISCONNECTED on a non-owning replica tombstones the "
@@ -3418,7 +3751,7 @@ std::int64_t now_ms() {
 std::string presence_hostname(yuzu::server::OfflineEndpointStore& s, const std::string& agent_id) {
     const auto roster = s.query_stale_within(std::chrono::hours(1));
     REQUIRE(roster.has_value()); // #5531: the read is typed; a store fault is not "absent"
-    for (const auto& e : *roster)
+    for (const auto& e : roster->rows)
         if (e.agent_id == agent_id)
             return e.hostname;
     return {};
@@ -3506,8 +3839,8 @@ TEST_CASE("WS-5 NotifyStreamStatus: the presence clear gate honours each half se
     }
 }
 
-TEST_CASE("WS-5 NotifyStreamStatus: a degraded directory read lets CONNECTED and DISCONNECTED "
-          "proceed for the session this replica registered",
+TEST_CASE("WS-5 NotifyStreamStatus: a degraded directory read refuses CONNECTED but still lets "
+          "DISCONNECTED (a teardown) proceed for the session this replica registered",
           "[pg][gateway_route_wiring][ws5]") {
     YUZU_REQUIRE_PG_DB_TPL(db, gwroutewiring_tpl);
     BatchHbFixture owner(db.dsn());
@@ -3520,8 +3853,8 @@ TEST_CASE("WS-5 NotifyStreamStatus: a degraded directory read lets CONNECTED and
     REQUIRE_FALSE(broken_store.is_open());
     owner.svc.set_gateway_route_store(&broken_store);
 
-    CHECK(notify(owner.svc, agent, sid, gw::StreamStatusNotification::CONNECTED));
-    CHECK(owner.desync("notify_stream_status", "connected_unverified") == 0);
+    CHECK_FALSE(notify(owner.svc, agent, sid, gw::StreamStatusNotification::CONNECTED));
+    CHECK(owner.desync("notify_stream_status", "connected_unverified") == 1);
     CHECK(owner.registry.get_session(agent));
 
     CHECK(notify(owner.svc, agent, sid, gw::StreamStatusNotification::DISCONNECTED));
@@ -3567,6 +3900,24 @@ TEST_CASE("WS-5 ProxyInventory: a degraded read with a local hint still ingests 
         REQUIRE(owner.svc.ProxyInventory(/*context=*/nullptr, &rpt, &ack).ok());
         CHECK_FALSE(ack.received());
         CHECK(owner.desync("session_lookup", "ambiguous_session") == 1);
+    }
+
+    // #6339: the local map names one agent and the directory row another. The inventory must not
+    // be attributed to either, and the refusal is counted as the mismatch, not as an unknown id.
+    SECTION("local map and directory name different agents") {
+        const std::string sid = owner.register_live("yuzu_test_6339_inv_local");
+        const std::string sql = "UPDATE gateway_route_store.agent_routes SET agent_id = "
+                                "'yuzu_test_6339_inv_row' WHERE agent_id = "
+                                "'yuzu_test_6339_inv_local'";
+        raw_exec(db.dsn(), sql.c_str());
+
+        apb::InventoryReport rpt;
+        rpt.set_session_id(sid);
+        apb::InventoryAck ack;
+        REQUIRE(owner.svc.ProxyInventory(/*context=*/nullptr, &rpt, &ack).ok());
+        CHECK_FALSE(ack.received());
+        CHECK(owner.desync("session_lookup", "agent_mismatch") == 1);
+        CHECK(owner.desync("proxy_inventory", "unknown_session") == 0);
     }
 }
 
@@ -4030,7 +4381,7 @@ TEST_CASE("NotifyStreamStatus DISCONNECTED for the CURRENT session clears presen
     const auto roster = offline_store.query_stale_within(std::chrono::hours(1));
     REQUIRE(roster.has_value()); // #5531: the roster read is typed; a store fault is not "absent"
     const yuzu::server::OfflineEndpoint* row = nullptr;
-    for (const auto& e : *roster)
+    for (const auto& e : roster->rows)
         if (e.agent_id == "agent-presence-1")
             row = &e;
     REQUIRE(row != nullptr);
@@ -4256,3 +4607,119 @@ TEST_CASE("GatewayUpstreamServiceImpl: the #5686 series and HELP lines exist bef
               "0"));
     CHECK(has("\nyuzu_server_agent_presence_upsert_skipped_total 0\n"));
 }
+
+// ── Gateway-asserted identifiers: an embedded NUL is refused at the boundary ─
+//
+// agent_id, session_id, cluster_id and stream_home_id arrive from the gateway and are compared
+// and stored as text. A value with an embedded NUL cannot be stored faithfully (the database
+// would see only its prefix), so NotifyStreamStatus refuses the whole notification before any
+// check, publish or write. The durable row and the agent's registered session stay as they were.
+
+TEST_CASE("NotifyStreamStatus: an identifier with an embedded NUL is refused and publishes "
+          "nothing",
+          "[pg][gateway_route_wiring][validation]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, gwroutewiring_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayRouteStore store{pool};
+    REQUIRE(store.is_open());
+
+    yuzu::MetricsRegistry metrics;
+    EventBus bus;
+    AgentRegistry registry{bus, metrics};
+    PgAuthManager auth_mgr;
+    yuzu::server::auth::AutoApproveEngine auto_approve;
+    GatewayUpstreamServiceImpl gateway_svc{registry, bus, auth_mgr, auto_approve, &metrics};
+    gateway_svc.set_gateway_route_store(&store);
+
+    auto req = make_gw_register(auth_mgr, "agent-nul-1");
+    apb::RegisterResponse resp;
+    REQUIRE(gateway_svc.ProxyRegister(/*context=*/nullptr, &req, &resp).ok());
+    const std::string session_id = resp.session_id();
+
+    const std::string nul("\0", 1);
+    const std::string field = GENERATE(std::string("cluster_id"), std::string("session_id"),
+                                       std::string("stream_home_id"), std::string("agent_id"));
+    const auto event = GENERATE(gw::StreamStatusNotification::CONNECTED,
+                                gw::StreamStatusNotification::DISCONNECTED);
+    INFO("field=" << field << " event=" << static_cast<int>(event));
+
+    gw::StreamStatusNotification notif;
+    notif.set_agent_id(field == "agent_id" ? "agent-nul-1" + nul + "x" : std::string("agent-nul-1"));
+    notif.set_session_id(field == "session_id" ? session_id + nul + "x" : session_id);
+    notif.set_event(event);
+    notif.set_cluster_id(field == "cluster_id" ? "cluster-x" + nul + "y" : std::string("cluster-x"));
+    notif.set_gateway_node("node-a");
+    notif.set_stream_home_id(field == "stream_home_id" ? "home" + nul + "z" : std::string("home-a"));
+    gw::StreamStatusAck ack;
+    const auto status = gateway_svc.NotifyStreamStatus(/*context=*/nullptr, &notif, &ack);
+    CHECK(status.error_code() == grpc::StatusCode::INVALID_ARGUMENT);
+    CHECK_FALSE(ack.acknowledged());
+
+    // Nothing was published or bound for the real agent: no cluster, no home affinity, and the
+    // session the agent registered with is still the durable one.
+    auto row = store.lookup_route("agent-nul-1");
+    REQUIRE(row.has_value());
+    REQUIRE(row->has_value());
+    CHECK((*row)->session_id == session_id);
+    CHECK_FALSE((*row)->cluster_id.has_value());
+    CHECK_FALSE((*row)->home_cluster_id.has_value());
+
+    // The agent's in-memory session was not given a placement either.
+    auto sess = registry.get_session("agent-nul-1");
+    REQUIRE(sess);
+    {
+        std::lock_guard lk(sess->stream_mu);
+        CHECK(sess->cluster_id.empty());
+        CHECK(sess->gateway_node.empty());
+    }
+}
+
+TEST_CASE("NotifyStreamStatus: the same CONNECTED without an embedded NUL is accepted and "
+          "records the placement",
+          "[pg][gateway_route_wiring][validation]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, gwroutewiring_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayRouteStore store{pool};
+    REQUIRE(store.is_open());
+
+    yuzu::MetricsRegistry metrics;
+    EventBus bus;
+    AgentRegistry registry{bus, metrics};
+    PgAuthManager auth_mgr;
+    yuzu::server::auth::AutoApproveEngine auto_approve;
+    GatewayUpstreamServiceImpl gateway_svc{registry, bus, auth_mgr, auto_approve, &metrics};
+    gateway_svc.set_gateway_route_store(&store);
+
+    auto req = make_gw_register(auth_mgr, "agent-nul-1");
+    apb::RegisterResponse resp;
+    REQUIRE(gateway_svc.ProxyRegister(/*context=*/nullptr, &req, &resp).ok());
+    const std::string session_id = resp.session_id();
+
+    gw::StreamStatusNotification notif;
+    notif.set_agent_id("agent-nul-1");
+    notif.set_session_id(session_id);
+    notif.set_event(gw::StreamStatusNotification::CONNECTED);
+    notif.set_cluster_id("cluster-x");
+    notif.set_gateway_node("node-a");
+    notif.set_stream_home_id("home-a");
+    gw::StreamStatusAck ack;
+    const auto status = gateway_svc.NotifyStreamStatus(/*context=*/nullptr, &notif, &ack);
+    CHECK(status.ok());
+    CHECK(ack.acknowledged());
+
+    auto row = store.lookup_route("agent-nul-1");
+    REQUIRE(row.has_value());
+    REQUIRE(row->has_value());
+    CHECK((*row)->session_id == session_id);
+    REQUIRE((*row)->cluster_id.has_value());
+    CHECK(*(*row)->cluster_id == "cluster-x");
+
+    auto sess = registry.get_session("agent-nul-1");
+    REQUIRE(sess);
+    {
+        std::lock_guard lk(sess->stream_mu);
+        CHECK(sess->cluster_id == "cluster-x");
+        CHECK(sess->gateway_node == "node-a");
+    }
+}
+

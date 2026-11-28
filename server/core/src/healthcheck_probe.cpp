@@ -15,8 +15,9 @@ namespace yuzu::server::healthcheck {
 
 #ifdef CPPHTTPLIB_OPENSSL_SUPPORT
 std::unique_ptr<httplib::SSLClient> make_tls_client(const HealthcheckTarget& t) {
-    // An empty CA path makes httplib's load_certs() fall through to the OS trust store
-    // (httplib.h:15545-15547), the fallback this probe must never take: refuse instead.
+    // An empty CA path makes httplib's load_client_ca_config() merge the OS trust store when the
+    // system-CA mode is Auto (httplib.h v0.59.0:10896-10903), the fallback this probe must never
+    // take: refuse instead.
     if (t.trust_anchor.empty())
         return nullptr;
     auto c = std::make_unique<httplib::SSLClient>(t.host, t.port);
@@ -26,9 +27,10 @@ std::unique_ptr<httplib::SSLClient> make_tls_client(const HealthcheckTarget& t) 
     if (!c->is_valid())
         throw std::runtime_error("TLS context unavailable");
     // The anchor goes in through the CA-file setter or the PEM one, NEVER httplib's
-    // store-injection setter: with neither a CA file path nor a CA PEM set, httplib 0.37.1
-    // load_certs() (httplib.h:15529-15549) merges the OS trust store into the context on first
-    // connect. Both of ours skip that merge and load ONLY the anchor, which is the whole trust
+    // store-injection setter: with no CA file, directory or PEM set, httplib merges the OS trust
+    // store into the context on first connect (0.37.1: load_certs(); 0.59.0:
+    // load_client_ca_config() when the system-CA mode is Auto). Both of ours skip that merge and
+    // load ONLY the anchor, which is the whole trust
     // decision (the server's own install CA, or the operator's --https-cert). The [live]
     // containment test counts the store after a connect.
     auto* ctx = static_cast<SSL_CTX*>(c->tls_context());
@@ -83,7 +85,8 @@ std::unique_ptr<httplib::SSLClient> make_tls_client(const HealthcheckTarget& t) 
 HealthcheckOutcome probe_once(const HealthcheckTarget& t, int max_total_ms) {
     // Heap client + explicit reset before return: httplib 0.37.1's SSLClient
     // destructor can crash after a failed handshake (same workaround as
-    // oidc_provider.cpp).
+    // oidc_provider.cpp). 0.59.0 rewrote that destructor and this was not re-tested against it;
+    // the explicit reset is kept because it is harmless.
     std::unique_ptr<httplib::ClientImpl> client;
 #ifdef CPPHTTPLIB_OPENSSL_SUPPORT
     if (t.tls) {
@@ -97,10 +100,12 @@ HealthcheckOutcome probe_once(const HealthcheckTarget& t, int max_total_ms) {
         client->set_follow_location(false);
     }
     // Per-phase knobs: connect, write and read timeouts plus the request-phase ceiling
-    // max_total_ms (httplib.h:9906-9950). Name resolution is bounded by the connect timeout in
-    // this build (the vcpkg httplib defines CPPHTTPLIB_USE_NON_BLOCKING_GETADDRINFO); the
-    // handshake loop (httplib.h:16517-16553) is bounded per select, never in total, hence
-    // run_healthcheck runs this under probe_bounded's absolute kProbeDeadline.
+    // max_total_ms. Name resolution is NOT bounded by the connect timeout on glibc: the vcpkg
+    // httplib defines CPPHTTPLIB_USE_NON_BLOCKING_GETADDRINFO, and since the #2431 fix (httplib
+    // >= 0.43.2) a timed-out getaddrinfo_a is cancelled and then WAITED for (gai_suspend with no
+    // timeout), so the calling thread is held for the system resolver's own timeout. The
+    // handshake loop is bounded per select, never in total. Hence run_healthcheck runs this under
+    // probe_bounded's absolute kProbeDeadline, which is what actually bounds the caller.
     client->set_connection_timeout(kConnectSec, 0);
     client->set_write_timeout(kWriteSec, 0);
     client->set_read_timeout(kReadSec, 0);
@@ -148,7 +153,7 @@ int run_healthcheck(const Config& cfg, std::string_view path, std::ostream& diag
                     std::function<HealthcheckOutcome(const HealthcheckTarget&)> probe,
                     std::chrono::milliseconds deadline, void (*hard_exit)(int)) {
 #ifndef _WIN32
-    // httplib ignores SIGPIPE only inside Server::Server() (httplib.h:10404-10406), which this
+    // httplib ignores SIGPIPE only inside Server::Server() (httplib.h v0.59.0:12956-12958), which this
     // one-shot mode never constructs, and sends with flags 0: a client writing into a reset peer
     // would otherwise die with 141 and no diagnostic. Set before the first socket write.
     std::signal(SIGPIPE, SIG_IGN);
@@ -161,8 +166,9 @@ int run_healthcheck(const Config& cfg, std::string_view path, std::ostream& diag
     const auto target =
         resolve_healthcheck_target(cfg, path, auth::default_cert_dir(), kTlsSupported);
     // The worker owns its copy of `probe` and `target`, so abandoning it (deadline first) is safe.
-    // probe_bounded rethrows what the probe threw (httplib can throw: 0.37.1 reserves res.body on
-    // a peer-claimed Content-Length before its payload ceiling applies, std::bad_alloc) and a
+    // probe_bounded rethrows what the probe threw (httplib can throw: through 0.37.1 it reserved
+    // res.body from a peer-claimed Content-Length before its payload ceiling applied, and 0.59.0
+    // still reserves up to that ceiling, std::bad_alloc) and a
     // failed thread start (std::system_error). The exit contract is exit 1 plus one line for
     // either, never an abort.
     std::optional<HealthcheckOutcome> outcome;

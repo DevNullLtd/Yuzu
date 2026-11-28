@@ -101,8 +101,9 @@ inline std::string json_escape(std::string_view in) {
 /// the RAW output is wrong in both directions. Too small and it cuts the
 /// operator's recovery instruction mid-sentence; too large and it runs past the
 /// newline and renders the head of the NEXT record as debris -- `echo status`'s
-/// offline reply is `error|...` followed by `storage_state|offline`, and a
-/// 300-byte window ends in a trailing `storage_stat`. Bounding the FIRST LINE is
+/// offline reply is `error|...` followed by `storage_state|offline|rollback_wedged`, and a
+/// byte window long enough to pass the first line ends mid-way through that second record.
+/// Bounding the FIRST LINE is
 /// the property that holds whatever the message length becomes.
 ///
 /// `max_bytes` is a display bound, so it is walked back off a UTF-8
@@ -165,6 +166,52 @@ inline std::string html_escape(const std::string& s) {
         }
     }
     return out;
+}
+
+/// The code point of a bidirectional-control or zero-width character starting at `s[i]`, or 0 when
+/// none does. The list is final and deliberately narrow: U+061C, U+200B-U+200F, U+202A-U+202E,
+/// U+2060-U+2064, U+2066-U+2069 and U+FEFF. Ordinary spaces (U+00A0, U+3000, U+2000-U+200A, U+2028,
+/// U+2029) are legitimate in names and are not on it. Reads at most three bytes and never past the
+/// end, so a truncated or malformed sequence is simply "none".
+[[nodiscard]] inline std::uint32_t invisible_code_point_at(const std::string& s, std::size_t i) {
+    const auto b = [&](std::size_t k) { return static_cast<unsigned char>(s[i + k]); };
+    const std::size_t left = s.size() - i;
+    if (b(0) == 0xD8 && left >= 2 && b(1) == 0x9C)
+        return 0x061C;
+    if (b(0) == 0xE2 && left >= 3) {
+        const unsigned lead = b(1);
+        const unsigned tail = b(2);
+        if (lead == 0x80 && ((tail >= 0x8B && tail <= 0x8F) || (tail >= 0xAA && tail <= 0xAE)))
+            return 0x2000u + (tail & 0x3Fu);
+        if (lead == 0x81 && ((tail >= 0xA0 && tail <= 0xA4) || (tail >= 0xA6 && tail <= 0xA9)))
+            return 0x2040u + (tail & 0x3Fu);
+    }
+    if (b(0) == 0xEF && left >= 3 && b(1) == 0xBB && b(2) == 0xBF)
+        return 0xFEFF;
+    return 0;
+}
+
+/// `html_escape` for a TEXT NODE that prints an agent-reported or stored name: each bidirectional
+/// control or zero-width character (see `invisible_code_point_at`) is printed as the visible text
+/// `<U+XXXX>` (escaped, so it shows as `&lt;U+202E&gt;`). Marked, never stripped: stripping would
+/// make two different names print identically. Never use this inside a tag: an attribute value the
+/// browser sends back (a form value, a search box) must keep its raw bytes.
+[[nodiscard]] inline std::string html_escape_marked(const std::string& s) {
+    // Every listed character starts with 0xD8, 0xE2 or 0xEF; without one there is nothing to mark.
+    if (s.find_first_of("\xD8\xE2\xEF") == std::string::npos)
+        return html_escape(s);
+    std::string work;
+    work.reserve(s.size() + 16);
+    for (std::size_t i = 0; i < s.size();) {
+        const std::uint32_t cp = invisible_code_point_at(s, i);
+        if (cp == 0) {
+            work += s[i++];
+            continue;
+        }
+        work += std::format("<U+{:04X}>", cp);
+        i += cp == 0x061C ? 2 : 3;
+    }
+    return html_escape(work);
 }
 
 /// Percent-encode `s` for use as ONE URL path segment (RFC 3986): everything
@@ -275,6 +322,22 @@ inline std::string html_escape(const std::string& s) {
 /// echo_tree_routes.cpp).
 [[nodiscard]] inline std::string audit_token(std::string_view s) {
     return ::yuzu::log_token(s); // shared mapping: common/include/yuzu/log_token.hpp
+}
+
+/// Put a store or driver error text on ONE line for use inside an audit detail. libpq error
+/// messages end with a newline and often carry a second CONTEXT line, so a suffix appended
+/// after one (`; credentials_revoked=N`) would land on its own physical line and a log reader
+/// would miss it. Each CR or LF becomes a space (a CRLF pair therefore gives two) and trailing
+/// space and tab are dropped; nothing else is changed (use `audit_token` for a caller-supplied
+/// value, which is stricter).
+[[nodiscard]] inline std::string flatten_audit_text(std::string_view s) {
+    std::string out;
+    out.reserve(s.size());
+    for (const char c : s)
+        out += (c == '\r' || c == '\n') ? ' ' : c;
+    while (!out.empty() && (out.back() == ' ' || out.back() == '\t'))
+        out.pop_back();
+    return out;
 }
 
 /// Percent-decode a URL-encoded string (also handles + as space).
@@ -752,23 +815,28 @@ has_non_identity_content_encoding(std::string_view content_encoding) noexcept {
 /// all-digit value above 2^64-1: `std::from_chars` reports
 /// `std::errc::result_out_of_range` for that input and the old code folded
 /// that to `content_length = 0` ("no header, don't cap"), while httplib's
-/// own `is_numeric()` + `strtoull()` parser (httplib.h:2769-2789) accepts
-/// the same digits and returns `SIZE_MAX` — the value it then ALSO uses to
-/// decide what it buffers (httplib.h:7057-7061). One unauthenticated
+/// own `is_numeric()` + `strtoull()` parser (0.37.1) accepted
+/// the same digits and returned `SIZE_MAX` — the value it then ALSO used to
+/// decide what it buffered. (0.59.0 parses with `std::from_chars`, flags an
+/// out-of-range value as invalid and answers 400, see the end of this comment.) One unauthenticated
 /// `Content-Length: 99999999999999999999999` (or any all-digit value above
 /// 2^64-1) defeated every class's cap, including /mcp/'s and the 256 KiB
 /// ca_import_chain/scim classes (governance Gate 8 CRITICAL). Calling
 /// httplib's accessor from this ONE function — used by both server.cpp's
 /// production gate and this file's own test fixtures
 /// (`test_body_cap_policy.cpp`'s `UnifiedBodyCapTestServer`,
-/// `test_mcp_body_cap.cpp`'s `BodyCapTestServer`) — makes that divergence
-/// structurally impossible rather than something to keep re-verifying by
-/// hand every time either call site is touched. A genuinely malformed
-/// (non-numeric / negative / whitespace-padded) `Content-Length` still
-/// reads as 0 here — that is fine, NOT a re-opened gap: httplib's OWN
-/// reader (the `is_invalid_value` branch, httplib.h:7057-7063) answers 400
-/// and refuses to read the body at all for that case, so no handler is
-/// ever reached regardless of what this gate alone decides.
+/// `test_mcp_body_cap.cpp`'s `BodyCapTestServer`), gives all three the same
+/// Content-Length reading, so a call site that is touched later need not be re-checked
+/// by hand. A genuinely malformed
+/// (non-numeric or negative) `Content-Length` still
+/// reads as 0 here (httplib trims surrounding whitespace, so `Content-Length:  5` reads as 5).
+/// That is fine, NOT a re-opened gap: httplib's OWN
+/// reader answers 400 and refuses to read the body at all for that case,
+/// so no handler is ever reached regardless of what this gate alone
+/// decides. (httplib 0.59.0 also answers 400 to an all-digit value above
+/// 2^64-1 while parsing the request head, before this gate runs; this
+/// function still returns SIZE_MAX for it, which the gate refuses with 413
+/// on an httplib that lets it through.)
 template <typename Req>
 [[nodiscard]] inline std::uint64_t content_length_for_body_cap(const Req& req) noexcept {
     return req.get_header_value_u64("Content-Length", 0);
@@ -787,12 +855,15 @@ template <typename Req>
 /// THE DESIGN RULE, learned the hard way: do NOT re-implement httplib's
 /// header parsing and hope the two agree. The first attempt tested
 /// `Transfer-Encoding` with a case-SENSITIVE `find("chunked")` while httplib
-/// decides with `case_ignore::equal(...)` (httplib.h:6967) — so
+/// decides with `case_ignore::equal(...)` (httplib.h v0.59.0:8469) — so
 /// `Transfer-Encoding: Chunked` passed this check as a measurable body and was
 /// then read as chunked, bounded only by the 100 MB global default. One
 /// capital letter defeated the whole cap. The substring test was also wrong in
-/// the other direction: httplib compares the value for EQUALITY, so
-/// `identity, chunked` is not chunked to httplib while `find` matched it. So
+/// the other direction on httplib 0.37.1, which compared the whole value for
+/// EQUALITY, so `identity, chunked` was not chunked to it while `find` matched
+/// it. From 0.59.0 httplib reads the FINAL coding of the combined list
+/// (httplib.h v0.59.0:8441-8470), so `gzip, chunked` is chunked to it and the two
+/// agree on that case; the rule below does not depend on which it is. So
 /// this refuses ANY non-empty `Transfer-Encoding`, on ANY method — not just
 /// chunked and not just POST/PUT/PATCH, since httplib's `expect_content`
 /// treats chunking independently of the method, so a chunked
@@ -800,7 +871,7 @@ template <typename Req>
 ///
 /// DELETE is DELIBERATELY EXCLUDED from the no-`Content-Length` rule, and the
 /// reasoning is worth keeping because two reviewers disagreed on it.
-/// `expect_content` (httplib.h:8330) is true for DELETE too, so a DELETE
+/// `expect_content` (httplib.h v0.59.0:10058-10064) is true for DELETE too, so a DELETE
 /// carrying an UNDECLARED body is admitted here — today harmlessly, because
 /// with `CPPHTTPLIB_SSL_ENABLED` that path returns without reading, which is
 /// an accidental dependency on a build flag rather than a bound. Closing it
@@ -844,16 +915,16 @@ template <typename Req>
 /// `oversize = !unmeasurable && content_length > cap`, so the BROAD rule
 /// suppressed the size check: `Transfer-Encoding: identity` plus a
 /// `Content-Length` of 8 MiB was admitted on every class whose
-/// `requires_measurable` is false, 24 of 25, including the
+/// `requires_measurable` is false, including the
 /// health probes — because httplib honours an exact `chunked` and NOTHING
 /// else, falling through to `Content-Length` and reading every byte. The gate
 /// discarded a length httplib was about to act on. Verified on a raw socket
 /// against the real vendored httplib.
 ///
-/// `is_chunked` MUST come from httplib's own `is_chunked_transfer_encoding`,
-/// never from a local reading of the header. Third time this change was bitten
-/// by that same root cause — `Content-Encoding` and the `Content-Length`
-/// overflow parse were the first two — and all three were fixed the same way:
+/// `is_chunked` MUST come from httplib's own decision, through `is_chunked_for_body_cap`
+/// (body_cap_httplib.hpp), never from a local reading of the header. Third time this
+/// change was bitten by that same root cause (`Content-Encoding` and the `Content-Length`
+/// overflow parse were the first two), and all three were fixed the same way:
 /// ask httplib instead of re-deciding.
 [[nodiscard]] inline bool content_length_is_authoritative(bool has_content_length,
                                                           bool is_chunked) noexcept {
@@ -976,15 +1047,18 @@ inline int64_t now_epoch_seconds() {
 
 /// Format epoch seconds as RFC 3339 / ISO 8601 in UTC: "YYYY-MM-DDTHH:MM:SSZ".
 /// Used in `title=` attributes so operators can copy a precise timestamp.
-/// Returns "—" for non-positive input (sentinel "never").
+/// Returns "—" (sentinel "never") for non-positive input and for a value past year 9999
+/// (253402300799) on every platform, and past year 3000 (32535215999) on Windows, where the
+/// platform conversion fails.
 inline std::string format_iso_utc(int64_t epoch_secs) {
-    if (epoch_secs <= 0) return "—";
+    static_assert(sizeof(std::time_t) >= 8, "the year-9999 bound makes the time_t cast lossless only on a 64-bit time_t");
+    if (epoch_secs <= 0 || epoch_secs > 253402300799LL) return "—";
     std::time_t t = static_cast<std::time_t>(epoch_secs);
     std::tm tm_val{};
 #ifdef _WIN32
-    gmtime_s(&tm_val, &t);
+    if (gmtime_s(&tm_val, &t) != 0) return "—";
 #else
-    gmtime_r(&t, &tm_val);
+    if (gmtime_r(&t, &tm_val) == nullptr) return "—";
 #endif
     return std::format("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
                         tm_val.tm_year + 1900, tm_val.tm_mon + 1, tm_val.tm_mday,
@@ -1152,5 +1226,78 @@ inline std::string render_duration_bar_html(int64_t duration_ms,
         "style=\"width:{}%\" role=\"img\" aria-label=\"{} ms\"></div>",
         status_class, pct, duration_ms);
 }
+
+
+/// True when the request carries a `Transfer-Encoding` header line of ANY value, including an
+/// empty one. `get_header_value` reads only the FIRST such line, while httplib decides on the
+/// LAST token of the LAST line (`is_chunked_transfer_encoding`), so a request sent as an empty
+/// `Transfer-Encoding:` line followed by `Transfer-Encoding: chunked` reads as "no
+/// Transfer-Encoding" through `get_header_value` and is still read as chunked by httplib. Ask
+/// this whenever the question is "does this request declare a framed body".
+template <typename Req>
+[[nodiscard]] inline bool transfer_encoding_present(const Req& req) {
+    return req.has_header("Transfer-Encoding");
+}
+
+/// The `transfer_encoding` argument `evaluate_body_cap` is given: the first line's value, or the
+/// non-empty marker "present" when the header exists but its first line is empty (see
+/// `transfer_encoding_present`). `body_unmeasurable` refuses ANY non-empty value, so the marker
+/// keeps the gate's "this body cannot be measured in advance" decision in step with httplib.
+template <typename Req>
+[[nodiscard]] inline std::string transfer_encoding_for_body_cap(const Req& req) {
+    auto value = req.get_header_value("Transfer-Encoding");
+    if (value.empty() && transfer_encoding_present(req))
+        value = "present";
+    return value;
+}
+
+/// True when the request declares a body httplib will read: a non-zero `Content-Length` (an
+/// out-of-range one reads as SIZE_MAX, see `content_length_for_body_cap`) or any
+/// `Transfer-Encoding` line. Deliberately BROAD, like `body_unmeasurable`: it only decides whether
+/// to close, so a false positive costs one keep-alive connection and a false negative leaves a
+/// body unread on a connection that stays open.
+template <typename Req>
+[[nodiscard]] inline bool declares_framed_body(const Req& req) {
+    return content_length_for_body_cap(req) > 0 || transfer_encoding_present(req);
+}
+
+
+/// WP06 F57: the ONE loopback-exemption decision for `GET /metrics`, called from server.cpp's
+/// pre-routing handler (extend, never fork). A loopback TCP peer is NOT proof of a local
+/// caller: a same-host reverse proxy, mesh sidecar or tunnel relays remote requests that the
+/// server sees as 127.0.0.1. So the exemption is an explicit opt-in (`--metrics-trust-loopback`,
+/// default OFF; the caller checks `cfg_.metrics_trust_loopback` first), and even then a request
+/// carrying forwarding evidence is treated as remote (defence in depth: a header-less proxy is
+/// NOT caught, so the operator must also block /metrics on any same-host proxy). Fails closed:
+/// an empty or unparseable peer address is not loopback. `--metrics-no-auth` is a separate,
+/// unchanged branch in the caller.
+[[nodiscard]] inline bool metrics_loopback_peer_exempt(std::string_view remote_addr,
+                                                       bool has_forwarding_header) noexcept {
+    if (has_forwarding_header)
+        return false;
+    return remote_addr == "127.0.0.1" || remote_addr == "::1";
+}
+
+/// The answer an UNAUTHENTICATED request gets from server.cpp's pre-routing handler (one copy;
+/// extend, never fork). Machine clients (`/api/*`, `/events`, `/mcp/*`, and the Prometheus
+/// scrape of `/metrics`) get a 401 JSON body: a scraper that is sent a 302 to the HTML sign-in
+/// page follows it and parses HTML. An htmx panel request gets a 401 with `HX-Redirect`, and
+/// everything else is redirected to the sign-in page. The 401 branch is tested BEFORE the htmx
+/// branch, so a request that carries `HX-Request` to a machine path still reads as a 401 JSON.
+enum class UnauthenticatedAnswer { Json401, HtmxRedirect401, SignInRedirect };
+
+[[nodiscard]] inline UnauthenticatedAnswer
+unauthenticated_answer(std::string_view path, bool has_hx_request) noexcept {
+    if (path.starts_with("/api/") || path == "/events" || path.starts_with("/mcp/") ||
+        path == "/metrics")
+        return UnauthenticatedAnswer::Json401;
+    if (has_hx_request)
+        return UnauthenticatedAnswer::HtmxRedirect401;
+    return UnauthenticatedAnswer::SignInRedirect;
+}
+
+/// Header names whose presence on a request means it passed through a proxy (WP06 F57).
+inline constexpr std::string_view kForwardingEvidenceHeaders[] = {
+    "X-Forwarded-For", "Forwarded", "X-Real-IP", "Via", "X-Forwarded-Host", "X-Forwarded-Proto"};
 
 } // namespace yuzu::server

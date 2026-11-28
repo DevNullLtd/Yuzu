@@ -24,6 +24,11 @@
 
 #include "rbac_store.hpp"
 #include "auth_routes.hpp"
+#include "pbkdf2_budget.hpp"
+#include "password_policy.hpp" // kMaxPasswordBytes
+#include "test_pbkdf2_budget_fill.hpp"
+#include "test_joining_thread.hpp"
+#include "../../../server/core/src/auth_db_sql_helpers.hpp"
 
 #include "analytics_event_store.hpp"
 #include "api_token_store.hpp"
@@ -31,12 +36,20 @@
 #include "test_api_token_pg_helper.hpp" // ApiTokenStorePg — PR 4.1 PG port
 #include "audit_store.hpp"
 #include "credential_change_owner.hpp"
+#include "mfa_factor_state.hpp" // judge_local_mfa_binding: is the stored proof bound (#6079)
 #include "session_store.hpp"
 #include "pg/pg_pool.hpp"
+#include "test_approver_route_fixture.hpp" // the real approval routes behind the real approver gate
 #include "test_route_sink.hpp"
+#include "../test_log_capture.hpp" // F20: LogCapture / stray_control_bytes
 #include "../../../server/core/src/totp.hpp"
 #include "test_auth_db_pg_helper.hpp"
+#include "test_forced_csprng_failure.hpp"
+#include "test_pg_fault_triggers.hpp"
+#include "source_scan.hpp"
+#include "../../../server/core/src/mfa_entropy_signal.hpp"
 #include "pg/pg_raii.hpp"
+#include <yuzu/metrics.hpp>
 #include <yuzu/server/auth.hpp>
 #include <yuzu/server/auth_db.hpp>
 #include <yuzu/server/server.hpp>
@@ -46,15 +59,21 @@
 
 #include <libpq-fe.h>
 
+#include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <filesystem>
+#include <future>
+#include <fstream>
 #include <memory>
 #include <optional>
 #include <shared_mutex>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -102,6 +121,13 @@ struct AuthRoutesHarness {
     // #4966: the last-Administrator guard AuthManager::remove_user/update_role now require (fail
     // closed without it), built on the same pool: the production composition.
     std::unique_ptr<yuzu::server::RbacStore> rbac_guard;
+    // The durable session store on the same pool: the production shape, and what the #6079 proof
+    // binding needs (the carried generation and instant are stored and read back through it).
+    // Declared before auth_mgr, which borrows it.
+    std::unique_ptr<SessionStore> sessions;
+    // #6995: the registry the MFA counters land in. Declared BEFORE auth_mgr, which holds a raw
+    // pointer to it, so it is destroyed after.
+    yuzu::MetricsRegistry metrics;
     // Declared AFTER auth_db and rbac_guard on purpose: it borrows both, so it must be destroyed
     // first (members are destroyed in reverse order of declaration).
     auth::AuthManager auth_mgr{};
@@ -138,6 +164,7 @@ struct AuthRoutesHarness {
         cfg.https_enabled = false; // no Secure cookie suffix
 
         auth_mgr.load_config(cfg.auth_config_path);
+        auth_mgr.set_metrics_registry(&metrics);
         REQUIRE(auth_mgr.upsert_user("admin", "adminpassword1", auth::Role::admin));
         REQUIRE(auth_mgr.upsert_user("alice", "alicepassword1", auth::Role::user));
         // Mirror users into AuthDB so verify_password's "still active in
@@ -163,6 +190,9 @@ struct AuthRoutesHarness {
         rbac_guard = std::make_unique<yuzu::server::RbacStore>(auth_db.pool());
         REQUIRE(rbac_guard->is_open());
         auth_mgr.set_rbac_store(rbac_guard.get());
+        sessions = std::make_unique<SessionStore>(auth_db.pool());
+        REQUIRE(sessions->is_open());
+        auth_mgr.set_session_store(sessions.get());
         // A second active admin: cases that demote/remove an admin test the write path, not the
         // last-Administrator refusal (that has its own cases).
         REQUIRE(auth_db->upsert_user("spare_admin", "hash", "salt", auth::Role::admin).has_value());
@@ -291,6 +321,20 @@ void corrupt_secret(const std::string& dsn, const std::string& username) {
 
 } // namespace
 
+/// `auth.users.mfa_enrolled_at` as epoch milliseconds, read from the column (0 = not enrolled).
+static std::int64_t enrolled_ms(yuzu::test::AuthDbPg& auth_db, const std::string& user) {
+    auto lease = auth_db.pool().acquire();
+    REQUIRE(lease);
+    auto r = yuzu::server::pg::exec_params(
+        lease.get(),
+        "SELECT COALESCE((extract(epoch from mfa_enrolled_at)*1000)::bigint, 0) "
+        "FROM auth.users WHERE username = $1",
+        std::vector<std::string>{user});
+    REQUIRE(r.status() == PGRES_TUPLES_OK);
+    REQUIRE(PQntuples(r.get()) == 1);
+    return std::strtoll(PQgetvalue(r.get(), 0, 0), nullptr, 10);
+}
+
 TEST_CASE("POST /login no-MFA success returns 200 + session cookie + auth.login audit",
           "[pg][mfa][routes][auth_routes]") {
     AuthRoutesHarness h;
@@ -365,8 +409,9 @@ TEST_CASE("POST /login for an ENROLLED user with an unreadable MFA secret fails 
     // backoff hint — a Retry-After header AND a retry_after_ms body field — so
     // a client/LB backs off instead of hammering a degraded store. (The
     // reason-labelled yuzu_auth_read_degrade_total counter is exercised at the
-    // store layer + server metric wiring; this harness wires no
-    // MetricsRegistry, so the handler's null-guarded increment is inert here.)
+    // store layer + server metric wiring; since #6995 this harness does wire a
+    // MetricsRegistry, and the enrolment-path counters are asserted at the end of
+    // this file.)
     CHECK(res->get_header_value("Retry-After") == "2");
     CHECK(res->body.find(R"("retry_after_ms":2000)") != std::string::npos);
     // No session was minted on ANY path — the terminal auth.login row never
@@ -542,7 +587,7 @@ TEST_CASE("POST /login/mfa with valid recovery code emits mfa.recovery_code.used
     // is consumed inside enroll_mfa via mfa_verify_enrollment which
     // returned them, but we discarded the return — regenerate gives a
     // clean batch we own).
-    auto codes = h.auth_db->mfa_regenerate_recovery_codes("admin");
+    auto codes = h.auth_db->mfa_regenerate_recovery_codes("admin", std::nullopt);
     REQUIRE(codes.has_value());
     REQUIRE_FALSE(codes->empty());
     auto recovery = codes->front();
@@ -583,7 +628,7 @@ TEST_CASE("POST /login/mfa recovery-code path still audits mfa.recovery_code.use
           "[pg][mfa][routes][auth_routes]") {
     AuthRoutesHarness h;
     h.enroll_mfa("admin");
-    auto codes = h.auth_db->mfa_regenerate_recovery_codes("admin");
+    auto codes = h.auth_db->mfa_regenerate_recovery_codes("admin", std::nullopt);
     REQUIRE(codes.has_value());
     REQUIRE_FALSE(codes->empty());
     auto recovery = codes->front();
@@ -691,7 +736,7 @@ TEST_CASE("POST /login/mfa strict shape gate routes non-6-digit to recovery path
           "[pg][mfa][routes][auth_routes]") {
     AuthRoutesHarness h;
     h.enroll_mfa("admin");
-    auto codes = h.auth_db->mfa_regenerate_recovery_codes("admin");
+    auto codes = h.auth_db->mfa_regenerate_recovery_codes("admin", std::nullopt);
     REQUIRE(codes.has_value());
 
     auto step1 = h.sink.Post("/login",
@@ -827,7 +872,7 @@ TEST_CASE(
     "[pg][mfa][stepup][routes]") {
     AuthRoutesHarness h;
     auto secret = h.enroll_mfa("admin");
-    auto codes = h.auth_db->mfa_regenerate_recovery_codes("admin");
+    auto codes = h.auth_db->mfa_regenerate_recovery_codes("admin", std::nullopt);
     REQUIRE(codes.has_value());
     REQUIRE_FALSE(codes->empty());
     auto recovery = codes->front();
@@ -1116,6 +1161,70 @@ TEST_CASE("POST /login/mfa/enroll for an already-enrolled account audits mfa.enr
     // Audited as a race, NOT mislabelled as a rejected-code attempt or an outage.
     CHECK(h.count_audits("mfa.enroll.race", "alice") >= 1);
     CHECK(h.count_audits("mfa.enroll.failed", "alice") == 0);
+}
+
+TEST_CASE("POST /login/mfa/enroll answers 409 and audits mfa.enroll.cancelled when a concurrent "
+          "disable lands mid-verify, not a 503 store outage (#3808)",
+          "[pg][mfa][enroll][routes][auth_routes]") {
+    // The REAL race, not a simulation: a committed MFA disable lands between this verify's
+    // secret load and its guarded UPDATE (run_enroll_verify_race queues the UPDATE behind a row
+    // lock, commits the disable, and releases it). The store grades that
+    // MfaEnrollmentCancelled; before #3808 it was WriteFailed, which is_store_unavailable()
+    // routed to a false 503 + yuzu_auth_secret_unavailable_total + a kCritical audit.
+    AuthRoutesHarness h;
+    h.cfg.mfa_enforcement = "required";
+    auto step1 =
+        h.sink.Post("/login", form({{"username", "alice"}, {"password", "alicepassword1"}}),
+                    "application/x-www-form-urlencoded");
+    REQUIRE(step1->status == 202);
+    auto body = nlohmann::json::parse(step1->body);
+    const std::string pending = body.at("mfa_pending_token");
+    const std::string secret = body.at("secret_base32");
+    const std::string code = h.totp_at(secret, 0);
+    const auto enroll_body = form({{"mfa_pending_token", pending}, {"code", code}});
+
+    std::unique_ptr<httplib::Response> step2;
+    REQUIRE(yuzu::test::run_enroll_verify_race(
+        h.auth_db.dsn(), "alice",
+        {"UPDATE auth.users SET mfa_totp_secret = NULL, mfa_enrolled_at = NULL WHERE "
+         "username = $1"},
+        [&] {
+            step2 = h.sink.Post("/login/mfa/enroll", enroll_body,
+                                "application/x-www-form-urlencoded");
+        }));
+
+    REQUIRE(step2);
+    CHECK(step2->status == 409);                           // not 503, not 401 "wrong code"
+    CHECK(step2->body.find("cancelled") != std::string::npos);
+    CHECK(step2->get_header_value("Set-Cookie").empty()); // no session minted
+    // Audited as its own benign outcome — not a rejected code, not the already-enrolled race,
+    // and not the store-unavailable failure.
+    CHECK(h.count_audits("mfa.enroll.cancelled", "alice") >= 1);
+    CHECK(h.count_audits("mfa.enroll.failed", "alice") == 0);
+    CHECK(h.count_audits("mfa.enroll.race", "alice") == 0);
+    // The detail states only the observed fact and NEVER a cause (the stale-provisional sweep,
+    // `--mfa-reset` and a KEK rewrap reach this path with no disable); a named "disable" sends
+    // an auditor looking for an mfa.disabled row that may not exist.
+    {
+        AuditQuery q;
+        q.action = "mfa.enroll.cancelled";
+        q.principal = "alice";
+        auto rows = h.audit_store->query(q);
+        REQUIRE(rows.has_value());
+        REQUIRE(rows->size() == 1);
+        CHECK((*rows)[0].detail == "reason=provisional_secret_changed; nothing enrolled");
+        CHECK((*rows)[0].detail.find("disable") == std::string::npos);
+    }
+    // Nothing was enrolled (the account really is un-enrolled after the disable).
+    auto status = h.auth_db->mfa_status("alice");
+    REQUIRE(status.has_value());
+    CHECK_FALSE(status->enrolled);
+
+    // The pending token was spent: its provisional secret is gone, so a retry cannot reuse it.
+    auto retry = h.sink.Post("/login/mfa/enroll", enroll_body, "application/x-www-form-urlencoded");
+    REQUIRE(retry);
+    CHECK(retry->status == 401);
+    CHECK(retry->get_header_value("Set-Cookie").empty());
 }
 
 TEST_CASE("POST /login under mfa_enforcement=admin-only: admin enrolls, regular user logs in "
@@ -1443,6 +1552,70 @@ TEST_CASE("POST /login: N bad passwords locks the account, applied audit fires o
     CHECK(h.count_audits("auth.lockout.applied", "alice") == 1);
 }
 
+TEST_CASE("POST /login: a malformed username never forges a log line (F20)",
+          "[pg][mfa][routes][auth_routes][lockout][log_injection]") {
+    AuthRoutesHarness h;
+    h.cfg.auth_lockout_threshold = 3;
+    h.cfg.auth_lockout_window_secs = 900;
+
+    yuzu::test::LogCapture cap{spdlog::level::warn};
+    // %0A / %1B / %C2%9B decode to LF, ESC and the C1 CSI: AuthDB refuses the name as
+    // InvalidUsername and the failure log used to echo it raw.
+    auto r = h.sink.Post("/login",
+                         "username=bob%0A%5BWARN%5D%20forged%1B%5B2J%C2%9B31m&password=wrong",
+                         "application/x-www-form-urlencoded");
+    cap.stop();
+    REQUIRE(r);
+    CHECK(r->status == 401);
+    const std::string text = cap.text();
+    INFO(text);
+    CHECK(text.find("forged") != std::string::npos); // the line is still emitted, neutralised
+    CHECK(yuzu::test::stray_control_bytes(text) == 0);
+    CHECK(text.find("\xC2\x9B") == std::string::npos);
+}
+
+TEST_CASE("POST /login: each username-bearing log site folds the username (F20)",
+          "[pg][mfa][routes][auth_routes][log_injection]") {
+    // Each case drives ONE site and asserts that site's own line, so a regression in one cannot hide
+    // behind another. %0A %1B %C2%9B decode to LF, ESC and the C1 CSI.
+    const std::string evil = "alice%0A%5BERROR%5D%20forged%1B%5B2J%C2%9B31m";
+    const auto run = [&](const std::string& body, auto&& setup) {
+        AuthRoutesHarness h;
+        setup(h);
+        yuzu::test::LogCapture cap{spdlog::level::warn};
+        auto r = h.sink.Post("/login", body, "application/x-www-form-urlencoded");
+        cap.stop();
+        REQUIRE(r);
+        return cap.text();
+    };
+    const auto none = [](AuthRoutesHarness&) {};
+    const auto lockout = [](AuthRoutesHarness& h) {
+        h.cfg.auth_lockout_threshold = 3;
+        h.cfg.auth_lockout_window_secs = 900;
+    };
+    const auto clean = [](const std::string& text, std::string_view line) {
+        INFO(text);
+        CHECK(text.find(line) != std::string::npos);
+        CHECK(yuzu::test::stray_control_bytes(text) == 0);
+        CHECK(text.find("\xC2\x9B") == std::string::npos);
+    };
+    SECTION("auth.cpp: unknown user") {
+        clean(run("username=" + evil + "&password=wrong", none), "unknown user");
+    }
+    SECTION("auth.cpp: bad password for a real account") {
+        // Folding must not mangle a clean name: it survives verbatim.
+        const auto text = run("username=alice&password=wrong", none);
+        CHECK(text.find("bad password for 'alice'") != std::string::npos);
+        CHECK(yuzu::test::stray_control_bytes(text) == 0);
+    }
+    SECTION("auth_routes.cpp: lockout read refused for a malformed name") {
+        clean(run("username=" + evil + "&password=wrong", lockout), "lockout_status read failed");
+    }
+    SECTION("auth_routes.cpp: record_failed_login refused for a malformed name") {
+        clean(run("username=" + evil + "&password=wrong", lockout), "record_failed_login failed");
+    }
+}
+
 TEST_CASE("POST /login: locked-account 401 body is shape-identical to a bad-password 401 (no oracle)",
           "[pg][mfa][routes][auth_routes][lockout]") {
     AuthRoutesHarness h;
@@ -1540,6 +1713,11 @@ TEST_CASE("POST /login: concurrent burst for one user cannot exceed the threshol
     const int threshold = 3;
     h.cfg.auth_lockout_threshold = threshold;
     h.cfg.auth_lockout_window_secs = 900;
+    // All 16 threads share ONE remote_addr and the unauthenticated lane holds half the cap: size
+    // the PBKDF2 budget so it does not throttle this lockout-race test (it has its own tests).
+    h.auth_routes->pbkdf2_budget().set_cap(64);
+    h.auth_routes->pbkdf2_budget().set_per_source_cap(64);
+    h.auth_routes->set_stripe_waiter_cap(64); // this test is about the lockout race, not the cap
 
     constexpr int kThreads = 16;
     // Per-thread result slots (distinct indices → no synchronization needed;
@@ -1564,15 +1742,25 @@ TEST_CASE("POST /login: concurrent burst for one user cannot exceed the threshol
 
     // Every burst request was rejected (bad password OR locked) — never a
     // session minted for an out-of-budget guess.
+    // A request that waited longer than the bounded stripe wait answers 429 (it was neither
+    // verified nor counted), so the burst is 401-or-429, never a cookie.
     for (int i = 0; i < kThreads; ++i) {
-        CHECK(statuses[i] == 401);
+        CHECK((statuses[i] == 401 || statuses[i] == 429));
         CHECK(got_cookie[i] == 0);
     }
 
-    // The serialization capped verifications at exactly the threshold (without
-    // it, the racy count would exceed `threshold`).
+    // The serialization capped verifications at the threshold (without it, the racy count
+    // would exceed `threshold`) whatever number of waiters timed out.
     auto st = h.auth_db->lockout_status("alice");
     REQUIRE(st.has_value());
+    CHECK(st->failed_count <= threshold);
+    // Finish the lock deterministically (sequential attempts never time out on the stripe).
+    for (int i = 0; i < threshold && !st->locked; ++i) {
+        h.sink.Post("/login", form({{"username", "alice"}, {"password", "wrong"}}),
+                    "application/x-www-form-urlencoded");
+        st = h.auth_db->lockout_status("alice");
+        REQUIRE(st.has_value());
+    }
     CHECK(st->locked);
     CHECK(st->failed_count == threshold);
 
@@ -1787,3 +1975,1842 @@ TEST_CASE("POST /login/mfa: an old-password login challenge cannot complete afte
     REQUIRE(fresh);
     CHECK(fresh->status == 202);
 }
+
+// ---------------------------------------------------------------------------
+// #6079: the verified {generation, instant} reaches the session unchanged.
+//
+// `set_mfa_verify_barrier_for_test` fires between the verifier's return and the mint or
+// stamp it feeds. The barrier records what the verifier produced and then waits a few
+// milliseconds, so the write's own now() is strictly later than the recorded instant and
+// "the stored instant equals the recorded one" can only hold if the route CARRIED it.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+struct SeenProof {
+    std::string route;
+    LocalMfaProof proof;
+};
+
+/// Installs the recording barrier. `rotate` (optional) runs after the record, still before the
+/// mint or stamp, to change the factor in that span.
+void record_proofs(AuthRoutesHarness& h, std::vector<SeenProof>& seen,
+                   std::function<void()> rotate = {}) {
+    h.auth_routes->set_mfa_verify_barrier_for_test(
+        [&seen, rotate = std::move(rotate)](std::string_view route, const LocalMfaProof& p) {
+            seen.push_back({std::string(route), p});
+            if (rotate) {
+                rotate();
+            } else {
+                // Makes the write's now() strictly later than the recorded instant.
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            }
+        });
+}
+
+std::string pending_token_of(const httplib::Response& r) {
+    return nlohmann::json::parse(r.body).at("mfa_pending_token").get<std::string>();
+}
+
+/// The raw session token out of a `Set-Cookie: yuzu_session=<token>; ...` header.
+std::string cookie_token_of(const httplib::Response& r) {
+    const auto hdr = r.get_header_value("Set-Cookie");
+    const std::string prefix = "yuzu_session=";
+    const auto at = hdr.find(prefix);
+    REQUIRE(at != std::string::npos);
+    const auto end = hdr.find(';', at);
+    return hdr.substr(at + prefix.size(),
+                      (end == std::string::npos ? hdr.size() : end) - at - prefix.size());
+}
+
+SessionRow stored_row(AuthRoutesHarness& h, const std::string& token) {
+    auto found = h.sessions->find(auth::AuthManager::sha256_hex(token));
+    REQUIRE(found.has_value());
+    REQUIRE(found->has_value());
+    return (*found)->row;
+}
+
+/// Replace `user`'s factor: clear and re-enrol, so the generation changes twice.
+void rotate_factor(AuthRoutesHarness& h, const std::string& user) {
+    REQUIRE(h.auth_db->mfa_disable(user).has_value());
+    (void)h.enroll_mfa(user);
+}
+
+/// Password step of the two-step login; returns the pending token.
+std::string login_pending(AuthRoutesHarness& h, const std::string& user, const std::string& pw) {
+    auto step1 = h.sink.Post("/login", form({{"username", user}, {"password", pw}}),
+                             "application/x-www-form-urlencoded");
+    REQUIRE(step1);
+    REQUIRE(step1->status == 202);
+    return pending_token_of(*step1);
+}
+
+/// What a binding gate decides for the session `token` of `user`, against the live factor.
+LocalMfaBinding binding_of(AuthRoutesHarness& h, const std::string& token,
+                           const std::string& user) {
+    const auto st = h.auth_db->mfa_status(user);
+    REQUIRE(st.has_value());
+    const auto durable = h.auth_mgr.read_durable_mfa_proof(token, user);
+    return judge_local_mfa_binding(durable, st->factor_gen, st->binding_enforced).kind;
+}
+
+/// The shared plumbing assertions: one barrier record on `route`, a live generation, and the
+/// stored session carrying EXACTLY the recorded proof (so not the write's own now()).
+void check_plumbing(AuthRoutesHarness& h, const std::vector<SeenProof>& seen,
+                    std::string_view route, const std::string& token, const std::string& user) {
+    REQUIRE(seen.size() == 1);
+    CHECK(seen[0].route == route);
+    const auto& proof = seen[0].proof;
+    const auto st = h.auth_db->mfa_status(user);
+    REQUIRE(st.has_value());
+    REQUIRE(st->enrolled);
+    CHECK(proof.factor_gen > 0);
+    CHECK(proof.verified_ms > 0);
+    CHECK(proof.factor_gen == st->factor_gen); // the verified generation IS the live one
+    const auto row = stored_row(h, token);
+    CHECK(row.mfa_verified_ms == proof.verified_ms);
+    CHECK(row.mfa_factor_gen == proof.factor_gen);
+    // The barrier waited, so a stored now() would be later than the recorded instant.
+    CHECK(proof.verified_ms < st->db_now_ms);
+    CHECK(binding_of(h, token, user) == LocalMfaBinding::kBound);
+}
+
+} // namespace
+
+// ── #6995: an MFA CSPRNG fault is its own signal, not a store outage ─────────
+//
+// #4763 made these faults fail closed; #6995 makes them countable. AuthDB reports
+// `EntropyUnavailable`, the routes keep the 503 and count
+// `yuzu_secure_random_failure_total{reason=prng_failure,site}` INSTEAD of
+// `yuzu_auth_secret_unavailable_total` / `yuzu_auth_read_degrade_total` (no query failed).
+namespace {
+
+double prng_failures(AuthRoutesHarness& h, const char* site) {
+    return h.metrics
+        .counter("yuzu_secure_random_failure_total", {{"reason", "prng_failure"}, {"site", site}})
+        .value();
+}
+
+double secret_unavailable(AuthRoutesHarness& h, const char* route) {
+    return h.metrics.counter("yuzu_auth_secret_unavailable_total", {{"route", route}}).value();
+}
+
+double read_degrade(AuthRoutesHarness& h, const char* route, const char* reason) {
+    return h.metrics
+        .counter("yuzu_auth_read_degrade_total", {{"route", route}, {"reason", reason}})
+        .value();
+}
+
+} // namespace
+
+TEST_CASE("POST /login/mfa TOTP stores the verifier's generation and instant, not the mint's now() "
+          "(#6079 T5)",
+          "[pg][mfa][routes][auth_routes][binding]") {
+    AuthRoutesHarness h;
+    auto secret = h.enroll_mfa("admin");
+    std::vector<SeenProof> seen;
+    record_proofs(h, seen);
+    const auto pending = login_pending(h, "admin", "adminpassword1");
+    auto res = h.sink.Post("/login/mfa",
+                           form({{"mfa_pending_token", pending}, {"code", h.totp_at(secret)}}),
+                           "application/x-www-form-urlencoded");
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    check_plumbing(h, seen, "/login/mfa", cookie_token_of(*res), "admin");
+    CHECK(seen[0].proof.verified_ms < stored_row(h, cookie_token_of(*res)).created_at_ms);
+}
+
+TEST_CASE("POST /login/mfa recovery code stores the verifier's generation and instant (#6079 T5)",
+          "[pg][mfa][routes][auth_routes][binding]") {
+    AuthRoutesHarness h;
+    (void)h.enroll_mfa("admin");
+    auto codes = h.auth_db->mfa_regenerate_recovery_codes("admin", std::nullopt);
+    REQUIRE(codes.has_value());
+    std::vector<SeenProof> seen;
+    record_proofs(h, seen);
+    const auto pending = login_pending(h, "admin", "adminpassword1");
+    auto res =
+        h.sink.Post("/login/mfa", form({{"mfa_pending_token", pending}, {"code", codes->front()}}),
+                    "application/x-www-form-urlencoded");
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    check_plumbing(h, seen, "/login/mfa", cookie_token_of(*res), "admin");
+    CHECK(seen[0].proof.verified_ms < stored_row(h, cookie_token_of(*res)).created_at_ms);
+}
+
+TEST_CASE("POST /login/mfa/enroll stores the enrolment's generation and a pre-UPDATE instant "
+          "(#6079 T5)",
+          "[pg][mfa][enroll][routes][auth_routes][binding]") {
+    AuthRoutesHarness h;
+    h.cfg.mfa_enforcement = "required";
+    std::vector<SeenProof> seen;
+    record_proofs(h, seen);
+    auto step1 =
+        h.sink.Post("/login", form({{"username", "alice"}, {"password", "alicepassword1"}}),
+                    "application/x-www-form-urlencoded");
+    REQUIRE(step1->status == 202);
+    const auto body = nlohmann::json::parse(step1->body);
+    auto res =
+        h.sink.Post("/login/mfa/enroll",
+                    form({{"mfa_pending_token", body.at("mfa_pending_token").get<std::string>()},
+                          {"code", h.totp_at(body.at("secret_base32").get<std::string>(), 0)}}),
+                    "application/x-www-form-urlencoded");
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    check_plumbing(h, seen, "/login/mfa/enroll", cookie_token_of(*res), "alice");
+    // The instant was captured by the statement that LOADED the provisional secret, before the
+    // TOTP check and the enrolling UPDATE, so it precedes the enrolment instant (a timestamp
+    // comparison would have called this proof stale; the generation decides).
+    const auto st = h.auth_db->mfa_status("alice");
+    REQUIRE(st.has_value());
+    CHECK(seen[0].proof.verified_ms <= enrolled_ms(h.auth_db, "alice"));
+}
+
+TEST_CASE("POST /login/mfa/stepup stores the verifier's generation and instant (#6079 T5, T8)",
+          "[pg][mfa][stepup][routes][binding]") {
+    AuthRoutesHarness h;
+    auto secret = h.enroll_mfa("admin");
+    const auto cookie = login_with_mfa(h, "admin", "adminpassword1", secret);
+    const std::string token = cookie.substr(std::string("yuzu_session=").size());
+
+    // A recovery code re-proves without waiting out the TOTP replay window.
+    auto codes = h.auth_db->mfa_regenerate_recovery_codes("admin", std::nullopt);
+    REQUIRE(codes.has_value());
+    std::vector<SeenProof> seen;
+    record_proofs(h, seen);
+    auto res = h.sink.dispatch("POST", "/login/mfa/stepup", form({{"code", codes->front()}}),
+                               "application/x-www-form-urlencoded", {{"Cookie", cookie}});
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    check_plumbing(h, seen, "/login/mfa/stepup", token, "admin");
+    CHECK(h.count_audits("mfa.step_up.passed", "admin") >= 1);
+}
+
+TEST_CASE("POST /login/mfa/stepup by TOTP stores the verifier's generation and instant "
+          "(#6079 T5)",
+          "[pg][mfa][stepup][routes][binding]") {
+    AuthRoutesHarness h;
+    auto secret = h.enroll_mfa("admin");
+    const auto cookie = login_with_mfa(h, "admin", "adminpassword1", secret);
+    const std::string token = cookie.substr(std::string("yuzu_session=").size());
+    // The login consumed the current TOTP counter, so replace the factor (the session survives,
+    // now holding a proof for the OLD generation): the new secret's counters are unspent.
+    REQUIRE(h.auth_db->mfa_disable("admin").has_value());
+    const auto new_secret = h.enroll_mfa("admin");
+    REQUIRE(binding_of(h, token, "admin") == LocalMfaBinding::kMismatch);
+
+    std::vector<SeenProof> seen;
+    record_proofs(h, seen);
+    auto res =
+        h.sink.dispatch("POST", "/login/mfa/stepup", form({{"code", h.totp_at(new_secret, 1)}}),
+                        "application/x-www-form-urlencoded", {{"Cookie", cookie}});
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    check_plumbing(h, seen, "/login/mfa/stepup", token, "admin");
+}
+
+// Every `auth.login` row for `user` is a refusal, and exactly one of them carries the mint
+// refusal's cause, so a 401 for any other reason cannot satisfy the caller's assertions.
+static void check_login_refused_for_factor_change(AuthRoutesHarness& h, const std::string& user) {
+    AuditQuery q;
+    q.action = "auth.login";
+    q.principal = user;
+    const auto rows = h.audit_store->query(q);
+    REQUIRE(rows.has_value());
+    int factor_cause_rows = 0;
+    for (const auto& row : *rows) {
+        CHECK(row.result != "ok");
+        if (row.detail.find("session_mint_failed;cause=factor_changed") != std::string::npos)
+            ++factor_cause_rows;
+    }
+    CHECK(factor_cause_rows == 1);
+}
+
+// A factor replaced between the verification and the session write must not leave an admissible
+// proof. Login routes: the mint is DENIED (no cookie); step-up: the stamp is CLEARED.
+TEST_CASE("a factor replaced between verification and mint denies the mint on every login route "
+          "(#6079 T5)",
+          "[pg][mfa][routes][auth_routes][binding]") {
+    AuthRoutesHarness h;
+    SECTION("/login/mfa TOTP") {
+        auto secret = h.enroll_mfa("admin");
+        std::vector<SeenProof> seen;
+        record_proofs(h, seen, [&h] { rotate_factor(h, "admin"); });
+        const auto pending = login_pending(h, "admin", "adminpassword1");
+        auto res = h.sink.Post("/login/mfa",
+                               form({{"mfa_pending_token", pending}, {"code", h.totp_at(secret)}}),
+                               "application/x-www-form-urlencoded");
+        REQUIRE(res);
+        CHECK(res->status == 401);
+        CHECK(res->get_header_value("Set-Cookie").empty());
+        REQUIRE(seen.size() == 1);
+        CHECK(seen[0].proof.factor_gen != h.auth_db->mfa_status("admin")->factor_gen);
+        // The code was genuinely consumed, so its true row stands; the login row is an honest
+        // failure.
+        CHECK(h.count_audits("mfa.login.verified", "admin") == 1);
+        check_login_refused_for_factor_change(h, "admin");
+    }
+    SECTION("/login/mfa recovery code") {
+        (void)h.enroll_mfa("admin");
+        auto codes = h.auth_db->mfa_regenerate_recovery_codes("admin", std::nullopt);
+        REQUIRE(codes.has_value());
+        std::vector<SeenProof> seen;
+        record_proofs(h, seen, [&h] { rotate_factor(h, "admin"); });
+        const auto pending = login_pending(h, "admin", "adminpassword1");
+        auto res = h.sink.Post("/login/mfa",
+                               form({{"mfa_pending_token", pending}, {"code", codes->front()}}),
+                               "application/x-www-form-urlencoded");
+        REQUIRE(res);
+        CHECK(res->status == 401);
+        CHECK(res->get_header_value("Set-Cookie").empty());
+        CHECK(h.count_audits("mfa.recovery_code.used", "admin") == 1);
+        check_login_refused_for_factor_change(h, "admin");
+    }
+    SECTION("/login/mfa/enroll") {
+        h.cfg.mfa_enforcement = "required";
+        auto step1 =
+            h.sink.Post("/login", form({{"username", "alice"}, {"password", "alicepassword1"}}),
+                        "application/x-www-form-urlencoded");
+        REQUIRE(step1->status == 202);
+        const auto body = nlohmann::json::parse(step1->body);
+        std::vector<SeenProof> seen;
+        record_proofs(h, seen, [&h] { rotate_factor(h, "alice"); });
+        auto res = h.sink.Post(
+            "/login/mfa/enroll",
+            form({{"mfa_pending_token", body.at("mfa_pending_token").get<std::string>()},
+                  {"code", h.totp_at(body.at("secret_base32").get<std::string>(), 0)}}),
+            "application/x-www-form-urlencoded");
+        REQUIRE(res);
+        CHECK(res->status == 401);
+        CHECK(res->get_header_value("Set-Cookie").empty());
+        // The one-time codes are withheld with the session.
+        CHECK(res->body.find("recovery_codes") == std::string::npos);
+        CHECK(h.count_audits("mfa.enroll.verified", "alice") == 1);
+        check_login_refused_for_factor_change(h, "alice");
+    }
+}
+
+TEST_CASE("a factor replaced between step-up verification and the stamp clears the stamp "
+          "(#6079 T5)",
+          "[pg][mfa][stepup][routes][binding]") {
+    AuthRoutesHarness h;
+    auto secret = h.enroll_mfa("admin");
+    const auto cookie = login_with_mfa(h, "admin", "adminpassword1", secret);
+    const std::string token = cookie.substr(std::string("yuzu_session=").size());
+    auto codes = h.auth_db->mfa_regenerate_recovery_codes("admin", std::nullopt);
+    REQUIRE(codes.has_value());
+
+    // The hook must NOT delete the session: a vanished row would never reach the recheck.
+    std::vector<SeenProof> seen;
+    record_proofs(h, seen, [&h] { rotate_factor(h, "admin"); });
+    auto res = h.sink.dispatch("POST", "/login/mfa/stepup", form({{"code", codes->front()}}),
+                               "application/x-www-form-urlencoded", {{"Cookie", cookie}});
+    REQUIRE(res);
+    CHECK(res->status == 401);
+    CHECK(res->body.find("MFA step-up failed") != std::string::npos);
+    REQUIRE(seen.size() == 1);
+    CHECK(h.count_audits("mfa.step_up.passed", "admin") == 0);
+    AuditQuery q;
+    q.action = "mfa.step_up.failed";
+    q.principal = "admin";
+    const auto rows = h.audit_store->query(q);
+    REQUIRE(rows.has_value());
+    bool saw = false;
+    for (const auto& row : *rows)
+        saw = saw || row.detail == "factor_changed_during_step_up";
+    CHECK(saw);
+
+    // The stamp is gone (or, were the clear to fail, bound to the OLD generation): never a
+    // proof the new factor's gates accept.
+    const auto durable = h.auth_mgr.read_durable_mfa_proof(token, "admin");
+    CHECK(durable.mfa_verified_ms == 0);
+    CHECK(durable.mfa_factor_gen == 0);
+    CHECK(binding_of(h, token, "admin") != LocalMfaBinding::kBound);
+}
+
+TEST_CASE("a session-store error while recording a valid step-up is a 503 with no retry hint, "
+          "and admits nothing (#6079)",
+          "[pg][mfa][stepup][routes][binding]") {
+    AuthRoutesHarness h;
+    auto secret = h.enroll_mfa("admin");
+    const auto cookie = login_with_mfa(h, "admin", "adminpassword1", secret);
+    const std::string token = cookie.substr(std::string("yuzu_session=").size());
+    auto codes = h.auth_db->mfa_regenerate_recovery_codes("admin", std::nullopt);
+    REQUIRE(codes.has_value());
+
+    // Hold the account's row lock from a separate connection between the verifier and the
+    // stamp: the stamp's factor recheck cannot read the generation inside its lock_timeout,
+    // which is a store error (not a verdict) and fails closed.
+    yuzu::server::pg::PgConn holder{PQconnectdb(h.auth_db.dsn().c_str())};
+    REQUIRE(PQstatus(holder.get()) == CONNECTION_OK);
+    std::vector<SeenProof> seen;
+    record_proofs(h, seen, [&holder] {
+        REQUIRE(yuzu::server::pg::exec_params(holder.get(), "BEGIN", std::vector<std::string>{})
+                    .status() == PGRES_COMMAND_OK);
+        REQUIRE(yuzu::server::pg::exec_params(
+                    holder.get(), "SELECT 1 FROM auth.users WHERE username = $1 FOR UPDATE",
+                    std::vector<std::string>{"admin"})
+                    .status() == PGRES_TUPLES_OK);
+    });
+    auto res = h.sink.dispatch("POST", "/login/mfa/stepup", form({{"code", codes->front()}}),
+                               "application/x-www-form-urlencoded", {{"Cookie", cookie}});
+    yuzu::server::pg::exec_params(holder.get(), "ROLLBACK", std::vector<std::string>{});
+    REQUIRE(res);
+    CHECK(res->status == 503); // an outage is not a bad credential
+    // The code is already spent, so a retry with the same code is a replay: the envelope says
+    // to wait for the next code and carries NO retry hint (a null retry_after_ms).
+    const auto body = nlohmann::json::parse(res->body, nullptr, false);
+    REQUIRE_FALSE(body.is_discarded());
+    CHECK(
+        body["error"]["message"].get<std::string>() ==
+        "Your code was accepted but could not be recorded. Wait for the next code and try again.");
+    CHECK(body["error"]["retry_after_ms"].is_null());
+    CHECK(res->body.find("MFA step-up failed") == std::string::npos);
+    CHECK(res->body.find("Invalid verification code") == std::string::npos);
+    CHECK(h.count_audits("mfa.step_up.passed", "admin") == 0);
+    AuditQuery q;
+    q.action = "mfa.step_up.failed";
+    q.principal = "admin";
+    const auto rows = h.audit_store->query(q);
+    REQUIRE(rows.has_value());
+    bool saw = false;
+    for (const auto& row : *rows)
+        saw = saw || row.detail == "step_up_proof_store_error";
+    CHECK(saw);
+
+    // Nothing was admitted: the stamp is cleared, never a proof a gate accepts.
+    const auto durable = h.auth_mgr.read_durable_mfa_proof(token, "admin");
+    CHECK(durable.mfa_verified_ms == 0);
+    CHECK(binding_of(h, token, "admin") != LocalMfaBinding::kBound);
+}
+
+// `durable_mfa_proof_for` is the one place a gate turns a request into a stored-proof read.
+TEST_CASE("AuthRoutes::durable_mfa_proof_for reads the request's own local session only "
+          "(#6079)",
+          "[pg][mfa][routes][auth_routes][binding]") {
+    AuthRoutesHarness h;
+    auto secret = h.enroll_mfa("admin");
+    const auto cookie = login_with_mfa(h, "admin", "adminpassword1", secret);
+    const std::string token = cookie.substr(std::string("yuzu_session=").size());
+
+    httplib::Request req;
+    req.set_header("Cookie", cookie);
+    const auto session = h.auth_mgr.validate_session(token);
+    REQUIRE(session.has_value());
+
+    SECTION("a local cookie session answers its stored, bound proof") {
+        const auto durable = h.auth_routes->durable_mfa_proof_for(req, *session);
+        CHECK(durable.source == auth::DurableMfaProof::Source::kRow);
+        CHECK(durable.mfa_verified_ms > 0);
+        CHECK(durable.mfa_factor_gen == h.auth_db->mfa_status("admin")->factor_gen);
+    }
+    SECTION("a bearer, OIDC or SAML session never reaches the store") {
+        for (const char* source : {"api_token", "mcp_token", "oidc", "saml"}) {
+            auto other = *session;
+            other.auth_source = source;
+            CHECK(h.auth_routes->durable_mfa_proof_for(req, other).source ==
+                  auth::DurableMfaProof::Source::kAbsent);
+        }
+    }
+    SECTION("a cookie that is another principal's, or missing, is kAbsent") {
+        auto other = *session;
+        other.username = "alice";
+        CHECK(h.auth_routes->durable_mfa_proof_for(req, other).source ==
+              auth::DurableMfaProof::Source::kAbsent);
+        httplib::Request bare;
+        CHECK(h.auth_routes->durable_mfa_proof_for(bare, *session).source ==
+              auth::DurableMfaProof::Source::kAbsent);
+    }
+}
+
+// A latched rebind guard is a LOCAL-binding fault: `durable_mfa_proof_for` (the local read the
+// generic gates and the local approver use) answers unavailable and counts the degrade, while the
+// raw `read_durable_mfa_proof` (the OIDC approver arm in server.cpp) still hands back the row, so
+// an SSO approver with a fresh IdP proof is not refused for it (the binding does not apply to SSO).
+TEST_CASE("a latched rebind guard makes the local proof read unavailable and leaves the raw read "
+          "(the OIDC approver arm) alone (#6079 K1)",
+          "[pg][mfa][routes][auth_routes][binding][approval_routes]") {
+    AuthRoutesHarness h;
+    auto& metrics = h.metrics; // the harness registry, which outlives auth_mgr
+    auto secret = h.enroll_mfa("admin");
+    const auto cookie = login_with_mfa(h, "admin", "adminpassword1", secret);
+    const std::string token = cookie.substr(std::string("yuzu_session=").size());
+    httplib::Request req;
+    req.set_header("Cookie", cookie);
+    const auto session = h.auth_mgr.validate_session(token);
+    REQUIRE(session.has_value());
+
+    // Production-shaped read, as server.cpp binds it: an OIDC session reads the row directly, a
+    // local one through the chokepoint.
+    auto fx_for = [&](bool oidc_arm) {
+        return std::make_unique<yuzu::test::ApproverRouteFixture>(
+            h.auth_mgr, *h.auth_db.get(),
+            [&h, oidc_arm](const httplib::Request& r, const auth::Session& s) {
+                return oidc_arm ? h.auth_mgr.read_durable_mfa_proof(
+                                      AuthRoutes::extract_session_cookie(r), s.username)
+                                : h.auth_routes->durable_mfa_proof_for(r, s);
+            });
+    };
+
+    // Latch it: validate on every read, then take the trigger away.
+    h.sessions->set_binding_validation_memo_for_test(std::chrono::milliseconds{0});
+    {
+        auto lease = h.auth_db.pool().acquire();
+        REQUIRE(lease);
+        auto r = yuzu::server::pg::exec_params(
+            lease.get(),
+            "ALTER TABLE session_store.sessions DISABLE TRIGGER sessions_mfa_rebind_guard",
+            std::vector<std::string>{});
+        REQUIRE(r.status() == PGRES_COMMAND_OK);
+    }
+
+    // The raw read (what the OIDC arm calls) still returns the row: not refused for the guard.
+    const auto raw = h.auth_mgr.read_durable_mfa_proof(token, "admin");
+    CHECK(raw.source == auth::DurableMfaProof::Source::kRow);
+    CHECK(raw.mfa_verified_ms > 0);
+    CHECK_FALSE(h.sessions->rebind_guard_ok());
+
+    const auto degrade = [&] {
+        return metrics.counter("yuzu_auth_session_store_degrade_total", {{"op", "rebind_guard"}})
+            .value();
+    };
+    const double before = degrade();
+    CHECK(h.auth_routes->durable_mfa_proof_for(req, *session).source ==
+          auth::DurableMfaProof::Source::kUnavailable);
+    CHECK(degrade() == before + 1.0); // counted once, at the one site that counts it
+
+    // Through the real approver gate: the local arm is a 503 (mfa_proof_unavailable), the
+    // direct-read arm decides the ticket.
+    {
+        auto fx = fx_for(false);
+        const auto ticket = fx->submit();
+        auto res = fx->decide("approve", ticket, token);
+        REQUIRE(res);
+        CHECK(res->status == 503);
+        CHECK(fx->status_of(ticket) == "pending");
+        // The latched guard lasts until an operator repairs it and restarts: no retry hint.
+        const auto body = nlohmann::json::parse(res->body);
+        CHECK(body.at("error").at("retry_after_ms").is_null());
+        CHECK(res->body.find("retry the request") == std::string::npos);
+    }
+    {
+        auto fx = fx_for(true);
+        const auto ticket = fx->submit();
+        auto res = fx->decide("approve", ticket, token);
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        CHECK(fx->status_of(ticket) == "approved");
+    }
+}
+
+// One catalog validation that cannot run is a TRANSIENT, per-read fault: the local proof read is
+// refused as unavailable with the retry hint and counted as a `validate` degrade (never as the
+// sticky `rebind_guard` latch), the raw read the OIDC arm uses still returns the row, and the next
+// read validates afresh and passes.
+TEST_CASE("an inconclusive rebind-guard validation refuses that one local proof read and no "
+          "other (#6079)",
+          "[pg][mfa][routes][auth_routes][binding][approval_routes]") {
+    AuthRoutesHarness h;
+    auto& metrics = h.metrics; // the harness registry, which outlives auth_mgr
+    auto secret = h.enroll_mfa("admin");
+    const auto cookie = login_with_mfa(h, "admin", "adminpassword1", secret);
+    const std::string token = cookie.substr(std::string("yuzu_session=").size());
+    httplib::Request req;
+    req.set_header("Cookie", cookie);
+    const auto session = h.auth_mgr.validate_session(token);
+    REQUIRE(session.has_value());
+
+    auto fx_for = [&](bool oidc_arm) {
+        return std::make_unique<yuzu::test::ApproverRouteFixture>(
+            h.auth_mgr, *h.auth_db.get(),
+            [&h, oidc_arm](const httplib::Request& r, const auth::Session& s) {
+                return oidc_arm ? h.auth_mgr.read_durable_mfa_proof(
+                                      AuthRoutes::extract_session_cookie(r), s.username)
+                                : h.auth_routes->durable_mfa_proof_for(r, s);
+            });
+    };
+    const auto degrade = [&](const char* op) {
+        return metrics.counter("yuzu_auth_session_store_degrade_total", {{"op", op}}).value();
+    };
+
+    h.sessions->set_binding_validation_memo_for_test(std::chrono::milliseconds{0});
+    h.sessions->set_binding_validation_inconclusive_for_test(true);
+
+    // The raw read serves the row and says its binding was not confirmed.
+    const auto raw = h.auth_mgr.read_durable_mfa_proof(token, "admin");
+    CHECK(raw.source == auth::DurableMfaProof::Source::kRow);
+    CHECK(raw.guard_unverified);
+    CHECK(h.sessions->rebind_guard_ok());
+
+    const double validate_before = degrade("validate");
+    const double latch_before = degrade("rebind_guard");
+    const auto local = h.auth_routes->durable_mfa_proof_for(req, *session);
+    CHECK(local.source == auth::DurableMfaProof::Source::kUnavailable);
+    CHECK_FALSE(local.binding_untrusted); // transient: the caller keeps its retry hint
+    CHECK(degrade("validate") == validate_before + 1.0);
+    CHECK(degrade("rebind_guard") == latch_before);
+
+    {
+        auto fx = fx_for(false);
+        const auto ticket = fx->submit();
+        auto res = fx->decide("approve", ticket, token);
+        REQUIRE(res);
+        CHECK(res->status == 503);
+        CHECK(fx->status_of(ticket) == "pending");
+        const auto body = nlohmann::json::parse(res->body);
+        CHECK(body.at("error").at("retry_after_ms") == 5000);
+    }
+    { // an SSO approver's direct read is not refused for it
+        auto fx = fx_for(true);
+        const auto ticket = fx->submit();
+        auto res = fx->decide("approve", ticket, token);
+        REQUIRE(res);
+        CHECK(res->status == 200);
+    }
+
+    // The next read validates afresh: the local approver is admitted again, and a confirmed read
+    // counts no degrade.
+    h.sessions->set_binding_validation_inconclusive_for_test(false);
+    const double validate_unverified = degrade("validate");
+    {
+        auto fx = fx_for(false);
+        const auto ticket = fx->submit();
+        auto res = fx->decide("approve", ticket, token);
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        CHECK(fx->status_of(ticket) == "approved");
+    }
+    CHECK(degrade("validate") == validate_unverified);
+}
+
+// Enrol then approve at once, through the real enrolment route and the real approval route:
+// the proof's instant precedes mfa_enrolled_at (it was captured before the enrolling UPDATE),
+// which the generation-bound approver gate admits by equality. This is the route-level proof for
+// the /login/mfa/enroll path; the Settings path is the sibling case in test_settings_routes_mfa.cpp
+// and the hand-stamped one is test_approval_routes.cpp's I14.
+TEST_CASE("enrol via /login/mfa/enroll then approve at once passes the real approver gate "
+          "(#6079 T18)",
+          "[pg][mfa][enroll][routes][auth_routes][binding][approval_routes]") {
+    AuthRoutesHarness h;
+    h.cfg.mfa_enforcement = "required";
+    yuzu::test::ApproverRouteFixture fx(h.auth_mgr, *h.auth_db.get(),
+                                        [&h](const httplib::Request& req, const auth::Session& s) {
+                                            return h.auth_routes->durable_mfa_proof_for(req, s);
+                                        });
+
+    std::vector<SeenProof> seen;
+    record_proofs(h, seen);
+    auto step1 =
+        h.sink.Post("/login", form({{"username", "admin"}, {"password", "adminpassword1"}}),
+                    "application/x-www-form-urlencoded");
+    REQUIRE(step1->status == 202);
+    const auto body = nlohmann::json::parse(step1->body);
+    auto enrol =
+        h.sink.Post("/login/mfa/enroll",
+                    form({{"mfa_pending_token", body.at("mfa_pending_token").get<std::string>()},
+                          {"code", h.totp_at(body.at("secret_base32").get<std::string>(), 0)}}),
+                    "application/x-www-form-urlencoded");
+    REQUIRE(enrol);
+    REQUIRE(enrol->status == 200);
+    const auto token = cookie_token_of(*enrol);
+    REQUIRE(seen.size() == 1);
+    const auto st = h.auth_db->mfa_status("admin");
+    REQUIRE(st.has_value());
+    // the case the timestamp rule refused
+    REQUIRE(seen[0].proof.verified_ms <= enrolled_ms(h.auth_db, "admin"));
+
+    const auto approve_ticket = fx.submit();
+    auto approved = fx.decide("approve", approve_ticket, token);
+    REQUIRE(approved);
+    CHECK(approved->status == 200);
+    CHECK(fx.status_of(approve_ticket) == "approved");
+    const auto reject_ticket = fx.submit();
+    auto rejected = fx.decide("reject", reject_ticket, token);
+    REQUIRE(rejected);
+    CHECK(rejected->status == 200);
+    CHECK(fx.status_of(reject_ticket) == "rejected");
+}
+
+TEST_CASE("POST /login enrol-init on a CSPRNG fault: 503, counted as mfa_enroll prng_failure, "
+          "not as a store outage (#6995)",
+          "[pg][mfa][enroll][routes][auth_routes][fail-closed]") {
+    AuthRoutesHarness h;
+    h.cfg.mfa_enforcement = "required";
+    auto res = [&] {
+        yuzu::test::ForcedCsprngFailure forced;
+        auto r = h.sink.Post("/login", form({{"username", "alice"}, {"password", "alicepassword1"}}),
+                             "application/x-www-form-urlencoded");
+        // Proves the TOTP-secret draw was reached and consumed the hook, so the 503 below is
+        // the CSPRNG path and not an unrelated earlier failure.
+        REQUIRE_FALSE(yuzu::server::test_hooks::is_failure_forced_for_this_thread());
+        return r;
+    }();
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    CHECK(res->get_header_value("Set-Cookie").empty());
+    CHECK(res->body.find(R"("otpauth_uri")") == std::string::npos);
+    CHECK(h.count_audits("mfa.enroll.required", "alice") >= 1);
+
+    CHECK(prng_failures(h, "mfa_enroll") == 1.0);
+    CHECK(prng_failures(h, "mfa_recovery") == 0.0);
+    // The misattribution being removed: no store-outage counter moves.
+    CHECK(secret_unavailable(h, "login") == 0.0);
+    CHECK(read_degrade(h, "login", "query_error") == 0.0);
+
+    // Nothing was written: the retry enrols normally.
+    auto retry = h.sink.Post("/login", form({{"username", "alice"}, {"password", "alicepassword1"}}),
+                             "application/x-www-form-urlencoded");
+    REQUIRE(retry);
+    CHECK(retry->status == 202);
+    CHECK(prng_failures(h, "mfa_enroll") == 1.0);
+}
+
+TEST_CASE("POST /login/mfa/enroll on a recovery-code CSPRNG fault: 503, enrolment rolled back, "
+          "counted as mfa_recovery prng_failure (#6995)",
+          "[pg][mfa][enroll][routes][auth_routes][fail-closed]") {
+    AuthRoutesHarness h;
+    h.cfg.mfa_enforcement = "required";
+    auto step1 = h.sink.Post("/login", form({{"username", "alice"}, {"password", "alicepassword1"}}),
+                             "application/x-www-form-urlencoded");
+    REQUIRE(step1->status == 202);
+    auto body = nlohmann::json::parse(step1->body);
+    const std::string pending = body.at("mfa_pending_token");
+    const std::string secret = body.at("secret_base32");
+    const auto code = h.totp_at(secret, 0);
+
+    auto step2 = [&] {
+        yuzu::test::ForcedCsprngFailure forced;
+        auto r = h.sink.Post("/login/mfa/enroll",
+                             form({{"mfa_pending_token", pending}, {"code", code}}),
+                             "application/x-www-form-urlencoded");
+        REQUIRE_FALSE(yuzu::server::test_hooks::is_failure_forced_for_this_thread());
+        return r;
+    }();
+    REQUIRE(step2);
+    CHECK(step2->status == 503);
+    CHECK(step2->get_header_value("Set-Cookie").empty());
+    CHECK(h.count_audits("mfa.enroll.failed", "alice") >= 1);
+    CHECK(h.count_audits("auth.login", "alice") == 0);
+
+    CHECK(prng_failures(h, "mfa_recovery") == 1.0);
+    CHECK(prng_failures(h, "mfa_enroll") == 0.0);
+    CHECK(secret_unavailable(h, "mfa_enroll") == 0.0);
+
+    // Rolled back: still not enrolled, no recovery codes.
+    auto status = h.auth_db->mfa_status("alice");
+    REQUIRE(status.has_value());
+    CHECK_FALSE(status->enrolled);
+    CHECK(status->recovery_codes_remaining == 0);
+}
+
+TEST_CASE("POST /login/mfa/enroll on a store write fault still counts as a store outage, not a "
+          "CSPRNG fault (#6995 control)",
+          "[pg][mfa][enroll][routes][auth_routes][fail-closed]") {
+    AuthRoutesHarness h;
+    h.cfg.mfa_enforcement = "required";
+    auto step1 = h.sink.Post("/login", form({{"username", "alice"}, {"password", "alicepassword1"}}),
+                             "application/x-www-form-urlencoded");
+    REQUIRE(step1->status == 202);
+    auto body = nlohmann::json::parse(step1->body);
+    const std::string pending = body.at("mfa_pending_token");
+    const auto code = h.totp_at(body.at("secret_base32"), 0);
+
+    {
+        yuzu::server::pg::PgConn conn{PQconnectdb(h.auth_db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        yuzu::server::pg::PgResult fn{PQexec(
+            conn.get(),
+            "CREATE OR REPLACE FUNCTION test_block_users_update() RETURNS trigger AS $$ "
+            "BEGIN RAISE EXCEPTION 'test-induced write failure'; END; $$ LANGUAGE plpgsql")};
+        REQUIRE(fn.ok());
+        yuzu::server::pg::PgResult trg{PQexec(
+            conn.get(), "CREATE TRIGGER test_block_users_update_trg BEFORE UPDATE ON auth.users "
+                       "FOR EACH ROW EXECUTE FUNCTION test_block_users_update()")};
+        REQUIRE(trg.ok());
+    }
+
+    auto step2 = h.sink.Post("/login/mfa/enroll",
+                             form({{"mfa_pending_token", pending}, {"code", code}}),
+                             "application/x-www-form-urlencoded");
+    REQUIRE(step2);
+    CHECK(step2->status == 503);
+    CHECK(secret_unavailable(h, "mfa_enroll") == 1.0);
+    CHECK(prng_failures(h, "mfa_enroll") == 0.0);
+    CHECK(prng_failures(h, "mfa_recovery") == 0.0);
+}
+
+// #6995: the new series must exist from boot (a first scrape and absent() alerts see 0, not a
+// missing series). The harness above creates counters on first use, so it cannot prove this;
+// pin the registration in server.cpp the way the `route="approval"` seed is pinned.
+TEST_CASE("server.cpp pre-seeds the MFA CSPRNG-failure series and route=\"mfa_recovery\" at boot "
+          "(#6995)",
+          "[mfa][routes][auth_routes][wiring]") {
+    // The site and metric names are the wire contract the docs and alerts quote.
+    CHECK(yuzu::server::mfa_entropy::kMetric == "yuzu_secure_random_failure_total");
+    CHECK(yuzu::server::mfa_entropy::kReason == "prng_failure");
+    CHECK(yuzu::server::mfa_entropy::kSiteEnroll == "mfa_enroll");
+    CHECK(yuzu::server::mfa_entropy::kSiteRecovery == "mfa_recovery");
+    // The pre-seed covers EVERY site, not only the two MFA ones (SRE-1): a series first created at
+    // its first fault starts at 1 with no earlier sample, so a lone first fault would not trip
+    // rate(...[5m]) > 0.
+    {
+        const auto& all = yuzu::server::mfa_entropy::kAllSites;
+        CHECK(all.size() == 6);
+        for (const std::string_view want : {"api_token", "api_token_htmx", "device_token",
+                                            "engine_principal", "mfa_enroll", "mfa_recovery"}) {
+            INFO(want);
+            CHECK(std::find(all.begin(), all.end(), want) != all.end());
+        }
+    }
+
+    const std::string& src = yuzu::test::source_scan::comment_free_source("server.cpp");
+
+    // (a) a seeding loop over BOTH sites, using the one header's names.
+    const auto describe = src.find("metrics_.describe(\"yuzu_secure_random_failure_total\"");
+    REQUIRE(describe != std::string::npos);
+    const auto loop = src.find("for (auto site :", describe);
+    REQUIRE(loop != std::string::npos);
+    const auto counter = src.find("metrics_.counter(std::string{mfa_entropy::kMetric}", loop);
+    REQUIRE(counter != std::string::npos);
+    const std::string seeded = src.substr(loop, counter - loop);
+    CHECK(seeded.find("mfa_entropy::kAllSites") != std::string::npos);
+    // The seed carries the reason the handlers count under; a mismatch seeds a different series.
+    const auto seed_end = src.find(");", counter);
+    REQUIRE(seed_end != std::string::npos);
+    CHECK(src.substr(counter, seed_end - counter).find("mfa_entropy::kReason") !=
+          std::string::npos);
+
+    // (b) route="mfa_recovery" is in the secret_unavailable seed loop.
+    const auto su_describe = src.find("metrics_.describe(\"yuzu_auth_secret_unavailable_total\"");
+    REQUIRE(su_describe != std::string::npos);
+    const auto su_loop = src.find("for (auto route :", su_describe);
+    REQUIRE(su_loop != std::string::npos);
+    const auto su_counter =
+        src.find("metrics_.counter(\"yuzu_auth_secret_unavailable_total\"", su_loop);
+    REQUIRE(su_counter != std::string::npos);
+    CHECK(src.substr(su_loop, su_counter - su_loop).find("\"mfa_recovery\"") !=
+          std::string::npos);
+}
+
+// The four token sites still count this metric INLINE (not through mfa_entropy::count), so the
+// kAllSites entries for them are only as good as the call sites. `labels_key` is ORDER-sensitive
+// (Labels is a vector of pairs), so a site rewritten as {site, reason} would silently create a second
+// series next to the pre-seeded one. Pin the ADJACENT `{reason, site}` text, not just the site literal.
+TEST_CASE("every pre-seeded yuzu_secure_random_failure_total token site is still emitted with the "
+          "pre-seeded label order at its call site (#6995)",
+          "[mfa][routes][auth_routes][wiring]") {
+    using yuzu::test::source_scan::comment_free_source;
+    const std::pair<const char*, const char*> kSiteFile[] = {
+        {"rest_api_v1.cpp", "api_token"},        {"mcp_server.cpp", "api_token"},
+        {"rest_api_v1.cpp", "engine_principal"}, {"rest_api_v1.cpp", "device_token"},
+        {"settings_routes.cpp", "api_token_htmx"},
+    };
+    for (const auto& [file, site] : kSiteFile) {
+        INFO(file << " " << site);
+        const std::string needle =
+            std::string("{\"reason\", \"prng_failure\"}, {\"site\", \"") + site + "\"}";
+        CHECK(comment_free_source(file).find(needle) != std::string::npos);
+    }
+}
+
+// The REVERSE direction: a fifth inline site added without touching mfa_entropy_signal.hpp would start
+// at 1 with no earlier sample, reopening the first-fault gap the pre-seed closes (SRE-1). Find EVERY
+// inline `{"reason", "prng_failure"}, {"site", "<x>"}` in server/core/src and require `<x>` to be listed
+// in kAllSites.
+TEST_CASE("every inline yuzu_secure_random_failure_total site in server/core/src is in kAllSites "
+          "(#6995)",
+          "[mfa][routes][auth_routes][wiring]") {
+    namespace fs = std::filesystem;
+    const std::string marker = "{\"reason\", \"prng_failure\"}, {\"site\", \"";
+    const auto& all = yuzu::server::mfa_entropy::kAllSites;
+    std::size_t found = 0;
+    for (const auto& entry : fs::recursive_directory_iterator(YUZU_SERVER_SRC_DIR)) {
+        if (!entry.is_regular_file())
+            continue;
+        const auto ext = entry.path().extension().string();
+        if (ext != ".cpp" && ext != ".hpp")
+            continue;
+        // Cheap prefilter on the raw bytes: only a file that mentions the reason can hold a site.
+        {
+            std::ifstream in(entry.path(), std::ios::binary);
+            std::ostringstream raw;
+            raw << in.rdbuf();
+            if (raw.str().find("prng_failure") == std::string::npos)
+                continue;
+        }
+        const auto rel = fs::relative(entry.path(), YUZU_SERVER_SRC_DIR).generic_string();
+        const std::string& src = yuzu::test::source_scan::comment_free_source(rel);
+        for (auto pos = src.find(marker); pos != std::string::npos;
+             pos = src.find(marker, pos + marker.size())) {
+            const auto start = pos + marker.size();
+            const auto end = src.find('"', start);
+            REQUIRE(end != std::string::npos);
+            const std::string_view site{src.data() + start, end - start};
+            INFO(rel << ": site \"" << site << "\"");
+            CHECK(std::find(all.begin(), all.end(), site) != all.end());
+            ++found;
+        }
+    }
+    // The four token sites (five literals across rest_api_v1.cpp, mcp_server.cpp, settings_routes.cpp
+    // = api_token x2, engine_principal, device_token, api_token_htmx). Guards against the scan going
+    // silent (e.g. the directory macro pointing somewhere empty).
+    CHECK(found >= 5);
+}
+
+TEST_CASE("POST /login enrol-init on a STORE write fault counts a store outage, not a CSPRNG fault "
+          "(#6995 control)",
+          "[pg][mfa][enroll][routes][auth_routes][fail-closed]") {
+    AuthRoutesHarness h;
+    h.cfg.mfa_enforcement = "required";
+    // Only the TOTP-secret mint changes mfa_totp_secret, so login bookkeeping is unaffected.
+    yuzu::test::block_users_update_when(h.auth_db.dsn(), "NEW.mfa_totp_secret IS DISTINCT FROM OLD.mfa_totp_secret");
+
+    auto res = h.sink.Post("/login", form({{"username", "alice"}, {"password", "alicepassword1"}}),
+                           "application/x-www-form-urlencoded");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    CHECK(res->get_header_value("Set-Cookie").empty());
+    // A real store fault keeps BOTH store counters, exactly as before #6995 ...
+    CHECK(secret_unavailable(h, "login") == 1.0);
+    CHECK(read_degrade(h, "login", "query_error") == 1.0);
+    // ... and never moves the entropy counter. This is the mutation that mattered: if the entropy
+    // test were widened to "any store-unavailable error", a database outage would page as an RNG
+    // failure.
+    CHECK(prng_failures(h, "mfa_enroll") == 0.0);
+    CHECK(prng_failures(h, "mfa_recovery") == 0.0);
+}
+
+#ifndef _WIN32
+TEST_CASE("POST /login/mfa/enroll on a recovery-code SALT-draw failure: 503, audited, counted as "
+          "mfa_recovery prng_failure, enrolment rolled back (#6995, was a bare 500)",
+          "[pg][mfa][enroll][routes][auth_routes][fail-closed]") {
+    AuthRoutesHarness h;
+    h.cfg.mfa_enforcement = "required";
+    auto step1 = h.sink.Post("/login", form({{"username", "alice"}, {"password", "alicepassword1"}}),
+                             "application/x-www-form-urlencoded");
+    REQUIRE(step1->status == 202);
+    auto body = nlohmann::json::parse(step1->body);
+    const std::string pending = body.at("mfa_pending_token");
+    const auto code = h.totp_at(body.at("secret_base32"), 0);
+
+    auto step2 = [&] {
+        yuzu::test::FailNthSaltDraw fail{1}; // the first recovery code's salt
+        auto r = h.sink.Post("/login/mfa/enroll",
+                             form({{"mfa_pending_token", pending}, {"code", code}}),
+                             "application/x-www-form-urlencoded");
+        REQUIRE(fail.fired());
+        return r;
+    }();
+    // Before the catch in regenerate_recovery_codes_locked the exception escaped to httplib: a bare
+    // 500 with no body, no audit row, no event and no counter.
+    REQUIRE(step2);
+    CHECK(step2->status == 503);
+    CHECK(step2->get_header_value("Set-Cookie").empty());
+    CHECK_FALSE(step2->body.empty());
+    CHECK(h.count_audits("mfa.enroll.failed", "alice") >= 1);
+    CHECK(h.count_audits("auth.login", "alice") == 0);
+
+    CHECK(prng_failures(h, "mfa_recovery") == 1.0);
+    CHECK(prng_failures(h, "mfa_enroll") == 0.0);
+    CHECK(secret_unavailable(h, "mfa_enroll") == 0.0);
+
+    auto status = h.auth_db->mfa_status("alice");
+    REQUIRE(status.has_value());
+    CHECK_FALSE(status->enrolled);
+    CHECK(status->recovery_codes_remaining == 0);
+}
+
+// ---------------------------------------------------------------------------
+// WP03 F8/F15: durable per-account MFA failure budget
+// ---------------------------------------------------------------------------
+namespace {
+bool audit_detail_contains(AuthRoutesHarness& h, const std::string& action,
+                           const std::string& needle) {
+    AuditQuery q;
+    q.action = action;
+    auto rows = h.audit_store->query(q);
+    REQUIRE(rows.has_value());
+    for (const auto& r : *rows)
+        if (r.detail.find(needle) != std::string::npos)
+            return true;
+    return false;
+}
+} // namespace
+
+TEST_CASE("POST /login/mfa: wrong codes across re-minted pending tokens lock the account "
+          "(F15), and a valid code is then refused",
+          "[pg][mfa][routes][auth_routes][lockout]") {
+    AuthRoutesHarness h;
+    h.cfg.auth_lockout_threshold = 3;
+    h.cfg.auth_lockout_window_secs = 900;
+    const auto secret = h.enroll_mfa("admin");
+
+    // One wrong code per FRESH pending token: the per-token cap (5) is never reached, so
+    // only the per-account budget can stop this.
+    for (int i = 0; i < 3; ++i) {
+        const auto pending = login_pending(h, "admin", "adminpassword1");
+        auto r = h.sink.Post("/login/mfa", form({{"mfa_pending_token", pending}, {"code", "000000"}}),
+                             "application/x-www-form-urlencoded");
+        REQUIRE(r);
+        CHECK(r->status == 401);
+    }
+    CHECK(h.count_audits("auth.mfa.lockout.applied", "admin") == 1);
+
+    // The CORRECT code on a fresh token is refused while locked: no cookie, honest audit.
+    const auto pending = login_pending(h, "admin", "adminpassword1");
+    auto locked = h.sink.Post("/login/mfa",
+                              form({{"mfa_pending_token", pending}, {"code", h.totp_at(secret, 1)}}),
+                              "application/x-www-form-urlencoded");
+    REQUIRE(locked);
+    CHECK(locked->status == 401);
+    CHECK(locked->get_header_value("Set-Cookie").empty());
+    CHECK(audit_detail_contains(h, "mfa.login.failed", "mfa locked"));
+}
+
+TEST_CASE("POST /login/mfa: a password success does not reset the MFA failure budget (F15)",
+          "[pg][mfa][routes][auth_routes][lockout]") {
+    AuthRoutesHarness h;
+    h.cfg.auth_lockout_threshold = 5;
+    h.cfg.auth_lockout_window_secs = 900;
+    h.enroll_mfa("admin");
+    for (int i = 0; i < 2; ++i) {
+        const auto pending = login_pending(h, "admin", "adminpassword1");
+        h.sink.Post("/login/mfa", form({{"mfa_pending_token", pending}, {"code", "000000"}}),
+                    "application/x-www-form-urlencoded");
+    }
+    login_pending(h, "admin", "adminpassword1"); // a further password success
+    auto st = h.auth_db->mfa_lockout_status("admin");
+    REQUIRE(st.has_value());
+    CHECK(st->failed_count == 2);
+}
+
+namespace {
+/// Expire the MFA lock DB-side (no sleeping): the window has "passed" 1 h ago.
+void expire_mfa_lock(const std::string& dsn) {
+    yuzu::server::pg::PgConn conn{PQconnectdb(dsn.c_str())};
+    REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+    yuzu::server::pg::PgResult r{PQexec(
+        conn.get(),
+        "UPDATE auth.users SET mfa_locked_until = now() - interval '1 hour', "
+        "mfa_last_attempt_at = now() - interval '1 hour'")};
+    REQUIRE(r.ok());
+}
+} // namespace
+
+TEST_CASE("POST /login/mfa: a correct code after the lock window has passed succeeds (F15)",
+          "[pg][mfa][routes][auth_routes][lockout]") {
+    AuthRoutesHarness h;
+    h.cfg.auth_lockout_threshold = 3;
+    h.cfg.auth_lockout_window_secs = 900;
+    const auto secret = h.enroll_mfa("admin");
+    for (int i = 0; i < 3; ++i) {
+        const auto pending = login_pending(h, "admin", "adminpassword1");
+        h.sink.Post("/login/mfa", form({{"mfa_pending_token", pending}, {"code", "000000"}}),
+                    "application/x-www-form-urlencoded");
+    }
+    {
+        auto st = h.auth_db->mfa_lockout_status("admin");
+        REQUIRE(st.has_value());
+        REQUIRE(st->locked); // the lock really armed before we expire it
+        const auto pending = login_pending(h, "admin", "adminpassword1");
+        auto still = h.sink.Post("/login/mfa",
+                                 form({{"mfa_pending_token", pending}, {"code", h.totp_at(secret, 1)}}),
+                                 "application/x-www-form-urlencoded");
+        REQUIRE(still);
+        CHECK(still->status == 401);
+    }
+    expire_mfa_lock(h.auth_db.dsn());
+    const auto pending = login_pending(h, "admin", "adminpassword1");
+    auto ok = h.sink.Post("/login/mfa",
+                          form({{"mfa_pending_token", pending}, {"code", h.totp_at(secret, 1)}}),
+                          "application/x-www-form-urlencoded");
+    REQUIRE(ok);
+    CHECK(ok->status == 200);
+}
+
+TEST_CASE("POST /login/mfa/stepup: wrong codes lock step-up for the account (F8)",
+          "[pg][mfa][stepup][routes][lockout]") {
+    AuthRoutesHarness h;
+    h.cfg.auth_lockout_threshold = 3;
+    h.cfg.auth_lockout_window_secs = 900;
+    const auto secret = h.enroll_mfa("admin");
+    const auto cookie = login_with_mfa(h, "admin", "adminpassword1", secret);
+
+    for (int i = 0; i < 3; ++i) {
+        auto r = h.sink.dispatch("POST", "/login/mfa/stepup", form({{"code", "000000"}}),
+                                 "application/x-www-form-urlencoded", {{"Cookie", cookie}});
+        REQUIRE(r);
+        CHECK(r->status == 401);
+    }
+    CHECK(h.count_audits("auth.mfa.lockout.applied", "admin") == 1);
+
+    auto locked = h.sink.dispatch("POST", "/login/mfa/stepup", form({{"code", "000000"}}),
+                                  "application/x-www-form-urlencoded", {{"Cookie", cookie}});
+    REQUIRE(locked);
+    CHECK(locked->status == 401);
+    CHECK(audit_detail_contains(h, "mfa.step_up.failed", "mfa locked"));
+}
+
+
+TEST_CASE("POST /login/mfa: an attempt that cannot be counted is never verified (503, fail closed)",
+          "[pg][mfa][routes][auth_routes][lockout][fail-closed]") {
+    AuthRoutesHarness h;
+    h.cfg.auth_lockout_threshold = 3;
+    h.cfg.auth_lockout_window_secs = 900;
+    const auto secret = h.enroll_mfa("admin");
+    const auto pending = login_pending(h, "admin", "adminpassword1");
+    // Break ONLY the budget write: every other users write passes.
+    yuzu::test::block_users_update_when(h.auth_db.dsn(),
+                                        "NEW.mfa_failed_count IS DISTINCT FROM OLD.mfa_failed_count");
+    // A VALID code: if the handler verified before counting, this would mint a session.
+    auto r = h.sink.Post("/login/mfa",
+                         form({{"mfa_pending_token", pending}, {"code", h.totp_at(secret, 1)}}),
+                         "application/x-www-form-urlencoded");
+    REQUIRE(r);
+    CHECK(r->status == 503);
+    CHECK(r->get_header_value("Set-Cookie").empty());
+    CHECK(audit_detail_contains(h, "mfa.login.failed", "could not be counted"));
+}
+
+TEST_CASE("POST /login/mfa/stepup: an attempt that cannot be counted is never verified (503)",
+          "[pg][mfa][stepup][routes][lockout][fail-closed]") {
+    AuthRoutesHarness h;
+    h.cfg.auth_lockout_threshold = 3;
+    h.cfg.auth_lockout_window_secs = 900;
+    const auto secret = h.enroll_mfa("admin");
+    const auto cookie = login_with_mfa(h, "admin", "adminpassword1", secret);
+    yuzu::test::block_users_update_when(h.auth_db.dsn(),
+                                        "NEW.mfa_failed_count IS DISTINCT FROM OLD.mfa_failed_count");
+    auto r = h.sink.dispatch("POST", "/login/mfa/stepup", form({{"code", "000000"}}),
+                             "application/x-www-form-urlencoded", {{"Cookie", cookie}});
+    REQUIRE(r);
+    CHECK(r->status == 503); // 503, never the 401 of an ordinary wrong code
+    CHECK(audit_detail_contains(h, "mfa.step_up.failed", "could not be counted"));
+    // Recovery-code shaped input takes the same gate.
+    auto rc = h.sink.dispatch("POST", "/login/mfa/stepup", form({{"code", "AAAA-BBBB-CCCC-DDDD"}}),
+                              "application/x-www-form-urlencoded", {{"Cookie", cookie}});
+    REQUIRE(rc);
+    CHECK(rc->status == 503);
+}
+
+TEST_CASE("POST /login/mfa: a verified code refunds its own reservation only",
+          "[pg][mfa][routes][auth_routes][lockout]") {
+    AuthRoutesHarness h;
+    h.cfg.auth_lockout_threshold = 2;
+    h.cfg.auth_lockout_window_secs = 900;
+    const auto secret = h.enroll_mfa("admin");
+    auto p1 = login_pending(h, "admin", "adminpassword1");
+    h.sink.Post("/login/mfa", form({{"mfa_pending_token", p1}, {"code", "000000"}}),
+                "application/x-www-form-urlencoded");
+    // The threshold-th reservation arms the lock but the code is still verified; success must
+    // give back just that one reservation: the earlier failure stays counted, the lock lifts.
+    auto p2 = login_pending(h, "admin", "adminpassword1");
+    auto ok = h.sink.Post("/login/mfa",
+                          form({{"mfa_pending_token", p2}, {"code", h.totp_at(secret, 1)}}),
+                          "application/x-www-form-urlencoded");
+    REQUIRE(ok);
+    CHECK(ok->status == 200);
+    auto st = h.auth_db->mfa_lockout_status("admin");
+    REQUIRE(st.has_value());
+    CHECK(st->failed_count == 1);
+    CHECK_FALSE(st->locked);
+}
+
+TEST_CASE("POST /login/mfa: a concurrent burst of wrong codes verifies at most `threshold` of them",
+          "[pg][mfa][routes][auth_routes][lockout][concurrency]") {
+    AuthRoutesHarness h;
+    const int threshold = 3;
+    h.cfg.auth_lockout_threshold = threshold;
+    h.cfg.auth_lockout_window_secs = 900;
+    h.enroll_mfa("admin");
+    constexpr int kThreads = 12;
+    std::vector<std::string> pendings;
+    for (int i = 0; i < kThreads; ++i)
+        pendings.push_back(login_pending(h, "admin", "adminpassword1"));
+    std::vector<int> statuses(kThreads, 0);
+    std::vector<std::thread> ts;
+    for (int i = 0; i < kThreads; ++i)
+        ts.emplace_back([&, i] {
+            auto r = h.sink.Post("/login/mfa",
+                                 form({{"mfa_pending_token", pendings[i]}, {"code", "000000"}}),
+                                 "application/x-www-form-urlencoded");
+            if (r)
+                statuses[i] = r->status;
+        });
+    for (auto& t : ts)
+        t.join();
+    for (int s : statuses)
+        CHECK(s == 401);
+    // Only `threshold` guesses reached verification; the rest were refused as locked.
+    AuditQuery q;
+    q.action = "mfa.login.failed";
+    auto rows = h.audit_store->query(q);
+    REQUIRE(rows.has_value());
+    int verified_wrong = 0, locked = 0;
+    for (const auto& r : *rows) {
+        if (r.detail.find("totp code rejected") != std::string::npos)
+            ++verified_wrong;
+        if (r.detail.find("mfa locked") != std::string::npos)
+            ++locked;
+    }
+    CHECK(verified_wrong == threshold);
+    CHECK(locked == kThreads - threshold);
+    CHECK(h.count_audits("auth.mfa.lockout.applied", "admin") == 1);
+}
+
+
+TEST_CASE("MFA budget: threshold 0 does NOT disable it (falls back to 5 / default window)",
+          "[pg][mfa][routes][auth_routes][lockout]") {
+    AuthRoutesHarness h;
+    h.cfg.auth_lockout_threshold = 0; // password lockout off
+    h.enroll_mfa("admin");
+    for (int i = 0; i < 5; ++i) {
+        const auto pending = login_pending(h, "admin", "adminpassword1");
+        h.sink.Post("/login/mfa", form({{"mfa_pending_token", pending}, {"code", "000000"}}),
+                    "application/x-www-form-urlencoded");
+    }
+    auto st = h.auth_db->mfa_lockout_status("admin");
+    REQUIRE(st.has_value());
+    CHECK(st->locked);
+    CHECK(h.count_audits("auth.mfa.lockout.applied", "admin") == 1);
+}
+
+TEST_CASE("MFA budget: wrong RECOVERY codes spend the same budget",
+          "[pg][mfa][routes][auth_routes][lockout]") {
+    AuthRoutesHarness h;
+    h.cfg.auth_lockout_threshold = 2;
+    h.cfg.auth_lockout_window_secs = 900;
+    h.enroll_mfa("admin");
+    for (int i = 0; i < 2; ++i) {
+        const auto pending = login_pending(h, "admin", "adminpassword1");
+        auto r = h.sink.Post("/login/mfa",
+                             form({{"mfa_pending_token", pending}, {"code", "AAAA-BBBB-CCCC-DDDD"}}),
+                             "application/x-www-form-urlencoded");
+        REQUIRE(r);
+        CHECK(r->status == 401);
+    }
+    auto st = h.auth_db->mfa_lockout_status("admin");
+    REQUIRE(st.has_value());
+    CHECK(st->locked);
+}
+
+TEST_CASE("MFA budget: operator unlock, admin reset and break-glass arming all lift the lock",
+          "[pg][mfa][routes][auth_routes][lockout]") {
+    AuthRoutesHarness h;
+    h.cfg.auth_lockout_threshold = 2;
+    h.cfg.auth_lockout_window_secs = 900;
+    h.enroll_mfa("admin");
+    auto lock = [&] {
+        for (int i = 0; i < 2; ++i) {
+            const auto pending = login_pending(h, "admin", "adminpassword1");
+            h.sink.Post("/login/mfa", form({{"mfa_pending_token", pending}, {"code", "000000"}}),
+                        "application/x-www-form-urlencoded");
+        }
+        auto st = h.auth_db->mfa_lockout_status("admin");
+        REQUIRE(st.has_value());
+        REQUIRE(st->locked);
+    };
+    auto unlocked = [&] {
+        auto st = h.auth_db->mfa_lockout_status("admin");
+        REQUIRE(st.has_value());
+        CHECK_FALSE(st->locked);
+        CHECK(st->failed_count == 0);
+    };
+    lock();
+    REQUIRE(h.auth_db->clear_account_lockouts("admin").has_value()); // REST + MCP unlock
+    unlocked();
+    lock();
+    h.admin_reset("admin", "adminpassword2"); // admin reset
+    unlocked();
+    h.sink.Post("/login", form({{"username", "admin"}, {"password", "adminpassword2"}}),
+                "application/x-www-form-urlencoded");
+    for (int i = 0; i < 2; ++i) {
+        const auto pending = login_pending(h, "admin", "adminpassword2");
+        h.sink.Post("/login/mfa", form({{"mfa_pending_token", pending}, {"code", "000000"}}),
+                    "application/x-www-form-urlencoded");
+    }
+    REQUIRE(h.auth_db->mfa_lockout_status("admin")->locked);
+    REQUIRE(h.auth_db->arm_break_glass("admin", 60).has_value()); // out-of-band recovery
+    unlocked();
+}
+
+TEST_CASE("POST /login answers a uniform 429 when the PBKDF2 budget is full (perf-F1)",
+          "[pg][mfa][routes][auth_routes][concurrency]") {
+    AuthRoutesHarness h;
+    auto& budget = h.auth_routes->pbkdf2_budget();
+    budget.set_cap(8); // break-glass floor 2, main share 6 (unauthenticated 3, authenticated 3)
+    auto held = yuzu::test::fill_pbkdf2_budget(budget);
+    REQUIRE(held.size() == 8);
+    // Same shape for a real and an unknown username: no enumeration through the refusal.
+    for (const char* user : {"alice", "no-such-user-xyz"}) {
+        auto r = h.sink.Post("/login", form({{"username", user}, {"password", "whatever"}}),
+                             "application/x-www-form-urlencoded");
+        REQUIRE(r);
+        CHECK(r->status == 429);
+        CHECK(r->get_header_value("Retry-After") == "2");
+        CHECK(r->get_header_value("Set-Cookie").empty());
+    }
+    held.clear(); // free every slot
+    auto ok = h.sink.Post("/login", form({{"username", "alice"}, {"password", "alicepassword1"}}),
+                          "application/x-www-form-urlencoded");
+    REQUIRE(ok);
+    CHECK(ok->status == 200);
+}
+
+TEST_CASE("reserve_mfa_attempt SQL: `reserved` comes from the pre-update lock state, not timestamps",
+          "[pg][mfa][routes][auth_routes][lockout]") {
+    AuthRoutesHarness h;
+    // Two reservations inside ONE transaction share now(). The second must see the lock the first
+    // armed and report reserved=false; a `mfa_last_attempt_at = now()` derivation reads it as
+    // reserved (a verification admitted past a live lock).
+    yuzu::server::pg::PgConn conn{PQconnectdb(h.auth_db.dsn().c_str())};
+    REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+    REQUIRE(yuzu::server::pg::PgResult{PQexec(conn.get(), "BEGIN")}.ok());
+    const char* params[3] = {"1", "900", "admin"}; // threshold 1: one reservation arms the lock
+    auto run = [&] {
+        return yuzu::server::pg::PgResult{PQexecParams(
+            conn.get(), yuzu::server::auth_sql::kReserveMfaAttemptSql, 3, nullptr, params,
+            nullptr, nullptr, 0)};
+    };
+    auto first = run();
+    REQUIRE(PQresultStatus(first.get()) == PGRES_TUPLES_OK);
+    REQUIRE(PQntuples(first.get()) == 1);
+    CHECK(std::string(PQgetvalue(first.get(), 0, 1)) == "t"); // reserved
+    CHECK(std::string(PQgetvalue(first.get(), 0, 2)) == "t"); // locked by it
+    auto second = run();
+    REQUIRE(PQresultStatus(second.get()) == PGRES_TUPLES_OK);
+    CHECK(std::string(PQgetvalue(second.get(), 0, 1)) == "f"); // NOT reserved: row was locked
+    CHECK(std::string(PQgetvalue(second.get(), 0, 0)) == "1"); // and nothing was spent
+    // Control: the retired derivation, `mfa_last_attempt_at = now()`, reads this LOCKED row as
+    // "reserved" inside the same transaction. That is the defect the pre-update CTE removes.
+    yuzu::server::pg::PgResult old_way{PQexec(
+        conn.get(),
+        "SELECT (mfa_last_attempt_at = now()) FROM auth.users WHERE username = 'admin'")};
+    REQUIRE(PQresultStatus(old_way.get()) == PGRES_TUPLES_OK);
+    CHECK(std::string(PQgetvalue(old_way.get(), 0, 0)) == "t");
+    yuzu::server::pg::PgResult rb{PQexec(conn.get(), "ROLLBACK")};
+}
+
+TEST_CASE("PBKDF2 budget exhaustion is a uniform 429 for locked and unlocked accounts alike",
+          "[pg][mfa][routes][auth_routes][lockout][concurrency]") {
+    AuthRoutesHarness h;
+    h.cfg.auth_lockout_threshold = 2;
+    h.cfg.auth_lockout_window_secs = 900;
+    h.enroll_mfa("admin");
+    // Lock admin's second factor AND alice's password.
+    for (int i = 0; i < 2; ++i) {
+        const auto pending = login_pending(h, "admin", "adminpassword1");
+        h.sink.Post("/login/mfa", form({{"mfa_pending_token", pending}, {"code", "000000"}}),
+                    "application/x-www-form-urlencoded");
+        h.sink.Post("/login", form({{"username", "alice"}, {"password", "wrong"}}),
+                    "application/x-www-form-urlencoded");
+    }
+    REQUIRE(h.auth_db->mfa_lockout_status("admin")->locked);
+    REQUIRE(h.auth_db->lockout_status("alice")->locked);
+    const auto p_locked = login_pending(h, "admin", "adminpassword1"); // taken before saturating
+    auto& budget = h.auth_routes->pbkdf2_budget();
+    budget.set_cap(8);
+    auto held = yuzu::test::fill_pbkdf2_budget(budget);
+    REQUIRE(held.size() == 8);
+    // Locked password account, unlocked password account, unknown name: all 429.
+    for (const char* user : {"alice", "admin", "no-such-user-xyz"}) {
+        auto r = h.sink.Post("/login", form({{"username", user}, {"password", "adminpassword1"}}),
+                             "application/x-www-form-urlencoded");
+        REQUIRE(r);
+        CHECK(r->status == 429);
+    }
+    // Locked second factor + recovery-shaped code: 429, not the locked 401.
+    auto rl = h.sink.Post("/login/mfa",
+                          form({{"mfa_pending_token", p_locked}, {"code", "AAAA-BBBB-CCCC-DDDD"}}),
+                          "application/x-www-form-urlencoded");
+    REQUIRE(rl);
+    CHECK(rl->status == 429);
+}
+
+TEST_CASE("POST /login/mfa: a 429 on a recovery code leaves the pending token usable",
+          "[pg][mfa][routes][auth_routes][concurrency]") {
+    AuthRoutesHarness h;
+    const auto secret = h.enroll_mfa("admin");
+    const auto pending = login_pending(h, "admin", "adminpassword1");
+    auto& budget = h.auth_routes->pbkdf2_budget();
+    budget.set_cap(8);
+    auto held = yuzu::test::fill_pbkdf2_budget(budget); // every lane full
+    REQUIRE(held.size() == 8);
+    auto busy = h.sink.Post("/login/mfa",
+                            form({{"mfa_pending_token", pending}, {"code", "AAAA-BBBB-CCCC-DDDD"}}),
+                            "application/x-www-form-urlencoded");
+    REQUIRE(busy);
+    CHECK(busy->status == 429);
+    held.clear();
+    auto ok = h.sink.Post("/login/mfa",
+                          form({{"mfa_pending_token", pending}, {"code", h.totp_at(secret, 1)}}),
+                          "application/x-www-form-urlencoded");
+    REQUIRE(ok);
+    CHECK(ok->status == 200); // the same token still works: the Retry-After hint is honest
+}
+
+
+// ---------------------------------------------------------------------------
+// WP03 r4: the per-username login stripe wait is BOUNDED
+// ---------------------------------------------------------------------------
+TEST_CASE("verify_password_with_lockout: a held stripe answers kBusy within the bounded wait",
+          "[pg][mfa][routes][auth_routes][stripe][concurrency]") {
+    AuthRoutesHarness h;
+    h.cfg.auth_lockout_threshold = 3;
+    auto& stripe = h.auth_routes->login_lock_for_test("stripe-ghost");
+    stripe.lock(); // a slow same-name request holds the stripe
+    PasswordCheckResult result{};
+    std::chrono::milliseconds waited{0};
+    std::promise<void> done;
+    auto finished = done.get_future();
+    std::thread t([&] {
+        httplib::Request req;
+        req.remote_addr = "203.0.113.9";
+        PasswordCheckOptions opts;
+        const auto t0 = std::chrono::steady_clock::now();
+        result = h.auth_routes->verify_password_with_lockout("stripe-ghost", "whatever-123456", req,
+                                                             opts);
+        waited = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - t0);
+        done.set_value();
+    });
+    // A bounded wait returns by itself; an unbounded one (a plain blocking lock) is still parked
+    // here, so the check goes RED instead of the test hanging.
+    const bool returned_in_time = finished.wait_for(std::chrono::milliseconds(700)) ==
+                                  std::future_status::ready;
+    stripe.unlock(); // lets an unbounded waiter finish so the thread can be joined
+    t.join();
+    CHECK(returned_in_time);
+    CHECK(result.outcome == PasswordCheckOutcome::kBusy);
+    CHECK(waited >= std::chrono::milliseconds(100)); // it did wait for the stripe...
+    CHECK(waited < std::chrono::milliseconds(400));  // ...but never unboundedly
+    CHECK(h.auth_routes->stripe_waiters() == 0);
+}
+
+TEST_CASE("live pool of 10: a flood of one unknown name cannot pin the workers",
+          "[pg][mfa][routes][auth_routes][stripe][concurrency]") {
+    AuthRoutesHarness h;
+    h.cfg.auth_lockout_threshold = 5;
+    h.auth_routes->pbkdf2_budget().set_cap(66); // not what this test is about
+    h.auth_routes->pbkdf2_budget().set_per_source_cap(64);
+    h.auth_routes->set_stripe_waiter_cap(2); // production value for a pool of 10: max(2, 10/8)
+    httplib::Server svr;
+    // (n, max_n, mqr): ten workers that can NOT grow (production: ThreadPool(pool_max, pool_max)),
+    // so blocked requests really pin them. ThreadPool(10, 400) would let the pool grow to 400
+    // threads and make this test unable to fail. The server owns and deletes the queue.
+    svr.new_task_queue = [] { return new httplib::ThreadPool(10, 10, 400); };
+    // The production login path, minus the route plumbing register_routes() needs a full server
+    // for: the shared lockout-accounted check (stripe, gate, slot, lockout, hash) on a real
+    // 10-worker pool.
+    std::atomic<int> saw_ghost{0};
+    svr.Post("/login", [&h, &saw_ghost](const httplib::Request& req, httplib::Response& res) {
+        if (req.get_param_value("username") == "flood-ghost")
+            ++saw_ghost;
+        PasswordCheckOptions opts;
+        opts.metric_route = "login";
+        const auto r = h.auth_routes->verify_password_with_lockout(
+            req.get_param_value("username"), req.get_param_value("password"), req, opts);
+        res.status = r.outcome == PasswordCheckOutcome::kBusy       ? 429
+                     : r.outcome == PasswordCheckOutcome::kVerified ? 200
+                                                                    : 401;
+        res.set_content("x", "text/plain");
+    });
+    svr.Get("/healthz", [](const httplib::Request&, httplib::Response& res) {
+        res.set_content("ok", "text/plain");
+    });
+    const int port = svr.bind_to_any_port("127.0.0.1");
+    REQUIRE(port > 0);
+    std::thread server_thread([&] { svr.listen_after_bind(); });
+    svr.wait_until_ready();
+
+    // A same-name request that holds the stripe for seconds (a slow hash, a stalled lockout read)
+    // is modelled by holding it here. The flood below is the K same-unknown-name logins behind it.
+    auto& stripe = h.auth_routes->login_lock_for_test("flood-ghost");
+    stripe.lock();
+    constexpr int kFlood = 80;
+    std::vector<std::thread> flood;
+    std::atomic<int> answered{0};
+    for (int i = 0; i < kFlood; ++i)
+        flood.emplace_back([&, port] {
+            httplib::Client c("127.0.0.1", port);
+            c.set_read_timeout(30, 0);
+            auto r = c.Post("/login", "username=flood-ghost&password=whatever-123456",
+                            "application/x-www-form-urlencoded");
+            if (r)
+                ++answered;
+        });
+    // Wait (bounded) until ten handlers have entered or the flood has been answered, not a fixed
+    // sleep. This test pins the END-TO-END outcome (the pool keeps serving /healthz); it is RED
+    // when the whole bounded-wait block is replaced by a blocking lock. It does NOT isolate the
+    // individual caps (a blocking lock added next to them, or one cap removed, can stay green):
+    // the per-stripe cap and the global ceiling are pinned by their own tests below.
+    for (int i = 0; i < 300 && saw_ghost.load() < 10; ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+
+    auto timed = [&](auto&& fn) {
+        const auto t0 = std::chrono::steady_clock::now();
+        const bool ok = fn();
+        return std::pair{ok, std::chrono::duration_cast<std::chrono::milliseconds>(
+                                 std::chrono::steady_clock::now() - t0)};
+    };
+    auto [health_ok, health_ms] = timed([&] {
+        httplib::Client c("127.0.0.1", port);
+        c.set_read_timeout(10, 0);
+        auto r = c.Get("/healthz");
+        return r && r->status == 200;
+    });
+    auto [other_ok, other_ms] = timed([&] {
+        httplib::Client c("127.0.0.1", port);
+        c.set_read_timeout(10, 0);
+        auto r = c.Post("/login", "username=alice&password=wrong-password-1",
+                        "application/x-www-form-urlencoded");
+        return r && (r->status == 401 || r->status == 429);
+    });
+    stripe.unlock(); // the slow holder finishes; an unbounded waiter is released only now
+    for (auto& t : flood)
+        t.join();
+    svr.stop();
+    server_thread.join();
+    // With the stripe held for the whole measurement, replacing the bounded wait by a blocking
+    // lock pins all ten workers and /healthz queues behind them; the bounded, capped wait keeps
+    // them free.
+    CHECK(health_ok);
+    CHECK(health_ms < std::chrono::milliseconds(2500));
+    CHECK(other_ok);
+    CHECK(other_ms < std::chrono::milliseconds(2500));
+    CHECK(answered.load() == kFlood); // every flooded request got an answer (200/401/429)
+    CHECK(saw_ghost.load() == kFlood); // and the handler really received the flooded name
+    INFO("healthz " << health_ms.count() << " ms, other login " << other_ms.count() << " ms");
+}
+
+
+TEST_CASE("the login stripe index is salted per process, so a colliding name cannot be computed",
+          "[pg][mfa][routes][auth_routes][stripe]") {
+    AuthRoutesHarness h;
+    // An unsalted index is std::hash(name) % 256 for every name; the per-process salt makes the
+    // mapping differ from it for essentially every name (mutation: drop the salt -> all equal).
+    int differing = 0;
+    for (int i = 0; i < 64; ++i) {
+        const std::string name = "stripe-probe-" + std::to_string(i);
+        if (h.auth_routes->login_stripe_index_for_test(name) !=
+            std::hash<std::string>{}(name) % 256)
+            ++differing;
+    }
+    CHECK(differing >= 56); // 64 names, 1/256 chance each of an accidental match
+}
+
+
+TEST_CASE("stripe waiters are capped: with the stripe held, only `cap` requests wait, the rest are "
+          "refused at once",
+          "[pg][mfa][routes][auth_routes][stripe][concurrency]") {
+    AuthRoutesHarness h;
+    h.cfg.auth_lockout_threshold = 5;
+    // Global ceiling HIGH so only the PER-STRIPE cap (2) can be what bounds the waiters of this
+    // one flooded stripe (mutation: per-stripe cap removed -> 8 waiters, RED).
+    h.auth_routes->set_stripe_waiter_cap(10);
+    h.auth_routes->pbkdf2_budget().set_cap(66);
+    h.auth_routes->pbkdf2_budget().set_per_source_cap(64);
+    auto& stripe = h.auth_routes->login_lock_for_test("cap-ghost");
+    stripe.lock();
+    constexpr int kCallers = 8;
+    std::vector<std::chrono::milliseconds> took(kCallers);
+    std::vector<PasswordCheckOutcome> outcome(kCallers, PasswordCheckOutcome::kVerified);
+    std::atomic<int> peak{0};
+    std::atomic<bool> stop_sampling{false};
+    std::thread sampler([&] {
+        while (!stop_sampling.load()) {
+            const int w = h.auth_routes->stripe_waiters();
+            int p = peak.load();
+            while (w > p && !peak.compare_exchange_weak(p, w)) {}
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+    });
+    std::vector<std::thread> ts;
+    for (int i = 0; i < kCallers; ++i)
+        ts.emplace_back([&, i] {
+            httplib::Request req;
+            req.remote_addr = "203.0.113." + std::to_string(i + 1);
+            PasswordCheckOptions opts;
+            opts.metric_route = "login";
+            const auto t0 = std::chrono::steady_clock::now();
+            outcome[i] = h.auth_routes->verify_password_with_lockout("cap-ghost", "whatever-123456",
+                                                                     req, opts).outcome;
+            took[i] = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - t0);
+        });
+    for (auto& t : ts)
+        t.join();
+    stop_sampling = true;
+    sampler.join();
+    stripe.unlock();
+    int waited = 0, immediate = 0;
+    for (int i = 0; i < kCallers; ++i) {
+        CHECK(outcome[i] == PasswordCheckOutcome::kBusy);
+        if (took[i] >= std::chrono::milliseconds(120))
+            ++waited;
+        else
+            ++immediate;
+    }
+    CHECK(waited == 2);    // exactly `cap` waited the bounded 150 ms (mutation: cap removed -> 8)
+    CHECK(immediate == 6); // the rest were refused at once, pinning no worker
+    CHECK(peak.load() <= 2);
+}
+
+
+namespace {
+/// A name whose stripe differs from `other`'s (or equals it when `same`), found deterministically.
+std::string name_on_stripe(AuthRoutes& r, const std::string& other, bool same) {
+    const auto idx = r.login_stripe_index_for_test(other);
+    for (int i = 0; i < 5000; ++i) {
+        const std::string n = "stripe-pick-" + std::to_string(i);
+        if ((r.login_stripe_index_for_test(n) == idx) == same)
+            return n;
+    }
+    return {};
+}
+} // namespace
+
+TEST_CASE("stripe waiter cap: the blast radius is the flooded stripe, not unrelated names",
+          "[pg][mfa][routes][auth_routes][stripe][concurrency]") {
+    AuthRoutesHarness h;
+    h.cfg.auth_lockout_threshold = 5;
+    h.auth_routes->set_stripe_waiter_cap(4); // global ceiling; per-stripe cap is 2
+    h.auth_routes->pbkdf2_budget().set_cap(66);
+    h.auth_routes->pbkdf2_budget().set_per_source_cap(64);
+    const std::string a = "flood-a";
+    const std::string b = name_on_stripe(*h.auth_routes, a, false); // another stripe
+    const std::string c = name_on_stripe(*h.auth_routes, a, true);  // collides on A's stripe
+    REQUIRE_FALSE(b.empty());
+    REQUIRE_FALSE(c.empty());
+    std::string d; // a third stripe, free of any contention
+    for (int i = 0; i < 5000 && d.empty(); ++i) {
+        const std::string n = "stripe-free-" + std::to_string(i);
+        const auto idx = h.auth_routes->login_stripe_index_for_test(n);
+        if (idx != h.auth_routes->login_stripe_index_for_test(a) &&
+            idx != h.auth_routes->login_stripe_index_for_test(b))
+            d = n;
+    }
+    REQUIRE_FALSE(d.empty());
+    auto call = [&](const std::string& name, const char* addr) {
+        httplib::Request req;
+        req.remote_addr = addr;
+        PasswordCheckOptions opts;
+        opts.metric_route = "login";
+        const auto t0 = std::chrono::steady_clock::now();
+        const auto r = h.auth_routes->verify_password_with_lockout(name, "whatever-123456", req, opts);
+        return std::pair{r.outcome, std::chrono::duration_cast<std::chrono::milliseconds>(
+                                        std::chrono::steady_clock::now() - t0)};
+    };
+    auto& stripe_a = h.auth_routes->login_lock_for_test(a);
+    auto& stripe_b = h.auth_routes->login_lock_for_test(b);
+    stripe_a.lock(); // a slow request holds A's stripe: the flood below waits behind it
+    std::vector<std::thread> flood;
+    for (int i = 0; i < 6; ++i)
+        flood.emplace_back([&, i] { call(a, ("203.0.113." + std::to_string(i + 1)).c_str()); });
+    for (int i = 0; i < 300 && h.auth_routes->stripe_waiters() < 2; ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    // All three probes start while the flood's two waiters are still inside their 150 ms wait.
+    // (c) A name on a DIFFERENT, contended stripe is still ADMITTED as a waiter (the flood used
+    // only 2 of the global 4): it waits the bounded 150 ms, it is not refused at once.
+    stripe_b.lock();
+    std::pair<PasswordCheckOutcome, std::chrono::milliseconds> b2{};
+    std::thread b2_thread([&] { b2 = call(b, "198.51.100.10"); });
+    // A name that COLLIDES onto the flooded stripe is refused at once: accepted and documented.
+    auto [c_outcome, c_ms] = call(c, "198.51.100.11");
+    CHECK(c_outcome == PasswordCheckOutcome::kBusy);
+    CHECK(c_ms < std::chrono::milliseconds(100));
+    // (a)/(b) An UNCONTENDED name on another stripe never touches the cap: it is served (an
+    // unknown-name verdict), not refused.
+    auto [b_outcome, b_ms] = call(d, "198.51.100.9");
+    (void)b_ms;
+    b2_thread.join();
+    stripe_b.unlock();
+    CHECK(b2.first == PasswordCheckOutcome::kBusy);
+    CHECK(b2.second >= std::chrono::milliseconds(120)); // mutation: per-stripe cap removed -> <50 ms
+    CHECK(b_outcome == PasswordCheckOutcome::kBadCredential);
+    stripe_a.unlock();
+    for (auto& t : flood)
+        t.join();
+}
+
+
+TEST_CASE("global stripe-waiter ceiling: across three held stripes exactly `cap` requests wait",
+          "[pg][mfa][routes][auth_routes][stripe][concurrency]") {
+    AuthRoutesHarness h;
+    h.cfg.auth_lockout_threshold = 5;
+    h.auth_routes->set_stripe_waiter_cap(3); // global ceiling 3; per-stripe cap is 2
+    h.auth_routes->pbkdf2_budget().set_cap(66);
+    h.auth_routes->pbkdf2_budget().set_per_source_cap(64);
+    // Three names on three DISTINCT stripes, each held, 6 callers per name.
+    std::vector<std::string> names;
+    std::vector<std::size_t> seen;
+    for (int i = 0; names.size() < 3 && i < 5000; ++i) {
+        const std::string n = "ceiling-" + std::to_string(i);
+        const auto idx = h.auth_routes->login_stripe_index_for_test(n);
+        if (std::find(seen.begin(), seen.end(), idx) == seen.end()) {
+            seen.push_back(idx);
+            names.push_back(n);
+        }
+    }
+    REQUIRE(names.size() == 3);
+    for (const auto& n : names)
+        h.auth_routes->login_lock_for_test(n).lock();
+    constexpr int kPer = 6;
+    std::vector<std::chrono::milliseconds> took(3 * kPer);
+    std::atomic<int> peak{0};
+    std::atomic<bool> stop_sampling{false};
+    std::thread sampler([&] {
+        while (!stop_sampling.load()) {
+            const int w = h.auth_routes->stripe_waiters();
+            int p = peak.load();
+            while (w > p && !peak.compare_exchange_weak(p, w)) {}
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    });
+    std::vector<std::thread> ts;
+    for (int n = 0; n < 3; ++n)
+        for (int i = 0; i < kPer; ++i)
+            ts.emplace_back([&, n, i] {
+                httplib::Request req;
+                req.remote_addr = "203.0.113." + std::to_string(n * kPer + i + 1);
+                PasswordCheckOptions opts;
+                opts.metric_route = "login";
+                const auto t0 = std::chrono::steady_clock::now();
+                (void)h.auth_routes->verify_password_with_lockout(names[n], "whatever-123456", req,
+                                                                  opts);
+                took[n * kPer + i] = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - t0);
+            });
+    for (auto& t : ts)
+        t.join();
+    stop_sampling = true;
+    sampler.join();
+    for (const auto& n : names)
+        h.auth_routes->login_lock_for_test(n).unlock();
+    int waited = 0;
+    for (const auto& t : took)
+        if (t >= std::chrono::milliseconds(120))
+            ++waited;
+    CHECK(waited == 3);       // mutation: global ceiling removed -> 6 (2 per stripe x 3)
+    CHECK(peak.load() <= 3);  // never more than the ceiling waiting at once
+}
+
+TEST_CASE("an over-length password takes a hashing slot too: a full lane refuses it (no flood escape)",
+          "[pg][mfa][routes][auth_routes][concurrency]") {
+    AuthRoutesHarness h;
+    h.cfg.auth_lockout_threshold = 5;
+    auto& budget = h.auth_routes->pbkdf2_budget();
+    budget.set_cap(8);
+    auto held = yuzu::test::fill_pbkdf2_budget(budget);
+    httplib::Request req;
+    req.remote_addr = "198.51.100.50";
+    PasswordCheckOptions opts;
+    opts.metric_route = "login";
+    const std::string over(yuzu::server::auth::kMaxPasswordBytes + 1, 'x');
+    // Before the fix the over-length shortcut skipped the slot (the hash is skipped) but the
+    // request still took a stripe and a database read, so a flood of them escaped every cap.
+    CHECK(h.auth_routes->verify_password_with_lockout("over-max-ghost", over, req, opts).outcome ==
+          PasswordCheckOutcome::kBusy);
+}
+
+TEST_CASE("live pool of 10: unique unknown names with over-length passwords cannot pin the workers",
+          "[pg][mfa][routes][auth_routes][concurrency][stripe]") {
+    AuthRoutesHarness h;
+    h.cfg.auth_lockout_threshold = 5;
+    auto& budget = h.auth_routes->pbkdf2_budget();
+    budget.set_cap(8); // unauthenticated lane 3 (production for a pool of 10 is cap 5)
+    budget.set_per_source_cap(64);
+    h.auth_routes->set_stripe_waiter_cap(2);
+    httplib::Server svr;
+    svr.new_task_queue = [] { return new httplib::ThreadPool(10, 10, 400); };
+    std::atomic<int> in_handler{0}, entered{0};
+    svr.Post("/login", [&](const httplib::Request& req, httplib::Response& res) {
+        ++entered;
+        ++in_handler;
+        PasswordCheckOptions opts;
+        opts.metric_route = "login";
+        const auto r = h.auth_routes->verify_password_with_lockout(
+            req.get_param_value("username"), req.get_param_value("password"), req, opts);
+        --in_handler;
+        res.status = r.outcome == PasswordCheckOutcome::kBusy ? 429 : 401;
+        res.set_content("x", "text/plain");
+    });
+    svr.Get("/healthz", [](const httplib::Request&, httplib::Response& res) {
+        res.set_content("ok", "text/plain");
+    });
+    // Every REQUIRE sits ABOVE the thread start: a throw after it would destroy a joinable
+    // std::thread (std::terminate). The server thread is a jthread behind a stop guard.
+    // Make the lockout read SLOW: another connection holds an exclusive lock on auth.users, so
+    // every request that reaches the database blocks there (a slow or contended store).
+    yuzu::server::pg::PgConn locker{PQconnectdb(h.auth_db.dsn().c_str())};
+    REQUIRE(PQstatus(locker.get()) == CONNECTION_OK);
+    const int port = svr.bind_to_any_port("127.0.0.1");
+    REQUIRE(port > 0);
+    yuzu::test::JoiningThread server_thread([&] { svr.listen_after_bind(); });
+    struct StopGuard {
+        httplib::Server& s;
+        ~StopGuard() { s.stop(); }
+    } stop_guard{svr};
+    svr.wait_until_ready();
+    {
+        const auto begin = yuzu::server::pg::PgResult{PQexec(locker.get(), "BEGIN")};
+        const auto lock = yuzu::server::pg::PgResult{
+            PQexec(locker.get(), "LOCK TABLE auth.users IN ACCESS EXCLUSIVE MODE")};
+        CHECK(begin.ok());
+        CHECK(lock.ok());
+    }
+
+    const std::string over(yuzu::server::auth::kMaxPasswordBytes + 1, 'x');
+    constexpr int kFlood = 160; // unique names: distinct stripes, no waiting, no lockout rows
+    // A SINGLE probe first: it must block on the locked database (this is what proves the lock
+    // really parks a request, so the later "blocked" reading has a lower bound).
+    yuzu::test::JoiningThread probe([&, port] {
+        httplib::Client c("127.0.0.1", port);
+        c.set_read_timeout(30, 0);
+        (void)c.Post("/login", "username=over-max-probe&password=" + over,
+                     "application/x-www-form-urlencoded");
+    });
+    for (int i = 0; i < 300 && entered.load() < 1; ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    CHECK(in_handler.load() == 1); // one probe is parked on the lock: it blocks
+    std::vector<yuzu::test::JoiningThread> flood;
+    std::atomic<int> answered{0};
+    for (int i = 0; i < kFlood; ++i)
+        flood.emplace_back([&, i, port] {
+            httplib::Client c("127.0.0.1", port);
+            c.set_read_timeout(30, 0);
+            auto r = c.Post("/login", "username=over-max-" + std::to_string(i) + "&password=" + over,
+                            "application/x-www-form-urlencoded");
+            if (r)
+                ++answered;
+        });
+    // Saturation is ASSERTED, not assumed: wait (bounded) until the flood has reached the handlers.
+    for (int i = 0; i < 500 && entered.load() < 40; ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    const bool saturated = entered.load() >= 40;
+    std::this_thread::sleep_for(std::chrono::milliseconds(300)); // refused requests have left
+    const int blocked_now = in_handler.load(); // requests still parked on the locked database
+    const auto t0 = std::chrono::steady_clock::now();
+    httplib::Client hc("127.0.0.1", port);
+    hc.set_read_timeout(10, 0);
+    auto health = hc.Get("/healthz");
+    const auto health_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - t0);
+    // Release the lock so the blocked requests (at most the lane) finish.
+    (void)yuzu::server::pg::PgResult{PQexec(locker.get(), "COMMIT")};
+    flood.clear(); // jthreads join here, after the lock is released
+    probe.join();
+    svr.stop();
+    CHECK(saturated);
+    CHECK((health && health->status == 200));
+    // With the slot taken for over-length passwords only the unauthenticated lane (3) reaches the
+    // blocked database read, the rest are refused 429 at once, so /healthz is served promptly.
+    // Without the fix every one of the ten workers blocks on the lock and /healthz waits for it.
+    CHECK(health_ms < std::chrono::milliseconds(700));
+    CHECK(blocked_now >= 2); // the lane (3, probe included) really is parked on the database
+    CHECK(blocked_now <= 6); // lane 3 + margin; without the fix all 10 workers are parked here
+    CHECK(answered.load() == kFlood);
+}
+
+#endif // !_WIN32

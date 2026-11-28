@@ -198,6 +198,15 @@ bool near_hours(std::chrono::system_clock::time_point tp, int h) {
 
 } // namespace
 
+// #6940: a token-list re-render is never cached. `set_header` appends and `get_header_value`
+// returns the first, so count the headers too.
+static void check_private_no_store(const httplib::Response& res) {
+    CHECK(res.get_header_value("Cache-Control") == "no-store, private");
+    CHECK(res.get_header_value("Vary") == "Cookie");
+    CHECK(res.headers.count("Cache-Control") == 1);
+    CHECK(res.headers.count("Vary") == 1);
+}
+
 TEST_CASE("settings enrollment: token create audits token_id + principal, never the raw token",
           "[pg][settings_routes][enrollment]") {
     EnrollRoutesHarness h;
@@ -230,6 +239,7 @@ TEST_CASE("settings enrollment: token create with the store down is 503 + a fail
     REQUIRE(res);
     CHECK(res->status == 503);
     CHECK(raw_token_in(res->body).empty());
+    check_private_no_store(*res); // the failure re-render lists the tokens too
     const auto row = h.only("enrollment.token_create");
     CHECK(row.result == "failure");
     CHECK(row.detail.find("store_unavailable") != std::string::npos);
@@ -253,6 +263,7 @@ TEST_CASE("settings enrollment: revoke audits success, and denied for an unknown
     auto res = h.sink.Delete("/api/settings/enrollment-tokens/" + created->token_id);
     REQUIRE(res);
     CHECK(res->status == 200);
+    check_private_no_store(*res);
     auto row = h.only("enrollment.token_revoke");
     CHECK(row.result == "success");
     CHECK(row.target_id == created->token_id);
@@ -273,6 +284,7 @@ TEST_CASE("settings enrollment: revoke with the store down is 503 and audited as
     auto res = h.sink.Delete("/api/settings/enrollment-tokens/abcd1234");
     REQUIRE(res);
     CHECK(res->status == 503);
+    check_private_no_store(*res);
     CHECK(h.only("enrollment.token_revoke").result == "failure");
 }
 
@@ -950,6 +962,48 @@ TEST_CASE("settings pending: an empty-looking dot-only agent id gets no row acti
     }
 }
 
+// #7811: the agent id is the `target_id` of every row these routes write (the denial rows too), and
+// the audit store keeps CR, LF and TAB, so an id over 256 bytes or with a byte below 0x20 is a 400
+// that writes no row and never reaches the store. CR and LF are not driven here: the routes'
+// `(.+)` capture does not match them, so they never reach the handler through the sink.
+TEST_CASE("settings pending: an over-long or control-byte agent id is a 400 with no audit row and "
+          "no store hit",
+          "[pg][settings_routes][enrollment][audit]") {
+    EnrollRoutesHarness h;
+    h.queue("normal");
+    h.audit_calls.clear();
+    const std::vector<std::string> bad = {std::string(257, 'a'), std::string("dev\0A", 5),
+                                          "dev\tA"};
+    for (const auto& seg : bad) {
+        INFO(seg.substr(0, 16));
+        auto a = h.sink.Post("/api/settings/pending-agents/" + seg + "/approve", "", kForm);
+        REQUIRE(a);
+        CHECK(a->status == 400);
+        auto d = h.sink.Post("/api/settings/pending-agents/" + seg + "/deny", "", kForm);
+        REQUIRE(d);
+        CHECK(d->status == 400);
+        auto r = h.sink.Delete("/api/settings/pending-agents/" + seg);
+        REQUIRE(r);
+        CHECK(r->status == 400);
+    }
+    CHECK(h.audit_calls.empty());
+    CHECK(h.attempt_calls.empty());
+    CHECK(h.status_of("normal") == auth::PendingStatus::pending);
+
+    // A 256-byte printable id is safe: it reaches the store, and is approved there.
+    const std::string edge(256, 'a');
+    // (queued directly: `h.queue` derives a hostname from the id, which would be over its bound)
+    REQUIRE(h.auth_mgr.add_pending_agent(edge, "edge-host", "linux", "x86_64", "1.0").value());
+    h.audit_calls.clear();
+    auto ok = h.sink.Post("/api/settings/pending-agents/" + edge + "/approve", "", kForm);
+    REQUIRE(ok);
+    CHECK(ok->status == 200);
+    const auto row = h.only("enrollment.approve");
+    CHECK(row.result == "success");
+    CHECK(row.target_id == edge);
+    CHECK(h.status_of(edge) == auth::PendingStatus::approved);
+}
+
 // An Active token is mild information, never the green OK colour: a credential that may be
 // lapsed or spent must not look healthy. The Expired state itself is pinned against an injected
 // clock in test_groups_enrolment_render.cpp (a lapsed token cannot be minted here without a wait).
@@ -989,6 +1043,88 @@ TEST_CASE("settings enrollment: token responses are no-store and private",
         REQUIRE(res);
         CHECK(res->get_header_value("Cache-Control") == "no-store, private");
         CHECK(res->get_header_value("Vary") == "Cookie");
+    }
+}
+
+// #6940: a token request the store's bounds refuse (here a negative use limit; the numeric-param
+// refusal above answers an A4 JSON body and lists nothing) re-renders the token list, so it is
+// uncacheable and private like the success and the outage answers.
+TEST_CASE("settings enrollment: a token request the store refuses is a 400 list re-render, "
+          "no-store and private",
+          "[pg][settings_routes][enrollment][cache]") {
+    EnrollRoutesHarness h;
+    auto res =
+        h.sink.Post("/api/settings/enrollment-tokens", "label=x&max_uses=-1&ttl_hours=1", kForm);
+    REQUIRE(res);
+    CHECK(res->status == 400);
+    CHECK(raw_token_in(res->body).empty());
+    check_private_no_store(*res);
+    CHECK(h.only("enrollment.token_create").result == "denied");
+    CHECK(h.auth_mgr.list_enrollment_tokens().value().empty());
+}
+
+// #6940: every pending-agent action re-renders the pending list, which names hostnames and
+// agent ids, so each answer (success, refusal and store outage) is uncacheable and private. One
+// request per `render_pending_fragment()` return in the route file.
+TEST_CASE("settings pending: every pending-agent action answer is no-store and private",
+          "[pg][settings_routes][enrollment][cache]") {
+    SECTION("store up: bulk approve, bulk deny, approve, stale approve, deny, remove, dot id") {
+        EnrollRoutesHarness h;
+        h.queue("p-bulk-a");
+        auto bulk_approve = h.sink.Post("/api/settings/pending-agents/bulk-approve", "", kForm);
+        REQUIRE(bulk_approve);
+        CHECK(bulk_approve->status == 200);
+        check_private_no_store(*bulk_approve);
+
+        h.queue("p-bulk-d");
+        auto bulk_deny = h.sink.Post("/api/settings/pending-agents/bulk-deny", "", kForm);
+        REQUIRE(bulk_deny);
+        CHECK(bulk_deny->status == 200);
+        check_private_no_store(*bulk_deny);
+
+        h.queue("p-one");
+        auto approve = h.sink.Post("/api/settings/pending-agents/p-one/approve", "", kForm);
+        REQUIRE(approve);
+        CHECK(approve->status == 200);
+        check_private_no_store(*approve);
+        auto stale = h.sink.Post("/api/settings/pending-agents/p-one/deny", "", kForm);
+        REQUIRE(stale);
+        CHECK(stale->status == 409);
+        check_private_no_store(*stale);
+
+        h.queue("p-two");
+        auto deny = h.sink.Post("/api/settings/pending-agents/p-two/deny", "", kForm);
+        REQUIRE(deny);
+        CHECK(deny->status == 200);
+        check_private_no_store(*deny);
+
+        h.queue("p-three");
+        auto remove = h.sink.Delete("/api/settings/pending-agents/p-three");
+        REQUIRE(remove);
+        CHECK(remove->status == 200);
+        check_private_no_store(*remove);
+
+        auto unaddressable = h.sink.Post("/api/settings/pending-agents/./approve", "", kForm);
+        REQUIRE(unaddressable);
+        CHECK(unaddressable->status == 400);
+        check_private_no_store(*unaddressable);
+    }
+    SECTION("store down: each action is a 503 with the same headers") {
+        EnrollRoutesHarness h(/*with_store=*/false);
+        for (const char* path : {"/api/settings/pending-agents/bulk-approve",
+                                 "/api/settings/pending-agents/bulk-deny",
+                                 "/api/settings/pending-agents/a1/approve",
+                                 "/api/settings/pending-agents/a1/deny"}) {
+            INFO(path);
+            auto res = h.sink.Post(path, "", kForm);
+            REQUIRE(res);
+            CHECK(res->status == 503);
+            check_private_no_store(*res);
+        }
+        auto remove = h.sink.Delete("/api/settings/pending-agents/a1");
+        REQUIRE(remove);
+        CHECK(remove->status == 503);
+        check_private_no_store(*remove);
     }
 }
 

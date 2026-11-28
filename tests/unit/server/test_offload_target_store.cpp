@@ -28,14 +28,26 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <libpq-fe.h>
+#include <yuzu/metrics.hpp>
 #include <nlohmann/json.hpp>
 
 #include "../test_helpers.hpp"
+#include "test_blocking_http_sink.hpp"
+#include "test_raw_listener.hpp"
 
 #include <chrono>
 #include <string>
 #include <thread>
 #include <vector>
+
+#if defined(__has_feature)
+#if __has_feature(thread_sanitizer)
+#define YUZU_TSAN_BUILD 1
+#endif
+#endif
+#if defined(__SANITIZE_THREAD__)
+#define YUZU_TSAN_BUILD 1
+#endif
 
 using namespace yuzu::server;
 using yuzu::test::OffloadTargetStorePg;
@@ -708,4 +720,200 @@ TEST_CASE("OffloadTargetStore[pg]: a non-NULL auth_credential with has_credentia
         "decode('00','hex') WHERE id = $1",
         std::vector<std::string>{std::to_string(*result)});
     CHECK(res.status() == PGRES_FATAL_ERROR);
+}
+
+// ── Drop accounting: the `reason` label on yuzu_server_offload_delivery_dropped_total ──────────
+
+namespace {
+
+double offload_dropped(yuzu::MetricsRegistry& reg, const char* reason) {
+    return reg.counter("yuzu_server_offload_delivery_dropped_total", {{"reason", reason}}).value();
+}
+
+} // namespace
+
+TEST_CASE("OffloadTargetStore[pg]: a delivery refused after quiesce() counts reason=quiescing",
+          "[offload_store][pg][metrics]") {
+    OffloadTargetStorePg store;
+    yuzu::MetricsRegistry reg;
+    store->set_metrics(&reg);
+    REQUIRE(store->create_target("quiesced", "http://127.0.0.1:1/h", OffloadAuthType::None, "", "*",
+                                 /*batch_size=*/1)
+                .has_value());
+    REQUIRE(store->quiesce(std::chrono::seconds(5)));
+
+    store->fire_event("execution.completed", R"({"k":"v"})");
+
+    CHECK(offload_dropped(reg, "quiescing") == 1.0);
+    CHECK(offload_dropped(reg, "queue_full") == 0.0);
+}
+
+// Compiled out under TSan for the same reason as the webhook twin: real loopback HTTP deliveries
+// hit the glibc getaddrinfo_a crash under this repo's TSan build (#2504).
+#ifndef YUZU_TSAN_BUILD
+TEST_CASE("OffloadTargetStore[pg]: deliveries past a full queue count reason=queue_full and the "
+          "backlog accessors read the pool",
+          "[offload_store][pg][metrics]") {
+    constexpr int kTargets = 300;
+    // Declaration order is load-bearing (locals are destroyed in reverse): the registry outlives
+    // the store, which a running delivery writes to, and the store comes before the sink so the
+    // sink releases its held deliveries first.
+    yuzu::MetricsRegistry reg;
+    OffloadTargetStorePg store;
+    yuzu::test::BlockingHttpSink sink;
+    REQUIRE(sink.ok());
+    store->set_metrics(&reg);
+    for (int i = 0; i < kTargets; ++i)
+        REQUIRE(store->create_target("held-" + std::to_string(i), sink.url(), OffloadAuthType::None,
+                                     "", "*", /*batch_size=*/1)
+                    .has_value());
+    const auto capacity = store->delivery_pool_capacity();
+    CHECK(capacity == 260);
+    CHECK(store->delivery_pool_pending() == 0);
+
+    store->fire_event("execution.completed", R"({"k":"v"})");
+
+    const double dropped = offload_dropped(reg, "queue_full");
+    CHECK(dropped >= kTargets - static_cast<double>(capacity));
+    CHECK(dropped <= kTargets - 256.0);
+    CHECK(offload_dropped(reg, "quiescing") == 0.0);
+    CHECK(store->delivery_pool_pending() == kTargets - static_cast<std::size_t>(dropped));
+    CHECK(store->delivery_pool_pending() >= 256);
+
+    sink.release();
+    REQUIRE(store->quiesce(std::chrono::seconds(60)));
+    CHECK(store->delivery_pool_pending() == 0);
+}
+#endif // !YUZU_TSAN_BUILD
+
+// ── (#4816, #3870): destination-address guard ─────────────────────────
+
+TEST_CASE("OffloadTargetStore[pg]: a literal link-local or metadata URL is refused at create",
+          "[offload_store][pg][security]") {
+    OffloadTargetStorePg store;
+    for (const char* u : {"http://169.254.169.254/latest/meta-data/", "http://0.0.0.0:22/x",
+                          "http://[fe80::1]/x", "http://224.0.0.1/x"}) {
+        INFO(u);
+        auto r = store->create_target("t", u, OffloadAuthType::None, "", "*");
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error() == OffloadWriteError::destination_refused); // distinct from validation
+    }
+    for (const char* u : {"http://2852039166/", "http://0xa9fea9fe/", "http://0/"}) {
+        INFO(u);
+        auto r = store->create_target("t2", u, OffloadAuthType::None, "", "*");
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error() == OffloadWriteError::destination_refused);
+    }
+    {
+        auto r = store->create_target("t3", "ftp://example.com/x", OffloadAuthType::None, "", "*");
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error() == OffloadWriteError::invalid_input);
+    }
+    CHECK(store->create_target("lo", "http://127.0.0.1:1/h", OffloadAuthType::None, "", "*").has_value());
+    CHECK(store->create_target("pv", "http://10.1.2.3/h", OffloadAuthType::None, "", "*").has_value());
+}
+
+TEST_CASE("OffloadTargetStore[pg]: a stored row aimed at a metadata address is never connected to",
+          "[offload_store][pg][security]") {
+    OffloadTargetStorePg store;
+    yuzu::MetricsRegistry metrics;
+    store->set_metrics(&metrics);
+    int sink_calls = 0;
+    store->set_delivery_refused_sink([&](std::int64_t, std::string_view, std::string_view,
+                                         const std::string&) { ++sink_calls; });
+    auto id = store->create_target("t", "http://127.0.0.1:1/h", OffloadAuthType::None, "",
+                                   "agent.registered");
+    REQUIRE(id.has_value());
+    {
+        auto lease = store.pool().acquire();
+        REQUIRE(lease);
+        auto res = yuzu::server::pg::exec_params(
+            lease.get(), "UPDATE offload_target_store.offload_targets SET url = $2 WHERE id = $1::bigint",
+            std::vector<std::string>{std::to_string(*id), "http://169.254.169.254/latest/meta-data/"});
+        REQUIRE(res.status() == PGRES_COMMAND_OK);
+    }
+    store->fire_event("agent.registered", R"({"k":"v"})");
+    std::vector<OffloadDelivery> d;
+    for (int i = 0; i < 250 && d.empty(); ++i) {
+        d = store->get_deliveries(*id);
+        if (d.empty())
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    REQUIRE(d.size() == 1);
+    CHECK(d[0].error == "destination_refused");
+    CHECK(d[0].status_code == 0);
+    CHECK(metrics.counter("yuzu_server_offload_delivery_refused_total",
+                          {{"cause", "destination_refused"}}).value() == 1.0);
+    CHECK(metrics.counter("yuzu_server_offload_delivery_failed_total").value() == 0.0);
+    CHECK(sink_calls == 1);
+}
+
+// ── delivery to a name with several vetted addresses ─────────────────────────
+
+namespace {
+// Create a target for `multi.test:port` whose lookup answers `addrs` in that order, fire one event and
+// wait for its delivery row. The listener(s) accept and drop the request.
+std::vector<OffloadDelivery> offload_fire_with_lookup(OffloadTargetStorePg& store,
+                                                      std::vector<std::string> addrs, int port) {
+    store->set_lookup_for_test([addrs](const std::string&) {
+        net::ResolveResult r;
+        r.status = net::ResolveStatus::kOk;
+        r.addresses = addrs;
+        return r;
+    });
+    auto id = store->create_target("multi", "http://multi.test:" + std::to_string(port) + "/h",
+                                   OffloadAuthType::None, "", "*");
+    REQUIRE(id.has_value());
+    store->fire_event("execution.completed", R"({"k":"v"})");
+    std::vector<OffloadDelivery> deliveries;
+    const auto start = std::chrono::steady_clock::now();
+    while (std::chrono::steady_clock::now() - start < std::chrono::seconds(30)) {
+        deliveries = store->get_deliveries(*id);
+        if (!deliveries.empty())
+            break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    return deliveries;
+}
+} // namespace
+
+TEST_CASE("OffloadTargetStore[pg]: a name with two addresses is not POSTed to twice once the first connected",
+          "[offload_store][pg][security]") {
+    OffloadTargetStorePg store;
+    auto pair = yuzu::test::open_dual_stack_pair();
+    if (!pair) {
+        SKIP("no IPv4+IPv6 loopback listener pair could be bound on one port in this environment");
+    }
+    // IPv4 is tried first; its listener drops the connection without answering (a read error after
+    // connecting), so a second POST to ::1 would deliver the event twice.
+    auto deliveries = offload_fire_with_lookup(store, {"::1", "127.0.0.1"}, pair->v4->port);
+    REQUIRE(deliveries.size() == 1);
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    CHECK(pair->v4->accepted.load() == 1);
+    CHECK(pair->v6->accepted.load() == 0);
+}
+
+TEST_CASE("OffloadTargetStore[pg]: a connect that FAILS moves on to the next address and the POST arrives once",
+          "[offload_store][pg][security]") {
+    OffloadTargetStorePg store;
+    yuzu::test::RawListener v4;
+    REQUIRE(v4.open(AF_INET, 0));
+    auto deliveries = offload_fire_with_lookup(store, {"127.0.0.2", "127.0.0.1"}, v4.port);
+    REQUIRE(deliveries.size() == 1);
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    CHECK(v4.accepted.load() == 1);
+}
+
+TEST_CASE("OffloadTargetStore[pg]: a connect that TIMES OUT also moves on, and still delivers once",
+          "[offload_store][pg][security]") {
+    OffloadTargetStorePg store;
+    yuzu::test::RawListener v4;
+    REQUIRE(v4.open(AF_INET, 0));
+    // A non-routable private address: the connect times out or is refused depending on the network
+    // (a sandbox may refuse at once). Either way no connection was made, so the request goes to the
+    // listener at 127.0.0.1 exactly once.
+    auto deliveries = offload_fire_with_lookup(store, {"10.255.255.1", "127.0.0.1"}, v4.port);
+    REQUIRE(deliveries.size() == 1);
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    CHECK(v4.accepted.load() == 1);
 }

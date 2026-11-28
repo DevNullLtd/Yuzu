@@ -21,6 +21,7 @@
 #include "pg/pg_exec.hpp"
 #include "pg/pg_migration_runner.hpp"
 #include "acquire_retry.hpp"
+#include "auth_lock_bounds.hpp" // kAuthRecheckLockTimeout: the write budget the owners stay below
 #include "auth_db_sql_helpers.hpp" // one copy of the soft-delete / role-write statements (#4966)
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
@@ -39,9 +40,13 @@
 #include <atomic>
 #include <cctype> // std::isalnum / std::toupper
 #include <chrono>
+#include <cstdint>
 #include <cstdlib> // std::strtoll
+#include <mutex>
 #include <span>
+#include <stdexcept> // std::runtime_error: the salt-draw catch (#6995)
 #include <thread>
+#include <vector>
 
 namespace yuzu::server {
 
@@ -186,9 +191,10 @@ constexpr const char* kStoreName = "auth";
 // statement / mutation paths get a little more room. Neither is unbounded —
 // unbounded `acquire()` is construction-only (used once, in the ctor).
 constexpr std::chrono::milliseconds kReadTimeout{1500};
-constexpr std::chrono::milliseconds kWriteTimeout{2000};
-// Also the lock_timeout of recheck_role_locked; CredentialChangeOwner::kWriteTimeout MUST stay
-// strictly below it (R22e).
+constexpr std::chrono::milliseconds kWriteTimeout{kAuthRecheckLockTimeout};
+// Also the lock_timeout of recheck_role_locked; CredentialChangeOwner::kWriteTimeout and
+// MfaDisableOwner::kWriteTimeout MUST both stay strictly below it (R22e). The value lives in
+// auth_lock_bounds.hpp, where a static_assert beside each owner enforces the ordering.
 
 // Bounded acquire-retry (issue #2396). The shared PG pool arms a short
 // connect-backoff breaker after a connectivity hiccup (pg_pool.cpp): for a
@@ -244,6 +250,68 @@ constexpr std::chrono::milliseconds kAcquireRetryTimeout{150};
             return pool.try_acquire_for(first ? first_timeout : kAcquireRetryTimeout);
         },
         [] { std::this_thread::sleep_for(kAcquireRetryBackoff); });
+}
+
+// #6079: the body of `users_mfa_factor_gen()`, pinned. ONE constant feeds both the v3 migration
+// (the text between the `$$` delimiters, which Postgres stores verbatim as `pg_proc.prosrc`) and
+// the validation query (`prosrc = $1`), so the two cannot drift: a function replaced with any
+// other body is reported as tampering. Application code never writes `mfa_factor_gen`; the trigger
+// assigns it on EVERY change of `mfa_enrolled_at`, whichever binary issued the UPDATE.
+// The value is an opaque token, not a counter: each change draws a fresh random value in
+// [1, 2^60], the last 15 hex digits of a version-4 UUID from `gen_random_uuid()` (a CSPRNG, core
+// in PostgreSQL 13+), which sit past the UUID's fixed version and variant nibbles. Consumers only
+// compare it for equality, and 0 means "never assigned". Why random: after an auth-only database
+// restore over a newer `session_store`, a counter would walk back onto a value that a surviving
+// stored proof carries, and that stale proof would match again; a random value is not reproduced
+// by replaying enrolments on the restored row. The distinctness guard keeps two changes of one
+// row in one transaction different even in the one-in-2^60 case of a repeated draw.
+// The function is created with `SET search_path = pg_catalog, pg_temp`, so the names it calls
+// (`gen_random_uuid`, `replace`, `substr`) and the operators it uses resolve in pg_catalog and
+// never in a schema the calling session lists first: without the pin, a session whose search_path
+// names a writable schema before pg_catalog could shadow them and force a known generation.
+// pg_temp is listed LAST on purpose: a path that omits it still searches the session's temporary
+// schema FIRST for relations and types, so a role with TEMP privilege could create a temporary
+// type named `text` (the body's `::text`) plus implicit casts through it and force a known
+// generation; listed explicitly, pg_temp is searched after pg_catalog and can no longer win.
+// The boot check requires the pin (`pg_proc.proconfig`), so a `CREATE OR REPLACE FUNCTION` that
+// omits the SET clause (which resets `proconfig`) is reported as tampering.
+// FROZEN: shipped in migration v3 and pinned byte-for-byte by the boot check, together with the
+// SET clause; changing either needs a NEW migration (CREATE OR REPLACE) and an accepted (old,new)
+// pair in the check, or every migrated replica refuses to boot.
+constexpr std::string_view kUsersMfaFactorGenBody =
+    "\n"
+    "BEGIN\n"
+    "  IF NEW.mfa_enrolled_at IS DISTINCT FROM OLD.mfa_enrolled_at THEN\n"
+    "    NEW.mfa_factor_gen := ('x' || substr(replace(gen_random_uuid()::text, '-', ''), 18, 15))"
+    "::bit(60)::bigint + 1;\n"
+    "    IF NEW.mfa_factor_gen = OLD.mfa_factor_gen THEN\n"
+    "      NEW.mfa_factor_gen := OLD.mfa_factor_gen + 1;\n"
+    "    END IF;\n"
+    "  ELSE\n"
+    "    NEW.mfa_factor_gen := OLD.mfa_factor_gen;\n"
+    "  END IF;\n"
+    "  RETURN NEW;\n"
+    "END\n";
+
+// v3 is a hard cutover (no upgrade path, no seed): the column starts at 0 for every existing row
+// and the trigger assigns a fresh value at the next enrolment change. An enrolled account that
+// already exists when this migration runs therefore reads generation 0, which every gate refuses
+// (503 `mfa_proof_unavailable`) until `yuzu-server --mfa-reset <user>` re-enrols it, so the
+// cutover is meant for a fresh database.
+std::string migration_v3_sql() {
+    std::string sql;
+    sql += "SET LOCAL lock_timeout = '3s'; ";
+    sql += "ALTER TABLE users ADD COLUMN mfa_factor_gen BIGINT NOT NULL DEFAULT 0; ";
+    sql += "CREATE FUNCTION users_mfa_factor_gen() RETURNS trigger LANGUAGE plpgsql "
+           "SET search_path = pg_catalog, pg_temp AS $$";
+    sql += kUsersMfaFactorGenBody;
+    sql += "$$; ";
+    sql += "CREATE TRIGGER users_mfa_factor_gen BEFORE UPDATE OF mfa_enrolled_at, mfa_factor_gen "
+           "ON users FOR EACH ROW EXECUTE FUNCTION users_mfa_factor_gen(); ";
+    // ENABLE ALWAYS (pg_trigger.tgenabled = 'A') fires under every session_replication_role; the
+    // default 'O' is skipped under 'replica', which a restore tool or a superuser can select.
+    sql += "ALTER TABLE users ENABLE ALWAYS TRIGGER users_mfa_factor_gen;";
+    return sql;
 }
 
 const std::vector<pg::PgMigration>& migrations() {
@@ -309,7 +377,8 @@ const std::vector<pg::PgMigration>& migrations() {
          "  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),"
          "  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),"
          "  last_login_at TIMESTAMPTZ,"
-         "  is_active BOOLEAN NOT NULL DEFAULT TRUE," // see RbacStore::unassign_role back-reference above
+         "  is_active BOOLEAN NOT NULL DEFAULT TRUE," // see RbacStore::unassign_role back-reference
+                                                      // above
          "  mfa_totp_secret BYTEA,"
          "  mfa_enrolled_at TIMESTAMPTZ,"
          "  mfa_disabled_at TIMESTAMPTZ,"
@@ -427,6 +496,23 @@ const std::vector<pg::PgMigration>& migrations() {
          "  imported_at TIMESTAMPTZ NOT NULL DEFAULT now(),"
          "  imported_by TEXT NOT NULL DEFAULT ''"
          ");"},
+
+        // v3 (#6079): a database-owned factor generation on `users`. The row trigger assigns a
+        // fresh random token on every change of `mfa_enrolled_at`, so "which factor is enrolled
+        // right now" is a value no repeated or skewed enrolment timestamp can forge and no
+        // restored row can re-issue (see kUsersMfaFactorGenBody). Every existing row
+        // starts at 0 (a hard cutover: no seed, see migration_v3_sql). A legacy binary ignores the
+        // column but its enrol and clear UPDATEs still fire the trigger. The 3 s lock_timeout
+        // bounds the ALTER and CREATE TRIGGER waits: while they queue behind a long transaction,
+        // every new users query on a running peer queues behind them, so a short cap keeps that
+        // stall short. A failed attempt rolls back and the next boot retries it.
+        {3, migration_v3_sql()},
+        // v4 (WP03 F8/F15): durable per-account MFA failure budget, separate from the password
+        // lockout columns so a password success cannot reset it. Additive; defaults are inert.
+        {4,
+         "SET LOCAL lock_timeout = '3s'; "
+         "ALTER TABLE users ADD COLUMN mfa_failed_count INTEGER NOT NULL DEFAULT 0, "
+         "ADD COLUMN mfa_locked_until TIMESTAMPTZ, ADD COLUMN mfa_last_attempt_at TIMESTAMPTZ;"},
     };
     return kMigrations;
 }
@@ -458,7 +544,17 @@ regenerate_recovery_codes_locked(PGconn* conn, const std::string& username) {
     std::vector<std::string> raw_codes;
     raw_codes.reserve(kRecoveryCodeCount);
     for (int i = 0; i < kRecoveryCodeCount; ++i) {
-        auto code = mfa::random_recovery_code();
+        auto minted = mfa::random_recovery_code();
+        if (!minted.has_value()) {
+            // #4763: CSPRNG failure — fail closed. Returning unexpected makes the
+            // caller roll back the txn, so the DELETE above is undone and the
+            // user keeps their existing codes; no partial set is ever issued.
+            spdlog::error("regenerate_recovery_codes: CSPRNG failure minting a recovery code "
+                          "for '{}' — refusing to issue recovery codes",
+                          username);
+            return std::unexpected(AuthDBError::EntropyUnavailable); // #6995: not a store fault
+        }
+        auto code = std::move(*minted);
         std::string norm;
         norm.reserve(code.size());
         for (char c : code) {
@@ -466,7 +562,25 @@ regenerate_recovery_codes_locked(PGconn* conn, const std::string& username) {
                 continue;
             norm += static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
         }
-        auto salt = auth::AuthManager::random_bytes(16);
+        // #6995 (gov UP-1/CO-1): the per-code salt is drawn through AuthManager::random_bytes,
+        // which THROWS (std::runtime_error) when the CSPRNG fails, unlike the typed
+        // mfa::random_recovery_code draw above. Left uncaught it unwinds through the txn
+        // callback (PgTxn still rolls back) into httplib, which installs no exception handler:
+        // a bare 500 with NO audit row, NO event and NO counter, for the very fault class this
+        // follow-up exists to make visible. Catch it HERE, inside the callback's helper, so the
+        // rollback is unchanged and the fault takes the same audited EntropyUnavailable path.
+        std::vector<std::uint8_t> salt;
+        try {
+            salt = auth::AuthManager::random_bytes(16);
+        } catch (const std::runtime_error& e) {
+            // runtime_error is all random_bytes throws for an entropy failure (RAND_bytes or
+            // BCryptGenRandom); a std::bad_alloc is NOT an entropy fault and must propagate rather
+            // than be audited and counted as one.
+            spdlog::error("regenerate_recovery_codes: CSPRNG failure drawing a recovery-code salt "
+                          "for '{}' ({}) - refusing to issue recovery codes",
+                          username, e.what());
+            return std::unexpected(AuthDBError::EntropyUnavailable);
+        }
         auto salt_hex = auth::AuthManager::bytes_to_hex(salt);
         auto hash = auth::AuthManager::pbkdf2_sha256(norm, salt, kRecoveryCodePbkdfIters);
 
@@ -498,6 +612,9 @@ struct LoadedMfaRow {
     // (`password_hash` is NOT NULL DEFAULT '', so an SSO-shaped row anchors
     // to '' and still compares by equality.)
     std::string password_hash_hex;
+    // #6079: the DATABASE instant (now(), epoch ms) of the statement that loaded this row, i.e. of
+    // the load that precedes the cryptographic check. Carried out as `MfaEnrolment::verified_ms`.
+    int64_t load_ms{0};
 };
 
 // ★ SECURITY (2026-07-25 review, HIGH #2): this helper returns a TYPED
@@ -527,11 +644,12 @@ struct LoadedMfaRow {
     auto lease = acquire_with_retry(pool, kReadTimeout); // #2396 transient-blip ride-out
     if (!lease)
         return std::unexpected(AuthDBError::StoreBusy);
-    pg::PgResult res = pg::exec_params(
-        lease.get(),
-        "SELECT id, encode(mfa_totp_secret, 'hex'), (mfa_enrolled_at IS NOT NULL), "
-        "mfa_last_counter, password_hash FROM auth.users WHERE username = $1 AND is_active = TRUE",
-        std::vector<std::string>{username});
+    pg::PgResult res =
+        pg::exec_params(lease.get(),
+                        "SELECT id, encode(mfa_totp_secret, 'hex'), (mfa_enrolled_at IS NOT NULL), "
+                        "mfa_last_counter, password_hash, (extract(epoch from now())*1000)::bigint "
+                        "FROM auth.users WHERE username = $1 AND is_active = TRUE",
+                        std::vector<std::string>{username});
     if (res.status() != PGRES_TUPLES_OK)
         return std::unexpected(AuthDBError::QueryFailed);
     if (PQntuples(res.get()) == 0)
@@ -544,6 +662,7 @@ struct LoadedMfaRow {
     out.enrolled = to_bool(col(res.get(), 0, 2));
     out.last_counter = to_i64(col(res.get(), 0, 3));
     out.password_hash_hex = col_str(res.get(), 0, 4);
+    out.load_ms = to_i64(col(res.get(), 0, 5));
     return out;
 }
 
@@ -561,6 +680,51 @@ decrypt_mfa_secret(pg::SecretCodec& codec, const LoadedMfaRow& row) {
     return std::move(*dec);
 }
 
+// #6079: is the factor-generation trigger EFFECTIVELY in force? Reads the catalog, not the
+// migration history: the trigger must exist, be ENABLE ALWAYS (tgenabled = 'A', so it also fires
+// under `session_replication_role = replica`), be a BEFORE UPDATE row trigger whose column list
+// is EXACTLY those two columns (attnum equality of the sorted lists; a superset is refused too,
+// so a catalog edit that widened the list reads as altered), with the INSERT/DELETE/TRUNCATE
+// bits clear and no WHEN clause, and call the plpgsql function of that name, in the table's
+// schema, whose body is byte-identical to the pinned constant and whose `proconfig` is exactly
+// `{"search_path=pg_catalog, pg_temp"}` (one element; pg_temp last so the session's temporary
+// schema cannot shadow a type name first): the pin keeps the function's name resolution and
+// operators independent of the caller's search_path, and a NULL `proconfig` (what
+// `CREATE OR REPLACE FUNCTION` without the SET clause leaves) reads as Invalid.
+// `tgtype` bits (pg_trigger.h): ROW 1, BEFORE 2,
+// INSERT 4, DELETE 8, UPDATE 16, TRUNCATE 32, INSTEAD 64.
+enum class BindingCheck : std::uint8_t {
+    Valid,   // the query ran and the trigger is in force
+    Invalid, // the query ran and the trigger is missing, disabled, replica-only, or altered
+    Unknown, // the query could not run (statement failure): says nothing about the trigger
+};
+
+[[nodiscard]] BindingCheck check_factor_trigger(PGconn* conn) {
+    pg::PgResult res = pg::exec_params(
+        conn,
+        "SELECT t.tgenabled = 'A' "
+        "AND (t.tgtype & 127) = 19 "
+        "AND t.tgqual IS NULL "
+        "AND ARRAY(SELECT x FROM unnest(t.tgattr::int2[]) AS x ORDER BY x) = "
+        "    ARRAY(SELECT attnum FROM pg_attribute "
+        "           WHERE attrelid = t.tgrelid "
+        "             AND attname IN ('mfa_enrolled_at','mfa_factor_gen') ORDER BY attnum) "
+        "AND p.proname = 'users_mfa_factor_gen' "
+        "AND p.pronamespace = (SELECT relnamespace FROM pg_class WHERE oid = t.tgrelid) "
+        "AND p.prolang = (SELECT oid FROM pg_language WHERE lanname = 'plpgsql') "
+        "AND p.prosrc = $1::text "
+        "AND COALESCE(p.proconfig = ARRAY['search_path=pg_catalog, pg_temp']::text[], false) "
+        "FROM pg_trigger t JOIN pg_proc p ON p.oid = t.tgfoid "
+        "WHERE t.tgrelid = 'auth.users'::regclass AND t.tgname = 'users_mfa_factor_gen' "
+        "AND NOT t.tgisinternal",
+        std::vector<std::string>{std::string(kUsersMfaFactorGenBody)});
+    if (res.status() != PGRES_TUPLES_OK)
+        return BindingCheck::Unknown;
+    if (PQntuples(res.get()) != 1)
+        return BindingCheck::Invalid;
+    return to_bool(col(res.get(), 0, 0)) ? BindingCheck::Valid : BindingCheck::Invalid;
+}
+
 } // namespace
 
 // ── AuthDB Implementation ────────────────────────────────────────────────────
@@ -570,6 +734,31 @@ struct AuthDB::Impl {
     pg::SecretCodec& secret_codec;
     bool open{false};
     int cleanup_interval_secs{60};
+
+    // #6079 factor-generation binding. `binding_ok` is STICKY: once the trigger has been observed
+    // not in force it never returns to true in this process, because generation changes made while
+    // it was not firing cannot be reconstructed (see `AuthDB::MfaStatus::binding_enforced`).
+    // Validation is request-driven: `mfa_status` re-runs it when the steady-clock deadline lapses.
+    // A tampering that begins and ends between two validations is not observable by this
+    // mechanism; the trust boundary is the database role, which can alter the generation itself.
+    std::atomic<bool> binding_ok{true};
+    std::atomic<std::int64_t> binding_next_check_ns{0}; // steady_clock ns; 0 = due now
+    std::atomic<std::int64_t> binding_memo_ns{
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::seconds(60)).count()};
+    // Set while the last validation could not run (BindingCheck::Unknown); cleared by the next
+    // Valid result. Every `mfa_status` reports "not enforced" while it is set, so once ONE
+    // check has come back inconclusive no reader (a compare-exchange loser included) reads
+    // "enforced" until a later check returns Valid. A loser that arrives while the FIRST
+    // inconclusive check is still in flight reads the previous state: that window is one catalog
+    // query (mirrors SessionStore::last_validation_inconclusive_).
+    std::atomic<bool> binding_inconclusive{false};
+
+    // Test seams (never set in production).
+    std::atomic<bool> commit_ack_lost{false};
+    std::atomic<bool> force_binding_unknown{false}; // forces BindingCheck::Unknown in mfa_status
+    std::function<void()> binding_check_hook;       // runs inside the forced-Unknown check
+    std::mutex hook_mu;
+    std::function<void()> enrolment_pre_txn_hook;
 
     // Background stale-provisional-MFA reaper. Sessions are no longer
     // persisted here at all, so this thread has exactly one job (unlike the
@@ -607,6 +796,10 @@ AuthDB::AuthDB(pg::PgPool& pool, pg::SecretCodec& secret_codec)
     : AuthDB(pool, secret_codec, /*cleanup_interval_secs=*/60) {}
 
 AuthDB::AuthDB(pg::PgPool& pool, pg::SecretCodec& secret_codec, int cleanup_interval_secs)
+    : AuthDB(pool, secret_codec, cleanup_interval_secs, MfaBindingCheck::kEnforce) {}
+
+AuthDB::AuthDB(pg::PgPool& pool, pg::SecretCodec& secret_codec, int cleanup_interval_secs,
+               MfaBindingCheck binding_check)
     : impl_(std::make_unique<Impl>(pool, secret_codec)) {
     impl_->cleanup_interval_secs = cleanup_interval_secs;
 
@@ -622,6 +815,36 @@ AuthDB::AuthDB(pg::PgPool& pool, pg::SecretCodec& secret_codec, int cleanup_inte
         spdlog::error("AuthDB: schema migration failed — auth store disabled");
         return;
     }
+    // #6079: boot gate. The generation trigger must be in force NOW, not merely recorded in
+    // schema_meta: a trigger dropped, disabled, switched to replica-only or given another body
+    // after the migration ran leaves the version table untouched. A failure (or a query that
+    // cannot run) leaves the store closed, the same fail-closed posture as a failed migration,
+    // so the server refuses to start rather than serving MFA decisions it cannot bind.
+    const BindingCheck boot_check = check_factor_trigger(lease.get());
+    if (binding_check == MfaBindingCheck::kBypassForRecovery) {
+        // Host-CLI recovery one-shot (--mfa-reset, --break-glass-arm): a locked-out operator must
+        // still be able to clear a factor or arm the break-glass account, so the store opens
+        // whatever the trigger state. The binding is reported NOT enforced for the life of this
+        // instance (sticky, like an observed tamper), so any binding decision made through it
+        // fails closed; the one-shots make none.
+        spdlog::warn("AuthDB: recovery bypass of the MFA factor-generation trigger check "
+                     "(trigger state: {}); this one-shot process does not enforce factor binding",
+                     boot_check == BindingCheck::Valid ? "in force"
+                     : boot_check == BindingCheck::Invalid
+                         ? "missing, not ENABLE ALWAYS, or altered"
+                         : "unreadable");
+        impl_->binding_ok.store(false);
+    } else if (boot_check != BindingCheck::Valid) {
+        spdlog::error("AuthDB: the MFA factor-generation trigger (auth.users_mfa_factor_gen) is "
+                      "missing, not ENABLE ALWAYS, or altered - auth store disabled");
+        impl_->binding_ok.store(false);
+        return;
+    }
+    // Validated just now: the first request-driven re-validation is due one memo period out.
+    impl_->binding_next_check_ns.store(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                           std::chrono::steady_clock::now().time_since_epoch())
+                                           .count() +
+                                       impl_->binding_memo_ns.load());
     lease.reset(); // release before touching the codec (never hold a lease across other work)
 
     // ADR-0010: register the sole secret-bearing column. This ctor never
@@ -704,13 +927,51 @@ void AuthDB::request_stop() noexcept {
 bool AuthDB::is_ready() const noexcept { return impl_ && impl_->open; }
 bool AuthDB::is_open() const noexcept { return is_ready(); }
 
+void AuthDB::set_commit_ack_lost_for_test(bool lost) noexcept {
+    if (impl_)
+        impl_->commit_ack_lost.store(lost, std::memory_order_release);
+}
+
+void AuthDB::set_binding_check_unknown_for_test(bool unknown) noexcept {
+    if (!impl_)
+        return;
+    impl_->force_binding_unknown.store(unknown, std::memory_order_release);
+    impl_->binding_next_check_ns.store(0); // due now
+}
+
+void AuthDB::set_binding_check_hook_for_test(std::function<void()> hook) {
+    if (!impl_)
+        return;
+    std::lock_guard lk(impl_->hook_mu);
+    impl_->binding_check_hook = std::move(hook);
+}
+
+void AuthDB::set_enrolment_pre_txn_hook_for_test(std::function<void()> hook) {
+    if (!impl_)
+        return;
+    std::lock_guard lk(impl_->hook_mu);
+    impl_->enrolment_pre_txn_hook = std::move(hook);
+}
+
+bool AuthDB::mfa_binding_enforced() const noexcept {
+    return impl_ && impl_->binding_ok.load(std::memory_order_acquire);
+}
+
+void AuthDB::set_binding_validation_memo_for_test(std::chrono::milliseconds memo) noexcept {
+    if (!impl_)
+        return;
+    impl_->binding_memo_ns.store(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(memo).count());
+    impl_->binding_next_check_ns.store(0); // due now: the next mfa_status re-validates
+}
+
 // ── User Operations ──────────────────────────────────────────────────────────
 
 std::expected<void, AuthDBError> AuthDB::upsert_user(const std::string& username,
                                                      const std::string& password_hash,
                                                      const std::string& salt_hex, auth::Role role) {
     if (!is_valid_username(username)) {
-        spdlog::warn("upsert_user rejected invalid username: '{}'", username);
+        spdlog::warn("upsert_user rejected invalid username: '{}'", ::yuzu::log_key_token(username));
         return std::unexpected(AuthDBError::InvalidUsername);
     }
     std::string role_str = (role == auth::Role::admin) ? "admin" : "user";
@@ -1026,7 +1287,7 @@ std::expected<bool, AuthDBError> AuthDB::user_exists(const std::string& username
 std::expected<void, AuthDBError> AuthDB::update_role(const std::string& username,
                                                      auth::Role new_role) {
     if (!is_valid_username(username)) {
-        spdlog::warn("update_role rejected invalid username: '{}'", username);
+        spdlog::warn("update_role rejected invalid username: '{}'", ::yuzu::log_key_token(username));
         return std::unexpected(AuthDBError::InvalidUsername);
     }
     std::string role_str = (new_role == auth::Role::admin) ? "admin" : "user";
@@ -1050,9 +1311,9 @@ std::expected<void, AuthDBError> AuthDB::update_role(const std::string& username
 }
 
 std::expected<void, AuthDBError>
-AuthDB::recheck_role_locked(
-    const std::string& username,
-    const std::function<void(auth::Role, const std::string& password_hash)>& under_row_lock) {
+AuthDB::recheck_role_locked(const std::string& username,
+                            const std::function<void(auth::Role, const std::string& password_hash,
+                                                     std::int64_t factor_gen)>& under_row_lock) {
     // is_valid_principal, NOT is_valid_username: this is called on the exact
     // same path as get_user() (via AuthManager::recheck_role_after_credential_
     // check, reachable with an SSO-prefixed principal) - see get_user()'s own
@@ -1116,8 +1377,8 @@ AuthDB::recheck_role_locked(
         // (see the header doc).
         pg::PgResult sel = pg::exec_params(
             conn,
-            "SELECT role, password_hash FROM auth.users WHERE username = $1 AND is_active = TRUE "
-            "FOR UPDATE",
+            "SELECT role, password_hash, mfa_factor_gen FROM auth.users WHERE username = $1 "
+            "AND is_active = TRUE FOR UPDATE",
             std::vector<std::string>{username});
         if (sel.status() != PGRES_TUPLES_OK) {
             err = AuthDBError::QueryFailed;
@@ -1134,7 +1395,10 @@ AuthDB::recheck_role_locked(
         }
         // under_row_lock runs here, still holding the row lock - see the
         // header doc: fast, local, in-process work only, no further DB I/O.
-        under_row_lock(auth::string_to_role(col_str(sel.get(), 0, 0)), col_str(sel.get(), 0, 1));
+        // #6079: the factor generation is read under the SAME lock, for the same reason as the
+        // credential hash: a clear + re-enrol cannot commit between this read and the callback.
+        under_row_lock(auth::string_to_role(col_str(sel.get(), 0, 0)), col_str(sel.get(), 0, 1),
+                       to_i64(col(sel.get(), 0, 2)));
         return true; // commit - releases the row lock; no DB mutation to persist
     });
     if (err)
@@ -1275,7 +1539,7 @@ std::expected<void, AuthDBError> AuthDB::reactivate_user(const std::string& user
     pg::PgResult res = pg::exec_params(
         lease.get(),
         "UPDATE auth.users SET is_active = TRUE, updated_at = now(), failed_login_count = 0, "
-        "last_failed_login_at = NULL, locked_until = NULL WHERE username = $1 RETURNING id",
+        "last_failed_login_at = NULL, locked_until = NULL, mfa_failed_count = 0, mfa_locked_until = NULL, mfa_last_attempt_at = NULL WHERE username = $1 RETURNING id",
         std::vector<std::string>{username});
     if (res.status() != PGRES_TUPLES_OK)
         return std::unexpected(AuthDBError::WriteFailed);
@@ -1414,6 +1678,113 @@ std::expected<void, AuthDBError> AuthDB::clear_failed_logins(const std::string& 
     return {};
 }
 
+// ── Per-account MFA failure budget (WP03 F8/F15) ─────────────────────────────
+
+std::expected<AuthDB::LockoutStatus, AuthDBError>
+AuthDB::mfa_lockout_status(const std::string& username) {
+    if (!is_valid_username(username))
+        return std::unexpected(AuthDBError::InvalidUsername);
+    auto lease = impl_->pool.try_acquire_for(kReadTimeout);
+    if (!lease)
+        return std::unexpected(AuthDBError::StoreBusy);
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "SELECT mfa_failed_count, COALESCE((mfa_locked_until AT TIME ZONE 'UTC')::text, ''), "
+        "(mfa_locked_until IS NOT NULL AND mfa_locked_until > now()) "
+        "FROM auth.users WHERE username = $1 AND is_active = TRUE",
+        std::vector<std::string>{username});
+    if (res.status() != PGRES_TUPLES_OK)
+        return std::unexpected(AuthDBError::QueryFailed);
+    LockoutStatus out;
+    if (PQntuples(res.get()) > 0) {
+        out.failed_count = static_cast<int>(to_i64(col(res.get(), 0, 0)));
+        out.locked_until = col_str(res.get(), 0, 1);
+        out.locked = to_bool(col(res.get(), 0, 2));
+    }
+    return out;
+}
+
+std::expected<AuthDB::MfaReservation, AuthDBError>
+AuthDB::reserve_mfa_attempt(const std::string& username, int threshold, int window_secs) {
+    MfaReservation out;
+    if (threshold <= 0 || window_secs <= 0)
+        return std::unexpected(AuthDBError::WriteFailed); // misconfigured: refuse, never fail open
+    if (!is_valid_username(username))
+        return std::unexpected(AuthDBError::InvalidUsername);
+    auto lease = impl_->pool.try_acquire_for(kWriteTimeout);
+    if (!lease)
+        return std::unexpected(AuthDBError::StoreBusy);
+    // ONE statement is the authority (kReserveMfaAttemptSql): the row lock serialises concurrent
+    // reservations (across replicas too) and `reserved` comes from the PRE-update state
+    // read under that lock, never from comparing timestamps.
+    pg::PgResult res = pg::exec_params(
+        lease.get(), auth_sql::kReserveMfaAttemptSql,
+        std::vector<std::string>{std::to_string(threshold), std::to_string(window_secs), username});
+    if (res.status() != PGRES_TUPLES_OK)
+        return std::unexpected(AuthDBError::WriteFailed);
+    if (PQntuples(res.get()) == 0)
+        return out; // no such active user: no budget to spend (reserved stays true, count 0)
+    out.failed_count = static_cast<int>(to_i64(col(res.get(), 0, 0)));
+    out.reserved = to_bool(col(res.get(), 0, 1));
+    out.locked = to_bool(col(res.get(), 0, 2));
+    out.just_locked = out.reserved && out.locked && out.failed_count == threshold;
+    return out;
+}
+
+std::expected<void, AuthDBError> AuthDB::refund_mfa_attempt(const std::string& username,
+                                                             int threshold) {
+    if (!is_valid_username(username))
+        return std::unexpected(AuthDBError::InvalidUsername);
+    auto lease = impl_->pool.try_acquire_for(kWriteTimeout);
+    if (!lease)
+        return std::unexpected(AuthDBError::StoreBusy);
+    // Give back exactly ONE reservation (never a reset: concurrent failures stay counted) and
+    // lift the lock only if the count falls back under the threshold.
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "UPDATE auth.users SET mfa_failed_count = GREATEST(mfa_failed_count - 1, 0), "
+        "mfa_locked_until = CASE WHEN GREATEST(mfa_failed_count - 1, 0) < $1::int "
+        "    THEN NULL ELSE mfa_locked_until END "
+        "WHERE username = $2 AND is_active = TRUE",
+        std::vector<std::string>{std::to_string(threshold), username});
+    if (res.status() != PGRES_COMMAND_OK)
+        return std::unexpected(AuthDBError::WriteFailed);
+    return {};
+}
+
+std::expected<void, AuthDBError> AuthDB::clear_account_lockouts(const std::string& username) {
+    if (!is_valid_username(username))
+        return std::unexpected(AuthDBError::InvalidUsername);
+    auto lease = impl_->pool.try_acquire_for(kWriteTimeout);
+    if (!lease)
+        return std::unexpected(AuthDBError::StoreBusy);
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "UPDATE auth.users SET failed_login_count = 0, last_failed_login_at = NULL, "
+        "locked_until = NULL, mfa_failed_count = 0, mfa_locked_until = NULL, "
+        "mfa_last_attempt_at = NULL WHERE username = $1 AND is_active = TRUE",
+        std::vector<std::string>{username});
+    if (res.status() != PGRES_COMMAND_OK)
+        return std::unexpected(AuthDBError::WriteFailed);
+    return {};
+}
+
+std::expected<void, AuthDBError> AuthDB::clear_mfa_failures(const std::string& username) {
+    if (!is_valid_username(username))
+        return std::unexpected(AuthDBError::InvalidUsername);
+    auto lease = impl_->pool.try_acquire_for(kWriteTimeout);
+    if (!lease)
+        return std::unexpected(AuthDBError::StoreBusy);
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "UPDATE auth.users SET mfa_failed_count = 0, mfa_locked_until = NULL, "
+        "mfa_last_attempt_at = NULL WHERE username = $1 AND is_active = TRUE",
+        std::vector<std::string>{username});
+    if (res.status() != PGRES_COMMAND_OK)
+        return std::unexpected(AuthDBError::WriteFailed);
+    return {};
+}
+
 // ── Break-glass arming (hardened mode) ───────────────────────────────────────
 
 std::expected<AuthDB::BreakGlassStatus, AuthDBError>
@@ -1421,23 +1792,40 @@ AuthDB::break_glass_status(const std::string& username) {
     if (!is_valid_username(username)) {
         return std::unexpected(AuthDBError::InvalidUsername);
     }
-    auto lease = impl_->pool.try_acquire_for(kReadTimeout);
-    if (!lease)
+    // Bounded in time on every axis (the caller is the sso-only login gate, run for every request
+    // naming the break-glass user): the pool acquire, the table-lock wait and the statement are
+    // each capped, so a stuck read surfaces as a failed statement (QueryFailed -> the gate fails
+    // CLOSED), never a parked refresher.
+    std::optional<BreakGlassStatus> out;
+    const bool ok = impl_->pool.with_txn_for(kReadTimeout, [&](PGconn* conn) -> bool {
+        for (const char* guc : {"lock_timeout", "statement_timeout"}) {
+            pg::PgResult set = pg::exec_params(conn, "SELECT set_config($1, '1000', true)",
+                                               std::vector<std::string>{guc});
+            if (set.status() != PGRES_TUPLES_OK)
+                return false;
+        }
+        pg::PgResult res = pg::exec_params(
+            conn,
+            "SELECT COALESCE((break_glass_armed_until AT TIME ZONE 'UTC')::text, ''), "
+            "(break_glass_armed_until IS NOT NULL AND break_glass_armed_until > now()), "
+            "COALESCE(GREATEST(0, (EXTRACT(EPOCH FROM (break_glass_armed_until - now())) * 1000)"
+            "::bigint), 0) "
+            "FROM auth.users WHERE username = $1 AND is_active = TRUE",
+            std::vector<std::string>{username});
+        if (res.status() != PGRES_TUPLES_OK)
+            return false;
+        BreakGlassStatus st;
+        if (PQntuples(res.get()) > 0) {
+            st.armed_until = col_str(res.get(), 0, 0);
+            st.armed = to_bool(col(res.get(), 0, 1));
+            st.remaining_ms = st.armed ? to_i64(col(res.get(), 0, 2)) : 0;
+        }
+        out = st;
+        return true;
+    });
+    if (!ok || !out)
         return std::unexpected(AuthDBError::QueryFailed);
-    pg::PgResult res = pg::exec_params(
-        lease.get(),
-        "SELECT COALESCE((break_glass_armed_until AT TIME ZONE 'UTC')::text, ''), "
-        "(break_glass_armed_until IS NOT NULL AND break_glass_armed_until > now()) "
-        "FROM auth.users WHERE username = $1 AND is_active = TRUE",
-        std::vector<std::string>{username});
-    if (res.status() != PGRES_TUPLES_OK)
-        return std::unexpected(AuthDBError::QueryFailed);
-    BreakGlassStatus out;
-    if (PQntuples(res.get()) > 0) {
-        out.armed_until = col_str(res.get(), 0, 0);
-        out.armed = to_bool(col(res.get(), 0, 1));
-    }
-    return out;
+    return *out;
 }
 
 std::expected<AuthDB::BreakGlassStatus, AuthDBError>
@@ -1453,7 +1841,10 @@ AuthDB::arm_break_glass(const std::string& username, int window_secs) {
         return std::unexpected(AuthDBError::WriteFailed);
     pg::PgResult res = pg::exec_params(
         lease.get(),
-        "UPDATE auth.users SET break_glass_armed_until = now() + make_interval(secs => $1::int) "
+        "UPDATE auth.users SET break_glass_armed_until = now() + make_interval(secs => $1::int), "
+        // Out-of-band recovery: arming also lifts any MFA failure lock, so a password-holder's
+        // guessing cannot keep the break-glass account's second factor wedged (WP03).
+        "mfa_failed_count = 0, mfa_locked_until = NULL, mfa_last_attempt_at = NULL "
         "WHERE username = $2 AND is_active = TRUE "
         "RETURNING COALESCE((break_glass_armed_until AT TIME ZONE 'UTC')::text, ''), "
         "          (break_glass_armed_until IS NOT NULL AND break_glass_armed_until > now())",
@@ -1520,7 +1911,7 @@ std::expected<AuthDB::MfaStatus, AuthDBError> AuthDB::mfa_status(const std::stri
                         "SELECT id, encode(mfa_totp_secret, 'hex'), (mfa_enrolled_at IS NOT NULL), "
                         "COALESCE((mfa_enrolled_at AT TIME ZONE 'UTC')::text, ''), "
                         "COALESCE((mfa_disabled_at AT TIME ZONE 'UTC')::text, ''), "
-                        "COALESCE((extract(epoch from mfa_enrolled_at)*1000)::bigint, 0) "
+                        "mfa_factor_gen, (extract(epoch from now())*1000)::bigint "
                         "FROM auth.users WHERE username = $1 AND is_active = TRUE",
                         std::vector<std::string>{username});
     if (res.status() != PGRES_TUPLES_OK)
@@ -1534,6 +1925,10 @@ std::expected<AuthDB::MfaStatus, AuthDBError> AuthDB::mfa_status(const std::stri
 
     MfaStatus status;
     status.disabled_at = col_str(res.get(), 0, 4);
+    // #6079: read for an un-enrolled account too (0 never enrolled; otherwise the random value the
+    // trigger last assigned, which is never ordered or counted).
+    status.factor_gen = to_i64(col(res.get(), 0, 5));
+    status.db_now_ms = to_i64(col(res.get(), 0, 6));
 
     if (!enrolled_flag) {
         // Genuinely not enrolled — a provisional secret, if any, does not
@@ -1552,7 +1947,6 @@ std::expected<AuthDB::MfaStatus, AuthDBError> AuthDB::mfa_status(const std::stri
             return std::unexpected(dec.error());
         status.enrolled = true;
         status.enrolled_at = col_str(res.get(), 0, 3);
-        status.enrolled_at_ms = to_i64(col(res.get(), 0, 5));
     }
 
     // Recovery-code count is best-effort display metadata (matches the
@@ -1570,6 +1964,60 @@ std::expected<AuthDB::MfaStatus, AuthDBError> AuthDB::mfa_status(const std::stri
         std::vector<std::string>{username});
     if (cres.status() == PGRES_TUPLES_OK && PQntuples(cres.get()) > 0)
         status.recovery_codes_remaining = static_cast<int>(to_i64(col(cres.get(), 0, 0)));
+
+    // #6079: re-validate the generation trigger behind a steady-clock memo, on the lease already
+    // held (never a second one, see above). Request-driven only: the cleanup cadence plays no
+    // part. A query that RAN and found the trigger not in force flips the STICKY flag; a query
+    // that could not run latches `binding_inconclusive` (every read reports "not enforced" until a
+    // later check returns Valid) and leaves the memo lapsed, so a transient blip neither poisons
+    // the process nor reads as enforced.
+    if (impl_->binding_ok.load(std::memory_order_acquire)) {
+        const auto now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::steady_clock::now().time_since_epoch())
+                                .count();
+        auto due = impl_->binding_next_check_ns.load(std::memory_order_acquire);
+        // compare_exchange: one caller per expiry runs the catalog query.
+        if (now_ns >= due &&
+            impl_->binding_next_check_ns.compare_exchange_strong(
+                due, now_ns + impl_->binding_memo_ns.load(std::memory_order_relaxed))) {
+            BindingCheck checked = BindingCheck::Unknown;
+            if (impl_->force_binding_unknown.load(std::memory_order_acquire)) {
+                std::function<void()> hook;
+                {
+                    std::lock_guard lk(impl_->hook_mu);
+                    hook = impl_->binding_check_hook;
+                }
+                if (hook)
+                    hook(); // test seam: hold the winner mid-check
+            } else {
+                checked = check_factor_trigger(lease.get());
+            }
+            switch (checked) {
+            case BindingCheck::Valid:
+                impl_->binding_inconclusive.store(false, std::memory_order_release);
+                break;
+            case BindingCheck::Invalid:
+                impl_->binding_ok.store(false, std::memory_order_release);
+                spdlog::error("AuthDB: the MFA factor-generation trigger is no longer in force "
+                              "(missing, not ENABLE ALWAYS, or altered): factor-bound MFA "
+                              "decisions fail closed until the server restarts");
+                break;
+            case BindingCheck::Unknown:
+                // One warning per episode (not per read): the gauge reads 1 during this latch, so
+                // the log line and the step-up refusal counters are the operator's signal.
+                if (!impl_->binding_inconclusive.exchange(true, std::memory_order_acq_rel)) {
+                    spdlog::warn("AuthDB: the MFA factor-generation trigger validation could not "
+                                 "run (catalog query failed); factor-bound MFA decisions refuse "
+                                 "until a later validation succeeds");
+                }
+                impl_->binding_next_check_ns.store(0, std::memory_order_release); // retry next read
+                break;
+            }
+        }
+    }
+    if (!impl_->binding_ok.load(std::memory_order_acquire) ||
+        impl_->binding_inconclusive.load(std::memory_order_acquire))
+        status.binding_enforced = false;
     return status;
 }
 
@@ -1670,7 +2118,16 @@ AuthDB::mfa_init_enrollment(const std::string& username, std::string_view issuer
         }
 
         // Fresh secret, encrypted under this row's id (the SecretId AAD).
-        auto secret_bytes = mfa::random_secret();
+        auto minted_secret = mfa::random_secret();
+        if (!minted_secret.has_value()) {
+            // #4763: CSPRNG failure — never enroll a zero/partial secret. Nothing
+            // has been encrypted or written at this point.
+            spdlog::error("mfa_init_enrollment: CSPRNG failure minting TOTP secret for '{}' — "
+                          "refusing enrollment",
+                          username);
+            return std::unexpected(AuthDBError::EntropyUnavailable); // #6995: not a store fault
+        }
+        auto secret_bytes = std::move(*minted_secret);
         auto secret_view = std::string_view(reinterpret_cast<const char*>(secret_bytes.data()),
                                             secret_bytes.size());
         auto secret_b32 = mfa::base32_encode(secret_view);
@@ -1746,7 +2203,7 @@ AuthDB::mfa_init_enrollment(const std::string& username, std::string_view issuer
     return std::unexpected(AuthDBError::WriteFailed); // unreachable: pass 1 always returns
 }
 
-std::expected<std::vector<std::string>, AuthDBError>
+std::expected<AuthDB::MfaEnrolment, AuthDBError>
 AuthDB::mfa_verify_enrollment(const std::string& username, std::string_view code,
                               const std::optional<std::string>& expected_password_hash_hex) {
     if (!is_valid_username(username)) {
@@ -1775,6 +2232,9 @@ AuthDB::mfa_verify_enrollment(const std::string& username, std::string_view code
     // #5342 Gate 8 (F4): the credential anchor, always bound in the guarded
     // UPDATE below — the caller's proven hash, else the hash read above.
     const std::string anchor = expected_password_hash_hex.value_or(row->password_hash_hex);
+    // The ENCRYPTED envelope blob (never the plaintext secret), hex-encoded once: the guarded UPDATE
+    // and, on a 0-row miss, the classify SELECT both bind it.
+    const std::string secret_hex = auth::AuthManager::bytes_to_hex(row->secret_blob);
 
     auto secret_view = std::string_view(reinterpret_cast<const char*>(dec->data()), dec->size());
     auto current = mfa::current_counter(std::chrono::system_clock::now());
@@ -1783,13 +2243,27 @@ AuthDB::mfa_verify_enrollment(const std::string& username, std::string_view code
         return std::unexpected(AuthDBError::InvalidCredentials);
     }
 
+    // #6079 test seam: a pause between the cryptographic check above and the transaction below.
+    // The verification instant was captured by `load_mfa_row`, BEFORE the check, so whatever
+    // happens here counts as proof age.
+    {
+        std::function<void()> hook;
+        {
+            std::lock_guard lk(impl_->hook_mu);
+            hook = impl_->enrolment_pre_txn_hook;
+        }
+        if (hook)
+            hook();
+    }
+
     // Stamp enrolled_at + generate recovery codes ATOMICALLY — a code-gen
     // failure must roll the stamp back too (the user stays provisional and
     // can simply retry, rather than landing in a permanent
     // MfaAlreadyEnrolled-with-zero-recovery-codes lockout).
     std::vector<std::string> raw_codes;
+    std::int64_t enrolled_gen = 0;
     AuthDBError txn_error = AuthDBError::WriteFailed;
-    const bool ok = impl_->pool.with_txn_for(kWriteTimeout, [&](PGconn* conn) -> bool {
+    const bool committed = impl_->pool.with_txn_for(kWriteTimeout, [&](PGconn* conn) -> bool {
         // ★ TOCTOU guard (#3762): the WHERE predicate makes the provisional→enrolled
         // commit atomic with its own preconditions, exactly as `mfa_consume_recovery_code`
         // guards on `consumed_at IS NULL` (docs/auth-mfa-design.md "Recovery codes",
@@ -1813,8 +2287,9 @@ AuthDB::mfa_verify_enrollment(const std::string& username, std::string_view code
         //       that rotates to a DIFFERENT provisional secret B likewise fails (B ≠ the
         //       loaded A → 0 rows) — a bare `IS NOT NULL` would have MATCHED B and enrolled
         //       the account against a secret whose code was never verified (#3781 review).
-        //       Any 0-row outcome here → classify below keeps WriteFailed/503 (fail-closed,
-        //       no half-enrolled state).
+        //       Either way nothing is enrolled (fail-closed, no half-enrolled state); the
+        //       0-row classify below grades it `MfaEnrollmentCancelled` (#3808), a benign
+        //       cancel, rather than a store outage.
         // LOAD-BEARING: dropping (a) reopens the double-regen; weakening (b) from the exact
         // blob to `IS NOT NULL` reopens the enrol-over-a-rotated-secret race. Neither wedges
         // a legitimate enroll: an uninterrupted verify's loaded secret is still the stored
@@ -1833,41 +2308,50 @@ AuthDB::mfa_verify_enrollment(const std::string& username, std::string_view code
         //       waited lands as CredentialChanged, never as an enrolment.
         pg::PgResult r = pg::exec_params(
             conn,
-            "UPDATE auth.users SET mfa_enrolled_at = now(), mfa_last_counter = $1, updated_at = now() "
+            "UPDATE auth.users SET mfa_enrolled_at = now(), mfa_last_counter = $1, updated_at = "
+            "now() "
             "WHERE username = $2 AND is_active = TRUE AND mfa_enrolled_at IS NULL "
             "AND mfa_totp_secret = decode($3, 'hex') "
-            "AND password_hash = $4 RETURNING id",
-            std::vector<std::string>{std::to_string(*matched), username,
-                                     auth::AuthManager::bytes_to_hex(row->secret_blob), anchor});
+            "AND password_hash = $4 RETURNING id, mfa_factor_gen",
+            std::vector<std::string>{std::to_string(*matched), username, secret_hex, anchor});
         if (r.status() != PGRES_TUPLES_OK)
             return false; // write outage → fail closed (WriteFailed → 503)
         if (PQntuples(r.get()) == 0) {
             // 0 rows = the user was deactivated/deleted mid-request, OR a concurrent
-            // verify already enrolled them (the guard above). Classify so the
-            // concurrent-enroll loser is graded MfaAlreadyEnrolled — NOT WriteFailed,
+            // verify already enrolled them, OR the provisional secret this verify
+            // loaded is no longer the stored one (#3808: a disable, a re-init, the
+            // stale-provisional sweep, `--mfa-reset` or a KEK rewrap — not
+            // distinguishable here, so no caller may name a cause). Classify so
+            // each benign race is graded by its own business outcome — NOT WriteFailed,
             // which `is_store_unavailable()` routes to a false 503 + a
-            // secret-unavailable degrade metric + a kCritical "store unavailable" audit
-            // for a benign race. A genuinely deactivated user keeps the fail-closed
-            // WriteFailed/503 (unchanged).
+            // secret-unavailable degrade metric + a kCritical "store unavailable" audit.
+            // A genuinely deactivated/deleted user, or a miss nothing explains, keeps
+            // the fail-closed WriteFailed/503 (unchanged).
             // #5342 Gate 8 (F2/F4): an active, still un-enrolled row whose hash
             // is no longer the anchor → CredentialChanged (a refusal, not a
-            // store fault). Evaluated in the SAME statement as the enrolled
-            // test so the two cannot disagree.
+            // store fault); it outranks the cancel because a password reset also wipes
+            // the provisional secret. All four facts come from the SAME statement so
+            // they cannot disagree; the precedence is the pure
+            // `detail::classify_enroll_verify_miss`.
             pg::PgResult cls = pg::exec_params(
                 conn,
                 "SELECT is_active, (mfa_enrolled_at IS NOT NULL), "
-                "(password_hash IS DISTINCT FROM $2) "
+                "(password_hash IS DISTINCT FROM $2), "
+                "(mfa_totp_secret IS DISTINCT FROM decode($3, 'hex')) "
                 "FROM auth.users WHERE username = $1",
-                std::vector<std::string>{username, anchor});
-            if (cls.status() == PGRES_TUPLES_OK && PQntuples(cls.get()) == 1 &&
-                to_bool(col(cls.get(), 0, 0))) {
-                if (to_bool(col(cls.get(), 0, 1)))
-                    txn_error = AuthDBError::MfaAlreadyEnrolled;
-                else if (to_bool(col(cls.get(), 0, 2)))
-                    txn_error = AuthDBError::CredentialChanged;
+                std::vector<std::string>{username, anchor,
+                                         secret_hex});
+            if (cls.status() == PGRES_TUPLES_OK && PQntuples(cls.get()) == 1) {
+                txn_error = detail::classify_enroll_verify_miss(
+                    to_bool(col(cls.get(), 0, 0)), to_bool(col(cls.get(), 0, 1)),
+                    to_bool(col(cls.get(), 0, 2)), to_bool(col(cls.get(), 0, 3)));
             }
             return false;
         }
+
+        // The generation the BEFORE trigger produced for this very UPDATE (RETURNING reads the
+        // post-trigger row), under the row lock this UPDATE holds until COMMIT.
+        enrolled_gen = to_i64(col(r.get(), 0, 1));
 
         auto codes = regenerate_recovery_codes_locked(conn, username);
         if (!codes) {
@@ -1877,12 +2361,15 @@ AuthDB::mfa_verify_enrollment(const std::string& username, std::string_view code
         raw_codes = std::move(*codes);
         return true;
     });
-    if (!ok)
+    // Published only as a COMMITTED fact: a lost acknowledgement (or the test seam standing in for
+    // one) is WriteFailed, and the codes of an enrolment the caller cannot confirm are never
+    // revealed.
+    if (!committed || impl_->commit_ack_lost.load(std::memory_order_acquire))
         return std::unexpected(txn_error);
-    return raw_codes;
+    return MfaEnrolment{std::move(raw_codes), enrolled_gen, row->load_ms};
 }
 
-std::expected<bool, AuthDBError>
+std::expected<AuthDB::MfaVerification, AuthDBError>
 AuthDB::mfa_verify_login_code(const std::string& username, std::string_view code) {
     if (!is_valid_username(username)) {
         return std::unexpected(AuthDBError::InvalidUsername);
@@ -1895,14 +2382,33 @@ AuthDB::mfa_verify_login_code(const std::string& username, std::string_view code
     // pass and both bump the counter → a TOTP code consumed twice (replay).
     // `SELECT ... FOR UPDATE` serializes them: the second waiter reads the
     // just-advanced counter and the monotonic window check rejects the replay.
+    //
+    // #6079: the same statement that locks the row also reads the factor generation and the
+    // database instant (`now()` is the transaction start, so a lock wait only makes the instant
+    // OLDER, the conservative direction), BEFORE the TOTP check. The TOTP window check stays under
+    // the row lock exactly as before (microseconds); no PBKDF2 runs here.
     std::optional<bool> result;                 // set = definitive true/false; unset = store/decrypt error
     AuthDBError err = AuthDBError::QueryFailed;  // used only when result stays unset
+    std::int64_t gen = 0;
+    std::int64_t verified_ms = 0;
     const bool committed = impl_->pool.with_txn_for(kWriteTimeout, [&](PGconn* conn) -> bool {
-        pg::PgResult sel = pg::exec_params(
-            conn,
-            "SELECT id, encode(mfa_totp_secret, 'hex'), (mfa_enrolled_at IS NOT NULL), mfa_last_counter "
-            "FROM auth.users WHERE username = $1 AND is_active = TRUE FOR UPDATE",
-            std::vector<std::string>{username});
+        // Bound the row-lock WAIT to kWriteTimeout (the recheck_role_locked idiom, parameterised,
+        // transaction-scoped): kWriteTimeout alone bounds only the connection acquire. A lock
+        // timeout surfaces as a failed statement below, i.e. QueryFailed (503), never a wrong code.
+        pg::PgResult set_lt =
+            pg::exec_params(conn, "SELECT set_config('lock_timeout', $1, true)",
+                            std::vector<std::string>{std::to_string(kWriteTimeout.count()) + "ms"});
+        if (set_lt.status() != PGRES_TUPLES_OK) {
+            err = AuthDBError::QueryFailed;
+            return false;
+        }
+        pg::PgResult sel =
+            pg::exec_params(conn,
+                            "SELECT id, encode(mfa_totp_secret, 'hex'), (mfa_enrolled_at IS NOT "
+                            "NULL), mfa_last_counter, "
+                            "mfa_factor_gen, (extract(epoch from now())*1000)::bigint "
+                            "FROM auth.users WHERE username = $1 AND is_active = TRUE FOR UPDATE",
+                            std::vector<std::string>{username});
         if (sel.status() != PGRES_TUPLES_OK) {
             err = AuthDBError::QueryFailed; // read outage → fail closed (503), never "wrong code"
             return false;
@@ -1917,6 +2423,8 @@ AuthDB::mfa_verify_login_code(const std::string& username, std::string_view code
             row.secret_blob = auth::AuthManager::hex_to_bytes(col_str(sel.get(), 0, 1));
         row.enrolled = to_bool(col(sel.get(), 0, 2));
         row.last_counter = to_i64(col(sel.get(), 0, 3));
+        gen = to_i64(col(sel.get(), 0, 4));
+        verified_ms = to_i64(col(sel.get(), 0, 5));
         if (!row.enrolled) {
             result = false; // genuinely not enrolled — nothing to verify against
             return false;
@@ -1995,19 +2503,28 @@ AuthDB::mfa_verify_login_code(const std::string& username, std::string_view code
         result = true;
         return true; // commit the counter advance
     });
-    if (result.has_value())
-        return *result;
-    (void)committed; // false on this path (error rollback or lease-acquire failure) → surface the error
+    if (result.has_value()) {
+        if (!*result)
+            return MfaVerification{}; // a definitive "no" is not a fact that needs a commit
+        // ★ #6079: `ok` is published ONLY as a COMMITTED fact. `result == true` was set before the
+        // COMMIT ran; a COMMIT that failed, or whose acknowledgement was lost (the test seam
+        // stands in for one), is WriteFailed: 503, no session, no burned attempt. After a lost
+        // acknowledgement the counter advance did persist, so the same code is refused as a
+        // replay on retry: fail closed either way.
+        if (!committed || impl_->commit_ack_lost.load(std::memory_order_acquire))
+            return std::unexpected(AuthDBError::WriteFailed);
+        return MfaVerification{true, gen, verified_ms};
+    }
     return std::unexpected(err);
 }
 
-std::expected<bool, AuthDBError>
+std::expected<AuthDB::MfaVerification, AuthDBError>
 AuthDB::mfa_consume_recovery_code(const std::string& username, std::string_view raw_code) {
     if (!is_valid_username(username)) {
         return std::unexpected(AuthDBError::InvalidUsername);
     }
     if (raw_code.empty()) {
-        return false;
+        return MfaVerification{};
     }
 
     struct Candidate {
@@ -2016,14 +2533,27 @@ AuthDB::mfa_consume_recovery_code(const std::string& username, std::string_view 
         std::string code_salt;
     };
     std::vector<Candidate> candidates;
+    // #6079: the DATABASE instant of the statement that loads the candidates, i.e. BEFORE the
+    // PBKDF2 scan below: every pause after it counts as proof age.
+    std::int64_t verified_ms = 0;
     {
         auto lease = impl_->pool.try_acquire_for(kReadTimeout);
         if (!lease)
             return std::unexpected(AuthDBError::WriteFailed);
         pg::PgResult res = pg::exec_params(
             lease.get(),
-            "SELECT id, code_hash, code_salt FROM auth.mfa_recovery_codes "
-            "WHERE username = $1 AND consumed_at IS NULL",
+            // #4058, defence in depth: an inactive account has no usable recovery
+            // codes, mirroring mfa_verify_login_code's `is_active = TRUE` filter.
+            // remove_user already deletes the codes with the soft-delete; this
+            // covers an account deactivated outside that path (a direct database
+            // edit). Lock-free by design: holding the user-row lock
+            // across the PBKDF2 walk below is the hazard
+            // mfa_regenerate_recovery_codes documents. The consuming statement
+            // below re-checks `is_active` under the row lock.
+            "SELECT c.id, c.code_hash, c.code_salt, (extract(epoch from now())*1000)::bigint "
+            "FROM auth.mfa_recovery_codes c "
+            "WHERE c.username = $1 AND c.consumed_at IS NULL "
+            "AND EXISTS (SELECT 1 FROM auth.users u WHERE u.username = c.username AND u.is_active = TRUE)",
             std::vector<std::string>{username});
         if (res.status() != PGRES_TUPLES_OK)
             return std::unexpected(AuthDBError::WriteFailed);
@@ -2032,6 +2562,8 @@ AuthDB::mfa_consume_recovery_code(const std::string& username, std::string_view 
         for (int i = 0; i < rows; ++i)
             candidates.push_back(
                 {to_i64(col(res.get(), i, 0)), col_str(res.get(), i, 1), col_str(res.get(), i, 2)});
+        if (rows > 0)
+            verified_ms = to_i64(col(res.get(), 0, 3));
     }
 
     // Normalise: recovery codes are displayed with a '-' separator for
@@ -2057,26 +2589,66 @@ AuthDB::mfa_consume_recovery_code(const std::string& username, std::string_view 
             matched_id = cand.id;
     }
     if (matched_id < 0) {
-        return false;
+        return MfaVerification{};
     }
 
-    auto lease = impl_->pool.try_acquire_for(kWriteTimeout);
-    if (!lease)
+    // #6079: ONE statement inside a bounded transaction. The CTE locks the `auth.users` row FOR
+    // UPDATE (it is MATERIALIZED and carries a row mark, so it runs before the UPDATE touches a
+    // code row), then the code row is consumed: users row, then codes row, the order
+    // regeneration, enrolment and disable all use, so none can deadlock against it. Two
+    // concurrent consumptions of one code serialise on the users row and exactly one returns a
+    // row. The generation is read under that lock. Zero rows is `ok=false`: a concurrent winner,
+    // a regeneration that deleted the candidate, or an account cleared (or deactivated) between
+    // the scan and the lock. The lock WAIT is bounded to kWriteTimeout; a timeout is a failed
+    // statement, i.e. QueryFailed (503), never a burned attempt.
+    bool consumed = false;
+    bool zero_rows = false;
+    std::int64_t gen = 0;
+    std::optional<AuthDBError> err;
+    const bool committed = impl_->pool.with_txn_for(kWriteTimeout, [&](PGconn* conn) -> bool {
+        pg::PgResult set_lt =
+            pg::exec_params(conn, "SELECT set_config('lock_timeout', $1, true)",
+                            std::vector<std::string>{std::to_string(kWriteTimeout.count()) + "ms"});
+        if (set_lt.status() != PGRES_TUPLES_OK) {
+            err = AuthDBError::QueryFailed;
+            return false;
+        }
+        pg::PgResult res = pg::exec_params(
+            conn,
+            "WITH u AS MATERIALIZED (SELECT mfa_factor_gen AS gen FROM auth.users "
+            "WHERE username = $2 AND is_active = TRUE AND mfa_enrolled_at IS NOT NULL FOR UPDATE) "
+            "UPDATE auth.mfa_recovery_codes c SET consumed_at = now() FROM u "
+            "WHERE c.id = $1 AND c.username = $2 AND c.consumed_at IS NULL RETURNING u.gen",
+            std::vector<std::string>{std::to_string(matched_id), username});
+        if (res.status() != PGRES_TUPLES_OK) {
+            err = AuthDBError::QueryFailed;
+            return false;
+        }
+        if (PQntuples(res.get()) == 0) {
+            zero_rows = true;
+            return false; // nothing consumed: roll back, report ok=false below
+        }
+        consumed = true;
+        gen = to_i64(col(res.get(), 0, 0));
+        return true;
+    });
+    if (err)
+        return std::unexpected(*err);
+    if (zero_rows)
+        return MfaVerification{};
+    if (!consumed)
+        return std::unexpected(AuthDBError::WriteFailed); // no connection / BEGIN failed
+    // ★ Published only as a COMMITTED fact. After a lost acknowledgement the code STAYS consumed
+    // (nothing is restored), no proof is published, and a retry of the same code is refused as a
+    // replay; the user continues with the next code.
+    if (!committed || impl_->commit_ack_lost.load(std::memory_order_acquire))
         return std::unexpected(AuthDBError::WriteFailed);
-    pg::PgResult res = pg::exec_params(
-        lease.get(),
-        "UPDATE auth.mfa_recovery_codes SET consumed_at = now() WHERE id = $1 AND consumed_at IS NULL "
-        "RETURNING id",
-        std::vector<std::string>{std::to_string(matched_id)});
-    if (res.status() != PGRES_TUPLES_OK)
-        return std::unexpected(AuthDBError::WriteFailed);
-    if (PQntuples(res.get()) == 0)
-        return false; // a concurrent consume won the race
-    return true;
+    return MfaVerification{true, gen, verified_ms};
 }
 
 std::expected<std::vector<std::string>, AuthDBError>
-AuthDB::mfa_regenerate_recovery_codes(const std::string& username) {
+AuthDB::mfa_regenerate_recovery_codes(const std::string& username,
+                                      std::optional<std::int64_t> expected_factor_gen) {
     if (!is_valid_username(username)) {
         return std::unexpected(AuthDBError::InvalidUsername);
     }
@@ -2116,7 +2688,9 @@ AuthDB::mfa_regenerate_recovery_codes(const std::string& username) {
         // is a shared-helper refactor (it touches the enrollment path too) tracked
         // as a follow-up, not folded here.
         pg::PgResult lock = pg::exec_params(
-            conn, "SELECT id FROM auth.users WHERE username = $1 AND is_active = TRUE FOR UPDATE",
+            conn,
+            "SELECT id, mfa_factor_gen FROM auth.users WHERE username = $1 AND is_active = TRUE "
+            "FOR UPDATE",
             std::vector<std::string>{username});
         if (lock.status() != PGRES_TUPLES_OK) {
             txn_error = AuthDBError::QueryFailed; // read outage → fail closed (503)
@@ -2124,6 +2698,14 @@ AuthDB::mfa_regenerate_recovery_codes(const std::string& username) {
         }
         if (PQntuples(lock.get()) == 0) {
             txn_error = AuthDBError::UserNotFound; // no active user → never issue codes
+            return false;
+        }
+        // #6079: the generation a gate ADMITTED this request at, compared under the lock every
+        // factor writer takes, BEFORE the DELETE. A factor rotated between the gate and this
+        // statement (clear + re-enrol by another party) reads a different generation here, so
+        // nothing is written: the committed code set belongs to the new factor and is untouched.
+        if (expected_factor_gen && to_i64(col(lock.get(), 0, 1)) != *expected_factor_gen) {
+            txn_error = AuthDBError::FactorChanged;
             return false;
         }
         auto codes = regenerate_recovery_codes_locked(conn, username);
@@ -2140,13 +2722,15 @@ AuthDB::mfa_regenerate_recovery_codes(const std::string& username) {
 }
 
 std::expected<void, AuthDBError> AuthDB::mfa_disable(const std::string& username) {
-    auto r = mfa_disable_report(username);
+    auto r = mfa_disable_report(username, std::nullopt);
     if (!r)
         return std::unexpected(r.error());
     return {};
 }
 
-std::expected<bool, AuthDBError> AuthDB::mfa_disable_report(const std::string& username) {
+std::expected<bool, AuthDBError>
+AuthDB::mfa_disable_report(const std::string& username,
+                           std::optional<std::int64_t> expected_factor_gen) {
     if (!is_valid_username(username)) {
         return std::unexpected(AuthDBError::InvalidUsername);
     }
@@ -2157,24 +2741,28 @@ std::expected<bool, AuthDBError> AuthDB::mfa_disable_report(const std::string& u
     // before it could miss an enrolment verified in between, and the caller would then skip
     // ending the sessions made under that factor. An absent or inactive account matches no row
     // and reports `true` (unknown counts as enrolled, so the caller fails safe).
+    //
+    // #6079: with an expected generation the `pre` CTE gains `AND mfa_factor_gen = $2`, so the
+    // admitted generation is compared INSIDE the locking read. The statements, their
+    // classification and the recovery-code DELETE live in `auth_sql::clear_mfa_factor_in_txn`
+    // (auth_db_sql_helpers.hpp), ONE copy shared with `MfaDisableOwner`.
     bool was_enrolled = true;
+    bool factor_changed = false;
     const bool ok = impl_->pool.with_txn_for(kWriteTimeout, [&](PGconn* conn) -> bool {
-        pg::PgResult upd = pg::exec_params(
-            conn,
-            "WITH pre AS (SELECT id, (mfa_enrolled_at IS NOT NULL) AS was_enrolled "
-            "FROM auth.users WHERE username = $1 AND is_active = TRUE FOR UPDATE) "
-            "UPDATE auth.users u SET mfa_totp_secret = NULL, mfa_enrolled_at = NULL, "
-            "mfa_disabled_at = now(), mfa_last_counter = 0, updated_at = now() "
-            "FROM pre WHERE u.id = pre.id RETURNING pre.was_enrolled",
-            std::vector<std::string>{username});
-        if (upd.status() != PGRES_TUPLES_OK)
+        std::string sql_err;
+        const auto report =
+            auth_sql::clear_mfa_factor_in_txn(conn, username, expected_factor_gen, sql_err);
+        if (!report)
             return false;
-        if (PQntuples(upd.get()) == 1)
-            was_enrolled = to_bool(col(upd.get(), 0, 0));
-        pg::PgResult del = pg::exec_params(conn, "DELETE FROM auth.mfa_recovery_codes WHERE username = $1",
-                                           std::vector<std::string>{username});
-        return del.status() == PGRES_COMMAND_OK;
+        if (report->status == auth_sql::MfaClearStatus::kFactorChanged) {
+            factor_changed = true;
+            return false; // roll back; nothing was cleared and the codes are untouched
+        }
+        was_enrolled = report->was_enrolled;
+        return true;
     });
+    if (factor_changed)
+        return std::unexpected(AuthDBError::FactorChanged);
     if (!ok)
         return std::unexpected(AuthDBError::WriteFailed);
     return was_enrolled;
@@ -2231,25 +2819,18 @@ bool read_pending_row(PGresult* res, int row, auth::PendingAgent& out) {
     return true;
 }
 
-/// True if `s` contains a byte that could corrupt a plain-string audit
-/// `detail` field or the comma-joined `bulk_audit_detail` list this store's
-/// caller (`settings_routes.cpp`) builds from `agent_id`s it reads back: any
-/// ASCII control character (0x00-0x1F, 0x7F — this subsumes `has_embedded_nul`;
-/// `\n`/`\r` in particular can forge additional log/audit lines) or a literal
-/// comma (the `bulk_audit_detail` delimiter). `agent_id` is the one field this
-/// store hard-rejects rather than sanitises (see `sanitize_enrollment_text`'s
-/// doc comment for why descriptive fields differ), so this is the single
-/// chokepoint — extend it, never add per-call-site escaping.
-bool has_audit_unsafe_byte(std::string_view s) {
-    for (const unsigned char c : s) {
-        if (c <= 0x1FU || c == 0x7FU || c == ',')
-            return true;
-    }
-    return false;
-}
-
+/// The one `agent_id` chokepoint of this store. The length and control-byte floor is the shared
+/// `auth::agent_id_is_audit_safe` (at most `auth::kMaxAgentIdLength` bytes, no byte below 0x20:
+/// this subsumes an embedded NUL, and `\n`/`\r` in particular can forge additional log/audit
+/// lines). On top of it this store hard-rejects an empty id, DEL (0x7F) and a literal comma,
+/// the `bulk_audit_detail` delimiter of the comma-joined list this store's caller
+/// (`settings_routes.cpp`) builds from `agent_id`s it reads back. `agent_id` is the one field
+/// this store hard-rejects rather than sanitises (see `sanitize_enrollment_text`'s doc comment
+/// for why descriptive fields differ), so this is the single chokepoint: extend it, never add
+/// per-call-site escaping.
 bool agent_id_ok(const std::string& id) {
-    return !id.empty() && id.size() <= auth::kMaxAgentIdLength && !has_audit_unsafe_byte(id);
+    return !id.empty() && auth::agent_id_is_audit_safe(id) &&
+           id.find_first_of("\x7f,") == std::string::npos;
 }
 
 bool pending_fields_ok(const auth::PendingAgent& a) {
@@ -2404,7 +2985,7 @@ std::expected<AuthDB::ConsumeEnrollResult, StoreError>
 AuthDB::consume_and_enroll(std::string_view raw_token, const std::string& agent_id,
                            const std::string& hostname, const std::string& os,
                            const std::string& arch, const std::string& agent_version,
-                           bool enforce_new_id_charset) {
+                           bool enforce_new_id_charset, bool require_single_use) {
     if (raw_token.empty() || raw_token.size() > auth::kMaxEnrollmentTokenLength ||
         has_embedded_nul(raw_token)) {
         return std::unexpected(StoreError::InvalidInput);
@@ -2441,8 +3022,12 @@ AuthDB::consume_and_enroll(std::string_view raw_token, const std::string& agent_
             "WHERE token_hash = $1 AND NOT revoked "
             "  AND (expires_at IS NULL OR expires_at > now()) "
             "  AND (max_uses = 0 OR use_count < max_uses) "
+            // WP01: a re-enrolment of an id that holds a live leaf accepts only a SINGLE-USE
+            // token. Decided INSIDE this guarded UPDATE so a multi-use token's use_count is
+            // never incremented (no consume-then-refuse burn, no rollback to get wrong).
+            "  AND (NOT $3::boolean OR max_uses = 1) "
             "RETURNING token_id, max_uses, use_count",
-            std::vector<std::string>{token_hash, agent_id});
+            std::vector<std::string>{token_hash, agent_id, require_single_use ? "t" : "f"});
         if (upd.status() != PGRES_TUPLES_OK)
             return false;
 
@@ -2458,7 +3043,7 @@ AuthDB::consume_and_enroll(std::string_view raw_token, const std::string& agent_
                 "SELECT revoked, "
                 "       (expires_at IS NOT NULL AND expires_at <= now()), "
                 "       (max_uses <> 0 AND use_count >= max_uses), "
-                "       last_consumed_by_agent_id "
+                "       last_consumed_by_agent_id, (max_uses <> 1) "
                 "FROM auth.enrollment_tokens WHERE token_hash = $1",
                 std::vector<std::string>{token_hash});
             if (cls.status() != PGRES_TUPLES_OK)
@@ -2468,7 +3053,12 @@ AuthDB::consume_and_enroll(std::string_view raw_token, const std::string& agent_
                     result.token_error = auth::EnrollmentTokenError::revoked;
                 else if (to_bool(col(cls.get(), 0, 1)))
                     result.token_error = auth::EnrollmentTokenError::expired;
-                else {
+                else if (!to_bool(col(cls.get(), 0, 2)) && require_single_use &&
+                         to_bool(col(cls.get(), 0, 4))) {
+                    // A valid multi-use token refused only because single-use was required.
+                    result.token_error = auth::EnrollmentTokenError::not_found;
+                    result.not_single_use = true;
+                } else {
                     // Exhausted — or (defence) the row changed between the
                     // UPDATE and this read; either way the honest label is
                     // "already consumed", never "not found".

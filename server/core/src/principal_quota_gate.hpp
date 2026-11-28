@@ -89,6 +89,10 @@ namespace yuzu::server::detail {
 /// rather than releasing it early at post-routing (the UP-1 hazard this guard exists to
 /// prevent). Any FUTURE streaming route added to `is_streaming_path` MUST do the same.
 ///
+/// `GET /api/v1/inventory/software/export` (SAM-36) is registered too, though it is a streamed file and
+/// not an SSE stream: its chunked body pins a worker for up to 900 s, so it adopts the slot in
+/// `software_export_routes.cpp` and leases from the one `StreamBudget` (`SseSurface::kSoftwareExport`).
+///
 /// POST /mcp/v1/ streams CONDITIONALLY (2f PR 3b, SSE-on-POST) — unlike the four GET routes
 /// above, which stream unconditionally. A POST /mcp/v1/ becomes a held-open SSE response only
 /// when the client opts in with an SSE-capable `Accept` AND (checked later, in the handler) the
@@ -116,6 +120,8 @@ namespace yuzu::server::detail {
     if (req.path.rfind("/sse/executions/", 0) == 0)   // dashboard per-execution SSE
         return true;
     if (req.path == "/mcp/v1/")                       // MCP Streamable HTTP GET SSE stream
+        return true;
+    if (req.path == "/api/v1/inventory/software/export") // streamed software export (SAM-36)
         return true;
     return false;
 }

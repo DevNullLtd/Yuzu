@@ -171,8 +171,9 @@ SummaryView DashboardSummaryRoutes::build_summary(const httplib::Request& req) c
                         scoped.push_back(r);
                 EstateCounts tally = tally_roster(scoped);
                 // The roster read is newest-first and capped before scope filtering, so a
-                // full read says nothing about what lies past the cap.
-                tally.at_least = all.rows.size() >= kRosterReadCap;
+                // truncated read says nothing about what lies past the cap. The typed bit
+                // (#5712), not a row count: a fleet of exactly the cap is complete and exact.
+                tally.at_least = all.roster_truncated;
                 v.devices = Fact<EstateCounts>::make_ok(tally);
             }
         }

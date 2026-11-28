@@ -26,8 +26,9 @@ const YuzuActionDescriptor kActionDescriptors[] = {
          "bounded reads of /etc/ssh/sshd_config (Include followed, config symlinks followed as sshd "
          "does) and each account's authorized_keys (no-follow; pure parsers, SHA-256 "
          "fingerprints); one bounded systemctl is-enabled argv per sshd unit",
-         "constrained: the agent runs unprivileged, so other users' homes (usually 0700) are "
-         "refused, not empty, and the listing is constrained; configured access as written, not "
+         "constrained: an agent without CAP_DAC_READ_SEARCH cannot enter other users' homes "
+         "(usually 0700), which are refused, not empty, and the listing is constrained; "
+         "configured access as written, not "
          "sshd's effective policy (Match is not evaluated); CA trust, key and principals "
          "commands, a principals file, hostbased auth and AuthenticationMethods are not read; "
          "key comments, option values and key-file "

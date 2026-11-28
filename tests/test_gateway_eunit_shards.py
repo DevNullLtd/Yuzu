@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Pin the gateway EUnit shard partition (scripts/gateway_eunit_shards.py).
 
-Meson runs the gateway eunit suite as shards (`gateway eunit shard A`, `...
-shard B`; root meson.build), each `scripts/test_gateway.py <gw> eunit
+Meson runs the gateway eunit suite as shards (`gateway eunit shard A` to
+`C`; root meson.build), each `scripts/test_gateway.py <gw> eunit
 --shard K/N`. A shard split is only safe if the shards together run exactly
 what the whole-suite `rebar3 eunit --dir apps/yuzu_gw/test` run did. This
 file pins:
@@ -108,12 +108,14 @@ class Partition(unittest.TestCase):
 
     def test_deterministic_regardless_of_listing_order(self):
         mods = ges.list_test_modules(TEST_DIR)
-        want = ges.partition(mods, 2)
         rng = random.Random(2093)
-        for _ in range(5):
-            shuffled = list(mods)
-            rng.shuffle(shuffled)
-            self.assertEqual(ges.partition(shuffled, 2), want)
+        for n in (1, 2, 3):
+            with self.subTest(n=n):
+                want = ges.partition(mods, n)
+                for _ in range(5):
+                    shuffled = list(mods)
+                    rng.shuffle(shuffled)
+                    self.assertEqual(ges.partition(shuffled, n), want)
 
     def test_bad_shard_count_is_refused(self):
         with self.assertRaises(ValueError):
@@ -184,6 +186,11 @@ class MesonAndCiAgree(unittest.TestCase):
         self.assertRegex(body, r"'REBAR_BASE_DIR': _gw_src / \('_build_eunit_' \+ _gw_shard_spec\.split\('/'\)\[0\]\)")
         self.assertIn("suite: 'gateway'", body)
 
+    def test_registered_shards_cover_the_real_inventory_exactly_once(self):
+        shards = [ges.shard_modules(TEST_DIR, int(k), int(n))
+                  for _, k, n in self._meson_shards()]
+        _assert_exact_cover(self, shards, ges.eunit_units(ges.list_test_modules(TEST_DIR)))
+
     def test_ci_registration_check_requires_every_shard(self):
         src = _read(ASSERT_SCRIPT)
         m = re.search(r'REQUIRED = \(([^)]*)\)', src)
@@ -203,6 +210,11 @@ class ShardConfigScript(unittest.TestCase):
         self.assertIn('os:getenv("YUZU_GW_EUNIT_SHARD_MODULES"', src)
         self.assertIn('{eunit_tests, [{spawn, {module, M}} || M <- Mods]}', src)
         self.assertIn('"rebar.config"', src)
+        # Cover is off in a shard (the test profile's cover_enabled forced to
+        # false, applied to the terms the script returns); why, and what it
+        # saves, in scripts/gateway_eunit_shards.py ("COVER").
+        self.assertIn('{cover_enabled, false}', src)
+        self.assertIn('lists:keystore(eunit_tests, 1, NoCover(Base),', src)
         wrapper = _read(WRAPPER)
         self.assertIn('env["YUZU_GW_EUNIT_SHARD_MODULES"]', wrapper)
         self.assertIn('env["REBAR_CONFIG"]', wrapper)

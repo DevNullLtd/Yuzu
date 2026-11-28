@@ -1,0 +1,40 @@
+# Images NOT covered by OS package vulnerability scanning (WP15/S9).
+#
+# scripts/ci/image-vuln-gate.sh fails an image whose OS package scan finds no
+# package at all: a scan that saw nothing is not a clean scan. An image listed
+# here passes that check anyway, and the gate prints NOT COVERED with the reason
+# for it on every run (and records it in the report). Listing an image is a
+# reviewed decision that its OS packages ship UNSCANNED by Trivy; it is not an
+# acceptance of any vulnerability in them. A listing applies only while Trivy
+# sees no OS package in the image. (The gate's second scanner, grype, refuses a
+# fixable CRITICAL it reports too, but nothing proves what it matched:
+# docs/ci-architecture.md "What it does not see". Each listing's reason
+# describes Trivy's view when it was approved.)
+#
+# Format, one image per line (validated by image-vuln-gate-checks.py; a
+# malformed line refuses the whole list):
+#   <image name>: approved_by=<login> approved_on=<YYYY-MM-DD> approval_ref=<#N|PR URL> expires=<YYYY-MM-DD> reason=<why>
+# The name is the published repository name without the registry
+# (yuzu-server-chisel), as release.yml passes it (`NAME=sha256:...`) and as
+# pre-release.yml's tags end in it; it is matched EXACTLY (never a prefix or a
+# substring). approved_by is the GitHub login of the person who accepted that
+# the image ships unscanned, approval_ref the pull request in which they did,
+# approved_on its date: a recorded reference the gate checks for format only
+# (nothing verifies the pull request or the approver; the control is review of
+# the change to this file; procedure: docs/ci-architecture.md "Recording an
+# approval"). Until it is recorded, write `approved_on=-
+# approval_ref=pending`: a pending listing is not honoured by the release gate
+# (--release), so the image fails there as unscanned. expires is at most 92
+# days out; an expired listing is not honoured anywhere, so the listing is
+# re-reviewed rather than forgotten (the gate warns 21 days before). The reason
+# is at least 20 characters.
+# Remove a line as soon as the scanner sees the image's packages; the gate
+# warns when a listed image does have OS packages.
+#
+# Nothing is listed. The four chiselled images (yuzu-server-chisel,
+# yuzu-gateway-chisel, yuzu-agent-chisel, yuzu-agent-bundle-chisel) carry
+# /var/lib/dpkg/status.d records: each Dockerfile runs
+# deploy/docker/chisel-emit-status.py, which writes the chisel manifest as those
+# stanzas, so Trivy and grype read the packages. An image whose OS scan finds no
+# package at all fails the gate, so a regression to zero packages is caught.
+# List an image again only as a reviewed decision, with the fields above.

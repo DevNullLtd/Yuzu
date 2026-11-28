@@ -1,6 +1,6 @@
 /**
  * test_protective_action_dispatch_gate.cpp — protective actions (the
- * quarantine plugin's four actions plus `__guard__.push_rules`) are never
+ * firewall plugin's four containment actions plus `__guard__.push_rules`) are never
  * refused by plugin enablement. Mirrors test_os_kill_switch_dispatch_gate.cpp:
  * every gate is bound with a real `AgentRegistry` and the exact send set
  * (`drain_gateway_pending`), with `echo.sql` as the control that is still
@@ -151,10 +151,10 @@ yuzu::server::ConfinedDispatchOutcome wire(AgentRegistry& registry, const Classi
 }
 
 const std::vector<std::pair<std::string, std::string>> kProtectiveWire{
-    {"quarantine", "quarantine"},
-    {"quarantine", "unquarantine"},
-    {"quarantine", "status"},
-    {"quarantine", "whitelist"}};
+    {"firewall", "quarantine"},
+    {"firewall", "release"},
+    {"firewall", "quarantine_status"},
+    {"firewall", "quarantine_allow"}};
 
 } // namespace
 
@@ -195,6 +195,16 @@ TEST_CASE("kill_switch_denial: control — echo.sql is still refused / still car
 
     CountingSwitch os_off{IdSet{"windows"}};
     CHECK(finalize(kEchoSql, os_off.fn()).kill_switched_os() == IdSet{"windows"});
+
+    // An ordinary firewall action is not exempt: the closed set stops at the four.
+    CountingSwitch fw_off{std::nullopt};
+    const auto fw = yuzu::server::detail::kill_switch_denial(protective_cap("firewall", "state"),
+                                                              fw_off.fn());
+    REQUIRE_FALSE(fw.has_value());
+    CHECK(*fw_off.calls == 1);
+    CountingSwitch fw_os_off{IdSet{"windows"}};
+    CHECK(finalize(protective_cap("firewall", "state"), fw_os_off.fn()).kill_switched_os() ==
+          IdSet{"windows"});
 }
 
 TEST_CASE("ids_missing_plugin: protective pairs are never reported missing",
@@ -208,7 +218,9 @@ TEST_CASE("ids_missing_plugin: protective pairs are never reported missing",
         CHECK_FALSE(registry.ids_missing_plugin(plugin, action).contains("dev-A"));
     CHECK_FALSE(registry.ids_missing_plugin("__guard__", "push_rules").contains("dev-A"));
 
-    CHECK(registry.ids_missing_plugin("quarantine", "reapply").contains("dev-A"));
+    // firewall's ordinary actions are still presence-filtered: only the four are protective.
+    CHECK(registry.ids_missing_plugin("firewall", "rules").contains("dev-A"));
+    CHECK(registry.ids_missing_plugin("firewall", "reapply").contains("dev-A"));
     CHECK(registry.ids_missing_plugin("echo", "sql").contains("dev-A"));
 }
 
@@ -218,7 +230,7 @@ TEST_CASE("wire_and_dispatch_confined: protective dispatch reaches every target 
     EventBus bus;
     yuzu::MetricsRegistry metrics;
     AgentRegistry registry(bus, metrics);
-    registry.register_agent(make_info("dev-A", "windows", {"os_info"})); // no quarantine plugin
+    registry.register_agent(make_info("dev-A", "windows", {"os_info"})); // no firewall plugin
     registry.register_agent(make_info("dev-B", "linux"));
     route_via_gateway(registry, {"dev-A", "dev-B"});
 
@@ -319,6 +331,52 @@ TEST_CASE("send_to / send_to_all: __guard__.push_rules reaches its targets under
     CHECK(*stub.calls == 0);
 }
 
+TEST_CASE("a plugin-level firewall kill-switch row never stops the four containment actions and "
+          "still stops firewall.state and firewall.rules",
+          "[server][dispatch][protective][security]") {
+    EventBus bus;
+    yuzu::MetricsRegistry metrics;
+    AgentRegistry registry(bus, metrics);
+    registry.register_agent(make_info("dev-A", "windows", {"firewall"}));
+    registry.register_agent(make_info("dev-B", "linux", {"firewall"}));
+    route_via_gateway(registry, {"dev-A", "dev-B"});
+    const std::vector<std::string> ids{"dev-A", "dev-B"};
+
+    // nullopt is both "switched off" and "degraded store": the answer a stored OFF row on the
+    // whole `firewall` plugin gives for every one of its actions.
+    CountingSwitch off{std::nullopt};
+
+    // The four reach every target, and the switch is never consulted.
+    for (const auto& [plugin, action] : kProtectiveWire) {
+        INFO(plugin << "." << action);
+        const auto out = wire(registry, finalize(protective_cap(plugin, action), off.fn()), ids);
+        CHECK(out.sent == 2);
+        CHECK(drained(registry) == ids);
+    }
+    CHECK(*off.calls == 0);
+
+    // firewall.state and firewall.rules are ordinary actions: the same row stops them before the
+    // wire, so the send set stays empty.
+    for (const char* action : {"state", "rules"}) {
+        INFO(action);
+        const auto cap = CommandCapability{
+            .plugin = "firewall",
+            .action = action,
+            .dispatch_class = DispatchClass::ReadOnly,
+            .mutability = Mutability::None,
+            .securable = "Infrastructure",
+            .operation = yuzu::server::authz::Operation::Read,
+            .risk_tier = yuzu::server::authz::RiskTier::Low,
+            .system_reserved = false,
+        };
+        const auto r = yuzu::server::detail::finalize_classified_command(
+            cap, off.fn(), cap.plugin, cap.action, "protective-cmd", {}, {}, 0, 0, {}, {});
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error().reason == yuzu::server::detail::DispatchDenialReason::KillSwitched);
+        CHECK(drained(registry).empty());
+    }
+}
+
 TEST_CASE("every other action is still refused at each gate (regression guard)",
           "[server][dispatch][protective][security]") {
     EventBus bus;
@@ -359,17 +417,17 @@ TEST_CASE("the protective set is tied to the real catalogue rows and the push la
               (push == yuzu::server::SystemReservedPush::guardian_push_rules));
     }
 
-    // The real rows that carry a protective pair: exactly the quarantine
-    // plugin's four actions plus __guard__.push_rules.
+    // The real rows that carry a protective pair: exactly the firewall
+    // plugin's four containment actions plus __guard__.push_rules.
     std::set<std::string> protective;
     for (const auto rows : {capdecls::plugin_action_catalogue_c(),
                             capdecls::core_dispatch_capabilities()})
         for (const auto& cap : rows)
             if (is_protective_action(cap.plugin, cap.action))
                 protective.insert(std::string(cap.plugin) + "." + std::string(cap.action));
-    CHECK(protective == std::set<std::string>{"quarantine.quarantine", "quarantine.unquarantine",
-                                             "quarantine.status", "quarantine.whitelist",
-                                             "__guard__.push_rules"});
+    CHECK(protective == std::set<std::string>{"firewall.quarantine", "firewall.release",
+                                             "firewall.quarantine_status",
+                                             "firewall.quarantine_allow", "__guard__.push_rules"});
 
     // The plugin-level label predicate is tied to the same rows: it must be true for
     // exactly the plugins that carry a protective row, so widening it to a plugin
@@ -388,21 +446,28 @@ TEST_CASE("kill_switch_row_covers_protective: labels rows that can never gate di
           "[server][dispatch][protective][security]") {
     using yuzu::server::plugin_config::KillSwitchScope;
     using yuzu::server::plugin_config::kill_switch_row_covers_protective;
-    CHECK(kill_switch_row_covers_protective(KillSwitchScope{"quarantine", "unquarantine", ""}));
-    CHECK(kill_switch_row_covers_protective(KillSwitchScope{"quarantine", "status", "windows"}));
+    CHECK(kill_switch_row_covers_protective(KillSwitchScope{"firewall", "release", ""}));
+    CHECK(kill_switch_row_covers_protective(KillSwitchScope{"firewall", "quarantine_status", "windows"}));
     CHECK(kill_switch_row_covers_protective(KillSwitchScope{"__guard__", "push_rules", ""}));
     // Plugin-level rows for the two plugins that own protective actions.
-    CHECK(kill_switch_row_covers_protective(KillSwitchScope{"quarantine", "", ""}));
+    CHECK(kill_switch_row_covers_protective(KillSwitchScope{"firewall", "", ""}));
     CHECK(kill_switch_row_covers_protective(KillSwitchScope{"__guard__", "", "linux"}));
     // Everything else is an ordinary, effective row.
     CHECK_FALSE(kill_switch_row_covers_protective(KillSwitchScope{"__guard__", "get_status", ""}));
-    CHECK_FALSE(kill_switch_row_covers_protective(KillSwitchScope{"firewall", "", ""}));
+    // The firewall plugin owns four protective actions and declares ordinary ones too: a
+    // plugin-level row is labelled (it never stops the four) and an ordinary action-level
+    // row is not.
+    CHECK(kill_switch_row_covers_protective(KillSwitchScope{"firewall", "quarantine", "linux"}));
+    CHECK_FALSE(kill_switch_row_covers_protective(KillSwitchScope{"firewall", "state", ""}));
+    CHECK_FALSE(kill_switch_row_covers_protective(KillSwitchScope{"firewall", "rules", "linux"}));
+    // The removed plugin's name covers nothing.
+    CHECK_FALSE(kill_switch_row_covers_protective(KillSwitchScope{"quarantine", "", ""}));
     CHECK_FALSE(kill_switch_row_covers_protective(KillSwitchScope{"echo", "sql", ""}));
 
     // The audit-evidence detail both write surfaces share (their only other
     // bindings are [pg]-tagged and SKIP without a DSN).
     using yuzu::server::plugin_config::kill_switch_set_detail;
-    CHECK(kill_switch_set_detail(KillSwitchScope{"quarantine", "unquarantine", ""}, false) ==
+    CHECK(kill_switch_set_detail(KillSwitchScope{"firewall", "release", ""}, false) ==
           "enabled=false, protective_exempt=true");
     CHECK(kill_switch_set_detail(KillSwitchScope{"__guard__", "", "linux"}, true) ==
           "enabled=true, protective_exempt=true");

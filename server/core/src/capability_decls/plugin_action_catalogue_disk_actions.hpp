@@ -27,9 +27,12 @@
 ///   `volumes` — enumerates volumes and reads their disk extents and mount
 ///               points, to report which physical drive backs which mount
 ///               point. `IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS` is a query.
-///   `partitions`, `topology` — planned placeholders on every OS: they read
-///               nothing and answer one unsupported status row until their
-///               legs land.
+///   `partitions` — read on Windows only (`Win32_DiskPartition` plus
+///               `Win32_LogicalDiskToPartition` through the bounded WMI
+///               helper); a query, no handle, no mutation. Planned on Linux
+///               and macOS.
+///   `topology` — a planned placeholder on every OS: it reads nothing and
+///               answers one unsupported status row until its legs land.
 ///
 /// The mutating half of the original Wave 6 PR6.1-a row — `cleanup_temp`,
 /// `cleanup_recycle`, `trim` — is a SEPARATE change and will need

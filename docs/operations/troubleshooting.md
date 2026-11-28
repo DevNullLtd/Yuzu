@@ -79,6 +79,15 @@ Health probes (`/livez`, `/readyz`, `/health`, `/api/health`) are exempt from th
 | `outside_validity` on every call although the certificate was renewed | The guard re-checks the certificate on every call, but the gateway keeps its long-lived connection and presents the certificate it had when it dialled; status 16 does not make it redial. Renew **before** `notAfter`, then check whether the gateway already redialled (cause class B in the row above: restart that node, one at a time, only if denials continue after about 2 minutes and its agents can take the disconnect, because unless the agents run a build with the #5183 fix, shipped in 0.15.0, released agents stay wedged afterwards). A renewal over the same key needs no pin change and no server restart; a new key needs its pin first |
 | Process limit | Erlang default process limit is 262144 — sufficient for most fleets |
 
+### Gateway image build fails at the platform check
+
+`deploy/docker/Dockerfile.gateway` builds for `linux/amd64` only (#6711). The first
+step of its `deps` stage refuses any other architecture:
+
+| Message | Fix |
+|---------|-----|
+| `Dockerfile.gateway supports linux/amd64 only (TARGETARCH=...)` | Build on a `linux/amd64` host or in CI, or pass `--platform linux/amd64` (for the UAT scripts and compose files that pass no platform: `DOCKER_DEFAULT_PLATFORM=linux/amd64`, or add `platform: linux/amd64` to the compose service; `scripts/start-viz-uat.sh` takes `VIZ_UAT_PLATFORM=linux/amd64`). On an arm64 host that means emulation, and the gateway's Erlang deps stage crashed under x86 emulation on an OrbStack Mac (see the #6711 thread), so it may not work there; `VIZ_UAT_PLATFORM` also builds all three images that way, so the first run takes much longer than the usual 25 to 40 minutes. The reason: `linux/amd64` is the only platform the release builds, publishes and tests, so no other platform of the image has been built or booted; adding one needs that check, and the abi-guard requires the builder and runtime on the same Alpine release on every architecture. For a single-node arm64 demo, `deploy/docker/Dockerfile.gateway.chisel` builds natively; it is the demo variant, runs no `gateway-entrypoint.sh`, and so cannot resolve its own advertise address automatically (set `YUZU_GW_ADVERTISE_ADDR` per node yourself; see [Gateway](../user-manual/gateway.md)), so do not use it for a scaled or clustered gateway. |
+
 ### Gateway image build fails at abi-guard
 
 When you build `deploy/docker/Dockerfile.gateway` yourself, a step in the
@@ -87,10 +96,22 @@ fails the build when the two stages cannot safely run the same release:
 
 | Message | Fix |
 |---------|-----|
-| `runtime Alpine/musl (...) differs from the builder's (...)` | The `erlang:28-alpine` builder and the runtime `alpine:` image are on different Alpine releases. Point the runtime `FROM` at the builder's Alpine release (`docker run --rm <erlang image> cat /etc/alpine-release`). |
+| `runtime Alpine/musl (...) differs from the builder's (...)` | The `hexpm/erlang` builder and the runtime `alpine:` image are on different Alpine releases. Point the runtime `FROM` at the builder's Alpine release (the builder's tag names it, e.g. `-alpine-3.23.8`; or `docker run --rm <erlang image> cat /etc/alpine-release`). |
 | `musl ... with OTP ...: beam.smp aborts at boot on AMX CPUs` | The runtime is on musl 1.2.6 or newer (Alpine 3.24+) with an OTP older than 29.1. Keep both stages on Alpine 3.23, or move the builder to OTP 29.1 or newer. |
-| `... is not a plain dotted version` | A version could not be read, for example an OTP release candidate or a patched OTP (`28.5.0.2**`). Build from a released OTP. |
+| `... is not a plain dotted version` | A version could not be read, for example an OTP release candidate or a patched OTP (`28.5.0.8**`). Build from a released OTP. |
 | `could not compare versions (apk printed ...)` | `apk version -t` gave no usable answer for versions that looked valid. Report it with the `abi-guard:` line; do not bypass the step. |
+
+### Gateway image build fails downloading rebar3
+
+The deps stage of `deploy/docker/Dockerfile.gateway` adds rebar3 from its GitHub
+release (`ADD --checksum=sha256:...`), and BuildKit checks the pinned sha256 before
+the file is used. The build host therefore needs `github.com` and its release-asset
+download host, besides Docker Hub and Hex.
+
+| Message | Fix |
+|---------|-----|
+| A download error at the `ADD --checksum=sha256:... rebar3` step | Give the build host access to `github.com`, or build where it has it (CI). |
+| A checksum mismatch at that step | The bytes are not the pinned rebar3 release. Do not change the checksum to make the build pass; the comments above that `ADD` in `Dockerfile.gateway` say how the pin is verified and bumped. |
 
 ## Certificate Errors
 

@@ -18,9 +18,11 @@
 // itself, so the omission compiled there and failed only on the first real MSVC
 // build; the stand-in has since been split to mirror the real header layout.
 #include <winioctl.h>
+#include <winternl.h> // NTSTATUS and the NtCreateFile signature, for the create-options spy
 #include <yuzu/agent/confined_fs_rules.hpp>
 
 #include "test_helpers.hpp" // yuzu::test::TempDir
+#include "win_junction_test_support.hpp" // yuzu::test::create_junction / JunctionCleanup
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -37,6 +39,8 @@
 #include <vector>
 
 using namespace yuzu::agent::confined_fs;
+using yuzu::test::create_junction;
+using yuzu::test::JunctionCleanup;
 
 namespace {
 
@@ -54,63 +58,6 @@ void write_file(const std::filesystem::path& path, std::string_view content) {
     REQUIRE(WriteFile(owned.get(), content.data(), static_cast<DWORD>(content.size()), &written,
                        nullptr));
 }
-
-// Builds a junction (NTFS mount point) at `link` pointing at `target`,
-// without administrator privilege. `link` must not already exist.
-// Hand-builds the IO_REPARSE_TAG_MOUNT_POINT data buffer -- REPARSE_DATA_BUFFER
-// is not declared by the public Windows SDK, only by the (kernel-mode) WDK.
-bool create_junction(const std::filesystem::path& link, const std::filesystem::path& target) {
-    if (!CreateDirectoryW(link.c_str(), nullptr))
-        return false;
-
-    const HANDLE raw =
-        CreateFileW(link.c_str(), GENERIC_WRITE, 0, nullptr, OPEN_EXISTING,
-                    FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS, nullptr);
-    if (raw == INVALID_HANDLE_VALUE)
-        return false;
-    yuzu::agent::confined_fs::WinHandle handle(raw);
-
-    // Mount-point substitute name is an NT device path ("\??\<absolute>");
-    // the print name is the plain absolute path shown to Explorer/dir.
-    const std::wstring substitute = L"\\??\\" + std::filesystem::absolute(target).wstring();
-    const std::wstring print_name = std::filesystem::absolute(target).wstring();
-
-    const std::size_t sub_bytes = (substitute.size() + 1) * sizeof(wchar_t);
-    const std::size_t print_bytes = (print_name.size() + 1) * sizeof(wchar_t);
-    constexpr std::size_t kFixedHeaderSize = 8; // ReparseTag(4) + ReparseDataLength(2) + Reserved(2)
-    constexpr std::size_t kMountFieldsSize = 8; // 4 USHORTs: sub/print offset+length
-
-    std::vector<std::byte> buf(kFixedHeaderSize + kMountFieldsSize + sub_bytes + print_bytes);
-    const auto put16 = [&](std::size_t off, std::uint16_t v) {
-        std::memcpy(buf.data() + off, &v, sizeof(v));
-    };
-    const auto put32 = [&](std::size_t off, std::uint32_t v) {
-        std::memcpy(buf.data() + off, &v, sizeof(v));
-    };
-
-    put32(0, IO_REPARSE_TAG_MOUNT_POINT);
-    put16(4, static_cast<std::uint16_t>(kMountFieldsSize + sub_bytes + print_bytes));
-    put16(6, 0); // Reserved
-    put16(8, 0); // SubstituteNameOffset
-    put16(10, static_cast<std::uint16_t>(sub_bytes - sizeof(wchar_t)));
-    put16(12, static_cast<std::uint16_t>(sub_bytes)); // PrintNameOffset
-    put16(14, static_cast<std::uint16_t>(print_bytes - sizeof(wchar_t)));
-    std::memcpy(buf.data() + kFixedHeaderSize + kMountFieldsSize, substitute.c_str(), sub_bytes);
-    std::memcpy(buf.data() + kFixedHeaderSize + kMountFieldsSize + sub_bytes, print_name.c_str(),
-                print_bytes);
-
-    DWORD bytes_returned = 0;
-    return DeviceIoControl(handle.get(), FSCTL_SET_REPARSE_POINT, buf.data(),
-                            static_cast<DWORD>(buf.size()), nullptr, 0, &bytes_returned,
-                            nullptr) != 0;
-}
-
-// RemoveDirectory on a reparse-point directory removes the reparse point
-// itself, never the target -- so this never touches victim content.
-struct JunctionCleanup {
-    std::filesystem::path path;
-    ~JunctionCleanup() { RemoveDirectoryW(path.c_str()); }
-};
 
 MatchFn always_match = [](std::string_view, const EntryMeta&) { return true; };
 
@@ -650,6 +597,279 @@ TEST_CASE("Windows enumeration supplies LastWriteTime and age can select on it",
     REQUIRE(result.stop_reason == Reason::None);
     CHECK_FALSE(std::filesystem::exists(tmp.path / "old.tmp"));
     CHECK(std::filesystem::exists(tmp.path / "new.tmp"));
+}
+
+// ── Windows: the listing fields, the file-id class, the cloud policy and the attribute-only open ──────────
+//
+// The cloud admission itself is covered by the pure rule's cases (test_confined_fs_rules.cpp) and by the
+// live run on the real host: a real cloud directory is not built here, because registering a sync root is
+// machine-wide state.
+
+namespace {
+
+std::uint64_t read_u64(const std::uint8_t* p) {
+    std::uint64_t v = 0;
+    for (int i = 7; i >= 0; --i)
+        v = (v << 8) | p[i];
+    return v;
+}
+
+/// The two halves of the opened handle's 128-bit FileIdInfo; nullopt where the filesystem does not answer.
+struct IdHalves {
+    std::uint64_t low;
+    std::uint64_t high;
+};
+std::optional<IdHalves> file_id_info(HANDLE h) {
+    FILE_ID_INFO info{};
+    if (!GetFileInformationByHandleEx(h, FileIdInfo, &info, sizeof(info)))
+        return std::nullopt;
+    return IdHalves{read_u64(info.FileId.Identifier), read_u64(info.FileId.Identifier + 8)};
+}
+
+bool is_ntfs(HANDLE h) {
+    wchar_t name[MAX_PATH + 1] = {};
+    return GetVolumeInformationByHandleW(h, nullptr, 0, nullptr, nullptr, nullptr, name, MAX_PATH) &&
+           std::wstring_view(name) == L"NTFS";
+}
+
+const EnumBudget kBudget{1000, std::chrono::steady_clock::time_point::max()};
+
+std::map<std::string, DirEntry> by_name(const EnumerateResult& r) {
+    std::map<std::string, DirEntry> out;
+    for (const auto& e : r.entries)
+        out.emplace(e.name, e);
+    return out;
+}
+
+// NtCreateFile spy: forwards to the real function and records the access mask and create options of every
+// open, so a test can state what an open asks for.
+using NtCreateFileSig = NTSTATUS(NTAPI*)(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, PIO_STATUS_BLOCK,
+                                         PLARGE_INTEGER, ULONG, ULONG, ULONG, ULONG, PVOID, ULONG);
+NtCreateFileSig g_real_nt_create_file = nullptr;
+struct SeenOpen {
+    ACCESS_MASK access;
+    ULONG options;
+};
+std::vector<SeenOpen> g_seen_opens;
+
+NTSTATUS NTAPI spy_nt_create_file(PHANDLE h, ACCESS_MASK access, POBJECT_ATTRIBUTES oa, PIO_STATUS_BLOCK io,
+                                  PLARGE_INTEGER alloc, ULONG attrs, ULONG share, ULONG disposition,
+                                  ULONG options, PVOID ea, ULONG ea_length) {
+    g_seen_opens.push_back({access, options});
+    return g_real_nt_create_file(h, access, oa, io, alloc, attrs, share, disposition, options, ea, ea_length);
+}
+
+struct NtCreateFileSpy {
+    NtCreateFileSpy() {
+        g_real_nt_create_file = reinterpret_cast<NtCreateFileSig>(
+            reinterpret_cast<void*>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtCreateFile")));
+        g_seen_opens.clear();
+        detail::set_ntcreatefile_for_test(reinterpret_cast<void*>(&spy_nt_create_file), /*enable=*/true);
+    }
+    ~NtCreateFileSpy() { detail::set_ntcreatefile_for_test(nullptr, /*enable=*/false); }
+    NtCreateFileSpy(const NtCreateFileSpy&) = delete;
+    NtCreateFileSpy& operator=(const NtCreateFileSpy&) = delete;
+};
+
+constexpr ULONG kNoRecallOption = 0x00400000UL;  // FILE_OPEN_NO_RECALL
+constexpr ULONG kDirectoryFileOption = 0x00000001UL;
+constexpr ULONG kNonDirectoryFileOption = 0x00000040UL;
+constexpr ULONG kOpenReparsePointOption = 0x00200000UL;
+
+} // namespace
+
+TEST_CASE("the default listing carries attributes and the reparse tag, a junction lists with its tag, and no id",
+          "[confined_fs][cloud]") {
+    yuzu::test::TempDir tmp{"yuzu_test_confined_win_listing_"};
+    std::filesystem::create_directories(tmp.path / "sub");
+    std::filesystem::create_directories(tmp.path / "target");
+    write_file(tmp.path / "a.txt", "hello");
+    REQUIRE(create_junction(tmp.path / "junc", tmp.path / "target"));
+    JunctionCleanup cleanup{tmp.path / "junc"};
+
+    OpenRootResult opened = open_root(tmp.path);
+    REQUIRE(opened.root.has_value());
+    const EnumerateResult listing = enumerate_at(opened.root->h_.get(), opened.root->identity(), kBudget);
+    REQUIRE(listing.reason == Reason::None);
+    const auto entries = by_name(listing);
+    REQUIRE(entries.size() == 4);
+    for (const auto& [name, e] : entries)
+        CHECK(e.meta.file_id == 0); // the default class never reads an id
+    CHECK((entries.at("sub").meta.attributes & FILE_ATTRIBUTE_DIRECTORY) != 0);
+    CHECK(entries.at("sub").meta.reparse_tag == 0);
+    CHECK((entries.at("a.txt").meta.attributes & FILE_ATTRIBUTE_DIRECTORY) == 0);
+    CHECK(entries.at("a.txt").meta.reparse_tag == 0);
+    CHECK(entries.at("a.txt").meta.size_bytes == 5);
+    CHECK(entries.at("junc").meta.type == EntryType::Reparse);
+    CHECK((entries.at("junc").meta.attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0);
+    CHECK(entries.at("junc").meta.reparse_tag == IO_REPARSE_TAG_MOUNT_POINT);
+}
+
+TEST_CASE("want_file_ids lists non-zero ids equal to the low half of each handle's FileIdInfo, entries otherwise identical",
+          "[confined_fs][cloud]") {
+    yuzu::test::TempDir tmp{"yuzu_test_confined_win_ids_"};
+    std::filesystem::create_directories(tmp.path / "sub");
+    std::filesystem::create_directories(tmp.path / "target");
+    write_file(tmp.path / "a.txt", "hello");
+    write_file(tmp.path / "b.txt", "");
+    REQUIRE(create_junction(tmp.path / "junc", tmp.path / "target"));
+    JunctionCleanup cleanup{tmp.path / "junc"};
+
+    OpenRootResult opened = open_root(tmp.path);
+    REQUIRE(opened.root.has_value());
+    if (!is_ntfs(opened.root->h_.get())) {
+        SKIP("skipped: the temp directory is not on NTFS");
+    }
+    const HANDLE root_handle = opened.root->h_.get();
+    const FileIdentity& root_id = opened.root->identity();
+
+    const auto plain = by_name(enumerate_at(root_handle, root_id, kBudget));
+    EnumBudget with_ids = kBudget;
+    with_ids.want_file_ids = true;
+    const EnumerateResult listing = enumerate_at(root_handle, root_id, with_ids);
+    REQUIRE(listing.reason == Reason::None);
+    const auto entries = by_name(listing);
+    REQUIRE(entries.size() == plain.size());
+    for (const auto& [name, e] : entries) {
+        INFO(name);
+        CHECK(e.meta.file_id != 0);
+        // the same record layout facts as the default class
+        const auto& p = plain.at(name).meta;
+        CHECK(e.meta.type == p.type);
+        CHECK(e.meta.size_bytes == p.size_bytes);
+        CHECK(e.meta.mtime == p.mtime);
+        CHECK(e.meta.attributes == p.attributes);
+        CHECK(e.meta.reparse_tag == p.reparse_tag);
+    }
+    CHECK(entries.at("junc").meta.reparse_tag == IO_REPARSE_TAG_MOUNT_POINT);
+
+    // the id the listing gives equals the low half of the opened handle's FileIdInfo, whose upper half is zero
+    for (const char* file : {"a.txt", "b.txt"}) {
+        OpenFileResult f = open_file_attributes_at(root_handle, file, root_id);
+        REQUIRE(f.h.valid());
+        const auto ids = file_id_info(f.h.get());
+        REQUIRE(ids.has_value());
+        CHECK(ids->high == 0);
+        CHECK(entries.at(file).meta.file_id == ids->low);
+    }
+    OpenDirResult d = open_dir_at(root_handle, "sub", root_id);
+    REQUIRE(d.h.valid());
+    const auto dir_ids = file_id_info(d.h.get());
+    REQUIRE(dir_ids.has_value());
+    CHECK(dir_ids->high == 0);
+    CHECK(entries.at("sub").meta.file_id == dir_ids->low);
+}
+
+TEST_CASE("open_dir_at returns the attributes of an ordinary directory and no reparse tag",
+          "[confined_fs][cloud]") {
+    yuzu::test::TempDir tmp{"yuzu_test_confined_win_dirattrs_"};
+    std::filesystem::create_directories(tmp.path / "sub");
+    OpenRootResult opened = open_root(tmp.path);
+    REQUIRE(opened.root.has_value());
+    for (const ReparseDirs policy : {ReparseDirs::refuse, ReparseDirs::allow_populated_cloud}) {
+        OpenDirResult r = open_dir_at(opened.root->h_.get(), "sub", opened.root->identity(), policy);
+        REQUIRE(r.h.valid());
+        CHECK(r.reason == Reason::None);
+        CHECK((r.attributes & FILE_ATTRIBUTE_DIRECTORY) != 0);
+        CHECK((r.attributes & FILE_ATTRIBUTE_REPARSE_POINT) == 0);
+        CHECK(r.reparse_tag == 0);
+    }
+}
+
+TEST_CASE("open_file_attributes_at reads size, time and attributes, refuses a directory, a missing and an invalid name, and cannot read",
+          "[confined_fs][cloud]") {
+    yuzu::test::TempDir tmp{"yuzu_test_confined_win_fileattrs_"};
+    std::filesystem::create_directories(tmp.path / "sub");
+    write_file(tmp.path / "a.txt", "hello");
+    OpenRootResult opened = open_root(tmp.path);
+    REQUIRE(opened.root.has_value());
+    const HANDLE root_handle = opened.root->h_.get();
+    const FileIdentity& root_id = opened.root->identity();
+
+    OpenFileResult f = open_file_attributes_at(root_handle, "a.txt", root_id);
+    REQUIRE(f.h.valid());
+    CHECK(f.reason == Reason::None);
+    CHECK(f.size == 5);
+    CHECK(f.mtime.has_value());
+    CHECK((f.attributes & FILE_ATTRIBUTE_DIRECTORY) == 0);
+    CHECK(f.reparse_tag == 0);
+    // the handle has no data right: a read through it is refused
+    char byte = 0;
+    DWORD got = 0;
+    const BOOL read_ok = ReadFile(f.h.get(), &byte, 1, &got, nullptr);
+    const DWORD read_error = GetLastError(); // straight after the call: CHECK_FALSE may itself touch the last error
+    CHECK_FALSE(read_ok);
+    CHECK(read_error == ERROR_ACCESS_DENIED);
+
+    CHECK_FALSE(open_file_attributes_at(root_handle, "sub", root_id).h.valid()); // the kernel refuses a directory
+    const OpenFileResult missing = open_file_attributes_at(root_handle, "nope.txt", root_id);
+    CHECK_FALSE(missing.h.valid());
+    CHECK(missing.reason == Reason::OsError);
+    CHECK(open_file_attributes_at(root_handle, "..", root_id).reason == Reason::InvalidName);
+    CHECK(open_file_attributes_at(root_handle, "a\\b", root_id).reason == Reason::InvalidName);
+    const FileIdentity wrong_id{root_id.volume_serial + 1, root_id.file_index};
+    CHECK(open_file_attributes_at(root_handle, "a.txt", wrong_id).reason == Reason::DeviceBoundary);
+}
+
+TEST_CASE("no open sends FILE_OPEN_NO_RECALL, and the directory open is the same under both reparse policies",
+          "[confined_fs][cloud]") {
+    yuzu::test::TempDir tmp{"yuzu_test_confined_win_options_"};
+    std::filesystem::create_directories(tmp.path / "sub");
+    write_file(tmp.path / "a.txt", "x");
+    OpenRootResult opened = open_root(tmp.path);
+    REQUIRE(opened.root.has_value());
+    const HANDLE root_handle = opened.root->h_.get();
+    const FileIdentity& root_id = opened.root->identity();
+
+    const NtCreateFileSpy spy;
+    OpenDirResult refuse = open_dir_at(root_handle, "sub", root_id, ReparseDirs::refuse);
+    OpenDirResult allow = open_dir_at(root_handle, "sub", root_id, ReparseDirs::allow_populated_cloud);
+    OpenFileResult file = open_file_attributes_at(root_handle, "a.txt", root_id);
+    REQUIRE(refuse.h.valid());
+    REQUIRE(allow.h.valid());
+    REQUIRE(file.h.valid());
+    REQUIRE(g_seen_opens.size() == 3);
+    for (const auto& seen : g_seen_opens)
+        CHECK((seen.options & kNoRecallOption) == 0);
+    CHECK(g_seen_opens[0].options == g_seen_opens[1].options); // identical under both policies
+    CHECK(g_seen_opens[0].access == g_seen_opens[1].access);
+    CHECK((g_seen_opens[0].options & kDirectoryFileOption) != 0);
+    // the file open: attribute rights only, a non-directory, opened as itself
+    CHECK(g_seen_opens[2].access == (FILE_READ_ATTRIBUTES | SYNCHRONIZE));
+    CHECK((g_seen_opens[2].options & kNonDirectoryFileOption) != 0);
+    CHECK((g_seen_opens[2].options & kOpenReparsePointOption) != 0);
+    CHECK((g_seen_opens[2].options & kDirectoryFileOption) == 0);
+}
+
+TEST_CASE("the allow_populated_cloud policy still refuses a junction and a directory symlink, with their attributes and tag",
+          "[confined_fs][cloud]") {
+    yuzu::test::TempDir tmp{"yuzu_test_confined_win_links_"};
+    std::filesystem::create_directories(tmp.path / "target");
+    REQUIRE(create_junction(tmp.path / "junc", tmp.path / "target"));
+    JunctionCleanup cleanup{tmp.path / "junc"};
+    // a directory symlink needs the unprivileged-create flag (Developer Mode) or a privilege: skipped without
+    const bool have_symlink = CreateSymbolicLinkW((tmp.path / "sym").c_str(), (tmp.path / "target").c_str(),
+                                                  SYMBOLIC_LINK_FLAG_DIRECTORY |
+                                                      SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE) != 0;
+    JunctionCleanup sym_cleanup{tmp.path / "sym"};
+    if (!have_symlink)
+        WARN("directory symlink case skipped: the account cannot create a symbolic link");
+
+    OpenRootResult opened = open_root(tmp.path);
+    REQUIRE(opened.root.has_value());
+    for (const ReparseDirs policy : {ReparseDirs::refuse, ReparseDirs::allow_populated_cloud}) {
+        OpenDirResult j = open_dir_at(opened.root->h_.get(), "junc", opened.root->identity(), policy);
+        CHECK_FALSE(j.h.valid());
+        CHECK(j.reason == Reason::ReparseRejected);
+        CHECK((j.attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0);
+        CHECK(j.reparse_tag == IO_REPARSE_TAG_MOUNT_POINT);
+        if (have_symlink) {
+            OpenDirResult l = open_dir_at(opened.root->h_.get(), "sym", opened.root->identity(), policy);
+            CHECK_FALSE(l.h.valid());
+            CHECK(l.reason == Reason::ReparseRejected);
+            CHECK(l.reparse_tag == IO_REPARSE_TAG_SYMLINK);
+        }
+    }
 }
 
 #endif // _WIN32

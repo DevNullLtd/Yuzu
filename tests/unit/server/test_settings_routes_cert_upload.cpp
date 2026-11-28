@@ -15,6 +15,7 @@
 /// (mode) or privileged (symlink) on Windows; the Windows custody is the
 /// explicit owner-only DACL in FileKeyProvider (not asserted here).
 
+#include "post_read_stage_test_support.hpp"
 #include "settings_routes.hpp"
 
 #include "oidc_provider.hpp"
@@ -254,6 +255,11 @@ TEST_CASE("cert upload (multipart): key is 0600, new dir 0700, symlink replaced"
     routes.set_cert_dir_for_test(cert_dir);
 
     httplib::Server svr;
+    // Production registers behind a post-read stage and the sink refuses a server without one.
+    yuzu::test::PostReadStageScope stage_scope{
+        svr, [](const httplib::Request&, httplib::Response&) {
+            return httplib::Server::HandlerResponse::Unhandled;
+        }};
     auto auth_fn = [](const httplib::Request&, httplib::Response&) -> std::optional<auth::Session> {
         auth::Session s;
         s.username = "admin";

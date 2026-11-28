@@ -1,0 +1,12 @@
+captured: linux Ubuntu 26.04.1 LTS x86_64 · vm · 2026-11-24 · euid 0 · leg-hash d2997fe1071a
+== action=search root=/tmp/yuzu_test_file_search_sample pattern=yuzu-fs-control-* kinds=both
+match|/tmp/yuzu_test_file_search_sample/n1/n2/n3/n4/n5/n6/n7/n8/n9/n10/n11/yuzu-fs-control-d12.bin|file|0000000000000830:00000000000d4348|8|1795498457|system
+extents|0000000000000830:00000000000d4348|ok|1|0:0:4096:delalloc
+match|/tmp/yuzu_test_file_search_sample/yuzu-fs-control-d1.bin|file|0000000000000830:0000000000029a5b|8|1795498457|system
+extents|0000000000000830:0000000000029a5b|ok|1|0:0:4096:delalloc
+match|/tmp/yuzu_test_file_search_sample/yuzu-fs-control-dir|directory|0000000000000830:00000000000d4349|-|-|system
+volume|/tmp|ext4|complete|none|extents=collected|entries=16
+coverage|complete|slices=1|prior_gaps=0|consistency=single_pass
+search|ok|none|bytes|seq=0|q=a3032aca|links_skipped=1
+[result_status] OK / FULL / 
+

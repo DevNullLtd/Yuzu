@@ -74,6 +74,9 @@ struct WorkflowListView {
     // Render hints probed once per render (never gates: the routes stay the gate). They ride
     // on the list root as data-can-* and decide whether a control is offered or disabled.
     bool can_run{false};    ///< Workflow:Execute
+    /// The caller is a supervised-tier MCP token: Workflow:Execute is approval-gated for it on
+    /// this transport, so Run stays off and says to use the MCP ticket flow, not that a grant is missing.
+    bool run_approval_gated{false};
     bool can_write{false};  ///< Workflow:Write (New workflow)
     bool can_delete{false}; ///< Workflow:Delete
 };

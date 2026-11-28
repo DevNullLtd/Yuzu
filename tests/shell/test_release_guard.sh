@@ -25,8 +25,11 @@
 #   (i.e. every image-publishing job, including any added later) and the
 #   `release` job list `release-guard` in `needs`, as do the three build jobs.
 #   Each of those publishing jobs and `release` runs
-#   scripts/ci/check-release-tag-sha.sh exactly once, before its first push /
-#   `gh release create` line (the script itself: test_release_tag_sha.sh).
+#   scripts/ci/check-release-tag-sha.sh exactly once, before its first
+#   publishing line: the release tags moving (`scripts/ci/image-publish.sh tag`,
+#   WP15/S9: the push itself is by digest or to a candidate tag and publishes
+#   nothing), a `push: true` / `--push`, or `gh release create` (the script
+#   itself: test_release_tag_sha.sh).
 #
 # Run:  bash tests/shell/test_release_guard.sh
 set -uo pipefail
@@ -176,7 +179,8 @@ run_guard notfound v0.14.1 ""
 check "unset ref type -> refused (exit 1)" 1 "$rc"
 check "unset ref type -> gh never called" "" "$(cat "$TMP/args")"
 
-for t in main v1.2.3-foo v1.2 1.2.3 v1.2.3-rc v1.2.3-rc1-extra; do
+# v12345.0.0 / v0.15.10000 / v1.2.3-rc12345: fields wider than the 4 digits scripts/build-agent-bundle.sh accepts (#7529)
+for t in main v1.2.3-foo v1.2 1.2.3 v1.2.3-rc v1.2.3-rc1-extra v12345.0.0 v0.15.10000 v1.2.3-rc12345; do
   run_guard notfound "$t"
   check "tag '$t' is not a release tag -> refused (exit 1)" 1 "$rc"
   check "tag '$t' -> gh never called" "" "$(cat "$TMP/args")"
@@ -189,7 +193,8 @@ check "empty GITHUB_REF_NAME -> gh never called" "" "$(cat "$TMP/args")"
 # ── Wiring ───────────────────────────────────────────────────────────────────
 # One line per job:
 #   "<job>|<needs-line>|<has-packages-write>|<#tag-recheck lines>|<first recheck line>|<first act line>"
-# An "act" line is a `push: true`, `--push` or `gh release create` outside a comment.
+# An "act" line is `image-publish.sh tag` (the release tags move), a `push: true`,
+# `--push` or `gh release create`, outside a comment.
 echo "release-guard wiring:"
 awk '
   function flush() {
@@ -207,7 +212,7 @@ awk '
   j {
     line = $0; sub(/[[:space:]]+#.*/, "", line)   # drop a trailing YAML comment
     if (line ~ /check-release-tag-sha\.sh/) { nchk++; if (!firstchk) firstchk = NR }
-    if (line ~ /push:[[:space:]]*true/ || line ~ /--push/ || line ~ /gh release create/) { if (!firstact) firstact = NR }
+    if (line ~ /image-publish\.sh tag / || line ~ /push:[[:space:]]*true/ || line ~ /--push/ || line ~ /gh release create/) { if (!firstact) firstact = NR }
   }
   END { flush() }
 ' "$WF" > "$TMP/jobs"
@@ -254,7 +259,8 @@ for job, spec in (wf.get("jobs") or {}).items():
     # The push itself must not run after a failed recheck (if: always() etc.).
     for st in spec.get("steps") or []:
         txt = (st.get("run") or "") + str(st.get("with") or "")
-        acts = "gh release create" in txt or "--push" in txt or "'push': True" in txt
+        acts = ("gh release create" in txt or "--push" in txt or "'push': True" in txt
+                or "image-publish.sh tag " in txt)
         cond = str(st.get("if", ""))
         if acts and any(k in cond for k in ("always()", "failure()", "cancelled()")):
             print(f"{job} push step|runs-after-failure")

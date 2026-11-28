@@ -4,7 +4,8 @@
  * @file dex_score_policy_writer.hpp
  * The one write path for the customer DEX score policy: validate, persist, audit, refresh.
  * apply_dex_score_policy() sits behind PUT and DELETE /api/v1/dex/score-policy and is the
- * entry the Settings panel reuses, so the two surfaces cannot drift.
+ * entry the DEX Scoring tab and the MCP tools set_dex_score_policy / reset_dex_score_policy
+ * reuse, so the three surfaces cannot drift.
  *
  * Header-only and store-free: it includes no store, httplib or clock type. Every boundary is
  * an injected closure (the observed store read, the store compare-and-set / -remove, the audit
@@ -37,11 +38,12 @@
  * overwritten a commit this request did make.
  *
  * Failure of the later audit rows (success, failure, no_change) never changes the answer: the
- * store state they describe already exists, and the handler's Sec-Audit-Failed header carries
- * the signal.
+ * store state they describe already exists, and the handler carries the signal
+ * (Sec-Audit-Failed on the REST routes and the Scoring tab, audit_persisted:false in the MCP
+ * tool result).
  *
- * Audit row size. The whole canonical document (about 130 KB at the override limit, at most
- * about 185 KB when image keys and names need escaping, always under the 256 KiB cap) rides
+ * Audit row size. The whole canonical document (about 150 KB at the override limit, at most
+ * about 220 KB when image keys and names need escaping, always under the 256 KiB cap) rides
  * only on the rows that record a proposal or an applied change: `attempted`, `success` and
  * `validate`. Every other row (denied, failure, no_change) carries `document_bytes`, the size
  * of the canonical text, instead, so a refused or failed request cannot multiply the document
@@ -209,7 +211,7 @@ struct DexScorePolicyWriteResult {
 
 /// {document, revision, source, fault?} of a policy in force: the data shape of GET and the
 /// base of every 200 write answer. `document` is the stored shape (version, tiers.edges,
-/// tiers.names, weights, overrides), never the Apps projection.
+/// tiers.names, weights, model, overrides), never the Apps projection.
 [[nodiscard]] inline nlohmann::json dex_score_policy_in_force_json(const DexPolicyInForce& p) {
     nlohmann::json j{{"document", dex_score_policy_to_json(p.policy)},
                      {"revision", p.revision},
@@ -510,8 +512,8 @@ apply_dex_score_policy(const DexScorePolicyWriteRequest& rq, const DexScorePolic
     out.status = Status::OutcomeUnknown;
     out.retry_after_ms = kDexScorePolicyRetryMs;
     out.remediation = "GET /api/v1/dex/score-policy and compare its revision: if it is the "
-                      "If-Match revision you sent, the write did not apply; if it is any other "
-                      "revision, review the policy before changing it again";
+                      "If-Match revision you sent, the policy is as it was before your request; "
+                      "if it is any other revision, review the policy before changing it again";
     if (re) {
         const bool intended = put ? (re->has_value() && **re == canonical) : !re->has_value();
         if (intended) {

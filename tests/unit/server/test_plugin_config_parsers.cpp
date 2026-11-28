@@ -327,6 +327,26 @@ TEST_CASE("resolve_kill_switch: base layer ANDed with the per-OS layer",
     CHECK(resolve("a", {{"b", "", false}, {"b", "linux", false}}) == Set{});
 }
 
+TEST_CASE("resolve_kill_switch: the documented file_search stop command beats an action-level ON row",
+          "[plugin_config][parsers][killswitch]") {
+    using Rows = std::vector<KillSwitchRowView>;
+    using Set = std::unordered_set<std::string>;
+    // An operator-set action ON row: a plugin-level OFF alone leaves the search running,
+    // which is why the README, upgrading.md and the changelog name the action-level row.
+    CHECK(resolve_kill_switch("search", Rows{{"search", "", true}, {"", "", false}}) == Set{});
+    // PUT ...?action=search {"enabled":false} writes the same (search, "") key, so it
+    // replaces the ON row and the search is off on every OS whatever else is stored.
+    CHECK_FALSE(resolve_kill_switch("search", Rows{{"search", "", false}, {"", "", true},
+                                                   {"search", "windows", true}})
+                    .has_value());
+    // The Windows leg: search@windows ON overrides plugin@windows OFF ...
+    CHECK(resolve_kill_switch("search", Rows{{"search", "windows", true}, {"", "windows", false}}) ==
+          Set{});
+    // ... and ?action=search&os=windows OFF withholds Windows only.
+    CHECK(resolve_kill_switch("search", Rows{{"search", "windows", false}, {"", "windows", true}}) ==
+          Set{"windows"});
+}
+
 // ── kill_switch_set_detail: the reason reaches the audit evidence ────────────
 
 TEST_CASE("kill_switch_set_detail without a reason is the unchanged evidence format",
@@ -334,8 +354,19 @@ TEST_CASE("kill_switch_set_detail without a reason is the unchanged evidence for
     const KillSwitchScope plain{"echo", "sql", ""};
     CHECK(kill_switch_set_detail(plain, false) == "enabled=false");
     CHECK(kill_switch_set_detail(plain, true, "") == "enabled=true");
-    CHECK(kill_switch_set_detail(KillSwitchScope{"quarantine", "", ""}, false) ==
+    CHECK(kill_switch_set_detail(KillSwitchScope{"__guard__", "", ""}, false) ==
           "enabled=false, protective_exempt=true");
+    // A plugin-level firewall row exempts the protective four but still gates state and rules:
+    // labelled `partial`, never the complete-exemption `true`. An action-level firewall row is
+    // exact.
+    CHECK(kill_switch_set_detail(KillSwitchScope{"firewall", "", ""}, false) ==
+          "enabled=false, protective_exempt=partial");
+    CHECK(kill_switch_set_detail(KillSwitchScope{"Firewall", "", "linux"}, true, "drill") ==
+          "enabled=true, protective_exempt=partial, reason=\"drill\"");
+    CHECK(kill_switch_set_detail(KillSwitchScope{"firewall", "release", ""}, false) ==
+          "enabled=false, protective_exempt=true");
+    CHECK(kill_switch_set_detail(KillSwitchScope{"firewall", "state", ""}, false) ==
+          "enabled=false");
 }
 
 TEST_CASE("kill_switch_set_detail appends a quoted, bounded, control-stripped reason",
@@ -344,8 +375,11 @@ TEST_CASE("kill_switch_set_detail appends a quoted, bounded, control-stripped re
     CHECK(kill_switch_set_detail(plain, false, "incident INC-42") ==
           "enabled=false, reason=\"incident INC-42\"");
     // Protective marker first, then the reason.
-    CHECK(kill_switch_set_detail(KillSwitchScope{"quarantine", "", ""}, false, "drill") ==
+    CHECK(kill_switch_set_detail(KillSwitchScope{"__guard__", "", ""}, false, "drill") ==
           "enabled=false, protective_exempt=true, reason=\"drill\"");
+    // A plugin-level firewall row is `partial` (it still gates state and rules); the reason follows.
+    CHECK(kill_switch_set_detail(KillSwitchScope{"firewall", "", ""}, false, "drill") ==
+          "enabled=false, protective_exempt=partial, reason=\"drill\"");
     // Quote and backslash cannot close the field; tab and other controls flatten to a space.
     CHECK(kill_switch_set_detail(plain, false, "a\"b\\c\td\x01" "e") ==
           "enabled=false, reason=\"a\\\"b\\\\c d e\"");

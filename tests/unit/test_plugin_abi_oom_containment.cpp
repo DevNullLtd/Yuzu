@@ -8,6 +8,9 @@
  *   C. yuzu::mgmt_posture::execute_posture
  *   D. yuzu::shares::execute_list
  *   E. yuzu::remote_access_audit::execute_list
+ *   F. yuzu::virtualization::execute_action
+ *   G. yuzu::process_introspect::execute_inspect
+ *   H. yuzu::file_search::execute_search
  * Their catch arms must build a token, write a status row and set the typed
  * status without letting a second bad_alloc escape. The SDK export wrapper
  * (plugin.hpp) and the test-side LocalDispatcher::run (agent.cpp) do not catch, so an
@@ -38,24 +41,31 @@
  * surviving signal. The healthy-allocator behaviour (full `:bad_alloc` token)
  * is pinned by the two local-dispatcher tests and is not duplicated here.
  *
- * SEAMS C, D and E differ in two respects. Their recovery writes the status ROW before it sets
+ * SEAMS C, D, E, F, G and H differ in two respects. Their recovery writes the status ROW before it sets
  * the typed status, so under sustained failure the row build throws first and the surviving
  * signal is rc 1 (the double-throw arm), not a typed status. And their token
  * (`<os>:leg:exception`) carries no `:bad_alloc` suffix, so the provenance-shape check above
  * does not apply to them.
+ *
+ * The last case, for seam H, runs with a healthy allocator: a telemetry hook that throws after the answer
+ * was written is dropped where it is called, so the answer keeps its one `search` row and its typed status.
  */
 
 #include "browser_policy_legs.hpp"
+#include "file_search_execute.hpp"
 #include "mgmt_posture_legs.hpp"
+#include "process_introspect_legs.hpp"
 #include "remote_access_audit_legs.hpp"
 #include "shares_legs.hpp"
 #include "update_source_trust_legs.hpp"
+#include "virtualization_legs.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
 #include <cstdlib>
 #include <cstring>
 #include <new>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 
@@ -81,6 +91,19 @@ void reset_stubs() {
 
 int oom_leg(yuzu::CommandContext&) {
     g_fail_alloc = true; // stays set until the seam returns: the catch arm allocates under failure
+    throw std::bad_alloc{};
+}
+
+// process_introspect's leg takes the parsed request as well.
+int oom_inspect_leg(yuzu::CommandContext&, const yuzu::process_introspect::Request&) {
+    g_fail_alloc = true;
+    throw std::bad_alloc{};
+}
+
+// file_search's slice: the whole one-slice driver is injected into the execute seam, so the throw happens
+// exactly where a leg's allocation failure would surface.
+yuzu::file_search::SliceResult oom_slice(const yuzu::file_search::Request&) {
+    g_fail_alloc = true;
     throw std::bad_alloc{};
 }
 
@@ -249,4 +272,104 @@ TEST_CASE("remote_access_audit execute_list contains a leg that throws under sus
     REQUIRE(g_injected > 0);
     CHECK((rc == 1 || (g_status == YUZU_RESULT_STATUS_UNAVAILABLE &&
                        g_completeness == YUZU_RESULT_COMPLETENESS_UNKNOWN)));
+}
+
+TEST_CASE("virtualization execute_action contains a leg that throws under sustained OOM",
+          "[plugin][abi][oom][virtualization]") {
+    for (const char* action : {"host", "wsl", "runtime_posture"}) {
+        yuzu::CommandContext ctx{nullptr};
+        reset_stubs();
+        bool escaped = false;
+        int rc = -1;
+        try {
+            rc = yuzu::virtualization::execute_action(
+                ctx, action, yuzu::virtualization::Legs{&oom_leg, &oom_leg, &oom_leg},
+                "linux:leg:exception");
+        } catch (...) {
+            escaped = true;
+        }
+        g_fail_alloc = false;
+
+        REQUIRE_FALSE(escaped);
+        // The recovery's status row must have hit the failing allocator, or this case proves
+        // nothing on a stdlib whose containment is never exercised.
+        REQUIRE(g_injected > 0);
+        CHECK((rc == 1 || (g_status == YUZU_RESULT_STATUS_UNAVAILABLE &&
+                           g_completeness == YUZU_RESULT_COMPLETENESS_UNKNOWN)));
+    }
+}
+
+TEST_CASE("process_introspect execute_inspect contains a leg that throws under sustained OOM",
+          "[plugin][abi][oom][process_introspect]") {
+    yuzu::CommandContext ctx{nullptr};
+    reset_stubs();
+    bool escaped = false;
+    int rc = -1;
+    try {
+        rc = yuzu::process_introspect::execute_inspect(ctx, "inspect", "4242", "oom", "",
+                                                       &oom_inspect_leg, "linux:leg:exception");
+    } catch (...) {
+        escaped = true;
+    }
+    g_fail_alloc = false;
+
+    REQUIRE_FALSE(escaped);
+    // The recovery's status row must have hit the failing allocator, or this case proves
+    // nothing on a stdlib whose containment is never exercised.
+    REQUIRE(g_injected > 0);
+    CHECK((rc == 1 || (g_status == YUZU_RESULT_STATUS_UNAVAILABLE &&
+                       g_completeness == YUZU_RESULT_COMPLETENESS_UNKNOWN)));
+}
+
+TEST_CASE("file_search execute_search contains a slice that throws under sustained OOM",
+          "[plugin][abi][oom][file_search]") {
+    yuzu::CommandContext ctx{nullptr};
+    reset_stubs();
+    bool escaped = false;
+    int rc = -1;
+    try {
+        rc = yuzu::file_search::execute_search(ctx, "search", "/", "yuzu-fs-control-*.bin", "", "",
+                                               &yuzu::shared::file_search::byte_exact, &oom_slice, {},
+                                               "linux:file_search:exception");
+    } catch (...) {
+        escaped = true;
+    }
+    g_fail_alloc = false;
+
+    REQUIRE_FALSE(escaped);
+    // The recovery's trailer must have hit the failing allocator, or this case proves nothing on a stdlib
+    // whose containment is never exercised.
+    REQUIRE(g_injected > 0);
+    CHECK((rc == 1 || (g_status == YUZU_RESULT_STATUS_UNAVAILABLE && g_completeness == YUZU_RESULT_COMPLETENESS_UNKNOWN)));
+}
+
+// The after hook (heartbeat and log) runs once the answer is written. Its own throw is dropped where it is
+// called: it must not add a second `search` row or rewrite the typed status. Allocator healthy: this pins the
+// call site's containment, not the OOM arm above.
+TEST_CASE("file_search execute_search never rewrites a written answer when its after hook throws",
+          "[plugin][abi][file_search]") {
+    yuzu::CommandContext ctx{nullptr};
+    reset_stubs();
+    const auto slice = [](const yuzu::file_search::Request&) {
+        yuzu::file_search::SliceResult r;
+        r.status = yuzu::file_search::Status::ok;
+        r.rows = {"coverage|complete|1|0|0|0|consistency=not_a_snapshot", "search|ok|none|bytes|seq=0|q=a|links_skipped=0"};
+        return r;
+    };
+    const auto throwing_hook = [](const yuzu::file_search::SliceResult&) { throw std::runtime_error("telemetry"); };
+    bool escaped = false;
+    int rc = -1;
+    try {
+        rc = yuzu::file_search::execute_search(ctx, "search", "/", "yuzu-fs-control-*.bin", "", "",
+                                               &yuzu::shared::file_search::byte_exact, slice, throwing_hook,
+                                               "linux:file_search:exception");
+    } catch (...) {
+        escaped = true;
+    }
+    REQUIRE_FALSE(escaped);
+    CHECK(rc == 0);
+    CHECK(g_writes == 2); // the slice's own two rows, no second `search|failed|internal_error` trailer
+    CHECK(g_status_calls == 1);
+    CHECK(g_status == YUZU_RESULT_STATUS_OK);
+    CHECK(g_completeness == YUZU_RESULT_COMPLETENESS_FULL);
 }

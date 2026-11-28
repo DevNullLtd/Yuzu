@@ -417,6 +417,37 @@ check_mgmt_auth_config_test_() ->
             Set([agent_entry(), mgmt_entry()]),
             ?assertEqual({error, insecure_mgmt_listener}, yuzu_gw_app:check_mgmt_listener_posture())
         end},
+       {"an unset mode is announced as defaulted to pin; a mode that is set is not",
+        fun() ->
+            Set([agent_entry(), mgmt_entry()]),
+            Env(mgmt_peer_pins, Pins),
+            Defaulted = fun(Lines) ->
+                            [L || L <- Lines,
+                                  binary:match(unicode:characters_to_binary(L),
+                                               <<"mgmt_peer_auth_mode} is not set; "
+                                                 "defaulting to pin (">>) =/= nomatch]
+                        end,
+            Lines = yuzu_gw_test_logs:capture(warning, fun() ->
+                        ?assertEqual(ok, yuzu_gw_app:check_mgmt_auth_config())
+                    end),
+            ?assertMatch([_], Defaulted(Lines)),
+            %% a mode that is set (here the shipped one) is not announced as defaulted
+            Env(mgmt_peer_auth_mode, identity),
+            Lines2 = yuzu_gw_test_logs:capture(warning, fun() ->
+                         ?assertEqual(ok, yuzu_gw_app:check_mgmt_auth_config())
+                     end),
+            ?assertEqual([], [L || L <- Lines2,
+                                   binary:match(unicode:characters_to_binary(L),
+                                                <<"defaulting to">>) =/= nomatch]),
+            %% an unset mode on a node with no management listener that runs the
+            %% auth_fun (a plaintext lab rig) has nothing to announce
+            application:unset_env(yuzu_gw, mgmt_peer_auth_mode),
+            Set([agent_entry()]),
+            Lines3 = yuzu_gw_test_logs:capture(warning, fun() ->
+                         ?assertEqual(ok, yuzu_gw_app:check_mgmt_auth_config())
+                     end),
+            ?assertEqual([], Defaulted(Lines3))
+        end},
        {"an explicit identity that differs from the derived one is warned of (and its case noted)",
         fun() ->
             WithCa(fun(Ca) ->

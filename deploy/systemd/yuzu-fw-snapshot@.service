@@ -1,0 +1,88 @@
+# yuzu-fw-snapshot@.service: one connection's worth of the read-only firewall snapshot.
+#
+# Started by yuzu-fw-snapshot.socket (Accept=yes), never enabled and never started by the agent.
+# It runs the fixed script /usr/share/yuzu/scripts/yuzu-fw-snapshot.sh as root with no input
+# (standard input is /dev/null; the connection is only the trigger and the output) and ends. The
+# contract is docs/adr/3007-os-activated-read-helpers.md. The unit needs systemd 239 or later; the
+# agent's README names the versions it has been measured on. Two claims are made here and they do
+# not contradict each other. What the script does is fixed by the script itself: it runs `nft`, the
+# two legacy save tools (by their literal paths) and `head` (by name under the reset PATH), all
+# read-only, and nothing else. The directives below bound what a process in the instance could do
+# beyond that if a tool misbehaved, and each has its own sandbox reason.
+[Unit]
+Description=Yuzu agent read-only firewall snapshot (one connection)
+Documentation=https://github.com/DevNullLtd/Yuzu
+# The instance is removed whether it succeeded or failed, so a failed read leaves nothing behind.
+CollectMode=inactive-or-failed
+
+[Service]
+User=root
+ExecStart=/bin/sh /usr/share/yuzu/scripts/yuzu-fw-snapshot.sh
+# The script reads nothing: no input is connected to it.
+StandardInput=null
+# The reply goes to the connection; the tools' own error output is dropped by the script.
+StandardOutput=socket
+StandardError=null
+# A hung tool ends here (the agent gives up on its own after 5 s) and the instance is killed.
+RuntimeMaxSec=30
+# Bounds the processes and threads the instance may create.
+TasksMax=16
+# NoNewPrivileges is deliberately NOT set. Measured on Rocky 9.9 with SELinux enforcing (systemd 252):
+# under NoNewPrivileges the exec of nft was a denied nnp_transition from initrc_t to iptables_t and
+# nft ran in the script's domain, not its own confined one; the distribution's policy grants that
+# transition only without no_new_privs. What
+# bounds the instance without it: it runs as root with only the two capabilities below, so an exec
+# can yield no more capabilities than that set, and the system call filter, address families,
+# namespaces, memory and file system restrictions below apply to every process the script starts.
+# One thing does change without the flag: an exec of a setuid or setgid program that belongs to
+# another user or group changes the process to that identity. That adds no capability beyond the two
+# in the bounding set, the filters still apply to it, and the script runs only the tools named in
+# its header, with no input.
+# The agent's own unit keeps NoNewPrivileges=true and its one capability (yuzu-agent.service).
+# Only the two capabilities the reads can need: CAP_NET_ADMIN to read nftables and iptables state,
+# CAP_NET_RAW for legacy iptables (a raw socket; that it needs the capability is inferred, not measured).
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW
+# Netlink for nftables, AF_INET and AF_INET6 for legacy iptables' raw socket, AF_UNIX for the
+# connection itself; no other address family can be opened.
+RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_INET AF_INET6
+# Drops IP traffic from and to the instance's cgroup. It filters only on hosts with the unified
+# cgroup hierarchy (cgroup v2), so it is defence in depth and not the bound; the family list above
+# is what limits the sockets the instance can open.
+IPAddressDeny=any
+# Allows the system calls an ordinary service needs and refuses the rest with EPERM.
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+# Refuses system calls of any other architecture the kernel would accept.
+SystemCallArchitectures=native
+# Refuses a change of execution domain (personality(2)).
+LockPersonality=true
+# Refuses memory that is both writable and executable.
+MemoryDenyWriteExecute=true
+# The file system is read-only for the instance.
+ProtectSystem=strict
+# With ProtectSystem=strict, /run stayed writable inside the instance whenever ProtectKernelTunables
+# or ProtectControlGroups was also set (measured on Ubuntu 26.04, systemd 259), so it is made
+# read-only by name. Nothing the script runs writes a file or takes a lock: the legacy save tools
+# take no xtables lock and the nft read creates nothing.
+ReadOnlyPaths=/run
+# Hides /home, /root and /run/user.
+ProtectHome=true
+# A private /tmp and /var/tmp. The script must not create files: on Rocky 8.10 with SELinux
+# enforcing, a file left in the private /tmp was not removed when the instance ended (measured), so
+# nothing here may depend on that clean-up.
+PrivateTmp=true
+# A minimal /dev without physical devices.
+PrivateDevices=true
+# Refuses explicit module loading by the instance's processes and makes the module files
+# unreachable. No read needs it: for the tables the kernel lists, the save tools load no module. It
+# does not stop the kernel loading a module on demand, which two reads can cause (ADR-3007, clause
+# 3; both measured on Ubuntu 26.04): an nft read on a host where nf_tables is not loaded loads
+# nf_tables, and a save tool that asks for a table whose module is not loaded (a table removed
+# between the kernel listing it and the tool asking for it) loads that module.
+ProtectKernelModules=true
+# Makes /proc/sys, /sys and similar kernel tunables read-only.
+ProtectKernelTunables=true
+# Makes the cgroup file system read-only.
+ProtectControlGroups=true
+# Refuses creating or joining namespaces.
+RestrictNamespaces=true

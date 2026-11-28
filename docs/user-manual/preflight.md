@@ -18,7 +18,7 @@ applies your thresholds server-side:
 | **Target App** | app name + min / max version (optional) | the named app is installed and its version is within `[min, max]` |
 | **OS version** | minimum OS version | the device OS version is at or above the floor |
 | **Arch** | required architecture (`x86_64` / `arm64` / `any`) | the device architecture matches |
-| **Free disk** | minimum free GiB (+ optional volume) | free space on the volume is at or above the floor |
+| **Free disk** | minimum free GiB (+ optional volume) | free space on the volume is at or above the floor. The volume must be a local path: a UNC or device spelling (two leading separators, `\\?\`, `\\.\`) or a control byte is refused with `400`, and the agent itself answers a network-mounted, non-fixed-drive or symlinked-into-a-network-mount path with `path_refused:...`, so that device reads as incomplete rather than passing. There is no override; a diskless-NFS-root host needs an explicit local volume |
 | **Pending reboot** | block or warn | no reboot is pending (a pending reboot fails when *block*, or warns when *warn*) |
 
 The Target App check only runs when you give it an app name; the rest always run.
@@ -322,3 +322,9 @@ denial under their own verb. Their MCP twins instead call the generic
 `mcp.list_deployments`/`mcp.get_deployment`) success audit, matching the majority
 convention for MCP read tools in this codebase — the two transports deliberately diverge here; see
 `docs/api-twin-recipe.md` §4 for why REST/MCP/dashboard audit postures are not required to agree.
+
+## Routed-concern invariants
+
+Moved verbatim from the `/auto Deploy` row of `.claude/routed-concerns.md` on 2026-11-12, when that always-loaded row was compressed to its catastrophic clauses plus a pointer here. This text is the authoritative long form of that row.
+
+`/auto` Deploy (the ACT stage after pre-flight ASSESS) — stage + execute an installer on a pre-flight run's go-cohort via the `content_dist` plugin (NO new agent code). Born-on-PG `DeploymentRunStore`: the device step is STATEFUL (mutating) → GUARDED transitions + `claim_for_exec` execute-once CAS (see the ladder row). Transitions are forward-only EXCEPT deliberate backward/terminal exceptions (PR #3939, 3 review rounds): `containment_unreadable` (systemic gate failure) reverts the WHOLE claim one step back; an individually-offline device (`not_sent`) reverts the same way per-id; either way execute-once holds (`apply_results`'s CAS is source-step-guarded; a reclaim is a second CLAIM, never a second EXECUTION). A claimed device the caller's OWN exec_visible now excludes (a DIFFERENT dimension from `authorized` below, dropped silently by the chokepoint's arm walk) settles 'skipped' instead — same as the pre-claim skip. RE-AUTHORIZATION every tick (`devices_fn(viewer)∩cohort`) keeps the mutating step safe. NO background runner in slice 1 (page/MCP poll advances it). ANY future store mutation MUST stay a guarded transition (never an unconditional grid overwrite) or execute-once breaks. Mints `deployment-*` ids `notify_exec_tracker` skips.

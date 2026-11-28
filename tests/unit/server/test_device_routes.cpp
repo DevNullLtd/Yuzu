@@ -21,6 +21,7 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <cstdint>
 #include <expected>
 #include <memory>
 #include <optional>
@@ -35,8 +36,8 @@ using namespace yuzu::server;
 namespace {
 
 // Minimal test double for the DeviceApi seam (ADR-0031 WS-A4 wave 2). `rows`
-// backs list_devices() (UNSCOPED — DeviceRoutes applies its own visible_set_fn
-// filter, matching the real seam's contract); `details` backs lookup_device()
+// backs list_devices() and list_devices_basic() (UNSCOPED -- DeviceRoutes applies its own
+// visible_set_fn filter, matching the real seam's contract); `details` backs lookup_device()
 // by agent_id (explicit per-id entries take precedence). `device_os_ptr`, when
 // wired and non-empty, makes lookup_device(ANY id without an explicit `details`
 // entry) resolve to a bare identity row carrying that OS — the K-4 live-result
@@ -50,7 +51,22 @@ public:
     std::vector<std::string> degraded_ids;
     const std::string* device_os_ptr = nullptr;
 
-    [[nodiscard]] std::vector<DeviceListRow> list_devices() const override { return rows; }
+    // Call counters: which list method a route used is the property under test for the
+    // "callers that discard the per-device backend must not pay for it" pin below.
+    mutable int full_list_calls = 0;
+    mutable int basic_list_calls = 0;
+
+    [[nodiscard]] std::vector<DeviceListRow> list_devices() const override {
+        ++full_list_calls;
+        return rows;
+    }
+    [[nodiscard]] std::vector<DeviceListRow> list_devices_basic() const override {
+        ++basic_list_calls;
+        auto out = rows;
+        for (auto& r : out)
+            r.guardian_backend.reset();
+        return out;
+    }
 
     [[nodiscard]] std::expected<std::optional<DeviceDetail>, DeviceReadError>
     lookup_device(const std::string& id) const override {
@@ -427,7 +443,7 @@ TEST_CASE("device live run: expanded kinds map to the right plugin/action + audi
         {"capture_sources", "echo", "status", "device.live.capture_sources"},
         {"disk", "disk_space", "free", "device.live.disk"},
         // Round-3 item 11: ten physical-hardware "generic pipe-row" kinds
-        // (live_kinds.hpp LiveKind::columns/.row_prefix + device_ui.cpp
+        // (live_model.hpp LiveKind::columns/.row_prefix + device_ui.cpp
         // render_device_live_generic). Same plugin/action/verb mapping as the
         // canonical kind table — see test_device_live_generic_kinds below for
         // render-path coverage of hw_disks + thermal.
@@ -642,39 +658,69 @@ TEST_CASE("device live result: table kinds parse + render", "[device][routes]") 
 TEST_CASE("device live capture_sources: echo status -> read-only source table", "[device][routes]") {
     LiveHarness h;
     h.fake_rows = {{"a-1", 1,
-                    "config|process_enabled|true\nconfig|process_live_rows|1234\n"
-                    "config|arp_enabled|false\nconfig|arp_live_rows|0",
+                    "config|process_enabled|true\nconfig|process_rows|1234\n"
+                    "config|arp_enabled|false\nconfig|arp_rows|0",
                     ""}};
     auto r = h.sink.Get("/fragments/device/live/result?command_id=echo-test"
                         "&agent_id=a-1&kind=capture_sources&n=1");
     REQUIRE(r);
-    CHECK(r->body.find("$Process_Live") != std::string::npos);
-    CHECK(r->body.find("1234") != std::string::npos);                  // live-row count
+    CHECK(r->body.find("$Process_Hourly") != std::string::npos);
+    CHECK(r->body.find("1234") != std::string::npos);                  // row count
     CHECK(r->body.find("id=\"ls-cnt-capture_sources\"") != std::string::npos); // OOB "X of N on"
     CHECK(r->body.find("/echo") != std::string::npos);                  // configure-on-Echo link
+}
+
+TEST_CASE("device live capture_sources: row count reads <src>_rows only",
+          "[device][routes]") {
+    const auto count_cell = [](const std::string& status) {
+        LiveHarness h;
+        h.fake_rows = {{"a-1", 1, status, ""}};
+        auto r = h.sink.Get("/fragments/device/live/result?command_id=echo-test"
+                            "&agent_id=a-1&kind=capture_sources&n=1");
+        REQUIRE(r);
+        return r->body;
+    };
+    // Only the new key: fails if the <src>_rows lookup is removed.
+    CHECK(count_cell("config|process_enabled|true\nconfig|process_rows|4321")
+              .find("<td class=\"ls-num\">4321</td>") != std::string::npos);
+    // Only the retired `<src>_live_rows` spelling: not read, so a dash, never the number.
+    const auto retired = count_cell("config|process_enabled|true\nconfig|process_live_rows|8765");
+    CHECK(retired.find("8765") == std::string::npos);
+    CHECK(retired.find("&mdash;") != std::string::npos);
+    CHECK(retired.find("without the roll-up tables") == std::string::npos);
+    // Both present: `<src>_rows` is the count.
+    const auto both = count_cell(
+        "config|process_enabled|true\nconfig|process_live_rows|1\nconfig|process_rows|2");
+    CHECK(both.find("<td class=\"ls-num\">2</td>") != std::string::npos);
+    CHECK(both.find("<td class=\"ls-num\">1</td>") == std::string::npos);
+    CHECK(both.find("without the roll-up tables") == std::string::npos);
+    // Neither: a dash, not a zero.
+    const auto neither = count_cell("config|process_enabled|true");
+    CHECK(neither.find("&mdash;") != std::string::npos);
+    CHECK(neither.find("without the roll-up tables") == std::string::npos);
 }
 
 TEST_CASE("device live capture_sources: registry row renders with the System category",
           "[device][routes]") {
     LiveHarness h;
-    h.fake_rows = {{"a-1", 1, "config|registry_enabled|true\nconfig|registry_live_rows|7", ""}};
+    h.fake_rows = {{"a-1", 1, "config|registry_enabled|true\nconfig|registry_rows|7", ""}};
     auto r = h.sink.Get("/fragments/device/live/result?command_id=echo-test"
                         "&agent_id=a-1&kind=capture_sources&n=1");
     REQUIRE(r);
     CHECK(r->body.find("<span class=\"src-on\">registry</span>") != std::string::npos);
-    CHECK(r->body.find("<code>$Registry_Live</code></td><td class=\"ls-num\">7</td>"
+    CHECK(r->body.find("<code>$Registry_Hourly</code></td><td class=\"ls-num\">7</td>"
                        "<td><span class=\"ls-pill\">System</span>") != std::string::npos);
     CHECK(r->body.find("1 of 1 on") != std::string::npos);
 }
 
 // Round-3 item 11: the ten new physical-hardware live kinds share ONE generic
-// pipe-row path (live_kinds.hpp LiveKind::columns/.row_prefix -> device_routes.cpp
+// pipe-row path (live_model.hpp LiveKind::columns/.row_prefix -> device_routes.cpp
 // render_live_result's `!lk.columns.empty()` branch -> device_ui.cpp
 // render_device_live_generic) instead of a bespoke render_device_live_KIND
 // function each. hw_disks gets the straightforward well-formed-row case;
 // thermal is the one kind whose row width VARIES (the "no zones" shape omits
 // celsius), so it gets both shapes exercised explicitly, matching the shared
-// renderer's pad-short-rows contract (device_routes.cpp: `f.resize(lk.columns.size())`).
+// renderer's pad-short-rows contract (live_model.cpp parse_generic_rows: `f.resize(lk.columns.size())`).
 TEST_CASE("device live: physical-hardware generic-table kinds dispatch + render",
           "[device][routes]") {
     SECTION("hw_disks dispatches hardware/disks, audited, polls hardware-<id>") {
@@ -740,6 +786,45 @@ TEST_CASE("device live: physical-hardware generic-table kinds dispatch + render"
         CHECK(structured_pos != std::string::npos);
         CHECK(raw_pos != std::string::npos);
         CHECK(structured_pos < raw_pos); // structured rows render before raw rows
+    }
+    SECTION("hw_processors: an escaped pipe in the CPU model stays in its cell and shifts no "
+            "column (#7040)") {
+        LiveHarness h;
+        h.fake_rows = {{"a-1", 1, "cpu|0|Foo \\| Bar CPU|4|8|2800|-|-", ""}};
+        auto r = h.sink.Get("/fragments/device/live/result?command_id=hardware-test"
+                            "&agent_id=a-1&kind=hw_processors&n=1");
+        REQUIRE(r);
+        CHECK(r->body.find("<td>0</td><td>Foo | Bar CPU</td><td>4</td><td>8</td>"
+                           "<td>2800</td>") != std::string::npos);
+    }
+    SECTION("hw_memory: an escaped pipe in the DIMM slot stays in its cell (#7040)") {
+        LiveHarness h;
+        h.fake_rows = {{"a-1", 1, "dimm|Bank\\|0 DIMM|8192|DDR4|3200|-|-|-", ""}};
+        auto r = h.sink.Get("/fragments/device/live/result?command_id=hardware-test"
+                            "&agent_id=a-1&kind=hw_memory&n=1");
+        REQUIRE(r);
+        CHECK(r->body.find("<td>Bank|0 DIMM</td><td>8192</td><td>DDR4</td><td>3200</td>") !=
+              std::string::npos);
+    }
+    SECTION("hw_disks keeps the raw split: its rows are not escaped at the source, so a backslash "
+            "before a separator must not swallow it (#7040 carve-out)") {
+        LiveHarness h;
+        h.fake_rows = {{"a-1", 1, "disk|0|Model\\|931|SSD|NVMe", ""}};
+        auto r = h.sink.Get("/fragments/device/live/result?command_id=hardware-test"
+                            "&agent_id=a-1&kind=hw_disks&n=1");
+        REQUIRE(r);
+        CHECK(r->body.find("<td>0</td><td>Model\\</td><td>931</td><td>SSD</td><td>NVMe</td>") !=
+              std::string::npos);
+    }
+    SECTION("volumes (another plugin) keeps the raw split: a mount point ending in a backslash "
+            "does not swallow the separator (#7040 carve-out)") {
+        LiveHarness h;
+        h.fake_rows = {{"a-1", 1, "volume|C:\\|C:\\|NTFS|100|-", ""}};
+        auto r = h.sink.Get("/fragments/device/live/result?command_id=disk_actions-test"
+                            "&agent_id=a-1&kind=volumes&n=1");
+        REQUIRE(r);
+        CHECK(r->body.find("<td>C:\\</td><td>C:\\</td><td>NTFS</td><td>100</td>") !=
+              std::string::npos);
     }
     SECTION("thermal dispatches power_health/thermal, audited, polls power_health-<id>") {
         LiveHarness h;
@@ -810,7 +895,8 @@ TEST_CASE("device routes: out-of-scope device is not listed/openable/live-querya
         if (agent_id == "other-team") { res.status = 403; return false; }
         return true;
     };
-    // The API's list_devices() is UNSCOPED (both "mine" and "other-team" resolve);
+    // The API's list_devices()/list_devices_basic() are UNSCOPED (both "mine" and "other-team"
+    // resolve);
     // visible_set_fn_ below is this test's OWN confinement filter, matching a flat
     // get_visible_agents JOIN with no ancestor walk — "ancestor-child" is absent
     // from it even though scoped_perm authorizes it (an ancestor-group role).
@@ -844,6 +930,16 @@ TEST_CASE("device routes: out-of-scope device is not listed/openable/live-querya
         CHECK(r->status == 200);
         CHECK(r->body.find("mine-host") != std::string::npos);
         CHECK(r->body.find("other-team") == std::string::npos);
+    }
+    SECTION("the list fragment reads the basic list and never the full one") {
+        // The dashboard row never renders the per-device backend, so it must not pay the
+        // health-store read that list_devices() costs (#2240); a return to the full list
+        // would leave every row-content assertion green.
+        auto r = sink.Get("/fragments/devices/list");
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(api->basic_list_calls >= 1);
+        CHECK(api->full_list_calls == 0);
     }
     SECTION("out-of-scope device page is 403, not opened") {
         auto r = sink.Get("/fragments/device/page?id=other-team");
@@ -992,5 +1088,207 @@ TEST_CASE("device routes: /devices + /device redirect to Hardware CI",
         REQUIRE(r);
         CHECK(r->status == 302);
         CHECK(r->get_header_value("Location") == "/hardware/ci");
+    }
+}
+
+// #7811: every per-device fragment takes the device id raw from the URL and hands it to the
+// scoped permission check, whose denial audit carries it, and to `target_id`. An over-long or
+// control-byte id is refused with a 400 before that check, before any audit row and before any
+// dispatch. The scoped gate below refuses every device, so a route that reached it would answer
+// 403: a 400 with `scoped_calls == 0` proves the id check runs first.
+TEST_CASE("device routes: a per-device fragment refuses an unsafe device id before the scoped check, "
+          "any audit row or dispatch",
+          "[device][routes][audit][authz]") {
+    auto okAuth = [](const httplib::Request&, httplib::Response&) {
+        return std::optional<auth::Session>(auth::Session{});
+    };
+    auto okPerm = [](const httplib::Request&, httplib::Response&, const std::string&,
+                     const std::string&) { return true; };
+    int scoped_calls = 0;
+    auto denyScoped = [&scoped_calls](const httplib::Request&, httplib::Response& res,
+                                      const std::string&, const std::string&, const std::string&) {
+        ++scoped_calls;
+        res.status = 403;
+        return false;
+    };
+    std::vector<std::string> audited;
+    auto audit = [&audited](const httplib::Request&, const std::string& action, const std::string&,
+                            const std::string&, const std::string& target_id,
+                            const std::string&) -> bool {
+        audited.push_back(action + "|" + target_id);
+        return true;
+    };
+    int dispatched = 0;
+    auto dispatch = [&dispatched](const std::string& plugin, const std::string&,
+                                  const std::vector<std::string>&, const std::string&,
+                                  const std::unordered_map<std::string, std::string>&)
+        -> yuzu::server::ConfinedDispatchOutcome {
+        ++dispatched;
+        return {.sent = 1, .command_id = plugin + "-x"};
+    };
+    auto responses = [](const std::string&, const std::string&) {
+        return std::vector<DexAgentResponse>{};
+    };
+    auto api = std::make_shared<FakeDeviceApi>();
+    DeviceRoutes routes;
+    yuzu::server::test::TestRouteSink sink; // after `routes`: its handlers capture `this`
+    routes.register_routes(sink, okAuth, okPerm, denyScoped, api, /*visible_set_fn=*/{},
+                           /*dex_score_fn=*/{}, dispatch, responses, audit);
+
+    struct Route {
+        const char* path;
+        const char* id_param;
+        const char* rest; // the other parameters a real request carries
+    };
+    const std::vector<Route> device_routes = {
+        {"/fragments/device/page", "id", ""},
+        {"/fragments/device/info", "id", ""},
+        {"/fragments/device/live", "id", ""},
+        {"/fragments/device/live/run", "id", "&kind=uptime"},
+        {"/fragments/device/live/result", "agent_id", "&kind=uptime&command_id=uptime-1"},
+    };
+    const std::vector<std::string> bad = {std::string(257, 'a'), "dev%00A", "dev%0D%0AA", "dev%0AA",
+                                          "dev%09A"};
+    for (const auto& route : device_routes) {
+        INFO(route.path);
+        for (const auto& id : bad) {
+            INFO(id.substr(0, 16));
+            auto r = sink.Get(std::string(route.path) + "?" + route.id_param + "=" + id + route.rest);
+            REQUIRE(r);
+            CHECK(r->status == 400);
+            CHECK(r->body.find("Invalid device id.") != std::string::npos);
+        }
+        // The same route does reach the permission check for a safe id, at the 256-byte limit.
+        const int before = scoped_calls;
+        auto safe = sink.Get(std::string(route.path) + "?" + route.id_param + "=" +
+                             std::string(256, 'a') + route.rest);
+        REQUIRE(safe);
+        CHECK(safe->status == 403);
+        CHECK(safe->body.find("Invalid device id.") == std::string::npos);
+        CHECK(scoped_calls == before + 1);
+    }
+    // Only the safe-id controls reached the gate: one per route, none for any refused id.
+    CHECK(scoped_calls == static_cast<int>(device_routes.size()));
+    CHECK(audited.empty());
+    CHECK(dispatched == 0);
+}
+
+// Behaviour-neutrality pin for the live-result render path (the #2146 live_model hoist). Each case
+// feeds one fixed agent output through the REAL /fragments/device/live/result route
+// and pins a 64-bit FNV-1a hash of the full response body (rendered card + OOB
+// count/KPI spans). The hashes were recorded against the code BEFORE the kind table
+// and parsers were hoisted into live_model.{hpp,cpp}; they must not move when a
+// parser is touched without intent. The inputs include malformed, oversized-pid,
+// HTML-special and short-row lines so the defensive branches are covered too.
+namespace {
+
+std::uint64_t fnv1a64(const std::string& s) {
+    std::uint64_t h = 1469598103934665603ULL;
+    for (const unsigned char c : s) {
+        h ^= c;
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
+struct LiveGoldenCase {
+    const char* name;
+    const char* kind;
+    const char* plugin;  // the poll command_id prefix the route requires
+    const char* output;
+    const char* output2; // process_tree's joined connections, else ""
+    const char* os;      // device record OS ("" = lookup unavailable)
+    std::uint64_t hash;
+};
+
+} // namespace
+
+TEST_CASE("device live result: every kind renders byte-identically (golden hashes)",
+          "[device][routes][live][golden]") {
+    // clang-format off
+    static const LiveGoldenCase kCases[] = {
+        {"uptime", "uptime", "os_info",
+         "uptime_display|3 days, 2 hours <b>\nuptime_seconds|266400\nnoise\n", "", "", 17714377614741603122ULL},
+        {"uptime_empty", "uptime", "os_info", "", "", "", 13908522961337362132ULL},
+        {"processes", "processes", "processes",
+         "proc|4|System||\nproc|800|svchost.exe|abc123|C:\\Windows\\svchost.exe\r\n"
+         "proc|xx|bad<script>\nproc|5\nproc|7|a|b|c|d|e\nnot-a-proc\n", "", "", 9272368529522833123ULL},
+        {"process_tree", "process_tree", "processes",
+         "proc|4|0|System||\nproc|800|4|svchost.exe|abc123|C:\\svchost.exe\n"
+         "proc|4294967296|4|huge|x|y\nproc|900|notnum|orph<an>|\nproc|1|2\nproc|zz|0|bad|\n",
+         "conn|tcp|10.0.0.5|52000|140.82.112.4|443|800\nconn|tcp|1|2|3|4|4294967296\n"
+         "conn|tcp|1|2|3\n", "", 5608399316293021798ULL},
+        {"process_tree_no_conns", "process_tree", "processes",
+         "proc|4|0|System||\nproc|800|4|svchost.exe|abc|\n", "", "", 17484148619117437842ULL},
+        {"services_windows", "services", "services",
+         "svc|Spooler|Print Spooler|Running|Automatic\nsvc|wuauserv|123|Stopped|Manual\n"
+         "svc|short\nsvc|a|b|c|d|e\nother|x\n", "", "windows", 11273355650890507249ULL},
+        {"services_macos5", "services", "services",
+         "svc|com.apple.a|1234|running|auto\nsvc|com.apple.b|-|stopped|manual\n", "", "darwin", 35018312916660046ULL},
+        {"services_unknown_os", "services", "services",
+         "svc|com.apple.mdworker|1234|running\nsvc|sshd|running|OpenSSH <daemon>\n"
+         "svc|x|-|stopped\nsvc|Win|Display Name|Running|Auto\n", "", "", 4002544976314623930ULL},
+        {"users", "users", "users",
+         "user|alice|host1|interactive|tty1\nuser|bob\nuser\nuser|c<d>|h|t|s|extra\n", "", "", 16842101205548047952ULL},
+        {"netconfig", "netconfig", "network_config",
+         "ip|eth0|10.0.0.5|24|10.0.0.1\nip|eth1|10.0.1.5|abc|-\nip|lo|127.0.0.1|8|0.0.0.0\n"
+         "ip|short\n", "", "", 2495346885234050625ULL},
+        {"arp", "arp", "network_config",
+         "arp|eth0|10.0.0.1|aa:bb:cc:dd:ee:ff|dynamic\narp|eth0|10.0.0.2|-|static\narp|a|b\n",
+         "", "", 10404120183992007253ULL},
+        {"dns_cache", "dns_cache", "network_config",
+         "cache_entry|example.com|A|1.2.3.4\ncache_entry|not_available|x\ncache_entry|only\n",
+         "", "", 14179553637856115045ULL},
+        {"listening", "listening", "network_diag",
+         "listen|tcp|0.0.0.0|22|100\nlisten|tcp|::|443\nlisten|tcp|1|nan|zz\nlisten|tcp\n", "", "", 9997056980947231045ULL},
+        {"connections", "connections", "network_diag",
+         "conn|tcp|10.0.0.5|52000|140.82.112.4|443|800\nconn|tcp|1|2|3\nconn|tcp|a|b|c|d\n",
+         "", "", 13132329531586418674ULL},
+        {"capture_sources", "capture_sources", "echo",
+         "config|process_enabled|true\nconfig|process_rows|42\nconfig|tcp_enabled|false\n"
+         "config|dns_enabled|true\nconfig|dns_rows|notnum\nconfig|bogus_enabled|true\n"
+         "config|registry_enabled|true\nconfig|registry_rows|7\n", "", "", 7383387908523866823ULL},
+        {"disk", "disk", "disk_space",
+         "disk|C:\\|1000|400|60\ndisk|D:\\|0|0|150\ndisk|E:\\|500|100|-5\ndisk|F:\\|x|y|z\n"
+         "disk|short\n", "", "", 11830862051687948488ULL},
+        {"disk_no_measured", "disk", "disk_space", "disk|C:\\|0|0|50\n", "", "", 8722607696415057087ULL},
+        {"hw_disks", "hw_disks", "hardware",
+         "disk|0|Samsung 970 EVO|931|SSD|NVMe\ndisk|1|short\nwarning|something <odd>\n", "", "", 15735852678560545135ULL},
+        {"hw_memory", "hw_memory", "hardware", "dimm|0|8192|DDR4|3200\n", "", "", 2632541226714463539ULL},
+        {"hw_processors", "hw_processors", "hardware", "cpu|0|Intel i7|8|16|3600\n", "", "", 17790793213014768953ULL},
+        {"hw_drivers", "hw_drivers", "hardware",
+         "driver|0|nvlddmkm|31.0|2024-01-01|NVIDIA|DISPLAY\n", "", "", 8425620710457206543ULL},
+        {"battery", "battery", "power_health",
+         "battery|true|charging|88|45|312|91\n", "", "", 9551677740290655581ULL},
+        {"thermal", "thermal", "power_health",
+         "thermal|ok|zone0|45.5\nthermal|no_zones\n", "", "", 12547511890097125445ULL},
+        {"smart", "smart", "disk_actions",
+         "smart|/dev/sda|Model X|sata|ssd|PASSED|3|97|ok\n", "", "", 8890680075107580598ULL},
+        {"volumes", "volumes", "disk_actions",
+         "volume|C:|C:\\|\\\\?\\Vol|NTFS|1000000|\n", "", "", 15657576891079029550ULL},
+        {"adapters", "adapters", "network_config",
+         "adapter|eth0|aa:bb:cc:dd:ee:ff|1000|up\n", "", "", 4018180594806629998ULL},
+        {"wifi", "wifi", "wifi", "connected|Home<Net>|80|WPA2|aa:bb|6\n", "", "", 11256949046592304492ULL},
+        {"generic_empty", "hw_memory", "hardware", "", "", "", 8433749018518019790ULL},
+    };
+    // clang-format on
+    for (const auto& c : kCases) {
+        DYNAMIC_SECTION(c.name) {
+            LiveHarness h;
+            h.device_os = c.os;
+            const std::string cmd = std::string(c.plugin) + "-test";
+            h.rows_by_cmd[cmd] = {{"a-1", 1, c.output, ""}};
+            std::string url = "/fragments/device/live/result?command_id=" + cmd +
+                              "&agent_id=a-1&kind=" + c.kind + "&n=1";
+            if (std::string(c.kind) == "process_tree") {
+                h.rows_by_cmd["network_diag-test"] = {{"a-1", 1, c.output2, ""}};
+                url += "&command_id2=network_diag-test";
+            }
+            auto r = h.sink.Get(url);
+            REQUIRE(r);
+            CHECK(r->status == 200);
+            CAPTURE(r->body);
+            CHECK(fnv1a64(r->body) == c.hash);
+        }
     }
 }

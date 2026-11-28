@@ -20,6 +20,9 @@
 %%%  10. yuzu_gw_mgmt_pins         — the management-pin watcher (#5696): resolves the
 %%%      {cert_file, Path} pins in init, so the first management stream finds them,
 %%%      and re-reads them (content digest) on its own timer; the per-stream check does no file I/O
+%%%      yuzu_gw_mgmt_crl_source   — the CA revocation list watcher (#6016 PR 4b): loads
+%%%      the CRL in init (bounded, total), so the first management stream finds it, and
+%%%      refreshes it on its own timer; `ignore' when no `mgmt_crl_source' is configured
 %%%  11. one yuzu_grpc_listener per {yuzu_gw, grpc_listeners} entry — LAST, so
 %%%      nothing is served before the registry, router and agent supervisor a
 %%%      handler calls exist, and a listener that cannot bind stops the tree
@@ -172,6 +175,15 @@ init([]) ->
         %% leaves the published pins in place (they are a persistent_term).
         #{id       => yuzu_gw_mgmt_pins,
           start    => {yuzu_gw_mgmt_pins, start_link, []},
+          restart  => permanent,
+          shutdown => 5000,
+          type     => worker},
+
+        %% After the pins and still ahead of the listeners, for the same reason:
+        %% its init/1 loads the CA's CRL before the management listener can take a
+        %% stream. It returns `ignore' when no CRL source is configured.
+        #{id       => yuzu_gw_mgmt_crl_source,
+          start    => {yuzu_gw_mgmt_crl_source, start_link, []},
           restart  => permanent,
           shutdown => 5000,
           type     => worker}

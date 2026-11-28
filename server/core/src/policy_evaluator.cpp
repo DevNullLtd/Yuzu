@@ -1,10 +1,12 @@
 #include "policy_evaluator.hpp"
 
 #include "agent_registry.hpp"
+#include "audit_store.hpp"
 #include "compliance_eval.hpp"
 #include "custom_properties_store.hpp"
 #include "instruction_store.hpp"
 #include "management_group_store.hpp"
+#include "on_behalf_guard.hpp" // onbehalf::sanitize_for_log (CWE-117: exception text can embed agent bytes)
 #include "mcp_jsonrpc.hpp" // json_exceeds_depth / kMcpMaxJsonDepth (#2437-class depth guard)
 #include "policy_store.hpp"
 #include "response_store.hpp"
@@ -21,6 +23,7 @@
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
+#include <new>
 
 #include <chrono>
 #include <format>
@@ -140,7 +143,7 @@ latest_per_agent(const std::vector<StoredResponse>& rows) {
 /// Evaluate one agent's check response into a status string.
 std::string verdict_for(const StoredResponse& r, const std::string& policy_id,
                         const std::string& instruction_id, const std::string& cel,
-                        InstructionStore* istore) {
+                        InstructionStore* istore, std::string* unevaluable_reason = nullptr) {
     if (is_terminal_failure(r.status))
         return "error"; // the check plugin itself failed/timed out/was rejected
 
@@ -187,7 +190,10 @@ std::string verdict_for(const StoredResponse& r, const std::string& policy_id,
         spdlog::error("policy_evaluator: policy {} check {} response from agent {} has output "
                      "nested past the depth guard (max {}); treating as evaluation error, "
                      "cannot be safely parsed",
-                     policy_id, instruction_id, r.agent_id, yuzu::server::mcp::kMcpMaxJsonDepth);
+                     policy_id, instruction_id, onbehalf::sanitize_for_log(r.agent_id, 128),
+                     yuzu::server::mcp::kMcpMaxJsonDepth);
+        if (unevaluable_reason)
+            *unevaluable_reason = "depth";
         return "error";
     }
 
@@ -223,6 +229,9 @@ std::string verdict_for(const StoredResponse& r, const std::string& policy_id,
     case ComplianceResult::non_compliant:
         return "non_compliant";
     default:
+        // The compliance expression itself failed to evaluate (division by zero, timeout, ...).
+        if (unevaluable_reason)
+            *unevaluable_reason = "expression";
         return "error";
     }
 }
@@ -230,8 +239,15 @@ std::string verdict_for(const StoredResponse& r, const std::string& policy_id,
 std::string make_check_result(const StoredResponse& r) {
     nlohmann::json j;
     j["status"] = r.status;
-    j["output"] = r.output.size() > 1000 ? r.output.substr(0, 1000) : r.output;
-    return j.dump();
+    // Agent-supplied bytes: cut on a UTF-8 boundary (never mid-sequence) and
+    // dump with `replace` so invalid UTF-8 cannot throw type_error 316 (F6).
+    std::size_t n = std::min<std::size_t>(r.output.size(), 1000);
+    if (n < r.output.size()) {
+        while (n > 0 && (static_cast<unsigned char>(r.output[n]) & 0xC0) == 0x80)
+            --n;
+    }
+    j["output"] = r.output.substr(0, n);
+    return j.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
 }
 
 /// HA WS-3 3.4 (fold-in #3, PR #3939 review / #3424 / #3511): `.sent` is a
@@ -306,6 +322,21 @@ PolicyEvaluator::PolicyEvaluator(Deps deps) : d_(std::move(deps)) {
         };
     }
 
+    // Closed-set `reason` label (observability-conventions: pre-seed so the family and HELP/TYPE
+    // exist on a healthy server). Reasons: depth (output nested past the depth guard), exception
+    // (evaluation threw) and expression (the compliance expression failed to evaluate).
+    if (d_.metrics) {
+        d_.metrics->describe("yuzu_server_policy_unevaluable_responses_total",
+                             "Policy check responses that could not be evaluated and scored error",
+                             "counter");
+        for (const char* r : {"depth", "exception", "expression"})
+            d_.metrics->counter("yuzu_server_policy_unevaluable_responses_total", {{"reason", r}});
+        // Pre-seeded so increase() sees the first skip (a series born at 1 contributes no
+        // increase) and the YuzuPolicyCollectSkipped alert can fire on it.
+        for (const char* ph : {"collect_target", "collect_item"})
+            d_.metrics->counter("yuzu_server_policy_eval_errors_total", {{"phase", ph}});
+    }
+
     // ADR-0056: the boot-time stranded-'fixing' reset that used to live here
     // is gone — under N replicas, resetting EVERY 'fixing' row on EVERY
     // process restart (a routine rolling-deploy event, not just a crash)
@@ -313,6 +344,28 @@ PolicyEvaluator::PolicyEvaluator(Deps deps) : d_(std::move(deps)) {
     // PolicyStore::claim_due_policies' per-tick, age-gated staleness sweep
     // (last_fix_at older than Deps::fixing_stale_seconds), which runs
     // continuously rather than only at boot.
+
+    // G01: describe and pre-seed the refusal counter at 0, one series per reason, so a rate()
+    // over it exists before the first refusal. The eight labels are the lowercase tokens the
+    // `blocked` row, the audit detail and the log use too (`to_string`).
+    if (d_.metrics) {
+        d_.metrics->describe(
+            "yuzu_server_policy_dispatch_denied_total",
+            "Policy dispatches refused before anything was sent, labelled by reason. One increment "
+            "per refused dispatch call (per policy and phase per attempt, not per target), "
+            "whether or not an audit row is written. Reasons: unclassified, ambiguous, gated, "
+            "destructive, reserved, unwired, dispatch_identifier_invalid, approval_required.",
+            "counter");
+        for (const auto reason :
+             {PolicyDispatchDenialReason::Unclassified, PolicyDispatchDenialReason::Ambiguous,
+              PolicyDispatchDenialReason::Gated, PolicyDispatchDenialReason::Destructive,
+              PolicyDispatchDenialReason::Reserved, PolicyDispatchDenialReason::Unwired,
+              PolicyDispatchDenialReason::DispatchIdentifierInvalid,
+              PolicyDispatchDenialReason::ApprovalRequired}) {
+            d_.metrics->counter("yuzu_server_policy_dispatch_denied_total",
+                                {{"reason", std::string(to_string(reason))}});
+        }
+    }
 }
 
 int64_t PolicyEvaluator::now() const { return d_.now_fn(); }
@@ -400,13 +453,149 @@ PolicyEvaluator::dispatch_instruction(const std::string& instruction_id,
         return DispatchInstructionResult{};
     }
     const auto& def = **def_result;
+
+    // G01: the action approval requirement is applied HERE, before anything is minted or
+    // sent. This is the only place `dispatch_fn` is reached, so one refusal covers the check,
+    // the fix and the post-fix verify, from every entry point. A refusal is a value, not an
+    // error: the caller records it.
+    {
+        std::optional<PolicyDispatchDenial> denial;
+        if (!d_.capability_registry) {
+            denial = PolicyDispatchDenial{PolicyDispatchDenialReason::Unwired};
+        } else if (auto allowed =
+                       authorize_policy_dispatch(*d_.capability_registry, def.plugin, def.action,
+                                         def.approval_mode);
+                   !allowed) {
+            denial = allowed.error();
+        }
+        if (denial) {
+            DispatchInstructionResult refused;
+            refused.denial = denial;
+            refused.denied_plugin = def.plugin;
+            refused.denied_action = def.action;
+            return refused;
+        }
+    }
+
     auto execid = gen_execution_id();
     auto outcome = d_.dispatch_fn(def.plugin, def.action, targets, /*scope_expr=*/"", parameters,
                                   execid);
-    return DispatchInstructionResult{.execution_id = execid, .outcome = std::move(outcome)};
+    return DispatchInstructionResult{.execution_id = execid,
+                                     .outcome = std::move(outcome),
+                                     .denial = std::nullopt,
+                                     .denied_plugin = {},
+                                     .denied_action = {}};
 }
 
-std::expected<std::string, std::string> PolicyEvaluator::kickoff_check(const Policy& p) {
+PolicyEvaluator::DenialAudit
+PolicyEvaluator::record_denial_status(const std::string& policy_id, std::string_view phase,
+                                      const std::vector<std::string>& targets,
+                                      const DispatchInstructionResult& r, DispatchOrigin origin,
+                                      std::optional<int64_t> expected_gen) {
+    DenialAudit audit;
+    if (!r.denial)
+        return audit;
+    const std::string token(to_string(r.denial->reason));
+    // The pair is only ever shown when it is a well formed identifier (letters, digits, '_',
+    // '.', '-'), so it carries nothing a log or audit reader could be misled by; otherwise
+    // only its byte lengths are shown. The status row follows the same rule (mark_blocked).
+    const bool well_formed = dispatch_pair_well_formed(r.denied_plugin, r.denied_action);
+
+    if (d_.metrics)
+        d_.metrics->counter("yuzu_server_policy_dispatch_denied_total", {{"reason", token}})
+            .increment();
+    if (well_formed)
+        spdlog::warn("policy_evaluator: dispatch refused: policy={} phase={} reason={} plugin={} "
+                     "action={}",
+                     policy_id, phase, token, r.denied_plugin, r.denied_action);
+    else
+        spdlog::warn("policy_evaluator: dispatch refused: policy={} phase={} reason={} "
+                     "plugin_len={} action_len={}",
+                     policy_id, phase, token, r.denied_plugin.size(), r.denied_action.size());
+
+    int64_t changed = 0;
+    bool write_error = false;
+    if (d_.policy_store && !targets.empty()) {
+        auto marked = d_.policy_store->mark_blocked(policy_id, targets, phase, r.denied_plugin,
+                                                    r.denied_action, token, expected_gen);
+        if (marked) {
+            changed = marked->changed;
+            if (d_.metrics) {
+                // A target a sibling reclaimed is a real fence skip (the alert watches it); a
+                // refusal recorded again unchanged is not.
+                if (marked->fenced_out > 0)
+                    d_.metrics->counter("yuzu_server_policy_remediation_fence_skip_total")
+                        .increment(static_cast<double>(marked->fenced_out));
+                if (changed > 0)
+                    d_.metrics->counter("yuzu_server_policy_verdicts_total", {{"status", "blocked"}})
+                        .increment(static_cast<double>(changed));
+            }
+        } else {
+            // Never reverses the refusal (nothing was sent). The error text can carry store
+            // detail, so only a generic line is logged and the audit row is written anyway.
+            write_error = true;
+            spdlog::warn("policy_evaluator: blocked status write failed for policy {} phase {}",
+                         policy_id, phase);
+        }
+    }
+
+    // Audit (rulings F and 4a): an operator-triggered refusal is always evidence of the
+    // attempt; on the tick and verify paths a row is written only when something changed or
+    // the status write failed, so a refusal that repeats every interval stays silent.
+    if (d_.audit_store && (origin == DispatchOrigin::Operator || changed > 0 || write_error)) {
+        std::string detail = "phase=" + std::string(phase);
+        if (well_formed)
+            detail += " plugin=" + r.denied_plugin + " action=" + r.denied_action;
+        else
+            detail += " plugin_len=" + std::to_string(r.denied_plugin.size()) +
+                      " action_len=" + std::to_string(r.denied_action.size());
+        detail += " reason=" + token;
+        detail += origin == DispatchOrigin::Operator ? " origin=operator" : " origin=tick";
+        if (write_error)
+            detail += " status_write=error";
+        audit.due = true;
+        audit.policy_id = policy_id;
+        audit.phase = std::string(phase);
+        audit.reason = token;
+        audit.detail = std::move(detail);
+    }
+    return audit;
+}
+
+void PolicyEvaluator::emit_denial_audit(const DenialAudit& a) {
+    if (!a.due || !d_.audit_store)
+        return;
+    AuditEvent ev;
+    ev.timestamp = now();
+    ev.principal = "system";
+    ev.action = "policy.dispatch";
+    ev.target_type = "policy";
+    ev.target_id = a.policy_id;
+    ev.result = "denied";
+    ev.detail = a.detail;
+    // Synchronous and fail-hard: AuditStore::log returns false on a closed store, a pool
+    // timeout or an INSERT error, and the row is then lost (the store counts every such
+    // failure in its emit_failed_ metric, and logs its own error on a pool timeout or an
+    // INSERT error, not on a closed store). Observed here, never reversed: the refusal
+    // already happened and nothing was sent. One warning names the policy, phase and reason,
+    // and carries no store text. The row is not retried: a repeated tick refusal changes
+    // nothing, so it writes no row, and a post-fix-check refusal is not dispatched a second
+    // time. The operator's own row is the route's.
+    if (!d_.audit_store->log(ev))
+        spdlog::warn("policy_evaluator: policy.dispatch audit row not written: policy={} "
+                     "phase={} reason={}",
+                     a.policy_id, a.phase, a.reason);
+}
+
+void PolicyEvaluator::record_denial(const std::string& policy_id, std::string_view phase,
+                                    const std::vector<std::string>& targets,
+                                    const DispatchInstructionResult& r, DispatchOrigin origin,
+                                    std::optional<int64_t> expected_gen) {
+    emit_denial_audit(record_denial_status(policy_id, phase, targets, r, origin, expected_gen));
+}
+
+std::expected<PolicyEvaluator::KickoffOutcome, std::string>
+PolicyEvaluator::kickoff_check(const Policy& p, DispatchOrigin origin) {
     if (!d_.policy_store)
         return std::unexpected("policy store not wired");
     auto frag_res = d_.policy_store->get_fragment(p.fragment_id);
@@ -422,7 +611,7 @@ std::expected<std::string, std::string> PolicyEvaluator::kickoff_check(const Pol
         return std::unexpected("degraded fragment read for policy " + p.id);
     }
     if (!*frag_res || (*frag_res)->check_instruction.empty())
-        return "";
+        return KickoffOutcome{};
     const PolicyFragment& frag = **frag_res;
     // #4981 PR-1 adversarial-review MEDIUM fix: distinguish "the policy's
     // scope genuinely matched nobody" from "the scope evaluation itself
@@ -439,7 +628,7 @@ std::expected<std::string, std::string> PolicyEvaluator::kickoff_check(const Pol
     if (!degrade_reason.empty())
         return std::unexpected("scope evaluation degraded: " + degrade_reason);
     if (targets.empty())
-        return "";
+        return KickoffOutcome{};
 
     // Dedupe (gov UP-5 / UP-13): if a Check for this policy is already in flight,
     // do not dispatch another — otherwise rapid /evaluate calls or a tick landing
@@ -449,7 +638,7 @@ std::expected<std::string, std::string> PolicyEvaluator::kickoff_check(const Pol
         std::lock_guard<std::mutex> lk(mu_);
         for (const auto& f : in_flight_)
             if (f.phase == Phase::Check && f.policy_id == p.id)
-                return "";
+                return KickoffOutcome{};
     }
 
     auto params = build_params(frag.check_parameters, p.inputs);
@@ -471,8 +660,14 @@ std::expected<std::string, std::string> PolicyEvaluator::kickoff_check(const Pol
         return std::unexpected(
             yuzu::server::genericize_db_error("PolicyEvaluator::kickoff_check dispatch",
                                               dispatch_result.error()));
+    if (dispatch_result->denial) {
+        // Refused (G01): nothing was sent and no execution id exists, so there is no in-flight
+        // entry to keep. Record it for every resolved target, then report it to the caller.
+        record_denial(p.id, "check", targets, *dispatch_result, origin, std::nullopt);
+        return KickoffOutcome{.execution_id = {}, .denial = dispatch_result->denial};
+    }
     if (dispatch_result->execution_id.empty())
-        return "";
+        return KickoffOutcome{};
     const std::string& execid = dispatch_result->execution_id;
 
     {
@@ -488,7 +683,7 @@ std::expected<std::string, std::string> PolicyEvaluator::kickoff_check(const Pol
                                       .verify_compliance = "",
                                       .verify_parameters_json = ""});
     }
-    return execid;
+    return KickoffOutcome{.execution_id = execid, .denial = std::nullopt};
 }
 
 void PolicyEvaluator::dispatch_due() {
@@ -546,7 +741,7 @@ void PolicyEvaluator::dispatch_due() {
     // server fails fast, so an un-gated loop over N claimed policies does
     // not multiply the shutdown-time cost by N.
     for (const auto& p : *claimed) {
-        auto k = kickoff_check(p); // does its own brief locking; dispatch runs without mu_
+        auto k = kickoff_check(p, DispatchOrigin::Tick); // does its own brief locking; dispatch runs without mu_
         if (!k) {
             // Governance UP-2 (2026-08-24): this policy's durable dispatch
             // claim already committed as part of `claimed`'s single
@@ -566,7 +761,7 @@ void PolicyEvaluator::dispatch_due() {
     }
 }
 
-std::expected<std::string, std::string>
+std::expected<PolicyEvaluator::KickoffOutcome, std::string>
 PolicyEvaluator::evaluate_now(const std::string& policy_id) {
     if (!d_.policy_store)
         return std::unexpected("policy store not wired");
@@ -576,7 +771,7 @@ PolicyEvaluator::evaluate_now(const std::string& policy_id) {
         return std::unexpected("degraded policy read for " + policy_id);
     }
     if (!*p_res)
-        return "";
+        return KickoffOutcome{};
     // Manual, operator-triggered — bypasses the interval claim entirely (an
     // explicit "check now" request), matching the pre-ADR-0056 behavior.
     // Runs on whichever replica received the REST call; if that replica
@@ -616,10 +811,37 @@ PolicyEvaluator::evaluate_now(const std::string& policy_id) {
                     policy_id, r.error());
         return std::unexpected("dispatch claim failed for " + policy_id + ": " + r.error());
     }
-    auto k = kickoff_check(**p_res); // dispatch runs without mu_ held
+    auto k = kickoff_check(**p_res, DispatchOrigin::Operator); // dispatch runs without mu_ held
     if (!k)
         return std::unexpected("kickoff_check degraded for " + policy_id + ": " + k.error());
     return *k;
+}
+
+PolicyEvaluator::InstructionCheck
+PolicyEvaluator::authorize_instruction(const std::string& instruction_id) const {
+    // No registry or no instruction store is an unavailable answer, not a verdict: an
+    // unwired evaluator reads as degraded (503) here, the same fail-closed posture the
+    // dispatch seam takes (`unwired`), never as an accept.
+    if (!d_.instruction_store || !d_.capability_registry) {
+        // A wiring defect a retry will not clear; logged so an operator can see it without
+        // reading source (the 503 carries no store text).
+        spdlog::error("policy_evaluator: authorize_instruction: evaluator is not wired (no "
+                      "instruction store or no capability registry)");
+        return {InstructionCheck::Kind::Degraded, std::nullopt, /*transient=*/false};
+    }
+    auto def = d_.instruction_store->get_definition(instruction_id);
+    if (!def) {
+        spdlog::warn("policy_evaluator: authorize_instruction: instruction store unavailable");
+        return {InstructionCheck::Kind::Degraded, std::nullopt, /*transient=*/true};
+    }
+    if (!*def)
+        return {InstructionCheck::Kind::Allowed, std::nullopt};
+    auto allowed =
+        authorize_policy_dispatch(*d_.capability_registry, (*def)->plugin, (*def)->action,
+                                 (*def)->approval_mode);
+    if (!allowed)
+        return {InstructionCheck::Kind::Refused, allowed.error()};
+    return {InstructionCheck::Kind::Allowed, std::nullopt};
 }
 
 PolicyEvaluator::RemediateResult
@@ -788,6 +1010,27 @@ PolicyEvaluator::remediate(const std::string& policy_id,
                                                        dispatch_result.error());
         return out;
     }
+    if (dispatch_result->denial) {
+        // Refused (G01). Write `blocked` FIRST, fenced on this claim's generation while the
+        // claim is still held, then release: releasing first would leave a window in which a
+        // sibling replica or an operator reclaims the row and an unfenced write overwrites
+        // their `fixing`. Fenced, the write matches no row after a reclaim.
+        // The audit row is written after the release: AuditStore::log is synchronous and can
+        // wait on the pool, and the claim must not be held across it.
+        const auto pending = record_denial_status(policy_id, "fix", claimed, *dispatch_result,
+                                                  DispatchOrigin::Operator, claim_gen);
+        auto rel = d_.policy_store->release_remediation_claim(policy_id, claimed, claim_gen);
+        if (!rel)
+            spdlog::warn("policy_evaluator: remediate: failed to release claim for policy {} "
+                        "after a refused dispatch: {}",
+                        policy_id, rel.error());
+        emit_denial_audit(pending);
+        // Not a store failure: `degraded` stays false. The message is neutral; the route
+        // answers on `denial`.
+        out.denial = dispatch_result->denial;
+        out.error = "policy dispatch refused";
+        return out;
+    }
     if (dispatch_result->execution_id.empty()) {
         auto rel = d_.policy_store->release_remediation_claim(policy_id, claimed, claim_gen);
         if (!rel)
@@ -825,7 +1068,7 @@ PolicyEvaluator::remediate(const std::string& policy_id,
         auto r = d_.policy_store->update_agent_status(policy_id, tgt, "fixing", "", claim_gen);
         if (!r)
             spdlog::warn("policy_evaluator: remediate: failed to mark {} fixing for policy {}: {}",
-                        tgt, policy_id, r.error());
+                        onbehalf::sanitize_for_log(tgt, 128), policy_id, r.error());
         else if (!*r && d_.metrics)
             // fenced no-op — a sibling reclaimed this row between our claim and
             // this write (see PolicyStore::update_agent_status); visible so a
@@ -896,15 +1139,23 @@ void PolicyEvaluator::collect_ready() {
                          "remaining ready item(s) deferred");
             break;
         }
+        // Item-level failure domain: `f` was moved out of in_flight_ above, so an escape would
+        // also abort every later ready item. Log + count + move on (the item is NOT retried;
+        // its policy re-evaluates at its next interval). Fail-closed: nothing is recorded as
+        // compliant here.
+        try {
+        if (d_.before_item_hook)
+            d_.before_item_hook(f.policy_id);
         // Degrade → empty (ADR-0039 deny-or-benign): a transient read failure
         // reads as "no terminal response yet", the same as a genuinely slow
         // agent — verdict_for() below already treats an unmatched target as
         // "unknown", never a fabricated compliant/drifted verdict.
         // #4990: the verdict and the first bytes of a check's output (`make_check_result`) are
         // served by the compliance routes and MCP to readers below the Forensics tier. So this
-        // read EXCLUDES the Forensics plugins outright (`deny_all()`): a Forensics check yields no
-        // row and scores `unknown`, never a verdict from, or a stored copy of, Forensics output.
-        // A separate follow-up (#6065) tracks the dispatch-side authorization of policy checks.
+        // read EXCLUDES the Forensics plugins outright (`deny_all()`), so a Forensics row never
+        // yields a verdict or a stored copy of its output, whichever way it got here. Policy
+        // evaluation does not dispatch such a check at all: every Forensics action carries an
+        // execute gate, so `dispatch_instruction` refuses it and the targets show `blocked`.
         const auto tier = d_.forensics_plugins
                               ? ResponseTierFilter::exclude(*d_.forensics_plugins, authz::deny_all())
                               : ResponseTierFilter::refuse_unwired();
@@ -916,33 +1167,89 @@ void PolicyEvaluator::collect_ready() {
 
         if (f.phase == Phase::Check) {
             for (const auto& tgt : f.targets) {
-                auto it = best.find(tgt);
-                std::string status, cr;
-                if (it == best.end() || it->second.status == kStatusRunning) {
-                    status = "unknown"; // no terminal response within the grace window
-                } else {
-                    status = verdict_for(it->second, f.policy_id, f.instruction_id,
-                                         f.compliance_expr, d_.instruction_store);
-                    cr = make_check_result(it->second);
-                }
-                if (d_.policy_store) {
-                    // Shared Check-phase write: a REMEDIATION verify entry
-                    // carries claim_gen != 0 and its verdict is fenced on it
-                    // (a sibling may have reclaimed while the verify was in
-                    // flight); an ordinary DETECTION entry carries 0 and writes
-                    // unconditionally.
-                    std::optional<int64_t> gen =
-                        f.claim_gen != 0 ? std::optional<int64_t>(f.claim_gen) : std::nullopt;
-                    auto r = d_.policy_store->update_agent_status(f.policy_id, tgt, status, cr, gen);
-                    if (!r)
-                        spdlog::warn("policy_evaluator: update_agent_status failed: {}", r.error());
-                    else if (!*r && d_.metrics)
-                        d_.metrics->counter("yuzu_server_policy_remediation_fence_skip_total")
+                // F6: `f` was already moved out of in_flight_, so an exception escaping this
+                // body would silently drop every LATER target (their verdict never recorded,
+                // never retried). Each target is therefore its own failure domain: whatever
+                // throws (a hostile response, a throwing store write) skips THAT target only.
+                try {
+                    auto it = best.find(tgt);
+                    std::string status, cr;
+                    if (it == best.end() || it->second.status == kStatusRunning) {
+                        status = "unknown"; // no terminal response within the grace window
+                    } else {
+                        // The response is agent-supplied. A response that cannot be evaluated
+                        // degrades THIS target to the existing fail-closed "error" verdict and
+                        // is counted by reason. std::bad_alloc is NOT an evaluation verdict
+                        // (a transient resource fault would overwrite a good verdict with
+                        // `error`): it propagates to the per-target handler below, which logs
+                        // and skips the target so its previous status stands.
+                        std::string why;
+                        try {
+                            if (d_.before_evaluate_hook)
+                                d_.before_evaluate_hook(tgt);
+                            status = verdict_for(it->second, f.policy_id, f.instruction_id,
+                                                 f.compliance_expr, d_.instruction_store, &why);
+                            cr = make_check_result(it->second);
+                        } catch (const std::bad_alloc&) {
+                            throw;
+                        } catch (const std::exception& e) {
+                            spdlog::warn("policy_evaluator: policy {} check {} response from "
+                                         "agent {} could not be evaluated ({}); verdict=error",
+                                         f.policy_id, f.instruction_id, onbehalf::sanitize_for_log(tgt, 128),
+                                         onbehalf::sanitize_for_log(e.what(), 256));
+                            status = "error";
+                            // Evidence for the operator, without echoing the response that
+                            // could not be evaluated.
+                            cr = R"({"reason":"unevaluable_response"})";
+                            why = "exception";
+                        }
+                        if (!why.empty() && d_.metrics)
+                            d_.metrics
+                                ->counter("yuzu_server_policy_unevaluable_responses_total",
+                                          {{"reason", why}})
+                                .increment();
+                    }
+                    if (d_.policy_store) {
+                        // Shared Check-phase write: a REMEDIATION verify entry
+                        // carries claim_gen != 0 and its verdict is fenced on it
+                        // (a sibling may have reclaimed while the verify was in
+                        // flight); an ordinary DETECTION entry carries 0 and writes
+                        // unconditionally.
+                        std::optional<int64_t> gen =
+                            f.claim_gen != 0 ? std::optional<int64_t>(f.claim_gen) : std::nullopt;
+                        auto r = d_.policy_store->update_agent_status(f.policy_id, tgt, status, cr,
+                                                                      gen);
+                        if (!r)
+                            spdlog::warn("policy_evaluator: update_agent_status failed: {}",
+                                         r.error());
+                        else if (!*r && d_.metrics)
+                            d_.metrics->counter("yuzu_server_policy_remediation_fence_skip_total")
+                                .increment();
+                    }
+                    if (d_.metrics)
+                        d_.metrics
+                            ->counter("yuzu_server_policy_verdicts_total", {{"status", status}})
+                            .increment();
+                } catch (const std::exception& e) {
+                    spdlog::error("policy_evaluator: policy {} target {} skipped, check-phase "
+                                  "evaluation threw: {}",
+                                  f.policy_id, onbehalf::sanitize_for_log(tgt, 128),
+                                  onbehalf::sanitize_for_log(e.what(), 256));
+                    if (d_.metrics)
+                        d_.metrics
+                            ->counter("yuzu_server_policy_eval_errors_total",
+                                      {{"phase", "collect_target"}})
+                            .increment();
+                } catch (...) {
+                    spdlog::error("policy_evaluator: policy {} target {} skipped, check-phase "
+                                  "evaluation threw a non-std exception",
+                                  f.policy_id, onbehalf::sanitize_for_log(tgt, 128));
+                    if (d_.metrics)
+                        d_.metrics
+                            ->counter("yuzu_server_policy_eval_errors_total",
+                                      {{"phase", "collect_target"}})
                             .increment();
                 }
-                if (d_.metrics)
-                    d_.metrics->counter("yuzu_server_policy_verdicts_total", {{"status", status}})
-                        .increment();
             }
         } else { // Phase::FixWait — fix dispatched; failures error out, the rest go to verify.
             // HA WS-3 3.4: this FixWait entry maturing is the normal,
@@ -977,7 +1284,7 @@ void PolicyEvaluator::collect_ready() {
                         if (!r)
                             spdlog::warn("policy_evaluator: fix-failure status write failed for "
                                         "{}/{}: {}",
-                                        f.policy_id, tgt, r.error());
+                                        f.policy_id, onbehalf::sanitize_for_log(tgt, 128), r.error());
                         else if (!*r && d_.metrics)
                             // fenced no-op: a sibling reclaimed after our
                             // release above — do not stomp its fresh 'fixing'.
@@ -996,7 +1303,18 @@ void PolicyEvaluator::collect_ready() {
             if (!verify_targets.empty()) {
                 auto vparams = params_from_json_obj(f.verify_parameters_json);
                 auto result = dispatch_instruction(f.verify_instruction, vparams, verify_targets);
-                if (result && !result->execution_id.empty()) {
+                if (result && result->denial) {
+                    // Refused (G01). The fix already ran and is not undone: the targets leave
+                    // `fixing` and become `blocked` (phase verify). The claim was released
+                    // above with its generation unchanged, so the write is fenced on it. This
+                    // must not take the error arm below and is not counted in
+                    // `yuzu_server_policy_eval_errors_total{phase="verify"}`: a refusal is not
+                    // a failed dispatch.
+                    record_denial(f.policy_id, "verify", verify_targets, *result,
+                                  DispatchOrigin::Tick,
+                                  f.claim_gen != 0 ? std::optional<int64_t>(f.claim_gen)
+                                                   : std::nullopt);
+                } else if (result && !result->execution_id.empty()) {
                     std::lock_guard<std::mutex> lk(mu_);
                     in_flight_.push_back(InFlight{.phase = Phase::Check,
                                                   .policy_id = f.policy_id,
@@ -1025,7 +1343,7 @@ void PolicyEvaluator::collect_ready() {
                         if (!r)
                             spdlog::warn("policy_evaluator: verify-dispatch-failed status write "
                                         "failed for {}/{}: {}",
-                                        f.policy_id, tgt, r.error());
+                                        f.policy_id, onbehalf::sanitize_for_log(tgt, 128), r.error());
                         else if (!*r && d_.metrics)
                             d_.metrics
                                 ->counter("yuzu_server_policy_remediation_fence_skip_total")
@@ -1038,6 +1356,20 @@ void PolicyEvaluator::collect_ready() {
                     }
                 }
             }
+        }
+        } catch (const std::exception& e) {
+            spdlog::error("policy_evaluator: collect_ready item for policy {} skipped: {}",
+                          f.policy_id, onbehalf::sanitize_for_log(e.what(), 256));
+            if (d_.metrics)
+                d_.metrics->counter("yuzu_server_policy_eval_errors_total", {{"phase", "collect_item"}})
+                    .increment();
+        } catch (...) {
+            spdlog::error("policy_evaluator: collect_ready item for policy {} skipped: "
+                          "non-std exception",
+                          f.policy_id);
+            if (d_.metrics)
+                d_.metrics->counter("yuzu_server_policy_eval_errors_total", {{"phase", "collect_item"}})
+                    .increment();
         }
     }
 }

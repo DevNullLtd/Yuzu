@@ -5,10 +5,12 @@
  * Two embed pipelines feed this file:
  *
  *   * Hand-written: `server/core/src/static_js_bundle.cpp` carries `kHtmxJs`
- *     (HTMX 2.0.4 minified, 50918 bytes) and `kSseJs` (htmx-ext-sse 2.2.2,
- *     8897 bytes) as raw-string-literal chunks. Update the file by hand
- *     when bumping HTMX / SSE; update the pinned-size constants below in
- *     lock-step.
+ *     (HTMX 2.0.4 minified, 50918 bytes) and `kSseJs` (htmx-ext-sse,
+ *     8897 bytes: upstream sse.js plus one trailing newline; sse.js is
+ *     identical in 2.2.2 and 2.2.3, so the version is unresolved in
+ *     server/core/vendored-components.json) as raw-string-literal chunks.
+ *     Update the file by hand when bumping HTMX / SSE; update the
+ *     pinned-size constants below in lock-step.
  *
  *   * Build-time codegen via `server/core/scripts/embed_js.py` (and
  *     `embed_binary.py` for woff2): the source files live under
@@ -92,6 +94,9 @@ constexpr std::size_t kYuzuChartsMinBytes = 6'000; // ≥6 KB adapter floor
 // any change here must coincide with a deliberate vendor refresh.
 constexpr std::size_t kExpectedThreeJsBytes = 685'408;
 constexpr std::size_t kExpectedThreeOrbitJsBytes = 32'134;
+// Cytoscape.js 3.33.3 ESM minified (static/cytoscape.min.js), pinned to the npm
+// tarball's dist/cytoscape.esm.min.mjs; the SHA-256 is in static/cytoscape-NOTICE.txt.
+constexpr std::size_t kExpectedCytoscapeJsBytes = 432'844;
 } // namespace
 
 // ── HTMX core ───────────────────────────────────────────────────────────────
@@ -143,8 +148,8 @@ TEST_CASE("static_js_bundle: kHtmxJs has no embedded NULs or unexpected delimite
 TEST_CASE("static_js_bundle: kHtmxJs has no leading whitespace", "[static-js][htmx]") {
     // Regression guard: an earlier draft preserved a `\n` at byte 0
     // because `R"HTMXEOF(` was followed by a newline before the payload.
-    // The reassembled bundle should be byte-identical to upstream, which
-    // begins with `var` directly.
+    // The reassembled bundle is upstream dist/htmx.min.js plus one trailing
+    // newline, so it begins with `var` directly, as upstream does.
     REQUIRE_FALSE(kHtmxJs.empty());
     CHECK(kHtmxJs.front() == 'v');
     CHECK(kHtmxJs.front() != '\n');
@@ -1550,6 +1555,12 @@ namespace yuzu::server {
 extern const std::string kYuzuVizHostJs;
 extern const std::string kCytoscapeJs;
 } // namespace yuzu::server
+
+TEST_CASE("static_js_bundle: kCytoscapeJs has expected pinned size", "[static-js][viz-host]") {
+    // A vendor refresh updates this constant and the hash in static/cytoscape-NOTICE.txt
+    // together.
+    CHECK(yuzu::server::kCytoscapeJs.size() == kExpectedCytoscapeJsBytes);
+}
 
 TEST_CASE("static_js_bundle: kYuzuVizHostJs imports cytoscape", "[static-js][viz-host]") {
     CHECK_THAT(yuzu::server::kYuzuVizHostJs, ContainsSubstring("cytoscape"));

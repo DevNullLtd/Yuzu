@@ -3,10 +3,11 @@
  * hardware-estate actions (`chassis`, `baseboard`, `swap`, `machine_id`), shared by
  * hardware_plugin.cpp's dispatch.
  *
- * Until each leg PR lands (H.5 Windows, H.11 Linux, H.13 macOS) every leg is PLANNED: the
- * dispatch answers one `status|<action>|unsupported|<os>:planned` row through the shared
- * reporter (agents/shared/planned_leg.hpp) and the per-OS mechanism lives in the descriptor
- * table. The leg PR that fills one adds its own TU and row formatter.
+ * Windows (H.5) reads these actions in hardware_estate_win.cpp. Until the Linux (H.11) and macOS
+ * (H.13) leg PRs land, those legs are PLANNED: the dispatch answers one
+ * `status|<action>|unsupported|<os>:planned` row through the shared reporter
+ * (agents/shared/planned_leg.hpp) and the per-OS mechanism lives in the descriptor table. The leg
+ * PR that fills one adds its own TU and reuses the row formatters in hardware_estate_parsers.hpp.
  *
  * ROW SCHEMAS the legs will emit (fixed-width, "-" for an absent value; every untrusted field
  * goes through yuzu::util::safe_output_field); the columns are declared in

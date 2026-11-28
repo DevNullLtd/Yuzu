@@ -6,8 +6,9 @@
 %%% scripts/integration-test.sh --tls --gateway-ct starts the gateway with the
 %%% management listener of deploy/docker/reference-gateway-sys.config: TLS with
 %%% verify_peer and fail_if_no_peer_cert, `auth_fun =>
-%%% fun yuzu_gw_authz:check_mgmt_peer/1', and `mgmt_peer_pins' naming the
-%%% SERVER's default leaf (`{cert_file, ...}'). The real yuzu-server dials it
+%%% fun yuzu_gw_authz:check_mgmt_peer/1', in the mode YUZU_MGMT_AUTH_MODE names:
+%%% `identity' (the shipped one: no pin at all) or `identity_or_pin' (the server's
+%%% default leaf also pinned with `{cert_file, ...}'). The real yuzu-server dials it
 %%% for every command it forwards (the script drives those through the server's
 %%% REST API). This suite is the other client of the same listener: it dials it
 %%% as the server would, with the server's own leaf, and as the peers the pin
@@ -22,9 +23,10 @@
 %%%     same identity (a server key renewal) and a same-key re-issue are served
 %%%     with no change on the gateway; a leaf carrying another install's
 %%%     identity is refused.
-%%%   - the pin is enforced on THIS hop: a valid leaf of the same CA that is not
-%%%     the pinned one (the gateway's own) is refused UNAUTHENTICATED and counted
-%%%     as `pin_mismatch'; an enrolled agent's leaf (clientAuth only) is refused
+%%%   - the check is enforced on THIS hop: a valid leaf of the same CA that is not
+%%%     the server's (the gateway's own) is refused UNAUTHENTICATED and counted
+%%%     as `no_uri_san' (mode identity) or `pin_mismatch' (identity_or_pin, which
+%%%     reports the pin's reason); an enrolled agent's leaf (clientAuth only) is refused
 %%%     and counted as `missing_server_auth_eku'; a peer with no certificate does
 %%%     not get a call through. The pinned leaf is served.
 %%%   - SendCommand (server streaming) over ONE connection: a command to the
@@ -42,8 +44,11 @@
 %%% Configuration (environment). YUZU_REAL_MGMT_STRICT=1 (the script sets it)
 %%% turns an unset variable into a failure; without it the suite skips.
 %%%   YUZU_MGMT_HOST / YUZU_MGMT_PORT          the gateway management listener
+%%%   YUZU_MGMT_AUTH_MODE                      identity (default, the shipped mode, no pin) |
+%%%                                            identity_or_pin; anything else fails the suite
+%%%                                            (scripts/integration-test.sh exports it)
 %%%   YUZU_MGMT_CACERT                         the install CA
-%%%   YUZU_MGMT_CERT / YUZU_MGMT_KEY           the PINNED leaf (the server's)
+%%%   YUZU_MGMT_CERT / YUZU_MGMT_KEY           the server's leaf
 %%%   YUZU_MGMT_CA_KEY                         the install CA's key (to mint leaves)
 %%%   YUZU_MGMT_UNPINNED_CERT / _KEY           a valid leaf of that CA, not pinned
 %%%   YUZU_MGMT_AGENT_CERT / _KEY              an enrolled agent's leaf
@@ -108,8 +113,8 @@ init_per_suite(Config) ->
             %% The real agent must be connected before any case commands it.
             Agent = agent_id(),
             ok = wait_until(fun() -> agent_listed(Agent) end, 60000),
-            ct:pal("management listener ~s:~B serves; agent ~s is connected",
-                   [mgmt_host(), mgmt_port(), Agent]),
+            ct:pal("management listener ~s:~B serves (mode ~p); agent ~s is connected",
+                   [mgmt_host(), mgmt_port(), auth_mode(), Agent]),
             Config
     end.
 
@@ -162,7 +167,8 @@ reissued_server_leaf_over_the_same_key_is_served(Config) ->
 %% A serverAuth leaf of this CA whose URI names another install (or the agent
 %% family): not the identity, and not a pinned key, so refused.
 leaf_with_another_installs_identity_is_refused(Config) ->
-    Before = rejected("pin_mismatch"),
+    Reason = refusal("identity_mismatch"),
+    Before = rejected(Reason),
     Other = mint_leaf(Config, "foreign", "yuzu://" ++ lists:duplicate(64, $0) ++ "/server",
                       new_key),
     {error, {<<"16">>, _}} = list_agents(Other),
@@ -170,16 +176,18 @@ leaf_with_another_installs_identity_is_refused(Config) ->
                       string:replace(server_identity(), "/server", "/agent/integration-agent-1"),
                       new_key),
     {error, {<<"16">>, _}} = list_agents(Agent),
-    ok = wait_until(fun() -> rejected("pin_mismatch") >= Before + 2 end, 10000),
+    ok = wait_until(fun() -> rejected(Reason) >= Before + 2 end, 10000),
     ?assertMatch({ok, #{agents := _}}, list_agents(pinned())).
 
-%% A valid leaf of the same CA that the gateway does not pin: the TLS handshake
+%% A valid leaf of the same CA that is not the server's: the TLS handshake
 %% passes (CA membership), the auth_fun refuses the stream.
 unpinned_leaf_is_refused(_Config) ->
-    Before = rejected("pin_mismatch"),
+    %% the gateway's own leaf carries no server identity at all
+    Reason = refusal("no_uri_san"),
+    Before = rejected(Reason),
     {error, {<<"16">>, _}} = list_agents(unpinned()),
-    ok = wait_until(fun() -> rejected("pin_mismatch") >= Before + 1 end, 10000),
-    %% And the pinned leaf is still served afterwards.
+    ok = wait_until(fun() -> rejected(Reason) >= Before + 1 end, 10000),
+    %% And the server's leaf is still served afterwards.
     ?assertMatch({ok, #{agents := _}}, list_agents(pinned())).
 
 %% An enrolled agent's leaf: CA-issued, clientAuth only, so it is not the pinned
@@ -490,6 +498,27 @@ agent_listed(Agent) ->
 %%%===================================================================
 %%% Metrics and environment
 %%%===================================================================
+
+%% The mode the gateway runs in (YUZU_MGMT_AUTH_MODE): `identity', the shipped
+%% one and the default here, has no pin; `identity_or_pin' also pins the server leaf.
+auth_mode() ->
+    %% The default is the shipped mode, which is also the script's. A value that is
+    %% neither is a failure, never a silent run of the wrong mode.
+    case os:getenv("YUZU_MGMT_AUTH_MODE") of
+        false           -> identity;
+        "identity"      -> identity;
+        "identity_or_pin" -> identity_or_pin;
+        Other           -> ct:fail({unknown_YUZU_MGMT_AUTH_MODE, Other})
+    end.
+
+%% The reason a refusal is counted under: with a pin configured, `no_uri_san' and
+%% `identity_mismatch' are reported as the pin's reason (so the rotation-suppressed
+%% pin alert stays meaningful); without one they are reported as themselves.
+refusal(IdentityReason) ->
+    case auth_mode() of
+        identity        -> IdentityReason;
+        identity_or_pin -> "pin_mismatch"
+    end.
 
 %% yuzu_gw_mgmt_auth_rejected_total{reason="Reason"} from the gateway's /metrics.
 rejected(Reason) ->

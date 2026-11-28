@@ -419,6 +419,85 @@ TEST_CASE("instruction_yaml: line-ending and EOF edges", "[instruction_yaml]") {
         CHECK(f.id == "crlf.id");
         CHECK(f.plugin == "p");
     }
+    // #2123: the case above has no blank line, which is why it passed while a
+    // CRLF blank line inside spec: truncated the block and Save reported
+    // "Missing spec.execution.plugin" for a document that has one.
+    SECTION("CRLF with a blank line inside spec, canonical execution block (#2123)") {
+        const std::string crlf = "apiVersion: yuzu.io/v1alpha1\r\n"
+                                 "kind: InstructionDefinition\r\n"
+                                 "metadata:\r\n"
+                                 "  id: crlf.blank.id\r\n"
+                                 "spec:\r\n"
+                                 "  type: action\r\n"
+                                 "\r\n"
+                                 "  execution:\r\n"
+                                 "    plugin: agent_actions\r\n"
+                                 "\r\n"
+                                 "    action: Set_Log_Level\r\n";
+        auto f = parse_definition_yaml(crlf);
+        CHECK(f.id == "crlf.blank.id");
+        CHECK(f.type == "action");
+        CHECK(f.plugin == "agent_actions");
+        CHECK(f.action == "set_log_level");
+        CHECK(validate_definition_yaml(crlf).empty());
+    }
+    SECTION("lone-CR endings with a blank line inside spec (#2123)") {
+        const std::string cr = "apiVersion: yuzu.io/v1alpha1\r"
+                               "kind: InstructionDefinition\r"
+                               "metadata:\r"
+                               "  id: cr.blank.id\r"
+                               "spec:\r"
+                               "  type: action\r"
+                               "\r"
+                               "  execution:\r"
+                               "    plugin: agent_actions\r"
+                               "    action: Set_Log_Level\r";
+        auto f = parse_definition_yaml(cr);
+        CHECK(f.id == "cr.blank.id");
+        CHECK(f.plugin == "agent_actions");
+        CHECK(f.action == "set_log_level");
+    }
+    SECTION("two documents are refused whatever the line breaks (#2123 G2-SEC-F2)") {
+        // The multi-document guard must split lines the same way yaml_scan does:
+        // with lone-CR breaks the `---` separator used to go unseen, so doc 1
+        // saved and doc 2 was silently dropped.
+        const std::string lf = "apiVersion: yuzu.io/v1alpha1\n"
+                               "kind: InstructionDefinition\n"
+                               "metadata:\n"
+                               "  id: a.b\n"
+                               "spec:\n"
+                               "  plugin: p\n"
+                               "  action: a\n"
+                               "---\n"
+                               "apiVersion: yuzu.io/v1alpha1\n"
+                               "kind: InstructionDefinition\n"
+                               "metadata:\n"
+                               "  id: c.d\n"
+                               "spec:\n"
+                               "  plugin: q\n"
+                               "  action: b\n";
+        for (const std::string eol : {"\r\n", "\r"}) {
+            std::string doc;
+            for (char c : lf)
+                doc += (c == '\n') ? eol : std::string(1, c);
+            INFO("eol = " << (eol == "\r" ? "CR" : "CRLF"));
+            auto errors = validate_definition_yaml(doc);
+            REQUIRE_FALSE(errors.empty());
+            CHECK(errors.front().find("multiple documents") != std::string::npos);
+        }
+    }
+    SECTION("comment line at column 0 inside spec, LF (#2123)") {
+        auto f = parse_definition_yaml("metadata:\n"
+                                       "  id: cmt.id\n"
+                                       "spec:\n"
+                                       "  type: action\n"
+                                       "# execution follows\n"
+                                       "  execution:\n"
+                                       "    plugin: agent_actions\n"
+                                       "    action: Set_Log_Level\n");
+        CHECK(f.plugin == "agent_actions");
+        CHECK(f.action == "set_log_level");
+    }
 }
 
 TEST_CASE("instruction_yaml: block-scalar indicators and comment-only openers are absent",

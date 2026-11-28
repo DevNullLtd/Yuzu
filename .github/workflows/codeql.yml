@@ -22,8 +22,9 @@ name: "CodeQL"
 # job spanning Linux + Windows; a job-level `if` cannot reference the
 # `matrix` context, so a fail-closed per-leg gate would require splitting
 # the job — out of scope for the cutover. If Big Tam is offline at the
-# weekly run, the Linux leg queues until its 90-min timeout (same as the
-# pre-cutover Shulgi-offline behaviour); CodeQL is not a required check.
+# scheduled run, the Linux leg waits in the queue for a runner (the job's
+# timeout-minutes only counts from pickup; same as the pre-cutover
+# Shulgi-offline behaviour); CodeQL is not a required check.
 #
 # The two runs are separate matrix legs with `fail-fast: false`, so a
 # quirk on one platform doesn't kill the other. Each leg uploads SARIF
@@ -41,6 +42,14 @@ name: "CodeQL"
 #     + build_tests=true + languages c-cpp,actions, and the workflow
 #     matrixed across Linux + Windows runners to close the #ifdef _WIN32
 #     gap that a Linux-only analysis physically cannot reach.
+#   ADR-0035 ladder step 1: the Windows row is configured agent-only
+#     (since step 3 by the server option's auto default), so it analyses
+#     the agent only; server code
+#     (Linux-only under ADR-0035) is CodeQL-scanned on the Linux row only.
+#   2026-10-21 → 2026-11-02: the dev→main promotion (first-party .cpp/.cc files 1157 → 1437)
+#     pushed both legs past the 90-min ceiling; scheduled runs were
+#     cancelled daily from 2026-10-22. Timeout raised to 180 — see the
+#     `analyze` job's timeout-minutes comment for the measurements.
 #
 # Coverage-knob setup (maximize findings on both platforms):
 #   - queries: +security-and-quality (superset of security-extended;
@@ -49,13 +58,16 @@ name: "CodeQL"
 #     handling — not style noise like it would be for JS/Python)
 #   - languages: c-cpp,actions on Linux; c-cpp only on Windows (no need
 #     to double-scan the same .github/workflows/*.yml)
+#   - Windows row: agent code only (no server off Linux, ADR-0035);
+#     server code is scanned on the Linux row only
 #   - -Dbuild_tests=true so the CodeQL tracer observes tests/unit/*.cpp
 #   - Dedicated per-OS build dirs (build-linux-codeql/ + build-windows-codeql/)
 #     isolated from operator's interactive builds and from
 #     build-{linux,windows}-{asan,tsan,coverage}/
 #   - Pre-build runner disk-free assertion (≥40 GB Linux, ≥45 GB Windows;
 #     MSVC debug builds are chunkier)
-#   - Daily scheduled run (04:00 UTC, low-activity window)
+#   - Daily scheduled run (cron 04:00 UTC; GitHub starts it late — observed
+#     starts 08:00-12:00 UTC, 2026-10 to 2026-11)
 #   - Manual workflow_dispatch
 #
 # Known remaining coverage gaps:
@@ -115,12 +127,19 @@ on:
   pull_request:
     branches: [dev, main]
   schedule:
-    # Daily 04:00 UTC — off-hours, both runners available. Tightens C++
-    # vuln detection from <=7 days to <=24h (folds CodeQL into the Tier-3
-    # nightly cadence; it stays a ~20-25 min trace, NOT the PR fast-path).
-    # 04:00 is 2h ahead of nightly.yml's 06:00 cron so the two self-hosted
-    # Linux workloads don't contend for the Big Tam pool. Both Linux and
-    # Windows legs start simultaneously on their respective runners.
+    # Daily 04:00 UTC cron. Tightens C++ vuln detection from <=7 days to
+    # <=24h WHEN scheduled runs complete. From 2026-10-22 to 2026-11-02
+    # they did not (incident: #6873), and nothing alerts on a stale scan
+    # (#6880). Folds CodeQL into the Tier-3 nightly cadence; it is a long
+    # trace, NOT the PR fast-path — last green run 2026-10-21: Linux ~52m,
+    # Windows ~72m wall-clock; see timeout-minutes below for why that no
+    # longer holds.
+    # The 04:00 slot was chosen to be 2h ahead of nightly.yml's 06:00 cron,
+    # but GitHub starts both late (observed: this 08:00-12:00 UTC, nightly
+    # 11:00-13:00 UTC), so the two now overlap in practice and CodeQL's Linux
+    # leg can contend with nightly's sanitizer/coverage legs for Big Tam
+    # runner agents. Both Linux and Windows legs start simultaneously on
+    # their respective runners.
     - cron: "0 4 * * *"
 
 concurrency:
@@ -131,9 +150,19 @@ permissions:
   contents: read
 
 env:
-  VCPKG_COMMIT: "4b77da7fed37817f124936239197833469f1b9a8"
+  VCPKG_COMMIT: "9eec002df1cd109f8f104cd966a763daf9751489"
   VCPKG_BINARY_SOURCES: "default"
-  CCACHE_MAXSIZE: "500M"
+  # Must equal every other self-hosted job's CCACHE_MAXSIZE: ccache trims a
+  # cache directory to the cap of whichever job is writing to it, and this
+  # job shares the runner's cache with ci.yml, nightly.yml, release.yml and
+  # sanitizer-tests.yml (tests/test_ci_ccache_cap.py). At 500M the daily
+  # trace cut a Big Tam runner's cache to 2.8-5.2 GB (the trace's ccache -s,
+  # 2026-11-12 to -16; 1588 cleanups in each run checked), from 18-30 GB,
+  # or 7.9 GB on a runner trimmed the day before. In four of five such
+  # trims that runner's next 12 h of CI hit the cache 13-24 points less
+  # often than the other runners did; the fifth showed no gap
+  # (docs/ci-architecture.md "Build speed (Big Tam)").
+  CCACHE_MAXSIZE: "30G"
   CCACHE_COMPRESS: "true"
 
 jobs:
@@ -155,13 +184,13 @@ jobs:
           persist-credentials: false
 
       - name: Initialize CodeQL
-        uses: github/codeql-action/init@6f2ac81f5cd81fe351a197ba0b00d91d03cd2aee # v4.39.0
+        uses: github/codeql-action/init@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
         with:
           languages: actions
           config-file: ./.github/codeql/codeql-config.yml
 
       - name: Perform CodeQL Analysis
-        uses: github/codeql-action/analyze@6f2ac81f5cd81fe351a197ba0b00d91d03cd2aee # v4.39.0
+        uses: github/codeql-action/analyze@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
         with:
           # Distinct category from the nightly Linux leg's actions scan so
           # the two analysis series don't overwrite each other's alerts.
@@ -177,11 +206,44 @@ jobs:
       security-events: write   # github/codeql-action/upload-sarif
     # Verified Linux wall-clock (2026-04-13, dev@9b16d3c, security-extended,
     # build_tests=false): 14m49s with 155/156 compiles being real misses
-    # on a 32-thread runner. Current config (+security-and-quality +
-    # build_tests=true + c-cpp,actions) should fit under 60 min on
-    # Linux. Windows is typically 1.5-2x slower per TU under MSVC —
-    # budget extra headroom. 90 min covers both.
-    timeout-minutes: 90
+    # on a 32-thread runner. The current config (+security-and-quality +
+    # build_tests=true + c-cpp,actions) was expected to fit under 60 min on
+    # Linux, with Windows 1.5-2x slower per TU under MSVC; the 2026-10-21
+    # figures below are what it actually measured.
+    #
+    # 90 min stopped covering either leg after the 2026-10-21 dev→main
+    # promotion (first-party .cpp/.cc files 1157 → 1437, ~1515 by
+    # 2026-11-01). Last green run (2026-10-21):
+    # Linux build 15m + analysis 35m; Windows build 48m + analysis 18m.
+    # From 2026-10-23: Windows build 71-84m and still growing, leaving the
+    # analysis 2-16m; Linux build 21-25m, then analysis cancelled after
+    # 65m+ of analysis (job at 90m) — 183 of 184 queries done by ~16m, the
+    # last one (Security/CWE/CWE-119/OverrunWriteProductFlow, 21m alone on
+    # 2026-10-21) never finished. 180 min is a ceiling chosen to let
+    # Windows fit (build ~80m + analysis ~18m leaves ~75m headroom) and to
+    # measure how long that query actually needs on Linux; it is not a
+    # derived bound. If Linux still cancels, the remedy is a per-query
+    # evaluation timeout (not an analyze-action input; it would need
+    # CODEQL_ACTION_EXTRA_OPTIONS `database run-queries --timeout`;
+    # that flag and its semantics are unverified, and a skipped query
+    # leaves the job green with a CWE-119 query never evaluated — a false
+    # green unless the skip is surfaced) or a query-filters exclude in
+    # codeql-config.yml (drops that query on both legs and requires
+    # updating scripts/ci/test_runner_health_check.py's pin of exactly two
+    # excludes) — not another bump. #6873 tracks the same incident. The
+    # explicit `threads:`/`ram:` cap on the init step is now set per leg in
+    # the matrix below (`codeql_ram`/`codeql_threads`); a Windows-specific
+    # budget and the cpp/overrun-write question are still open there. If the
+    # slowdown is the cap itself, see the matrix comment on `codeql_ram`.
+    #
+    # Scheduled runs execute the DEFAULT-branch copy of this file, so this
+    # value takes effect only once it reaches main. Measure with a
+    # workflow_dispatch from main only (see the standing invariant above);
+    # the concurrency group means a main dispatch cancels an in-flight
+    # scheduled run, and vice versa. Revisit if any green leg exceeds ~135m
+    # (75% of the ceiling) or Linux is still cancelled at 180 on two
+    # consecutive runs.
+    timeout-minutes: 180
     strategy:
       # fail-fast: false so Linux completes its SARIF upload even if
       # Windows hits a quirk (and vice versa). Each leg's findings land
@@ -195,12 +257,28 @@ jobs:
             runner: [self-hosted, Linux, X64, yuzu-bigtam-linux]
             triplet: x64-linux
             vcpkg_bin: vcpkg
+            # Full manifest (server + tests): the Linux row analyses the server.
+            vcpkg_features: ""
             build_dir: build-linux-codeql
             category: "/language:c-cpp-linux"
             languages: "c-cpp,actions"
-            ccache_path: ~/.cache/ccache
-            ccache_key_prefix: ccache-codeql-linux
             disk_min_gb: 40
+            # CodeQL resource caps, passed to the init step (which the analyze step
+            # inherits). Without them the action autodetects the WHOLE host: the
+            # 2026-10-21 to 11-01 runs logged `finalize --threads=64 --ram=239468` on a
+            # runner pinned to 16 CPUs (#6873), and on 2026-11-23 the evaluator's java
+            # process reached 141 GB RSS on the 246 GB shared Big Tam box, was
+            # OOM-killed, and took the co-hosted runner-0 service down with it.
+            # 49152 MB is a quarter of the host
+            # (one of four runners) less headroom for the other three jobs' compiles. It
+            # is a judgement, not a derived bound: nobody has measured what these queries
+            # need. `--ram` bounds the evaluator's heap, not its total RSS and not a cgroup
+            # limit, so this reduces the blast radius but is not a hard cap. If a main
+            # workflow_dispatch shows an evaluator out-of-memory error, or a leg nearing
+            # its timeout that the log ties to heap pressure, raise it in steps rather
+            # than removing it.
+            codeql_ram: "49152"
+            codeql_threads: "16"
             shell: bash
           - os: windows
             # yuzu-weetam-windows pin — successor to the retiring Shulgi
@@ -211,19 +289,25 @@ jobs:
             # to 16 threads, so the Build step passes the job-level
             # -j $YUZU_BUILD_JOBS cap — without it ninja sizes -j from the 64-CPU host
             # and thrashes the 32 MB L3 (the 98-min-timeout failure mode), which
-            # CCACHE_RECACHE's forced full recompile makes acute.
+            # CCACHE_DISABLE's forced full recompile makes acute.
             runner: [self-hosted, Windows, X64, yuzu-weetam-windows]
             triplet: x64-windows
             vcpkg_bin: vcpkg.exe
+            # Agent-only profile (ADR-0035 step 3), the same as ci.yml's and
+            # nightly.yml's Windows legs (each runner keeps its own tree).
+            vcpkg_features: "--x-no-default-features --x-feature=tests"
             build_dir: build-windows-codeql
             category: "/language:c-cpp-windows"
             # c-cpp only — no need to double-scan the same
             # .github/workflows/*.yml files; the Linux leg covers
             # actions.
             languages: "c-cpp"
-            ccache_path: ~\AppData\Local\ccache
-            ccache_key_prefix: ccache-codeql-windows
             disk_min_gb: 45
+            # Threads only: the runner is pinned to 16 CPUs (YUZU_BUILD_JOBS) but the
+            # action autodetects the 64-CPU host (#6873). No ram cap here: the Wee Tam
+            # memory budget was not checked, and an empty value leaves the action default.
+            codeql_ram: ""
+            codeql_threads: "16"
             # The default `shell: bash` on a self-hosted Windows runner
             # resolves to C:\Windows\system32\bash.EXE which is WSL
             # bash. WSL refuses to run as LOCAL SYSTEM (the runner's
@@ -321,10 +405,10 @@ jobs:
           # database. Wipe the build dir each run.
           rm -rf ${{ matrix.build_dir }}
 
-      # ccache (matrix.ccache_path: ~/.cache/ccache on Linux,
-      # ~\AppData\Local\ccache on Windows) persists in the runner
-      # user's home dir between jobs on both self-hosted runners.
-      # vcpkg_installed/ persists in the workspace. Issue #569.
+      # ccache persists between jobs: on Big Tam in each runner's own
+      # ~/.cache/ccache (HOME=/home/runner/rN/home), on Wee Tam in one
+      # D:\ci\ccache shared by the pool. vcpkg_installed/ persists in the
+      # workspace. Issue #569.
       - name: Reset ccache stats
         run: ccache -z
 
@@ -377,7 +461,7 @@ jobs:
           mkdir -p "$VCPKG_DEFAULT_BINARY_CACHE"
           "$GITHUB_WORKSPACE/vcpkg/${{ matrix.vcpkg_bin }}" install \
             --triplet ${{ matrix.triplet }} \
-            --x-manifest-root="$GITHUB_WORKSPACE"
+            --x-manifest-root="$GITHUB_WORKSPACE" ${{ matrix.vcpkg_features }}
 
       # Install Erlang/OTP + rebar3 for the gateway custom_target. The
       # meson `gateway` custom_target is scheduled when rebar3 is found AND
@@ -414,7 +498,7 @@ jobs:
           rebar3-version: '3.24'
 
       - name: Initialize CodeQL
-        uses: github/codeql-action/init@6f2ac81f5cd81fe351a197ba0b00d91d03cd2aee # v4.39.0
+        uses: github/codeql-action/init@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
         with:
           languages: ${{ matrix.languages }}
           # The leading `+` means "augment the default suite" (applies
@@ -432,6 +516,9 @@ jobs:
           # Scope the scan to first-party code; see the config file for
           # the list of vendored/generated paths that are excluded.
           config-file: ./.github/codeql/codeql-config.yml
+          # See the matrix comment: an explicit cap instead of the autodetected whole host.
+          ram: ${{ matrix.codeql_ram }}
+          threads: ${{ matrix.codeql_threads }}
 
       - name: Configure (Meson debug) — linux
         if: matrix.os == 'linux'
@@ -482,6 +569,9 @@ jobs:
           # Note: the gateway custom_target may fail on Windows if
           # rebar3/erl aren't installed on the runner; meson will skip
           # it via the `if command -v rebar3` guard inside meson.build.
+          # Agent only (ADR-0035): the `server` option defaults to auto, which
+          # is off on a Windows target, so this row analyses the agent's
+          # Windows code only; server code is analysed by the Linux row.
           meson setup ${{ matrix.build_dir }} \
             --buildtype=debug \
             -Dcpp_std=vc++latest \
@@ -493,7 +583,7 @@ jobs:
         # its database. Full graph traversal required — no --no-rebuild,
         # no partial target selection.
         #
-        # CCACHE_RECACHE=true is load-bearing for CodeQL coverage. The
+        # CCACHE_DISABLE=true is load-bearing for CodeQL coverage. The
         # tracer attaches to compiler processes; if ccache returns a
         # cached object file without invoking the compiler, the tracer
         # never sees that translation unit and CodeQL's database omits
@@ -501,17 +591,29 @@ jobs:
         # this silently dropped 98% of TUs from the database (e.g. only
         # 1 of 47 plugin .cpp files was reaching analysis), making most
         # custom and standard queries report 0 alerts on plugin code.
-        # `RECACHE` forces the compiler to actually run while still
-        # updating the cache, so non-CodeQL CI builds keep their cache
-        # warm. `CCACHE_DISABLE=true` would also work but would skip
-        # the cache update and degrade subsequent CI builds.
+        # DISABLE runs the compiler for every TU and never reads, writes
+        # or cleans the cache. This step used CCACHE_RECACHE so that it
+        # would refresh the cache for the other CI jobs. RECACHE stores
+        # every TU (ccache counts these as "Uncacheable calls", 1581 of
+        # 1590 on Linux, 2026-11-14 to -16) and never reads. On Linux no
+        # other job could read those objects either: for a -g compile
+        # ccache hashes the build directory, and this one is unique. At
+        # this job's old 500M cap each store also ran a cleanup, which
+        # trimmed the shared cache. On Wee Tam one cache (D:\ci\ccache)
+        # serves all four runners, so the trace kept the whole pool's
+        # cache small while it ran (2026-11-15: ci.yml Windows jobs during
+        # the trace ended at 2.0 of 30 GB).
         env:
-          CCACHE_RECACHE: "true"
-        # Essential because CCACHE_RECACHE forces every TU to compile. Both
+          CCACHE_DISABLE: "true"
+        # Essential because CCACHE_DISABLE forces every TU to compile. Both
         # hosts are one-CCD-per-runner, so cap Ninja to that 16-thread domain.
         run: meson compile -C ${{ matrix.build_dir }} -j "$YUZU_BUILD_JOBS"
 
       - name: ccache stats
+        # Covers Configure's probe compiles only: CCACHE_DISABLE calls are
+        # not counted. On Wee Tam the counters are the pool's: they include
+        # other Windows jobs running at the same time, and any Wee Tam job
+        # that starts during this one resets them (ccache -z).
         if: always()
         run: ccache -s
 
@@ -521,7 +623,7 @@ jobs:
         # reliably suppress findings whose location is a transitively-
         # included header in compiled C/C++. The `output` directory
         # holds the raw SARIF for post-processing.
-        uses: github/codeql-action/analyze@6f2ac81f5cd81fe351a197ba0b00d91d03cd2aee # v4.39.0
+        uses: github/codeql-action/analyze@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
         with:
           category: "${{ matrix.category }}"
           output: codeql-sarif
@@ -577,7 +679,7 @@ jobs:
           done
 
       - name: Upload SARIF
-        uses: github/codeql-action/upload-sarif@6f2ac81f5cd81fe351a197ba0b00d91d03cd2aee # v4.39.0
+        uses: github/codeql-action/upload-sarif@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
         with:
           sarif_file: codeql-sarif
           category: "${{ matrix.category }}"

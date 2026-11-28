@@ -337,7 +337,8 @@ DESCRIPTOR_TEST("rdp_control", "rdp_control", 2, "set_state", "status")
 DESCRIPTOR_TEST("disk_actions", "disk_actions", 4, "smart", "volumes", "partitions", "topology")
 DESCRIPTOR_TEST("disk_space", "disk_space", 1, "free")
 DESCRIPTOR_TEST("antivirus", "antivirus", 3, "products", "status", "av_exclusions")
-DESCRIPTOR_TEST("firewall", "firewall", 2, "state", "rules")
+DESCRIPTOR_TEST("firewall", "firewall", 6, "state", "rules", "quarantine", "release", "quarantine_status",
+                "quarantine_allow")
 
 // DESCRIPTOR_TEST has no per-plugin version parameter (shared across ~15
 // plugins with unrelated version histories) -- a standalone case pins the
@@ -345,7 +346,8 @@ DESCRIPTOR_TEST("firewall", "firewall", 2, "state", "rules")
 // string is caught, not just observed once in a manual capture
 // (code-review r1, FV-codex-05). The pinned value tracks the highest bump
 // merged onto this plugin -- 0.5.0 for the macOS parity-residual work,
-// then 0.6.0 once the nftables netlink hardening bump landed on top.
+// then 0.6.0 once the nftables netlink hardening bump landed on top, then
+// 1.0.0 when the four containment actions joined the plugin.
 TEST_CASE("firewall: version reflects the parity-residual bump",
           "[plugins][descriptor][firewall]") {
     auto ph = load_plugin("firewall");
@@ -357,7 +359,7 @@ TEST_CASE("firewall: version reflects the parity-residual bump",
     }
     REQUIRE(ph.desc != nullptr);
     REQUIRE(ph.desc->version != nullptr);
-    CHECK(std::string_view(ph.desc->version) == "0.6.0");
+    CHECK(std::string_view(ph.desc->version) == "1.0.0");
 }
 
 DESCRIPTOR_TEST("windows_updates", "windows_updates", 4, "installed", "missing", "pending_reboot", "patch_connectivity")

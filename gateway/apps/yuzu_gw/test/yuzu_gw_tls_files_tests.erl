@@ -90,12 +90,18 @@ files_test_() ->
               F = P("noread.pem"),
               ok = file:write_file(F, <<"x">>),
               ok = file:change_mode(F, 8#000),
-              case file:read_file(F) of
-                  {error, eacces} ->
-                      ?assertEqual([{cacertfile, F, eacces}],
-                                   yuzu_gw_tls_files:diagnose([{cacertfile, F}]));
-                  _ ->
-                      ok
+              try
+                  case file:read_file(F) of
+                      {error, eacces} ->
+                          ?assertEqual([{cacertfile, F, eacces}],
+                                       yuzu_gw_tls_files:diagnose([{cacertfile, F}]));
+                      _ ->
+                          ok
+                  end
+              after
+                  %% Windows maps mode 000 to read-only; deleting it then fails.
+                  %% Restore permissions even when the diagnostic assertion fails.
+                  ok = file:change_mode(F, 8#600)
               end
           end},
          {"a plaintext endpoint has nothing to check; a TLS one is checked",

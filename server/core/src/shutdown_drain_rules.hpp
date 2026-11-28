@@ -16,7 +16,20 @@
 ///      listener immediately and the LB learned about it from refused
 ///      connections. Default 0 (single-node shutdown unchanged).
 ///   2. In-flight executions — the pre-existing wait, capped at
-///      `kExecutionDrainCap` from drain start.
+///      `kExecutionDrainCap` from drain start. Three things count: the tracker's `running`
+///      executions, the workflow runs this process holds IN-PROCESS, and the per-device live
+///      reads this process holds (below), never a count of
+///      `running` rows in Postgres (an orphan left by a crash, or a run owned by another replica,
+///      must not hold this replica's shutdown). A run is counted two ways, combined by
+///      `workflow_runs_to_drain`: the `StreamBudget` `kWorkflowRun` leases (taken at admission,
+///      so a run still in PREPARE counts, and held until the adapter returns, so the final audit
+///      write counts) and `WorkflowEngine::in_flight_runs()` (runs inside `execute()`, kept as
+///      the count for a caller that holds no lease). The per-device live reads this process
+///      holds count too (the `StreamBudget` `kLiveRead` leases), because each pins a worker for
+///      up to its poll budget. `keep_draining_for_work` is the one
+///      decision over every kind of work, and the same cap bounds it: a workflow run still going
+///      at the cap is stopped (`WorkflowStopLevel::kStop`) when `stop_requested_` is set, not
+///      waited for.
 ///
 /// Total wait is therefore max(N, time for executions to finish), normally at
 /// most max(N, kExecutionDrainCap). Residual: the executions query runs on a
@@ -40,6 +53,8 @@
 /// setting; it is not derived from the 210s budget.
 
 #include <chrono>
+#include <cstddef>
+#include <limits>
 
 namespace yuzu::server::shutdown_drain {
 
@@ -52,6 +67,34 @@ constexpr bool keep_draining(std::chrono::steady_clock::duration elapsed,
     if (elapsed < min_grace)
         return true;
     return executions_running && elapsed < kExecutionDrainCap;
+}
+
+/// How many workflow runs the drain waits on: the larger of the engine's in-process count and the
+/// `kWorkflowRun` lease count. Every adapter takes its lease before the run's first read and
+/// holds it past `execute()`, so the lease count covers the engine count and a MAX counts each run
+/// once (a sum would report every leased run twice in the progress log). The engine count stays in
+/// as the floor for a run that holds no lease. Only non-zero changes the decision.
+constexpr int workflow_runs_to_drain(int engine_runs, std::size_t leased_runs) noexcept {
+    constexpr auto kIntMax = static_cast<std::size_t>(std::numeric_limits<int>::max());
+    const int leased = static_cast<int>(leased_runs > kIntMax ? kIntMax : leased_runs);
+    const int engine = engine_runs > 0 ? engine_runs : 0;
+    return leased > engine ? leased : engine;
+}
+
+/// `keep_draining` over every kind of in-flight work: `tracker_running` executions the tracker
+/// reports as running, `workflow_runs` runs the workflow engine holds in-process, and `live_reads`
+/// per-device live reads this process holds (the `kLiveRead` leases: the REST route, the MCP tool
+/// and the quarantine release wait). Any being non-zero extends the wait, up to the same
+/// `kExecutionDrainCap`. A live read holds an HTTP worker for up to its poll budget and is
+/// otherwise neither tracked nor signalled, so without this count `stop()` would close the
+/// listener under it and, past the web-thread wait, hard-exit. New live reads are refused from the
+/// moment `draining_` is set, so the count only falls; a lease that never fell would cost at most
+/// the cap, never an unbounded wait.
+constexpr bool keep_draining_for_work(std::chrono::steady_clock::duration elapsed,
+                                      std::chrono::seconds min_grace, std::size_t tracker_running,
+                                      int workflow_runs, std::size_t live_reads) noexcept {
+    return keep_draining(elapsed, min_grace,
+                         tracker_running > 0 || workflow_runs > 0 || live_reads > 0);
 }
 
 } // namespace yuzu::server::shutdown_drain

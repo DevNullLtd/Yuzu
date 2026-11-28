@@ -122,6 +122,19 @@ VCPKG_INSTALL_ARGS=(
 if [[ -n "$TRIPLET" ]]; then
   VCPKG_INSTALL_ARGS+=(--triplet="$TRIPLET")
 fi
+# The server is Linux-only (ADR-0035). On a Windows or macOS host with no cross
+# file the build is agent-only (meson's `server` option is auto, which is off
+# for a non-Linux target), so install the agent-only vcpkg profile: no `server`
+# feature (libpq, xmlsec, drogon), and ALWAYS the `tests` feature (Catch2), as CI
+# does: a plain `setup.sh` run after `setup.sh --tests` must not drop Catch2
+# from a build dir that stored build_tests=true. Every cross file under
+# meson/cross/ targets Linux, so a cross build keeps the full manifest. Linux
+# is unchanged (full manifest: server + tests). Pinned by
+# tests/test_server_feature_option.py.
+if [[ "$HOST_OS" != "linux" && -z "$CROSS_FILE" ]]; then
+  VCPKG_INSTALL_ARGS+=(--x-no-default-features --x-feature=tests)
+  echo "   agent-only profile (ADR-0035): the server builds on Linux only"
+fi
 "$VCPKG_EXE" "${VCPKG_INSTALL_ARGS[@]}"
 
 # ── Determine cmake_prefix_path for Meson ────────────────────────────────────
@@ -251,6 +264,10 @@ echo ""
 echo "Build configured. Next steps:"
 echo "  meson compile -C $BUILDDIR"
 if $TESTS; then
-  echo "  meson test -C $BUILDDIR --suite server --print-errorlogs"
+  if [[ "$HOST_OS" == "linux" || -n "$CROSS_FILE" ]]; then
+    echo "  meson test -C $BUILDDIR --suite server --print-errorlogs"
+  else
+    echo "  meson test -C $BUILDDIR --suite agent --print-errorlogs   # agent-only build (ADR-0035)"
+  fi
   echo "  bash scripts/link-tests.sh        # refresh tests-build-* symlinks"
 fi

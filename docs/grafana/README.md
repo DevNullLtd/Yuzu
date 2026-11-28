@@ -4,7 +4,7 @@ This directory contains Grafana dashboard JSON files and documentation for monit
 
 ## Prometheus Metric Families
 
-Yuzu exposes Prometheus metrics from two scrape targets: the **server** (`/metrics` on the web port, default `:8080`) and the **gateway** (`/metrics` on its Prometheus port, default `:9568`). Per-agent metrics are *not* scraped — the agent has no HTTP metrics endpoint; it piggybacks its counters into heartbeats, and fleet-wide health is re-exported by the server as the `yuzu_fleet_*` gauges below. All metric names use the `yuzu_` prefix. The metric names, types, and labels below are taken from the emitting code (`server/core/src`, `gateway/apps/yuzu_gw/src/yuzu_gw_telemetry.erl`); only metrics that are actually emitted are listed.
+Yuzu exposes Prometheus metrics from two scrape targets: the **server** (`/metrics` on the HTTPS port, default `:8443`; on `--web-port` only with `--no-https`) and the **gateway** (`/metrics` on its Prometheus port, default `:9568`). Per-agent metrics are *not* scraped — the agent has no HTTP metrics endpoint; it piggybacks its counters into heartbeats, and fleet-wide health is re-exported by the server as the `yuzu_fleet_*` gauges below. All metric names use the `yuzu_` prefix. The metric names, types, and labels below are taken from the emitting code (`server/core/src`, `gateway/apps/yuzu_gw/src/yuzu_gw_telemetry.erl`); only metrics that are actually emitted are listed.
 
 ### Server Metrics
 
@@ -92,7 +92,14 @@ Scraped from the gateway's Prometheus endpoint (default `:9568`). Duration histo
 | `yuzu_gw_upstream_lane_saturated_seconds_total` | counter | The same, per lane (label `lane`: `serial`, `notify`, `guardian`; all three created at 0 at start). The lanes overlap, so never add them: the figure for the gateway as a whole is the counter above |
 | `yuzu_gw_upstream_backpressure_duty_cycle` | gauge | The backpressure duty cycle over the last 60 s, 0 to 1. Reads low for the first minute after a start (the missing seconds count as not saturated) |
 | `yuzu_gw_upstream_slow` | gauge | 1 when the duty cycle above is 0.5 or more (a slow server, as this gateway sees it), else 0. Not a readiness input |
-| `yuzu_gw_mgmt_auth_rejected_total` | counter | Management-listener (`:50063`) streams refused by the peer authorization (the SPKI pin and, since #6016, the server identity and the serial deny-list), labeled by `reason` (closed set of eleven, all created at 0 at start: `pin_mismatch`, `missing_server_auth_eku`, `no_pins_resolved`, `no_pins_configured`, `bad_peer_cert`, `bad_pin_config`, `no_uri_san`, `identity_mismatch`, `identity_unresolved`, `revoked`, `internal_error`). In `identity_or_pin` with pins configured, `no_uri_san` and `identity_mismatch` are counted as the pin's reason (`pin_mismatch`, `no_pins_resolved`); `identity_unresolved` and `revoked` are counted as themselves |
+| `yuzu_gw_mgmt_auth_rejected_total` | counter | Management-listener (`:50063`) streams refused by the peer authorization (the SPKI pin and, since #6016, the server identity and the serial deny-list), labeled by `reason` (closed set of fourteen, all created at 0 at start: `pin_mismatch`, `missing_server_auth_eku`, `no_pins_resolved`, `no_pins_configured`, `bad_peer_cert`, `bad_pin_config`, `no_uri_san`, `identity_mismatch`, `identity_unresolved`, `revoked`, `revocation_unknown`, `revocation_stale`, `crl_revoked`, `internal_error`). In `identity_or_pin` with pins configured, `no_uri_san` and `identity_mismatch` are counted as the pin's reason (`pin_mismatch`, `no_pins_resolved`); `identity_unresolved`, `revoked` and the three CRL reasons are counted as themselves |
+| `yuzu_gw_mgmt_crl_enforced` | gauge | 1 when a `mgmt_crl_source` is set (every admitted management peer is checked against the CA's CRL), 0 when none is |
+| `yuzu_gw_mgmt_crl_loaded` | gauge | 1 when a verified CRL is held, 0 before the first loads (every stream is then refused `revocation_unknown` under a source) |
+| `yuzu_gw_mgmt_crl_number` | gauge | The `cRLNumber` of the held CRL; 0 when none |
+| `yuzu_gw_mgmt_crl_next_update_timestamp_seconds` | gauge | `nextUpdate` (Unix seconds) of the held CRL; 0 when none |
+| `yuzu_gw_mgmt_crl_last_success_timestamp_seconds` | gauge | Unix seconds of the last successful read of the CRL source; 0 until then |
+| `yuzu_gw_mgmt_crl_revoked_entries` | gauge | Revoked serials in the held CRL; 0 when none |
+| `yuzu_gw_mgmt_crl_rejected_total` | counter | CRLs not obtained or refused, labeled by `reason` (closed set of fourteen, all created at 0 at start; the same refused bytes are counted once in a row, repeated hourly while they persist, not once per refresh, except `future_dated`, `replay`, the fetch reasons and a fetch-reported `too_large`, which count every attempt: `malformed`, `unsupported`, `too_large`, `unverified`, `issuer_mismatch`, `validity_too_long`, `future_dated`, `replay`, `fetch_timeout`, `fetch_connect`, `fetch_tls`, `fetch_status`, `fetch_error`, `file_unreadable`) |
 | `yuzu_gw_mgmt_auth_admitted_total` | counter | Management-listener streams let in, labeled by `method` (`identity` or `pin`; both created at 0 at start): which path carries the traffic. Read it under real command traffic before narrowing the mode; `pin` standing still on an idle gateway proves nothing |
 | `yuzu_gw_mgmt_auth_pin_unresolved_total` | counter | Management auth attempts during which a configured `mgmt_peer_pins` entry did not resolve, including `identity_or_pin` attempts the identity admits |
 | `yuzu_gw_mgmt_pin_rotated_timestamp_seconds` | gauge | Unix time the pin watcher last published a different key for a `{cert_file, Path}` pin; 0 until the first change in the process |
@@ -150,8 +157,14 @@ Add the following targets to your `prometheus.yml`:
 scrape_configs:
   - job_name: 'yuzu-server'
     static_configs:
-      - targets: ['localhost:8080']
+      - targets: ['localhost:8443']
     metrics_path: '/metrics'
+    scheme: https
+    tls_config:
+      ca_file: /etc/prometheus/yuzu-ca.pem
+    authorization:
+      type: Bearer
+      credentials_file: /etc/prometheus/yuzu-metrics-token
 
   - job_name: 'yuzu-gateway'
     static_configs:
@@ -161,4 +174,4 @@ scrape_configs:
 
 There is no `yuzu-agent` scrape job: agents do not expose an HTTP `/metrics` endpoint. Per-agent counters are delivered to the server inside heartbeats and surfaced as the server-side `yuzu_fleet_*` / `yuzu_agents_*` series, so the server target above already covers fleet-wide agent health.
 
-Adjust addresses and ports to match your deployment. For Docker Compose deployments, the `deploy/docker/docker-compose.yml` file includes a pre-configured Prometheus instance.
+`/metrics` requires a bearer token (the recipe: [Scraping /metrics with a bearer token](../user-manual/metrics.md#scraping-metrics-with-a-bearer-token)). Adjust addresses and ports to match your deployment. For Docker Compose deployments, the `deploy/docker/docker-compose.yml` file includes a pre-configured Prometheus instance.

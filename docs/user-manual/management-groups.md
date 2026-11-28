@@ -41,13 +41,13 @@ A role assignment on "London Office" applies to both "London Desktops" and "Lond
 
 ## Visibility Filtering
 
-When RBAC is enabled, the agent list shown in the dashboard and returned by the agent API is filtered based on management group role assignments:
+When RBAC is enabled, what a user sees in an agent list depends on the permission the list route requires:
 
 - **Global administrators** (users with the `Infrastructure:Read` permission) see all agents.
-- **Non-admin users** only see agents that belong to management groups where they have at least one role assignment (Operator, Viewer, or ITServiceOwner).
-- This applies to the dashboard view, the `/api/agents` endpoint, and any UI page that lists devices.
-
-For example, if `jane.ops` holds the Operator role on the "London Office" group, she sees only agents that are members of "London Office" or its child groups ("London Desktops", "London Servers").
+- **Non-admin users** are narrowed to the groups they hold a group-scoped role on only by a list route that makes a per-group permission check, such as `/api/v1/devices`.
+- That narrowing applies only if the group-scoped role itself carries `Infrastructure:Read`. A user whose only grant is a group-scoped `Operator` role is refused (`403`, `Infrastructure:Read`) and is not shown the group's agents.
+- An existing `ITServiceOwner` row shows its holder the agents of its group on `/api/v1/devices`. That role can no longer be assigned at group scope.
+- `/api/agents` and the dashboard device list require the global `Infrastructure:Read` permission, so they do not narrow by group-scoped role: a caller without that permission is refused (`403`).
 
 > **When RBAC is disabled (the default posture):** management-group role
 > assignments are **not** consulted. Every authenticated user sees the full
@@ -103,6 +103,8 @@ All list endpoints return a paginated envelope:
 ```
 
 ### Create a Group
+
+Creating a group is audit-first: an `attempted` audit row is stored before the group is created. If it cannot be stored the call answers `503` with `Sec-Audit-Failed: true` and creates nothing. A fault of the group store also answers `503` (with a fixed message), including a failed read of the parent group, while an empty name, a name already in use, an unknown parent or a hierarchy that is too deep answers `400`. A name over 256 bytes or holding a control character (a tab or newline, for example) answers `400` too, as does a parent id over 256 bytes or holding one (`parent group not found`); nothing is written for those. The Settings form shows the refusal text for those two inline (HTTP 200, no toast) rather than answering `400`. The Settings form and the MCP tool `create_management_group` follow the same order, for both static and dynamic groups. A supervised MCP call that is refused because the audit row cannot be stored has already used its one-time approval, so retry it with a new approval. Group creation (REST, MCP and the Settings form), member add (REST and MCP) and member remove (REST only: there is no MCP remove tool, and the Settings page has no member routes) are audit-first and refused when the audit row cannot be stored: REST and Settings answer `503`, MCP a retryable internal error. Group update, group delete, role assignment and unassignment, Settings delete and automatic service groups are audited after the change, or not at all, and proceed during an audit outage; they are tracked as follow-ups. The rows and their details are listed in [Audit Log](audit-log.md).
 
 #### Static Membership
 
@@ -303,6 +305,10 @@ Returns `201 Created`:
 }
 ```
 
+An agent id with no enrolment record is still added, so you can place a device in a group before it first appears. Whether the id has an enrolment record (pending, approved or denied) is recorded on the success audit row (`agent_known=<1|0|unreadable>` as the last token of its `detail`; filter on `result=success` before parsing it, see [Audit Log](audit-log.md)), not returned in the response. Matching is exact, letter case included, so an id in the wrong case is still added and reads `agent_known=0`. The flag is a point-in-time lookup and is not evidence that the device is enrolled; `0` is also the normal value when you stage a membership ahead of the device, so it does not by itself protect a group's scope. An `agent_id` over 256 bytes answers `400` and writes nothing.
+
+Adding and removing a member are audit-first like creating a group: an `attempted` audit row is stored before the change, and if it cannot be stored the call answers `503` with `Sec-Audit-Failed: true` and changes nothing. Other group writes are not audit-first; see [Create a Group](#create-a-group).
+
 This endpoint is intended for static membership groups. For a dynamic group the server computes members only for the root group (filled at enrollment) and, as a one-time snapshot at creation, for the `Service: {name}` groups it creates itself when a `service` tag is first written; for any other dynamic group created through the API, members are not computed from the scope expression.
 
 ### Remove a Member
@@ -323,6 +329,10 @@ Returns `200 OK`:
 ```
 
 Only removes static membership records. Dynamic membership entries (the root group's enrollment members and the one-time snapshot of a `Service: {name}` group) are not removed by this endpoint.
+
+### Decommissioning a Device
+
+`DELETE /api/v1/sle/agents/{agent_id}` (see [REST API](rest-api.md#software-licensing-sle)) removes the device from every management group in one statement: static and dynamic memberships and the root group alike. The response's `stores` map reports this as `management_group_memberships`. Only the membership rows are removed. The groups, their role assignments and the device's tags are not touched, and neither is its enrolment, so the same agent id is accepted again on its next registration (under the default `--agent-reregistration-proof=audit`; under `enforce` an agent without its current certificate needs a fresh single-use token, and decommission does not revoke that certificate) and is added back to the root group only, on a best-effort basis; the other groups it was in are not restored. Stop the agent first. The removal is a point in time: an operator adding the id to a group, or a dynamic or `Service:` group created later from the tags decommission leaves in place, can put it back in a group after the DELETE returned. A device that is decommissioned but still connected belongs to no group until it registers again, and an agent that registers while the DELETE runs can lose its All Devices re-add to that DELETE. Until it is added back to its groups, group-targeted compliance policies, group-scoped Guardian and dispatch reach, group-scoped visibility of its quarantine record and group-scoped collection settings no longer cover it (a running agent is pushed the All Devices settings document if one is stored, otherwise the built-in default, once its cached membership expires, about ten minutes), and it drops out of the matching compliance counts. With RBAC enforcement off, the callers that read the legacy group visibility directly (destructive-class targeted dispatch on the generic routes, the dashboard execute console, instruction execute, and Echo scan) answer "no visible target" for it; the main device lists are not affected. To bring the device back sooner, add its id to the All Devices group with `POST /api/v1/management-groups/000000000000/members` (body `{"agent_id": ...}`; needs the global `ManagementGroup:Write`). The All Devices rejoin at registration is best effort: Register does not fail if it cannot be written. The groups the device left are recorded, best effort, in the `sle.agent.decommission` outcome audit row as `management_group_memberships.groups=<n>:<ids>` (if that row cannot be stored the response carries `Sec-Audit-Failed` and the list is lost; the server log also notes them; if the removal committed but the ids could not be copied, which takes an out-of-memory condition, the row reads `<n>:unrecorded`, or has no `groups=` token at all, and then neither the row nor the log has the ids); read them from that audit row if you need to restore the device to the same groups; they cannot be read back from the device afterwards.
 
 ## Role Delegation
 
@@ -357,7 +367,7 @@ curl -s -b cookies.txt \
 
 ### Add a Role Assignment
 
-Only `Operator` and `Viewer` roles can be delegated via this endpoint. Assigning other roles (e.g., `ITServiceOwner`) returns `403 Forbidden`. The caller must be a global Administrator or hold `ITServiceOwner` on the target group.
+Only `Operator` and `Viewer` roles can be delegated via this endpoint. Assigning other roles (e.g., `ITServiceOwner`) returns `403 Forbidden`. The caller must be a global Administrator or hold `ITServiceOwner` on the target group. A service-scoped API token is refused outright, and the `ITServiceOwner` arm is also refused for any MCP-tier session and for an engine-classed session (those two need the global `ManagementGroup:Write` permission); the same refusals apply to listing and removing role assignments.
 
 ```bash
 curl -s -b cookies.txt -X POST \
@@ -405,7 +415,7 @@ Returns `200 OK`:
 }
 ```
 
-The caller must be a global Administrator or hold `ITServiceOwner` on the target group.
+The caller must be a global Administrator or hold `ITServiceOwner` on the target group. A caller admitted only as `ITServiceOwner` of the group can remove only `Operator` and `Viewer` assignments (`403` otherwise); removing an `ITServiceOwner` assignment needs the global `ManagementGroup:Write` permission.
 
 ## Service Groups
 
@@ -473,9 +483,9 @@ Groups are created and deleted through the **Settings** page in the HTMX dashboa
 
 From the Settings page, administrators can:
 
-- **Create groups** -- specify name, description, parent, and membership type.
+- **Create groups** -- specify name, description, parent, and membership type. If the audit row for the create cannot be stored the form shows an error toast and creates nothing.
 - **View member counts** -- each group row shows the number of member agents.
-- **Delete groups** -- a delete button appears on every group except the root group.
+- **Delete groups** -- a delete button appears on every group except the root group. The delete is audited after the change, not before.
 
 Group updates (rename, re-parent, membership type changes) are performed via the REST API `PUT` endpoint.
 
@@ -501,7 +511,7 @@ Two gauges are exposed on the `/metrics` endpoint, refreshed on every scrape:
 | `DELETE` | `/api/v1/management-groups/{id}/members/{agent_id}` | Remove an agent from a group |
 | `GET` | `/api/v1/management-groups/{id}/roles` | List role assignments for a group |
 | `POST` | `/api/v1/management-groups/{id}/roles` | Add a role assignment to a group |
-| `DELETE` | `/api/v1/management-groups/{id}/roles` | Remove a role assignment from a group |
+| `DELETE` | `/api/v1/management-groups/{id}/roles` | Remove a role assignment from a group (a caller who is only the group's `ITServiceOwner` can remove only `Operator` and `Viewer`) |
 
 ## Constraints
 
@@ -515,6 +525,7 @@ Two gauges are exposed on the `/metrics` endpoint, refreshed on every scrape:
 | Cascade delete | Deleting a group cascade-deletes all children, memberships, and role assignments |
 | Dynamic scope syntax | Same as the scope engine (see `docs/yaml-dsl-spec.md` section on scope expressions) |
 | Visibility filtering | Non-admin users see only agents in groups where they hold a role assignment |
+| Text bounds | A group name, a parent id, a group id and an agent id are each at most 256 bytes. A group name and a parent id must not contain control characters or invalid UTF-8. A value that breaks a bound is refused with `400` (`404` for a group id over 256 bytes in a member path) before any audit row is written; the Settings form shows the refusal text inline instead of answering `400`. An agent id with a control byte or invalid UTF-8 is also `400`, but writes a `denied` audit row (`detail=invalid_agent_id`) |
 
 ## Planned Features
 

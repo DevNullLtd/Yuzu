@@ -1,0 +1,26 @@
+# python_framework.manifest -- portable description of the python.org macOS framework subtree for the
+# runtimes macOS-leg walk tests (tests/unit/test_runtimes_python_parsers.cpp materializes it under a
+# yuzu_test_runtimes_ TempDir at run time; same line grammar as linux/tree.manifest).
+#
+# REAL CAPTURE: the python.org 3.13.1 macOS installer
+#   source:  https://www.python.org/ftp/python/3.13.1/python-3.13.1-macos11.pkg
+#   sha256:  67c6f0a3190851e0013214d5abd725a42ec398ff1b50eec47826820fd052d86b
+#   method:  `pkgutil --expand-full python-3.13.1-macos11.pkg exp` (no install, no sudo, no system
+#            change); the file is exp/Python_Framework.pkg/Payload/Versions/3.13/Resources/Info.plist,
+#            the path it takes inside a real install (/Library/Frameworks/Python.framework/...).
+#   host/date: braga (macOS), 2026-10-28; Info.plist sha256 5164de20bc50e35f218f59394c7b095ddc895b195412a76417317bf801c03be0
+#   shape:   XML plist; CFBundleVersion = "3.13.1" (a full version) while CFBundleShortVersionString =
+#            "3.13.1, (c) 2001-2024 Python Software Foundation." (suffixed: NOT a version).
+#            CFBundleIdentifier = org.python.python. The payload also carries `Versions/Current -> 3.13`
+#            (the symlink below).
+# RECONSTRUCTION (named so, not captured):
+#   - Versions/3.12/Resources/Info.plist is a `bplist00` header with filler text: a binary plist the
+#     bounded reader must not parse (the python.org installer ships XML; a binary one is the shape other
+#     tools write).
+#   - Versions/3.11 has no Resources/ directory at all (an interrupted or stripped install).
+#   - Versions/Headers is a non-version entry beside the real ones.
+Library/Frameworks/Python.framework/Versions/3.13/Resources/Info.plist	T:<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE plist SYSTEM "file://localhost/System/Library/DTDs/PropertyList.dtd">\n<plist version="0.9">\n<dict>\n\t<key>CFBundleDevelopmentRegion</key>\n\t<string>English</string>\n\t<key>CFBundleExecutable</key>\n\t<string>Python</string>\n\t<key>CFBundleGetInfoString</key>\n\t<string>Python Runtime and Library</string>\n\t<key>CFBundleIdentifier</key>\n\t<string>org.python.python</string>\n\t<key>CFBundleInfoDictionaryVersion</key>\n\t<string>6.0</string>\n\t<key>CFBundleName</key>\n\t<string>Python</string>\n\t<key>CFBundlePackageType</key>\n\t<string>FMWK</string>\n\t<key>CFBundleShortVersionString</key>\n\t<string>3.13.1, (c) 2001-2024 Python Software Foundation.</string>\n\t<key>CFBundleLongVersionString</key>\n\t<string>3.13.1, (c) 2001-2024 Python Software Foundation.</string>\n\t<key>CFBundleSignature</key>\n\t<string>????</string>\n\t<key>CFBundleVersion</key>\n\t<string>3.13.1</string>\n\t<key>CFBundleAllowMixedLocalizations</key>\n\t<true/>\n</dict>\n</plist>\n
+Library/Frameworks/Python.framework/Versions/Current	L:3.13
+Library/Frameworks/Python.framework/Versions/3.12/Resources/Info.plist	T:bplist00-binary-filler
+Library/Frameworks/Python.framework/Versions/3.11	D:
+Library/Frameworks/Python.framework/Versions/Headers	D:

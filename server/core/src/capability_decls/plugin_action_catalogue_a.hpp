@@ -302,6 +302,16 @@ inline constexpr std::array<CommandCapability, 48> kPluginActionCatalogueA{{
         .execute_gate = ExecuteGate::None,
     },
     {
+        // Mutating/Reversible on purpose (#6901, recorded decision). `db_budget_bytes` is the
+        // first `configure` parameter that can lead to deletion: lowering it makes the agent's
+        // maintenance pass evict the oldest eligible rows, inside their tier's window, within
+        // about 15 minutes, and raising it again restores nothing. The setting itself stays
+        // reversible; the deletion is done by the `rollup` pass below, which is already
+        // Destructive/Irreversible. The control that matters on this row is the AdminOrApproval
+        // gate. Unlike a Destructive pair this row does not refuse `__all__` dispatch (#3685); a
+        // Destructive reclassification, or a guard on fleet-wide small budgets, is a policy
+        // decision for the dispatch-model owner because it applies to every `configure`
+        // parameter that can lead to deletion.
         .plugin = "echo",
         .action = "configure",
         .dispatch_class = DispatchClass::Mutating,
@@ -313,6 +323,10 @@ inline constexpr std::array<CommandCapability, 48> kPluginActionCatalogueA{{
         .execute_gate = ExecuteGate::AdminOrApproval,
     },
     {
+        // ReadOnly still: the capture itself writes nothing but new rows. Since the byte budget,
+        // a collect_fast tick also ends with a bounded budget catch-up slice, so a dispatch can
+        // evict rows. It is the same slice the 60 s trigger runs, so no deletion happens that the
+        // timer would not make (#6901).
         .plugin = "echo",
         .action = "collect_fast",
         .dispatch_class = DispatchClass::ReadOnly,
@@ -361,7 +375,11 @@ inline constexpr std::array<CommandCapability, 48> kPluginActionCatalogueA{{
         // run_aggregation(), permanently deleting event rows past the
         // configured retention window — genuinely destroys data, so
         // Destructive/Irreversible/Delete like purge_source, not a plain
-        // Mutating/Write for the aggregation half alone.
+        // Mutating/Write for the aggregation half alone. Since the byte
+        // budget (#6901) the pass also evicts the oldest eligible rows
+        // INSIDE their retention window while the database is over
+        // `db_budget_bytes`, and may run the one-time conversion VACUUM;
+        // lowering the budget through `configure` reaches this deletion.
         .plugin = "echo",
         .action = "rollup",
         .dispatch_class = DispatchClass::Destructive,

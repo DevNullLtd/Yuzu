@@ -20,6 +20,10 @@
 
 #include <yuzu/plugin.hpp>
 
+#include <bounded_wait.hpp>      // bounded_call_ex: a stalled filesystem cannot hold the command worker
+#include <local_path_policy.hpp> // agents/shared: refuse UNC / device / network-mount paths
+
+#include <chrono>
 #include <format>
 #include <string>
 #include <string_view>
@@ -72,23 +76,36 @@ private:
 };
 #endif
 
-int do_free(yuzu::CommandContext& ctx, yuzu::Params params) {
-    constexpr std::string_view default_path =
-#ifdef _WIN32
-        "C:\\";
-#else
-        "/";
-#endif
-    const auto path = params.get("path", default_path);
+// What one volume query produced. A plain value type: it crosses the helper-thread boundary.
+struct Measured {
+    bool ok{false};
+    unsigned long long total{0};
+    unsigned long long free{0};
+    std::string error;
+};
 
-    unsigned long long total_bytes = 0;
-    unsigned long long free_bytes = 0;
+// The OS query itself (statvfs / statfs / GetDiskFreeSpaceExW). A query on a stalled filesystem can
+// block inside the kernel, so do_free runs this on a bounded helper (bounded_wait.hpp) and gives up
+// after kQueryBudget instead of holding a command worker.
+Measured measure_volume(const std::string& path) {
+    Measured m;
+    // Refuse a network or device path BEFORE any syscall: a UNC path makes the LocalSystem agent
+    // authenticate to the named host; on POSIX a statvfs under a network mount can block on a dead
+    // server or trigger an automount. The row names the class, never the caller's path. (Judging
+    // walks the path too, so it runs on the same bounded helper as the query.)
+    if (const auto refusal = yuzu::shared::local_path::local_path_refusal(path);
+        yuzu::shared::local_path::refused(refusal)) {
+        m.error = std::string{yuzu::shared::local_path::refusal_token(refusal)};
+        return m;
+    }
+    unsigned long long& total_bytes = m.total;
+    unsigned long long& free_bytes = m.free;
 
 #ifdef _WIN32
     const std::wstring wpath = utf8_to_wide(path);
     if (wpath.empty()) {
-        ctx.write_output(std::format("error|failed to query disk space for path: {}", path));
-        return 1;
+        m.error = std::format("failed to query disk space for path: {}", path);
+        return m;
     }
     ULARGE_INTEGER avail_to_caller{}, total{}, total_free{};
     BOOL ok;
@@ -98,8 +115,8 @@ int do_free(yuzu::CommandContext& ctx, yuzu::Params params) {
         ok = ::GetDiskFreeSpaceExW(wpath.c_str(), &avail_to_caller, &total, &total_free);
     }
     if (!ok) {
-        ctx.write_output(std::format("error|failed to query disk space for path: {}", path));
-        return 1;
+        m.error = std::format("failed to query disk space for path: {}", path);
+        return m;
     }
     total_bytes = total.QuadPart;
     free_bytes = avail_to_caller.QuadPart;
@@ -111,8 +128,8 @@ int do_free(yuzu::CommandContext& ctx, yuzu::Params params) {
     // installer-headroom basis); f_bsize is the fundamental block size.
     struct statfs vfs{};
     if (statfs(std::string(path).c_str(), &vfs) != 0) {
-        ctx.write_output(std::format("error|failed to stat path: {}", path));
-        return 1;
+        m.error = std::format("failed to stat path: {}", path);
+        return m;
     }
     const auto block_size = vfs.f_bsize;
     total_bytes = static_cast<unsigned long long>(vfs.f_blocks) * block_size;
@@ -121,8 +138,8 @@ int do_free(yuzu::CommandContext& ctx, yuzu::Params params) {
 #elif defined(__linux__)
     struct statvfs vfs{};
     if (statvfs(std::string(path).c_str(), &vfs) != 0) {
-        ctx.write_output(std::format("error|failed to stat path: {}", path));
-        return 1;
+        m.error = std::format("failed to stat path: {}", path);
+        return m;
     }
     // Some virtual / network filesystems report f_frsize == 0; fall back to
     // f_bsize so the volume doesn't silently read as 0 total / 0 free (the
@@ -134,9 +151,50 @@ int do_free(yuzu::CommandContext& ctx, yuzu::Params params) {
     free_bytes = static_cast<unsigned long long>(vfs.f_bavail) * block_size;
 
 #else
-    ctx.write_output("error|unsupported platform");
-    return 1;
+    m.error = "unsupported platform";
+    return m;
 #endif
+
+    m.ok = true;
+    return m;
+}
+
+// RESIDUAL (bounded helper inside a plugin DSO; the discovery and power_health plugins record the
+// same one): `bounded_call_ex` runs `fn` on a detached thread whose code lives in THIS plugin's
+// DSO. After a timeout the thread can still be running (blocked in the kernel on a stalled
+// filesystem or resolver) when `shutdown()` returns; the host dlclose()s plugins only at final
+// process exit (agent.cpp), and the shipped DSOs happen to stay mapped (each exports
+// STB_GNU_UNIQUE symbols) -- an accident, not a guarantee, and a plain DSO would fault. The
+// ceiling is per DSO, not process-wide: `g_outstanding_bounded_calls` is an `inline` variable, so
+// each plugin has its own 64 slots, a slot is released only by the worker, and a refused call
+// reads as a timeout. Moving the primitive into agent-core would not remove the residual (the
+// lambda bodies stay here), so it is accepted as the precedent trade (plugin.hpp: "accept a
+// bounded resource residue instead"). The drain barrier that would close it is tracked as #8204.
+// Adjudication belongs to governance, not to this file.
+constexpr auto kQueryBudget = std::chrono::seconds(15);
+
+int do_free(yuzu::CommandContext& ctx, yuzu::Params params) {
+    constexpr std::string_view default_path =
+#ifdef _WIN32
+        "C:\\";
+#else
+        "/";
+#endif
+    const auto path = params.get("path", default_path);
+
+    auto measured = yuzu::shared::bounded_call_ex(
+        std::chrono::duration_cast<std::chrono::milliseconds>(kQueryBudget),
+        [p = std::string(path)]() { return measure_volume(p); });
+    if (measured.status != yuzu::shared::BoundedCallStatus::Completed || !measured.value) {
+        ctx.write_output("error|timeout: the volume query did not answer (stalled filesystem?)");
+        return 1;
+    }
+    if (!measured.value->ok) {
+        ctx.write_output(std::format("error|{}", measured.value->error));
+        return 1;
+    }
+    const unsigned long long total_bytes = measured.value->total;
+    const unsigned long long free_bytes = measured.value->free;
 
     const unsigned long long used_bytes = total_bytes >= free_bytes ? total_bytes - free_bytes : 0;
     const int percent_used =

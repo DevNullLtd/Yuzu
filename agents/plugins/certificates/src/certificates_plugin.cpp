@@ -62,8 +62,8 @@
 #endif
 
 #ifdef __APPLE__
-// geteuid() -- privilege detection for the store-read sudo hop (mirrors
-// quarantine_plugin.cpp's sudo_prefix()). macos_console_user.hpp declares
+// geteuid() -- privilege detection for the store-read sudo hop (the same
+// root-or-sudo idiom as agents/shared/sudo_argv.hpp). macos_console_user.hpp declares
 // `namespace yuzu::macos`, and subprocess_runner.hpp declares
 // `namespace yuzu::agent` -- ALL THREE headers below MUST be included
 // here, at global scope, before the anonymous namespace below opens:
@@ -1282,8 +1282,8 @@ CertRecord parse_pem_block_macos(const std::string& pem_block, const std::string
     return rec;
 }
 
-// Whether THIS process (the agent daemon) is already root. Mirrors
-// quarantine_plugin.cpp's sudo_prefix(): the shipped macOS LaunchDaemon has
+// Whether THIS process (the agent daemon) is already root. The same
+// root-or-sudo idiom as agents/shared/sudo_argv.hpp: the shipped macOS LaunchDaemon has
 // no `UserName` key today, so it runs as root (docs/agent-privilege-model.md's
 // TL;DR) and `launchctl asuser` -- which itself requires root privileges,
 // per `man launchctl` -- already succeeds with no escalation. The target

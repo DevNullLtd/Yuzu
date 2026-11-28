@@ -397,6 +397,29 @@ void push_capped(std::vector<Entry<T>>& vec, bool& cap_hit, const View& v, F dec
     return out;
 }
 
+/// DSP0134 7.4.1 "System Enclosure or Chassis" types, indexed by the type value (index 0 is
+/// unused: 0 is not a defined type). Shared so every OS leg names a type identically.
+inline constexpr std::array<std::string_view, 37> kChassisTypeNames{
+    "",                "Other",         "Unknown",          "Desktop",
+    "Low Profile Desktop", "Pizza Box", "Mini Tower",       "Tower",
+    "Portable",        "Laptop",        "Notebook",         "Hand Held",
+    "Docking Station", "All in One",    "Sub Notebook",     "Space-saving",
+    "Lunch Box",       "Main Server Chassis", "Expansion Chassis", "SubChassis",
+    "Bus Expansion Chassis", "Peripheral Chassis", "RAID Chassis", "Rack Mount Chassis",
+    "Sealed-case PC",  "Multi-system chassis", "Compact PCI", "Advanced TCA",
+    "Blade",           "Blade Enclosure", "Tablet",         "Convertible",
+    "Detachable",      "IoT Gateway",   "Embedded PC",      "Mini PC",
+    "Stick PC"};
+
+/// The name of a chassis type value (Type3::chassis_type, already masked to 7 bits), or nullopt
+/// for 0 and for any value the specification does not define -- the caller writes "-", never a
+/// guessed name.
+[[nodiscard]] constexpr std::optional<std::string_view> chassis_type_name(unsigned t) noexcept {
+    if (t == 0 || t >= kChassisTypeNames.size())
+        return std::nullopt;
+    return kChassisTypeNames[t];
+}
+
 /// The OEM filler strings firmware ships instead of real data, matched whole (see is_placeholder).
 /// Deliberately excludes "Standard", "Default", "Family", "Empty" and "NULL": each is a plausible
 /// real value, and a false positive blanks it. Exposed so the test pins the exact table.

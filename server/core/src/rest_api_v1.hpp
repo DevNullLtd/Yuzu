@@ -24,6 +24,8 @@
 #include "device_api.hpp" // ADR-0031 WS-A4 wave 2: the public in-process DEVICE API seam
 #include "guardian_api.hpp" // ADR-0031 WS-A4 (ninth family): the public in-process Guardian-read API seam
 #include "network_perf_model.hpp"
+#include "event_emit.hpp"     // EmitEventFn: the httplib adapter half (execution_mutation.hpp takes only the request-free hook)
+#include "execution_mutation.hpp" // cancel/rerun twins: the shared admit-audit-effect sequence + its test seam
 #include "execution_tracker.hpp"
 #include "guaranteed_state_store.hpp"
 #include "instruction_store.hpp"
@@ -37,6 +39,7 @@
 #include "response_store.hpp"
 #include "result_set_store.hpp"
 #include "schedule_engine.hpp"
+#include "scoped_gate_outcome.hpp" // ScopedGateFn's return type: the per-device gate's refusal class
 #include "scope_eval_error.hpp" // #4981 PR-2: ScopeEvalError — ScopeEvaluateFn's typed failure surface
 #include "scope_engine.hpp"     // #4981 PR-2: yuzu::scope::Expression — ScopeEvaluateFn's parsed-expr param
 #include "software_deployment_store.hpp"
@@ -108,14 +111,23 @@ namespace yuzu::server {
 
 namespace detail {
 // --- /api/v1/dex/devices/{id}/live tuning (TEST SEAM, not a request knob) ---
-// The synchronous live-read handler bounds its blast radius with an in-flight cap
-// (UP-1/2/3: keeps httplib workers free for the dashboard, SSE and health probes)
-// and a bounded poll. These default to production values; unit tests lower them to
-// exercise the 429 (cap) and 504 (timeout) branches without real concurrency or a
-// ~20s wall. Process-global by design — the cap is a whole-server budget.
-std::atomic<int>& live_max_inflight();     // default 4 (strictly below the worker pool)
+// The synchronous live-read handler bounds its blast radius with a bounded poll. The poll
+// budget defaults to its production value; unit tests lower it to exercise the 504 (timeout)
+// branch without a ~20s wall. The concurrency cap is not a seam: it is the `kLiveRead` surface of
+// the shared held-open `StreamBudget` (per principal `kPerPrincipalLiveRead`, across principals
+// `kLiveReadSurfaceCap`), so a test exercises it by passing a budget of its own.
 std::atomic<int>& live_poll_max_polls();   // default 40
 std::atomic<int>& live_poll_interval_ms(); // default 500
+// DELETE /api/v1/quarantine/{agent_id}: how many times (one per live_poll_interval_ms) the handler
+// reads the device's reply to its firewall.release before answering 202. Same seam, same reason.
+std::atomic<int>& release_confirm_max_polls(); // default 10
+// TEST SEAM, in the pattern of the two above and never set outside tests: called by the DELETE
+// handler's reply wait before every poll after the first, just ahead of the interval sleep. A test
+// stores the device's reply from it, so a reply that arrives BETWEEN polls (the late confirmation,
+// #7584a) is produced without a thread or a sleep. Empty in production. Unlike the atomics above it
+// is not synchronised: set it only while no request is in flight (the tests run the handler on
+// their own thread through TestRouteSink).
+std::function<void()>& release_confirm_pause_hook();
 } // namespace detail
 
 /// Versioned REST API v1 — registers all /api/v1/ routes on the httplib::Server.
@@ -155,6 +167,21 @@ public:
                                                              yuzu::server::detail::DispatchDenial>(
         const yuzu::server::DispatchCaller& caller, std::string_view plugin,
         std::string_view action)>;
+    /// agent_id -> hostname over the device table's roster (the 30-day roster, offline devices
+    /// included — the same read the dashboard's Software devices table uses), one call per page.
+    /// Consumers: the `hostname` field of GET /api/v1/inventory/software[/components] rows.
+    /// Set via `set_hostnames_fn` (below), BEFORE `register_routes()`; `{}` leaves those
+    /// hostnames `null` (unknown).
+    using HostnamesFn = std::function<std::unordered_map<std::string, std::string>()>;
+    /// The per-device scoped gate (`AuthRoutes::require_scoped_permission_outcome`) WITH its
+    /// refusal class: the gate writes its own response and audit row, and returns why it refused
+    /// so a route can tell a denial from an unavailable or degraded authorization read. Sole
+    /// consumer: POST /api/v1/echo/retention-paused/purge. Set via `set_scoped_gate_fn` (below),
+    /// BEFORE `register_routes()`; unset makes that route answer its fail-closed 500
+    /// `scope gate not configured`.
+    using ScopedGateFn = std::function<yuzu::server::ScopedGateOutcome(
+        const httplib::Request&, httplib::Response&, const std::string& securable_type,
+        const std::string& operation, const std::string& agent_id)>;
     /// ADR-0017 admit-then-filter list-read gate for a list/fan-out route
     /// over per-agent data (`AuthRoutes::require_list_read`). Unlike PermFn/
     /// ScopedPermFn (bool: caller re-derives the session separately if
@@ -395,7 +422,7 @@ public:
         std::function<SessionRevokeResult(const std::string& username, bool revoke_api_tokens)>;
 
     /// Clear a user's account-lockout counter (admin unlock — SOC 2 CC6.3).
-    /// Wraps `AuthDB::clear_failed_logins` so RestApiV1 stays decoupled from
+    /// Wraps `AuthDB::clear_account_lockouts` (password lockout AND MFA failure budget) so RestApiV1 stays decoupled from
     /// AuthDB (same injection pattern as SessionRevokeFn). Returns true when
     /// the underlying auth.db write succeeded. Empty/missing callback =
     /// `POST /api/v1/users/<name>/unlock` returns 503.
@@ -608,8 +635,8 @@ public:
     /// Guardian rule create/update/delete/push, software package create,
     /// software deploy start, user delete/role-change, and the engine-principal
     /// and RBAC assignment routes). The routes that need step-up are classified
-    /// in step_up_policy.hpp; for those, the central check in server.cpp's
-    /// pre-request handler (step_up_gate.hpp) evaluates the same decision
+    /// in step_up_policy.hpp; for those, the central check in the post-read
+    /// stage `server.cpp` installs (step_up_gate.hpp) evaluates the same decision
     /// BEFORE the handler runs, ahead of the handler's own permission and
     /// its own cross-site copy (a cookie write has already met the server-wide
     /// same-site gate in pre-routing), and this functor repeats it from that
@@ -745,6 +772,34 @@ public:
     /// `device_ids` is unaffected either way.
     void set_all_agent_ids_fn(AllAgentIdsFn fn) { all_agent_ids_fn_ = std::move(fn); }
 
+    /// The device-table roster behind the `hostname` field of GET /api/v1/inventory/software and
+    /// .../components (see `HostnamesFn`). A setter, not a `register_routes()` parameter: the
+    /// tier-policy lexical gate pins `authorize_dispatch` as that call's trailing argument. MUST be
+    /// called BEFORE `register_routes()`, same timing contract as `set_engine_principal_store`.
+    /// Unset (`{}`, the default) leaves those hostnames `null`.
+    void set_hostnames_fn(HostnamesFn fn) { hostnames_fn_ = std::move(fn); }
+
+    /// The typed per-device scoped gate (see `ScopedGateFn`). MUST be called BEFORE
+    /// `register_routes()`: the purge route copies the function by value when routes register, so
+    /// a call after that point leaves the route on its 500 for good. Unset (`{}`, the default)
+    /// leaves POST /api/v1/echo/retention-paused/purge on its fail-closed 500.
+    void set_scoped_gate_fn(ScopedGateFn fn) { scoped_gate_fn_ = std::move(fn); }
+
+    /// TEST SEAM for POST /api/v1/executions/{id}/cancel and .../rerun. Production leaves this
+    /// unset and the routes bind `make_tracker_mutation_ports(execution_tracker)`; a test that
+    /// has no Postgres sets fake ports instead. MUST be called BEFORE `register_routes()`. An
+    /// unwired set of ports (the default) is ignored, never used as "no store".
+    void set_execution_mutation_ports_for_test(ExecutionMutationPorts ports) {
+        execution_mutation_ports_ = std::move(ports);
+    }
+
+    /// The platform event emitter (`ServerImpl::emit_event`) for the routes whose LEGACY siblings
+    /// publish an event: POST /api/v1/executions/{id}/cancel -> `execution.completed`,
+    /// POST /api/v1/executions/{id}/rerun -> `execution.created` (see
+    /// `apply_execution_mutation`). Best effort; unset = no event. MUST be called BEFORE
+    /// `register_routes()`.
+    void set_emit_event_fn(EmitEventFn fn) { emit_event_fn_ = std::move(fn); }
+
     /// #5342 Gate 7 (C5) — an audit writer that stamps the principal
     /// EXPLICITLY instead of re-resolving it from the request's session.
     /// Wired from `AuthRoutes::audit_log_for_principal`. The password routes
@@ -836,6 +891,14 @@ public:
         const std::string& target_type, const std::string& target_id, const std::string& detail)>;
     void set_audit_as_session_fn(AuditAsSessionFn fn) { audit_as_session_fn_ = std::move(fn); }
 
+    /// True while the server is draining or stopping (`ServerImpl::draining_` or
+    /// `stop_requested_`, the same predicate MCP's `set_draining_fn` reads). The per-device live
+    /// read and the quarantine release-confirm wait refuse a NEW wait while it holds: a live read
+    /// holds an HTTP worker for up to the poll budget, and the shutdown drain waits only for the
+    /// reads it counted. Unset (tests, a deployment with no drain) = never draining. MUST be
+    /// called BEFORE `register_routes()` (captured by value).
+    void set_draining_fn(std::function<bool()> fn) { draining_fn_ = std::move(fn); }
+
     /// The score policy writer behind GET/PUT/DELETE /api/v1/dex/score-policy: the observed
     /// store read, the store conditional writes and the provider (`audit` is bound per request
     /// by the handler). Unset = the three routes answer 503 "runtime config store
@@ -848,6 +911,7 @@ public:
 private:
     std::optional<DexScorePolicyWriteDeps> dex_score_policy_writer_;
     AuditAsSessionFn audit_as_session_fn_;
+    std::function<bool()> draining_fn_; // see set_draining_fn
     EnginePrincipalStore* engine_principal_store_{nullptr};
     UserExistsFn user_exists_fn_;
     const ForensicsPluginSet* forensics_plugins_{nullptr}; // #4990 - see set_forensics_plugin_set
@@ -856,6 +920,10 @@ private:
     std::vector<std::string> csrf_trusted_origins_;
     ScopeEvaluateFn scope_evaluate_fn_;
     AllAgentIdsFn all_agent_ids_fn_;
+    HostnamesFn hostnames_fn_; // see set_hostnames_fn
+    ScopedGateFn scoped_gate_fn_; // see set_scoped_gate_fn
+    ExecutionMutationPorts execution_mutation_ports_; // see set_execution_mutation_ports_for_test
+    EmitEventFn emit_event_fn_;                       // see set_emit_event_fn
 };
 
 } // namespace yuzu::server

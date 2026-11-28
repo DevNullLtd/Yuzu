@@ -20,9 +20,11 @@
 ///
 /// Error surfaces never echo raw DSN fragments: a malformed conninfo is
 /// reported as a fixed string (libpq's parse error quotes tokens, which can
-/// include credentials — F1 conditions ledger #3 on #1320). Connect errors
-/// from a well-formed conninfo pass through `PQerrorMessage`, which names
-/// host/port but never the password.
+/// include credentials — F1 conditions ledger #3 on #1320). Connect failures
+/// from a well-formed conninfo surface only a FIXED cause (`connect_failure_cause`,
+/// pg_raii.hpp) in the log and in `last_error()`, never libpq's text: that text
+/// quotes the host/port/dbname libpq parsed, and a URI password holding an unescaped
+/// '/' or '@' puts part of itself there (F56).
 ///
 /// TLS note for DSN wiring (F1 ledger #4): on Windows libpq verifies
 /// `sslmode=verify-ca/verify-full` against `%APPDATA%\postgresql\root.crt`

@@ -187,8 +187,8 @@ spec:
         example: jsmith
         platforms: [windows, linux, darwin]
       - name: enabled
-        type: bool
-        description: 'Whether the account is enabled. Values: true, false.'
+        type: string
+        description: 'Whether the account is enabled; macOS reports unknown when the login-shell read failed or was cut off. Values: true, false, unknown.'
         example: "true"
         platforms: [windows, linux, darwin]
       - name: last_logon
@@ -198,7 +198,7 @@ spec:
         platforms: [windows, linux, darwin]
       - name: description
         type: string
-        description: "The account's comment/description text (Windows comment, macOS RealName, Linux GECOS field), or \"-\" when empty. Values: free text or \"-\"."
+        description: "The account's comment/description text (Windows comment, macOS RealName, Linux GECOS field), or \"-\" when empty or, on macOS, not read. Values: free text or \"-\"."
         example: Built-in account for administering the computer/domain
         platforms: [windows, linux, darwin]
       - name: console_state
@@ -238,7 +238,9 @@ metadata:
     queries the Administrators group via NetLocalGroupGetMembers and
     reports member type (user, group, well_known_group, alias) and domain.
     On Linux checks sudo/wheel groups plus root. On macOS reads the
-    admin group via dscl.
+    admin group via dscl. On Linux, if a group or account lookup fails
+    (as opposed to the group not existing) the result is marked
+    constrained (partial) rather than silently listing fewer members.
   tags: [users, admins, security, compliance, privilege-audit]
 
 spec:
@@ -302,8 +304,10 @@ metadata:
     Lists members of a specified local group. On Windows queries
     NetLocalGroupGetMembers and reports member type (user, group,
     well_known_group, alias). On Linux reads /etc/group and checks
-    primary GID assignments in /etc/passwd. On macOS reads the group
-    via dscl. The group name is a required parameter.
+    primary GID assignments in /etc/passwd; a failed group lookup answers
+    "Group lookup failed" and a constrained (partial) result, distinct from
+    "Group not found". On macOS reads the group via dscl. The group name
+    is a required parameter.
   tags: [users, groups, security, compliance, privilege-audit]
 
 spec:

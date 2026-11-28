@@ -3,7 +3,7 @@
 /**
  * server_address_resolver.hpp -- resolves the agent's configured server
  * target ("host:port", possibly a hostname) to concrete IP literal(s) ONCE
- * at agent startup, before any plugin (including quarantine) ever runs.
+ * at agent startup, before any plugin (including firewall) ever runs.
  *
  * WHY THIS LIVES HERE, RESOLVED AT STARTUP, AND CACHED -- not re-resolved
  * on demand by a plugin at the moment it's needed: quarantine's whitelist
@@ -18,12 +18,27 @@
  * startup" instead. It also means quarantine-time performs NO DNS I/O at
  * all: resolve_server_address_literals() below is bounded, so a wedged
  * resolver delays agent startup once rather than blocking every future
- * quarantine/unquarantine/whitelist dispatch (which all share one
- * mutation gate in the quarantine plugin).
+ * quarantine/release/quarantine_allow dispatch (which all share one
+ * mutation gate in the firewall plugin).
  *
  * Threaded into every plugin's config as "agent.server_address_resolved"
- * by Agent::Run() (agent.cpp), read by the quarantine plugin's
- * do_quarantine instead of resolving anything itself.
+ * by Agent::Run() (agent.cpp), read by the firewall plugin's
+ * quarantine action instead of resolving anything itself.
+ *
+ * Its companion, "agent.server_peer" (UP-8): the literal address of the peer
+ * the LATEST successful Register actually answered on (`host:port` or
+ * `[v6]:port`, grpc_peer_literal() in server_address_parsers.hpp), published
+ * by AgentImpl::publish_server_peer at every Register and answered by
+ * yuzu_ctx_get_config from an atomic, not from the config map (empty/unset
+ * until the first Register, and whenever the peer is not a usable literal).
+ * The start-resolved set above can name a server that has since moved; the
+ * live peer is the address the control channel uses NOW. It carries the same
+ * trust rule: produced by agents/core from the stream the server answered on
+ * (certificate-authenticated when tls_enabled), never resolved by a plugin or
+ * by the host being contained -- a plugin admits only the literal published
+ * here. The firewall plugin's containment allows it first and proves it in
+ * its verification; a server re-addressed AFTER a containment still strands
+ * the host (the new address is blocked before the agent can learn it).
  *
  * Bounding note (#3429 round 4): the deadline is enforced by
  * yuzu::shared::bounded_call() (agents/shared/bounded_wait.hpp), which runs

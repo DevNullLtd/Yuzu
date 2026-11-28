@@ -29,7 +29,7 @@ Take the next free number in your block. Filename is `<number>-<kebab-slug>.md`.
 
 ## The convention binds prospectively
 
-It was adopted **after** most `0xxx` ADRs were written, so the low block is mixed: roughly 21 ADRs sit in `0xxx` that belong to a namespaced author (10 @lesault, 7 Dave Rae, 4 Alex Young).
+It was adopted **after** most `0xxx` ADRs were written, so the low block is mixed: roughly 25 ADRs sit in `0xxx` whose owner or Authors line names a namespaced author (10 @lesault, 7 Dave Rae, 5 Alex Young, 2 Liam Somerville, 1 Fraser Jarvis; recounted 2026-11-14). The Postgres store-migration ADRs (0030, 0036–0065) are counted as platform records whatever their committer. Two of the 25 (0070, 0071) were numbered after this convention was adopted.
 
 **Those are not errors and are deliberately not being renumbered.** They predate the rule, and renumbering them would churn thousands of inbound references across `CLAUDE.md`, `AGENTS.md`, `CONTEXT.md`, `docs/`, and code comments — several through routed-concern rows carrying catastrophic-if-violated invariants. Leave them where they are.
 

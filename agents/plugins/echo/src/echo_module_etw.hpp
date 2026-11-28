@@ -6,8 +6,9 @@
  * The Windows peer of the $Module capture source, structurally mirroring
  * echo_proc_etw.hpp. Subscribes a real-time ETW session to the
  * Microsoft-Windows-Kernel-Process provider with the IMAGE keyword (0x40) and
- * decodes image load (event 5) / unload (event 6) into the shared
- * ModuleEventRing the Echo plugin drains and persists. Answers "what did a
+ * decodes image load (event 5) into the shared ModuleEventRing the Echo
+ * plugin drains and persists; event 6 (unload) is not consumed, unloads are
+ * not stored. Answers "what did a
  * process LOAD" — the DLL-search-order-hijack / injection / BYOVD surface
  * $Process cannot see.
  *
@@ -47,7 +48,7 @@ namespace yuzu::echo {
 /// EVENT_RECORD keeps the ModuleEvent mapping unit-testable without ETW headers.
 struct EtwImageSample {
     std::int64_t ts_unix{0};
-    bool is_load{true};     ///< true = image load (event 5); false = unload (event 6)
+    bool is_load{true};     ///< always true from the ETW callback; false only in the pure mapping
     std::uint32_t pid{0};   ///< loading process id (System/Idle ⇒ kernel/driver load)
     std::string image_path; ///< full image path (NT \Device\... or drive form)
 };
@@ -55,11 +56,12 @@ struct EtwImageSample {
 /// Pure mapping: ETW sample → ModuleEvent. Splits image_path into module_name
 /// (basename) + module_dir (directory — NOT yet redacted; the collector redacts
 /// at drain, AFTER signing, since signing needs the real path). is_kernel =
-/// pid <= 4 (System/Idle own kernel/driver image loads). action = loaded/unloaded
-/// from is_load (a 'blocked' verdict comes only from the M3 CodeIntegrity overlay,
-/// never this provider). signed_state/signer/process_name stay default —
-/// resolved by the collector at drain. Defined in the .cpp, exercised on every
-/// platform by the unit tests.
+/// pid <= 4 (System/Idle own kernel/driver image loads). action = loaded, or
+/// unloaded when is_load is false (only this pure mapping produces that; the ETW
+/// callback never does, and apply_module_risk_filter drops it). A 'blocked'
+/// verdict comes only from the M3 CodeIntegrity overlay, never this provider.
+/// signed_state/signer/process_name stay default — resolved by the collector at
+/// drain. Defined in the .cpp, exercised on every platform by the unit tests.
 ModuleEvent etw_image_sample_to_module_event(const EtwImageSample& s);
 
 /// A code-signing verdict for one image, returned by a ModuleVerifier.
@@ -68,33 +70,70 @@ struct ModuleSignVerdict {
     std::string signer; ///< publisher CN / team id; "" if unresolved
 };
 
+/// What the system-catalog lookup found for an image WinVerifyTrust reported as having no
+/// embedded signature (TRUST_E_NOSIGNATURE). Most Windows system binaries carry no embedded
+/// signature: their hashes are listed in signed catalog files instead.
+enum class CatalogLookup : std::uint8_t {
+    kNotFound,   ///< no installed catalog lists the file hash: genuinely unsigned
+    kFoundValid, ///< a catalog lists the hash and WinVerifyTrust accepts the catalog member
+    kError,      ///< any API failure, or a catalog that lists the hash but did not verify
+};
+
+/// Pure mapping from a catalog lookup to a verdict: NotFound is kUnsigned, FoundValid is
+/// kSigned carrying the catalog's signer, everything else is kUnknown. A failed lookup is
+/// never kUnsigned, so it cannot make an ordinary system DLL read as risky.
+[[nodiscard]] ModuleSignVerdict catalog_lookup_verdict(CatalogLookup lookup,
+                                                       std::string catalog_signer = {});
+
 /// Verifier callback: full image path → verdict. The real Windows verifier
 /// (WinVerifyTrust on an open handle, signer from its provider chain, in the .cpp)
 /// is wired at drain; tests inject a fake. A null verifier yields {kUnknown, ""}
 /// (never fabricates signed).
 using ModuleVerifier = std::function<ModuleSignVerdict(const std::string& full_path)>;
 
-/// Bounded cache of signing verdicts keyed by (path, last-write-time), so the
-/// costly WinVerifyTrust runs ~once per (file, version) instead of per load.
-/// Pure + cross-platform (the verifier is injected) → unit-tested on macOS with
-/// a fake. Touched only on the drain thread, so no internal lock.
+/// Identity + change-counter of ONE open image file (WP13 / F47). Cache-key material that the
+/// file's writer cannot reset: the NTFS/ReFS file id and the file's USN (the change-journal
+/// sequence number, which advances on every data or basic-info change and cannot be set from
+/// user mode). Last-write time and size are carried only as extra equality terms: both are
+/// attacker-settable and must NEVER be the sole binding (the old key was exactly mtime).
+/// `available == false` means the stamp could not be read or proves nothing (USN unreadable, or
+/// 0 = the file has no journal record); such an image is re-verified on every load and its
+/// verdict is not cached. Plain data, so SigningCache stays portable and unit-testable.
+struct FileVersionStamp {
+    bool available{false};
+    std::uint64_t volume_serial{0};
+    std::uint64_t file_id_hi{0};
+    std::uint64_t file_id_lo{0};
+    std::uint64_t size{0};
+    std::int64_t mtime{0}; ///< extra term only (settable)
+    std::int64_t usn{0};
+    bool operator==(const FileVersionStamp&) const = default;
+};
+
+/// Bounded cache of signing verdicts keyed by (path, FileVersionStamp), so the costly
+/// WinVerifyTrust runs ~once per (file, version) instead of per load. A verdict is served only
+/// when the stamp is `available` and EVERY field matches; otherwise the image is re-verified
+/// (and an unavailable stamp is never stored - no mtime fallback). Pure + cross-platform (the
+/// verifier is injected) → unit-tested on Linux/macOS with a fake. Touched only on the drain
+/// thread, so no internal lock.
 class SigningCache {
 public:
     explicit SigningCache(std::size_t cap = 8192) : cap_(cap == 0 ? 1 : cap) {}
 
-    /// Verdict for (full_path, mtime). Cache hit only when BOTH path and mtime
-    /// match (a changed file re-verifies). On a miss, calls `verify`. Bounded:
-    /// when full and inserting a new key, clears the cache first — the working
-    /// set of distinct loaded images is small and stable, so a periodic flush is
-    /// cheaper than per-entry LRU bookkeeping.
-    ModuleSignVerdict get(const std::string& full_path, std::int64_t mtime,
+    /// Verdict for (full_path, stamp). Cache hit only when `stamp.available` AND the stored
+    /// stamp is identical (a changed file re-verifies). On a miss, calls `verify`. Bounded:
+    /// when full and inserting a new key, clears the cache first — the working set of distinct
+    /// loaded images is small and stable, so a periodic flush is cheaper than per-entry LRU
+    /// bookkeeping. A null verifier yields kUnknown (never fabricates signed). Take the stamp
+    /// BEFORE verifying so a change in between only costs a re-verify, never a stale hit.
+    ModuleSignVerdict get(const std::string& full_path, const FileVersionStamp& stamp,
                           const ModuleVerifier& verify);
 
     std::size_t size() const noexcept { return entries_.size(); }
 
 private:
     struct Entry {
-        std::int64_t mtime{0};
+        FileVersionStamp stamp;
         ModuleSignVerdict verdict;
     };
     std::unordered_map<std::string, Entry> entries_;
@@ -119,8 +158,15 @@ using ImageHandle = std::unique_ptr<void, ImageHandleCloser>;
 /// Nothing is ever reopened by name.
 [[nodiscard]] ImageHandle open_local_image_no_reparse(const std::string& nt_path);
 
-/// Last-write time of the OPEN image (the SigningCache key), unix seconds; 0 on failure.
+/// Last-write time of the OPEN image, unix seconds; 0 on failure. Only an extra term of the
+/// stamp (settable by the file's writer, so never the binding on its own).
 [[nodiscard]] std::int64_t image_mtime_unix(void* image) noexcept;
+
+/// The SigningCache key for the OPEN image (F47): volume serial + 128-bit file id + size from
+/// the handle, and the USN from FSCTL_READ_FILE_USN_DATA. `available == false` on ANY failure
+/// (non-journaled volume, USN 0, IOCTL refused). Measured on NTFS only (Windows 11
+/// 26200, standalone harness); ReFS and journal-less volumes untested - see docs/echo-module-loads.md.
+[[nodiscard]] FileVersionStamp read_image_version_stamp(void* image) noexcept;
 
 /// WinVerifyTrust on the OPEN handle (WINTRUST_FILE_INFO::hFile); `nt_path` only fills the
 /// required path field. The signer is the leaf of the provider chain's first signer.
@@ -128,10 +174,10 @@ using ImageHandle = std::unique_ptr<void, ImageHandleCloser>;
 #endif // _WIN32
 
 /// Owns a real-time ETW session on Microsoft-Windows-Kernel-Process (IMAGE
-/// keyword) and decodes image load/unload into a ModuleEventRing on a dedicated
-/// ProcessTrace thread. The $Module peer of ProcEtwCollector. The
-/// ImageStreamCollector base is non-copyable/non-movable (it owns a live
-/// session). Windows-only; every method is a no-op off-Windows and start()
+/// keyword) and decodes image load (event 5; unloads are not consumed) into a
+/// ModuleEventRing on a dedicated ProcessTrace thread. The $Module peer of
+/// ProcEtwCollector. The ImageStreamCollector base is non-copyable/non-movable
+/// (it owns a live session). Windows-only; every method is a no-op off-Windows and start()
 /// returns false so the source simply produces nothing (no poll fallback for
 /// modules — unlike process, there is no snapshot-diff equivalent).
 class ModuleEtwCollector : public ImageStreamCollector {

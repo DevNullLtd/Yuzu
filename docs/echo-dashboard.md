@@ -14,8 +14,8 @@ The Echo plugin is one of the **highest-leverage operator surfaces** in Yuzu —
 The page is also the home for several affordances that did not have anywhere to live:
 
 1. **Retention-paused source list** — the operator-facing view of `<source>_enabled=false` per device, born from issue #539. Without it, an operator who disabled `process_enabled` on a device for forensic preservation has no aggregate view of which boxes are accumulating non-aging data.
-2. **Process tree viewer** — reconstructed per-host from that host's local Echo warehouse (`$Process_Live` + `$TCP_Live`) only, with no seed (as-built; see §5). Forensic timeline of every process born under a parent over a chosen window, with an honest "no-seed" completeness caveat (Windows is names-only). **The pane also embeds device-level DNS-cache + ARP-table panels (ADR-0015)** — dispatched read-only `echo.sql` over `$DNS_Live`/`$ARP_Live` to the selected host, rendered beside the tree. These are **device views, not per-process** (the DNS cache carries no pid); they audit `echo.dns.read` / `echo.arp.read` (DNS is usage-class PII, separately countable).
-3. **Capture sources frame (ADR-0015)** — a per-device toggle table for the eleven core sources (`process`, `tcp`, `service`, `user`, `perf`, `procperf`, `netqual`, `module`, `arp`, `dns`, `registry`; the rest are toggled through `echo.configure`), with a category filter (six chips: Processes, Network, Services, User sessions, Performance and, for `registry`, System; the `registry` row also carries a NEW badge) and a **staged-then-push guardrail**: toggling a source only *stages* the change; nothing is dispatched until the operator clicks **Push** (guards against an accidental toggle of a usage-class source in either direction). Reads `echo status` + `echo compatibility`; Push dispatches `echo configure <source>_enabled` per change (audited `echo.sources.read` / `echo.sources.configure`). The same configure path is reachable via MCP/REST `crossplatform.echo.configure`.
+2. **Process tree viewer** — built per host and per hour from that host's own hourly roll-up (`$Process_Hourly` + `$TCP_Hourly`) only (as-built; see §5). A name-level tree of what started and stopped in one chosen hour, with start and stop counts, flagged anomalies and a plain statement of what the roll-up does not keep (process ids, command lines, paths). **The pane also embeds device-level DNS and ARP panels (ADR-0015)** — dispatched read-only `echo.sql` over `$DNS_Hourly`/`$ARP_Hourly` for the selected hour, rendered beside the tree. These are **device views, not per-process** (the DNS roll-up carries no process); they audit `echo.dns.read` / `echo.arp.read`.
+3. **Capture sources frame (ADR-0015)** — a per-device toggle table for the eleven core sources (`process`, `tcp`, `service`, `user`, `perf`, `procperf`, `netqual`, `module`, `arp`, `dns`, `registry`; the rest are toggled through `echo.configure`), with a category filter (six chips: Processes, Network, Services, User sessions, Performance and, for `registry`, System; the `registry` row also carries a NEW badge) and a **staged-then-push guardrail**: toggling a source only *stages* the change; nothing is dispatched until the operator clicks **Push** (guards against an accidental toggle of a usage-class source in either direction). Reads `echo status` + `echo compatibility`; Push dispatches `echo configure <source>_enabled` per change (audited `echo.sources.read` / `echo.sources.configure`). Push is **audit-first** (ADR-0033 §9, "no audit row, no mutation"): one `echo.sources.configure` / `attempted` row listing every validated change is stored before the first dispatch, and if it cannot be stored the push is refused with 503 and `Sec-Audit-Failed` and nothing is dispatched; the permissions are decided and the caller derived again before each source is dispatched, so a grant or session withdrawn after that row dispatches nothing and one withdrawn between two sources stops the rest (a `failure` row, `permission_revoked sent=<n> <pairs not dispatched>`). A dispatch the chokepoint refuses (the push needs `Infrastructure:Write` and, because this route stamps no approval, a caller whose effective role is admin) ends the batch with `dispatch_denied reason=<token>`, and one that throws with `dispatch_exception`. The per-source outcome rows (`dispatched` / `no_agents`) stay set-and-proceed. The page swaps nothing from the response, so the toast is server-authored (`HX-Trigger`) on every answer after authentication, refusals included, and counted in `yuzu_echo_sources_push_total{result}`. The same configure path is reachable via MCP/REST `crossplatform.echo.configure`.
 
 The page is also the surface where **scope walking** (per `docs/scope-walking-design.md`) becomes most visibly useful — the Echo SQL query is the canonical iterative-narrowing tool (it now starts from the Result sets page, **From Echo query**, rather than from a frame on `/echo`), and result-set chips are the operator's reasoning chain made visible.
 
@@ -36,9 +36,9 @@ The page is also the surface where **scope walking** (per `docs/scope-walking-de
  │  │  ─── lineage breadcrumb (per scope-walking §8.2) ────────────────  │    │
  │  └────────────────────────────────────────────────────────────────────┘    │
  │  ┌─ Retention-paused sources (PR-A) ──────────────────────────────────┐    │
- │  │   device              source     paused since   live rows  oldest  │    │
- │  │   prod-eu-1 (Linux)   process    2026-04-25      18,402   31d 4h   │    │
- │  │   prod-eu-1 (Linux)   tcp        2026-04-25       4,193   31d 4h   │    │
+ │  │   device         source   paused since  hourly rows  oldest bucket │    │
+ │  │   prod-eu-1      process  2026-04-25       18,402   03-25 04:00    │    │
+ │  │   prod-eu-1      tcp      2026-04-25        4,193   03-25 04:00    │    │
  │  │   ...                                                              │    │
  │  │   [Re-enable]  [Purge data]  [Export CSV]                          │    │
  │  └────────────────────────────────────────────────────────────────────┘    │
@@ -50,18 +50,19 @@ The page is also the surface where **scope walking** (per `docs/scope-walking-de
  │  │   [Save as result set ▼ "chrome-procs"]                            │    │
  │  └────────────────────────────────────────────────────────────────────┘    │
  │  ┌─ Process tree viewer (PR-H) ───────────────────────────────────────┐    │
- │  │   device: [pick from scope ▼]                                      │    │
+ │  │   device: [pick from scope ▼]  hour: [2026-04-25 09:00 UTC ▼]      │    │
  │  │                                                                    │    │
- │  │   1   systemd                                                      │    │
- │  │   ├── 234   sshd                                                   │    │
- │  │   │   └── 1402  bash (user=alice)                                  │    │
- │  │   │       └── 1419  python3 train.py  ← still running              │    │
- │  │   ├── 412   docker                                                 │    │
- │  │   │   ├── 998   containerd                                         │    │
+ │  │                                                     starts / stops │    │
+ │  │   systemd                                                   1 / 0  │    │
+ │  │   ├── sshd                                                 14 / 14 │    │
+ │  │   │   └── bash (user=alice)                                 9 / 9  │    │
+ │  │   │       └── python3                                       3 / 2  │    │
+ │  │   ├── docker                                                1 / 0  │    │
+ │  │   │   ├── containerd                                        1 / 0  │    │
  │  │   │   └── ...                                                      │    │
- │  │   ├── 814   yuzu-agent  (★ self)                                   │    │
+ │  │   ├── yuzu-agent  (★ self)                                  1 / 0  │    │
  │  │   ...                                                              │    │
- │  │   Tree as observed since 2026-04-12 09:14 UTC (agent install)      │    │
+ │  │   Names only: ids, command lines and paths are not kept.           │    │
  │  └────────────────────────────────────────────────────────────────────┘    │
  │                                                                            │
  ├─ Settings      (existing)                                                  │
@@ -87,7 +88,7 @@ URL structure:
 
 The source of truth is the agent's `echo_config` table — the `<source>_enabled` keys, set by the `echo.configure` action. The server does not currently maintain a centralised "Echo config" mirror; the data path is **request-driven**:
 
-1. Page load fans out `echo.status` (extended in PR-A to emit the four `<source>_enabled` values + the `<source>_live_rows` count + `<source>_oldest_ts` per source) to every device the page's scope resolves to. Scope is the active scope chip (default `__all__` for fresh page load).
+1. Page load fans out `echo.status` (extended in PR-A to emit the four `<source>_enabled` values + the `<source>_rows` count + `<source>_oldest_ts` per source; the server reads `<source>_rows`; a source with no `<source>_rows` shows a dash) to every device the page's scope resolves to. Scope is the active scope chip (default `__all__` for fresh page load).
 2. Responses stream back via the standard agent-streaming pipeline.
 3. Server collates into a transient in-memory table; renders as HTMX OOB swaps.
 4. Empty rows (`enabled=true` for all four sources) are dropped — the table only shows the *paused* state, not the entire fleet.
@@ -107,11 +108,11 @@ The action's response gains four lines per source (so 16 new lines total for the
 
 ```
 config|process_enabled|true
-config|process_live_rows|18402
+config|process_rows|18402
 config|process_oldest_ts|1730000000
 config|process_paused_at|0           # 0 = never; otherwise the ts when last set to false
 config|tcp_enabled|false
-config|tcp_live_rows|4193
+config|tcp_rows|4193
 config|tcp_oldest_ts|1733000000
 config|tcp_paused_at|1735689600
 ...
@@ -127,20 +128,30 @@ Per-source independence (the #539 invariant) means re-enabling one source on a d
 
 ### 3.4 Purge action
 
-The "Purge data" button on a row is more dangerous than re-enable — it tells the agent to drop every row from `<source>_live`, `<source>_hourly`, `<source>_daily`, `<source>_monthly` for that source, *without* re-enabling the collector. The use case is "we paused process collection 8 weeks ago for forensic preservation; we have what we need, the disk is filling up, drop the rows but keep the collector paused."
+The "Purge data" button on a row is more dangerous than re-enable — it tells the agent to drop every row from the `<source>_hourly`, `<source>_daily` and `<source>_monthly` tiers for that source, *without* re-enabling the collector. The use case is "we paused process collection 8 weeks ago for forensic preservation; we have what we need, the disk is filling up, drop the rows but keep the collector paused."
 
-Server dispatches a new agent action `echo.purge_source` with `{source: <name>}`. The action is gated behind a typed-hostname confirmation ("type the device hostname to confirm purge of `process` data"), per the destructive-action discipline in the project root `CLAUDE.md`. Audit row: `action: echo.source.purge, principal: <session>, result: success|failure, detail: device=<id> source=<name>` — the dispatch audit row does **not** carry `rows_deleted` (see the as-shipped note below).
+Server dispatches a new agent action `echo.purge_source` with `{source: <name>}`. The action is gated behind a typed-hostname confirmation ("type the device hostname to confirm purge of `process` data"), per the destructive-action discipline in the project root `CLAUDE.md`. Audit rows: `action: echo.source.purge, principal: <session>`, first `result: attempted` (before the dispatch), then `result: success|failure`, `detail: device=<id> source=<name> cid=<correlation-id>` — the `cid` is the same, last token on the `attempted` row and on every row the request writes after it, so an outcome pairs with its attempt — and the dispatch audit row does **not** carry `rows_deleted` (see the as-shipped note below). The `echo.source.purge` row of `docs/user-manual/audit-log.md` is the authoritative list of every result and `detail` the purge writes, including the `denied` rows a refused request writes before any `attempted` row.
 
-> **As shipped (Phase 15.A, 2026-07-01).** Route `POST /fragments/echo/retention-paused/purge`; audit verb `echo.source.purge` (matching the `echo.source.reenable` sibling); metric `yuzu_echo_source_purge_total{result}`. The typed confirmation is a native `prompt()` ("type the device hostname"), not a bespoke modal — CSP-safe (no `hx-on`/eval), consistent with the native `confirm()` used for re-enable. **The paused-guard is agent-side and authoritative:** `echo.purge_source` refuses (`source_not_paused`) if the source is currently enabled, or (`config_unreadable`) if the enable flag cannot be read so the agent cannot confirm the source is paused (nothing is purged either way), which closes the scan→purge TOCTOU. The server does **not** enforce a `SOURCE_NOT_PAUSED` check (§3.5) because the retention-paused frame is an ephemeral live scan with no persisted paused-state to check. Dispatch is fire-and-forget, so `rows_deleted` is computed agent-side and returned in the response record — it is not in the immediate dispatch audit row.
+> **As shipped (Phase 15.A, 2026-07-01).** Route `POST /fragments/echo/retention-paused/purge`; audit verb `echo.source.purge` (matching the `echo.source.reenable` sibling); metric `yuzu_echo_source_purge_total{result,surface}` (§7). The typed confirmation is a native `prompt()` ("type the device hostname"), not a bespoke modal — CSP-safe (no `hx-on`/eval), consistent with the native `confirm()` used for re-enable. **The paused-guard is agent-side and authoritative:** `echo.purge_source` refuses (`source_not_paused`) if the source is currently enabled, or (`config_unreadable`) if the enable flag cannot be read so the agent cannot confirm the source is paused (nothing is purged either way), which closes the scan→purge TOCTOU. The server does **not** enforce a `SOURCE_NOT_PAUSED` check (§3.5) because the retention-paused frame is an ephemeral live scan with no persisted paused-state to check. Dispatch is fire-and-forget, so `rows_deleted` is computed agent-side and returned in the response record — it is not in the immediate dispatch audit row. Since the roll-up-only change the record also carries `dictionary_pending` and `wal_checkpoint_pending`: either `true` (with a `CONSTRAINED` result status, detail `echo:purge_dictionary_pending` or `echo:purge_wal_pending`; the completeness stays in the agent's log) means the rows are deleted but the dictionary sweep that follows ran out of its deadline, was stopped or failed (`dictionary_pending`, the strings those rows referenced stay on the device until the weekly sweep or a rerun of the purge), or the final WAL checkpoint could not truncate (`wal_checkpoint_pending`, the deleted pages stay in the write-ahead log until a later checkpoint truncates it; a rerun of the purge does) — a pending result is not a complete erasure, `CONSTRAINED` can arrive with `dictionary_pending` false, and nothing in the dispatch audit row says which it was.
 >
+> **Per-device scoped gate (#2540).** Both fragment POSTs authorize through the per-device scoped-permission gate like the REST twin, so a management-group-scoped operator can act on in-scope devices and a no-grant caller now gets the 404 collapse (`scope_violation`) where it used to get a 403 (`rbac_denied`). The gate reports why it refused as a typed class (`ScopedGateOutcome`), so an authorization that could not be evaluated is answered `503` and recorded `store_unavailable`, not collapsed into that `404` (§3.5). The frame (`GET /fragments/echo/retention-paused`) is gated by the fleet read gate and shows only in-scope rows. **Row buttons still follow the global grant:** the Re-enable and Purge buttons render only for a holder of a global `Execution:Execute` / `Infrastructure:Delete` grant, so a scoped operator sees their in-scope rows without buttons. They purge through `POST /api/v1/echo/retention-paused/purge`; Re-enable has no REST route, so for a scoped operator the dashboard shows no Re-enable button even though the re-enable POST itself admits them. A per-device button probe is not built because every refused scoped probe writes an audit denial row.
+
 > **A1 REST parity + generic-dispatch hardening (2026-07-01).** Automation/MCP callers use the structured `POST /api/v1/echo/retention-paused/purge` (JSON body `{device_id, source}`, `Infrastructure:Delete` per-device-scoped, A4 error envelope, `202` + `command_id`; audited fail-closed — no dispatch without a durable audit row). Both the fragment and the REST route confirm the guard is agent-side authoritative. The generic `POST /api/command` escape hatch now also elevates destructive actions: `echo.purge_source` there additionally requires `Infrastructure:Delete` and is confined to the caller's visible agents with untargeted broadcast/scope fan-out refused, so it can't be a weaker path than the dedicated route. The atomic agent-side guard (check + delete under one lock) closes the agent-local check→delete race in addition to the scan→purge TOCTOU.
 
 ### 3.5 Permissions and safety
 
 - View-only access requires `Infrastructure:Read`.
 - **Scan fleet** requires `Execution:Execute` (it dispatches a fleet-wide command — same tier as `run-instruction` and `echo-execute` siblings).
-- **Re-enable** requires `Execution:Execute` and the operator's RBAC visibility on the target device. Out-of-scope `device_id` values collapse to the same 404 response as not-connected agents (no enumeration oracle); the audit log records the real reason server-side.
-- Purge requires `Infrastructure:Delete` on the target device (a higher tier than re-enable's `Execution:Execute`), plus the operator's RBAC visibility on the device (same 404-collapse as re-enable). The paused-state guard is **agent-side and authoritative**: `echo.purge_source` refuses (`source_not_paused`) unless the source currently reports disabled, or (`config_unreadable`) when the enable flag cannot be read so the agent cannot confirm it (nothing is purged either way), which closes the scan→purge TOCTOU and prevents purging an actively-collecting source. The server does **not** enforce a `SOURCE_NOT_PAUSED` check — the retention-paused frame is an ephemeral live scan with no persisted paused-state to check, so the authoritative guard lives on the agent that owns the data (see §3.4). The agent action validates `source` against the full capture-source registry; the server route additionally restricts it to the four retention-frame sources `{process, tcp, service, user}`.
+- **Re-enable** requires `Execution:Execute` on the target device, decided by the per-device scoped-permission gate (the same chokepoint as the REST purge twin), which is the route's sole authorization gate and is decided again after the `attempted` audit row. The gate answers with its own refusal class and the route admits only on the one admitting class. A denied `device_id` collapses to the same 404 response as not-connected agents (no enumeration oracle); the audit log records the real reason server-side (`scope_violation`, or `permission_revoked` when the grant moved, or the session ended, after the `attempted` row). An authorization that could not be evaluated is answered `503` with an error toast, never the 404 (htmx does not swap a `5xx` body on this page, so the toast is what the operator sees): an unwired gate, a gate that itself answers 503 (`scoped_gate_unavailable`), and a failed RBAC or management-group read (`store_unavailable store=<mgmt_group_store|rbac_store>`, recorded `denied` at admission and `failure` after the `attempted` row, counted `store_unavailable`). The store label is the gate's own class, the same value that marks the gate's `auth.scoped_permission_required` row `(read degraded: <store>)`. The gate's response to the caller is unchanged: for a failed read it still refuses fail closed (ADR-0041); only this route's own answer, audit row and metric tell the outage from a denial. A session that ended before the gate was asked is recorded `denied` `session_revoked`, not a scope violation. A service-scoped API token is refused `403` on both POSTs before the gate (audit `denied`, `service_scoped_token_denied`), as it was before #2540: the dashboard fragments are a cookie-session surface.
+- **Repeat bound.** A re-enable or purge is dispatched at most once per device and source per 30 seconds. The key is held from the gate's admission to the end of the request, so a repeat that arrives while the first is still in flight is refused too, and the window starts at the dispatch; an attempt that dispatched nothing (the `attempted` row could not be stored, a refusal after the row, a dispatch denial, a zero-reach) frees the key at once. A repeat answers `429` with `Retry-After`, an error toast saying how long to wait, no `attempted` row, an audit row `denied` `rate_limited cooldown=<N>s`, and counts `rate_limited`. The window is kept in memory per server process: it is lost on a restart and each replica has its own. The map is bounded at 4,096 keys: with that many held or inside their window, every further purge and re-enable is refused for up to 30 seconds, which takes 4,096 dispatches by authorized callers inside one window, so it is an availability limit, not a bypass. The REST purge has no such bound.
+- Purge requires `Infrastructure:Delete` on the target device (a higher tier than re-enable's `Execution:Execute`), decided by the same per-device scoped gate (same 404-collapse, 503 and `store_unavailable` when authorization could not be evaluated, service-scoped-token refusal, repeat bound and re-decision after the `attempted` row as re-enable). The dispatch still narrows to the caller's `Execution:Execute` set, so a caller with `Infrastructure:Delete` but no `Execution:Execute` on the device passes the gate and then reads `Agent not reachable.` (audit `agent_not_connected`), as on the REST route. The paused-state guard is **agent-side and authoritative**: `echo.purge_source` refuses (`source_not_paused`) unless the source currently reports disabled, or (`config_unreadable`) when the enable flag cannot be read so the agent cannot confirm it (nothing is purged either way), which closes the scan→purge TOCTOU and prevents purging an actively-collecting source. The server does **not** enforce a `SOURCE_NOT_PAUSED` check — the retention-paused frame is an ephemeral live scan with no persisted paused-state to check, so the authoritative guard lives on the agent that owns the data (see §3.4). The agent action validates `source` against the full capture-source registry; the server route additionally restricts it to the four retention-frame sources `{process, tcp, service, user}`.
+
+**Known residuals of the typed refusal class** (documented, not closed by this change):
+
+- When both the management-group store and the RBAC store fail, the label names the first failed read, which is the RBAC store, so a combined outage reads `rbac_store`.
+- An engine principal's degraded read is still recorded as a refusal: the gate's engine branch is deliberately deny-only and uses the unchecked read, so the gate returns the plain-denial class and the REST purge counts `scope_violation` for it.
+- A service token's `ITServiceOwner` ceiling failure or tag-store failure is answered `503` by the gate itself and counts `infra_unavailable`, not `store_unavailable`.
+- In a partial management-group outage where the member read works and the ancestor read fails, a device with group membership answers `503` while an unknown id still answers `404`: a narrow existence signal that the 404 collapse otherwise prevents (an authenticated operator, one failure shape, nothing the caller can induce).
 
 ### 3.6 Tests
 
@@ -163,75 +174,99 @@ No changes to the `echo.sql` agent action; the change is purely server-side scop
 ## 5. PR-H — Process tree viewer (**as-built**)
 
 > **Deviation from the original seed-based design below (kept for history).** What
-> shipped reconstructs the tree from **the agent's existing local Echo warehouse
-> only** (`$Process_Live` + `$TCP_Live`, queried via the read-only `echo.sql`
-> action) — there is **no agent-side seed action, no `action='seed'` rows, no
-> `__checkpoint__` rows, and (until #4027) no `/api/v1/echo/process-tree` REST
-> surface at all**. #4027 added `GET /api/v1/echo/process-tree` as the frame's
-> device-PICKER list twin only (§5.6) — the per-device reconstructed-tree JSON
-> surface this paragraph is about remains deferred. This was
-> a deliberate scope choice (local-Echo-data-only); the consequence is an honest
-> completeness limit (see "Honesty" below). Modules: server engine
+> shipped builds the tree from **the agent's own hourly roll-up only**
+> (`$Process_Hourly` + `$TCP_Hourly`, queried via the read-only `echo.sql`
+> action) for **one hour at a time** — there is **no agent-side seed action, no
+> `action='seed'` rows, no `__checkpoint__` rows, and (until #4027) no
+> `/api/v1/echo/process-tree` REST surface at all**. #4027 added `GET
+> /api/v1/echo/process-tree` as the frame's device-PICKER list twin only (§5.6) — the
+> per-device reconstructed-tree JSON surface this paragraph is about remains
+> deferred. This was a deliberate scope choice (local-Echo-data-only); the consequence
+> is an honest limit on detail (see "Honesty" below). Modules: server engine
 > `server/core/src/echo_process_tree.{hpp,cpp}` (pure, unit-tested), routes
 > `server/core/src/echo_tree_routes.{hpp,cpp}`, page `echo_page_ui.cpp` Frame 3.
 
 ### 5.1 Reconstruction model (as-built)
 
-- The viewer dispatches two canned, **read-only** `echo.sql` queries to ONE selected
-  live host — `SELECT … FROM $Process_Live` and `… FROM $TCP_Live` — through the
-  same dispatch-and-poll seam the device-page "Get live info" uses (untracked
-  dispatch, `execution_id=""`, so it never enters the executions drawer). The agent
-  runs them on its read-only authorizer connection (#760/#631).
-- The agent forbids recursive CTEs, so the tree is reconstructed **server-side in
-  C++** from the flat event rows: per-pid alive-intervals are built from the
-  `started`/`stopped` stream, incarnations whose lifetime overlaps the chosen window
-  `[from, to]` are kept (PID-reuse-safe — each lifetime is its own node), and each is
-  linked to the parent incarnation that owned its `ppid` when it started. Orphans
-  (parent not present / `ppid` 0 / start event aged out) become roots. Cycle- and
-  50k-node-cap guarded.
-- **Timescale controls.** Preset chips — **On boot · On agent install · Last minute
-  · Last 10m · Last hour · Last day** — plus a **custom From/To (UTC)** box.
-  Point-in-time is the `from == to` case. `to` is the upper bound (running-vs-exited
-  is decided at `to`); the SQL fetch lower bound stays oldest-retained so a
-  long-running process started before the window still appears. **`On boot` and
-  `On agent install` are Echo-derived proxies** (Echo has no boot/install-time column):
-  install = `MIN(ts)` over retained rows; boot = the most-recent start of a root
-  process (`ppid==0`), falling back to install.
+- The viewer dispatches three canned, **read-only** `echo.sql` queries to ONE selected
+  live host through the same dispatch-and-poll seam the device-page "Get live info" uses
+  (untracked dispatch, `execution_id=""`, so it never enters the executions drawer): a
+  `SELECT DISTINCT hour_ts FROM $Process_Hourly` over the window (the Hour selector, at
+  most 168 hours), and `… FROM $Process_Hourly` and `… FROM $TCP_Hourly` for **one
+  hour** (`WHERE hour_ts = <hour>`). The agent runs them on its read-only authorizer
+  connection (#760/#631). Every bound is an `int64` built from whole-hour values.
+- **An answer is never shown as complete when it may not be.** The agent's `echo.sql`
+  applies its own row limit (10,000 rows by default, whatever `LIMIT` the query names) and a 10 second statement deadline (a statement over it fails with `query exceeded the 10 s statement deadline`, never a short result), so
+  an answer at that count is flagged ("Results were cut at 10,000 rows for this hour"). A
+  long answer arrives as several response frames; the page reads every frame of the
+  command, and keeps polling until the command has finished. A row with the wrong number
+  of cells is dropped and counted ("N rows unreadable"); a failed read says so, showing the
+  device's own error ("The device reported an error: ..."), instead of showing an empty
+  tree. The agent writes each cell raw, joined by `|`, so a process name that itself
+  contains `|` or a newline can still shift cells or forge a row until the agent escapes
+  them (the server cannot tell a forged row with the right cell count from a real one).
+- The hourly roll-up carries no process id, so the tree is **name-level**: one node per
+  process name (and user) in the chosen hour, linked to its parent **by name** from
+  the row's `parent_name`. A name whose parent is itself, or that has no parent row,
+  becomes a root; a name reached by more than one parent is placed once, under the
+  parent with the most starts (ties: the lowest name), with its counts summed; cycles
+  terminate at their lowest (name, user) member and every node is shown once, whatever
+  order the rows arrive in. The suspicious-spawn check runs on every row, whichever
+  parent the node is placed under. The render is capped at 50k names and a display
+  depth limit, and says so when either applies.
+- **Timescale controls.** Preset chips — **Last hour · Last 24 hours · Last 7 days**
+  (whole hourly buckets ending at the last complete hour) — plus a **custom From/To
+  (UTC)** box that floors to the hour. The default is 24 hours. A window is at most 168
+  hourly buckets. The tree itself shows **one hour**: an **Hour** selector lists the
+  hours the device reports for the window, newest first; the window's last complete
+  hour is shown by default, and an hour asked for that the device did not report is
+  offered too, so the box and the banner agree.
+  There are no boot or agent-install anchors (they need process ids and raw capture
+  rows, which the roll-up does not keep).
 
-**Honesty in framing.** Banner reads e.g. `Window <from> → <to> · observed since
-<oldest-retained> · 411 nodes (281 running / 130 exited) · 0 flagged`, with a note
-that — because there is **no seed** — a process whose `started` event has aged out of
-the 100k `$Process_Live` cap (or that predates the oldest retained row) may not
-appear, and that the boot/install anchors are proxies. On **Windows the feeder is
-ETW (names-only)** so per-process path and command line are blank (stated inline);
-they are populated on Linux/macOS.
+**Honesty in framing.** The banner reads e.g. `Hour <hour> · 41 process names · 118
+starts · 2 abnormal exits · 1 flagged`, and a note says the tree is built from the
+host's hourly roll-up, names only, and that processes sharing a name share one
+position. Windows and Linux/macOS look the same: process ids, command lines and
+paths are not kept by the roll-up on any platform, and the detail panel says so.
 
-### 5.2 Filtering, grouping, network (client-side display)
+### 5.2 Filtering, network (client-side display)
 
-Reconstruction always returns the **full** tree; display filtering is client-side
-(instant, no re-dispatch — each row carries `data-state`/`data-anom`):
+The server renders the **full** tree for the hour; display filtering is client-side
+(instant, no re-dispatch — each row carries `data-anom`):
 
-- **State filter** — All / Running / Exited chips.
-- **Anomalies only** — toggle (the sole heuristic is a **suspicious parent→child**
-  name-pair denylist, e.g. an office app or browser spawning a shell/LOLBin; flagged
-  server-side, name-based so it works on Windows).
-- **Text filter** — matches name / PID / **remote IP**.
-- All three combine, reveal+expand the ancestor branches of matches, and are
-  re-applied after every tree swap (`htmx:afterSettle`).
-- **Same-name grouping** — 4+ identical-name siblings collapse into one
-  `name ×N (R running · E exited)` row (e.g. `svchost.exe ×106`), expandable to the
-  individual PIDs (each still drill-able). Filters auto-expand groups with matches.
-- **Inline network** — each row shows its `$TCP_Live` connections joined by pid:
-  a count + remote `IP:port` endpoints (public/routable egress highlighted amber;
-  listeners shown as `:port listen`). Full connection table is in the detail panel.
+- **Anomalies only** — toggle. The anomaly set is a row with **abnormal exits** in the
+  hour, or a **suspicious parent→child** name-pair denylist hit (e.g. an office app or
+  browser spawning a shell/LOLBin; flagged server-side, name-based). A name with more
+  stops than starts is shown as a soft note in the detail panel, not as an anomaly.
+  Elevated-process and spoofed-parent flags follow once the agent writes those columns.
+- **Text filter** — matches name, user or **remote IP**.
+- Both combine, reveal+expand the ancestor branches of matches, and are re-applied
+  after every tree swap (`htmx:afterSettle`).
+- **Counts, not state.** Each row shows `started N · stopped M` for the hour; there is
+  no running/exited state and no same-name grouping, because the roll-up has already
+  merged same-name processes into one node.
+- **Inline network** — each row shows the hour's `$TCP_Hourly` connections joined by
+  process **name**: a count + remote `IP:port` endpoints (public/routable egress
+  highlighted amber; listeners shown as `:port listen`). The full connection table is in
+  the detail panel.
+- **Device network.** Beside the tree, device-level **DNS** and **ARP** panels read
+  `$DNS_Hourly` and `$ARP_Hourly` for the same hour (`GET
+  /fragments/echo/process-tree/device-net`): per-hour appear / remove counts. The agent
+  does not write a DNS "no such name" count or the ARP router role and rebind count yet,
+  so those columns are not shown; they return when the agent writes them. Each panel
+  reads for the device the tree was built for (the device id travels in the URL), a
+  new run or a note clears them, and a render is audited as `echo.dns.read` /
+  `echo.arp.read` with the hour and row count.
 
 ### 5.3 Layout & detail panel
 
 Two-column: a scrollable tree on the left and a **sticky, always-visible detail
-panel on the right** (stacks below on narrow viewports). Clicking any process row
-hx-gets `/fragments/echo/process-tree/detail` into the right panel — name, PID, parent
-PID, user, running/exited + start time, path + command line (blank-with-note on
-Windows), the process's connections, and anomaly evidence. The detail renders from a
+panel on the right** (stacks below on narrow viewports). Clicking any name row
+hx-gets `/fragments/echo/process-tree/detail` into the right panel — name, parent
+name, user, started / stopped counts for the hour, abnormal exits, anomaly evidence,
+the name's connections for the hour, and a line stating what is not kept (process ids,
+command lines, file paths). The detail renders from a
 **server-side reconstruction cache** (bounded LRU, 180 s TTL, keyed by a CSPRNG token —
 `secure_random::random_hex`, never `mt19937`) so row clicks need no further agent
 round-trip. The cache entry is **bound to the operator who created it**: `detail`
@@ -245,9 +280,23 @@ in-panel error and caches nothing rather than minting a weak token.
 | Route | Purpose |
 |---|---|
 | `GET /fragments/echo/process-tree` | Frame body: host picker (operator-scoped) + timescale + filter bar + tree/detail targets |
-| `GET /fragments/echo/process-tree/run?device=&preset=&from=&to=` | Resolve window, dispatch the two `echo.sql`, return the polling fragment |
-| `GET /fragments/echo/process-tree/result?…&pcmd=&tcmd=&n=` | Poll both commands, reconstruct, cache, render the tree |
+| `GET /fragments/echo/process-tree/run?device=&preset=1h\|24h\|7d\|custom&from=&to=&hour=` | Resolve the whole-hour window, dispatch the two hourly `echo.sql`, return the polling fragment |
+| `GET /fragments/echo/process-tree/result?…&pcmd=&tcmd=&n=` | Poll both commands, build the name-level tree for the chosen hour (newest by default) with the Hour selector, cache, render |
+| `GET /fragments/echo/process-tree/device-net?device=&dcmd=&acmd=&hour=&n=` | Dispatch and poll the hourly DNS and ARP queries, render the device network panels for the hour |
 | `GET /fragments/echo/process-tree/detail?token=&node=` | Render one node's detail from the cache (re-checks scope **+ Execute + originating principal**) |
+
+A `device` longer than 256 bytes or containing a byte below 0x20 (a control character) is
+refused with status 400 on `run`, `result`, `device-net` and the capture-sources load and push
+routes, before any permission check, dispatch or audit row. The routes answer with the note
+"Invalid device id."; the capture-sources push also raises the error toast "Invalid device id.",
+which is the only signal visible there, because the dashboard's htmx drops a 4xx body. Agent
+registration and enrolment already refuse such an id (over 256 bytes, or a control byte), so
+the case cannot arise for a registered device: only a hand-built URL reaches this refusal. The
+DEX per-device fragments, the device-page fragments, the REST purge
+(`POST /api/v1/echo/retention-paused/purge`) and the two retention-paused posts on the Echo page
+(`POST /fragments/echo/retention-paused/reenable` and `.../purge`, which answer
+"Invalid device id." and count the refusal as `invalid_input`) refuse the same ids with a 400 before
+the per-device permission check.
 
 ### 5.5 Permissions & audit
 
@@ -262,11 +311,11 @@ in-panel error and caches nothing rather than minting a weak token.
   binds to the originating principal. So a leaked/predicted token can neither cross
   management scope, downgrade the Execute tier (read behavioral detail an operator
   couldn't reconstruct themselves), nor be replayed under a different session.
-- `$Process_Live.cmdline` is already redaction-applied at capture by the agent, so no
-  server-side re-redaction is needed; all agent-controlled fields are HTML-escaped.
+- The hourly roll-up holds names, counts and remote endpoints only (no command lines or
+  paths); all agent-controlled fields are HTML-escaped.
 - Agent output is byte-capped before parse (16 MiB process / 4 MiB TCP, defense in
   depth over the gRPC message bound); the `echo.sql` query interpolates only an
-  `int64` upper-bound timestamp (no string concat — see the load-bearing comment at
+  whole-hour `int64` bounds (no string concat — see the load-bearing comment at
   the query site).
 - Audit `echo.process_tree.read` fires twice (parity with `device.live.*`): a
   **dispatch** row when the live query is sent (recorded even if the device is offline
@@ -298,7 +347,7 @@ in-panel error and caches nothing rather than minting a weak token.
   pair is an ordinary `echo sql` dispatch result (`Infrastructure:Read`, no
   execute gate) reachable in principle through the already-twinned generic
   dispatch surface (`execute_instruction` / `POST /api/command`) by reproducing
-  the two canned `$Process_Live`/`$TCP_Live` queries verbatim — not a dedicated
+  the two canned `$Process_Hourly`/`$TCP_Hourly` queries verbatim — not a dedicated
   API path, and a real twin would still need a new async polling contract (no
   htmx auto-reissue on REST/MCP). Both are otherwise minted only by the
   dashboard-only `/run` route, itself excluded as dispatch-shaped (batched with
@@ -317,9 +366,8 @@ the device bar, the "what is kept" chart, the lanes, the moment and selected pan
 and the "What this record cannot tell you" list. No page, route or API uses them yet,
 so nothing is operator-visible.
 
-- **What the model must say.** Each lane covers its window with typed regions (exact,
-  rolled-up, pruned, paused, not readable with a reason, capped with the point it
-  reaches back to). A stretch with no region renders as "Coverage not stated", never
+- **What the model must say.** Each lane covers its window with typed regions (rolled-up
+  at the hourly, daily or monthly tier, pruned, paused, not readable with a reason). A stretch with no region renders as "Coverage not stated", never
   as exact. Offline, failed and too-old-agent reads render as not readable, never as
   empty.
 - **Retention.** An expiry is stated only from the configured policy or a row limit.
@@ -371,7 +419,7 @@ operator-visible. A signed-out request is redirected to sign in; a missing `id` 
   arrow, Page, Home and End keys move the moment line (UTC). Every committed time
   change requests the moment panel and, while an item is selected, the selected panel at
   the same time; the newest request per panel wins and a superseded one is aborted. The
-  panels show whatever the server returns, including offline, not-readable and capped
+  panels show whatever the server returns, including offline and not-readable
   states; a non-2xx is "Could not load this panel (HTTP n)." and an unreachable server
   "Could not reach the server." (failures are announced as alerts, a landed panel is not).
   Every panel request sends `HX-Request: true`, so the server answers a signed-out one with
@@ -435,8 +483,8 @@ The dashboard rendered the seed timestamp prominently (`Tree as observed since �
 | `/echo` page load | `Infrastructure:Read` | Same as Devices/Inventory pages |
 | Retention-paused list view | `Infrastructure:Read` | |
 | Scan fleet (Phase 15.A) | `Execution:Execute` | Dispatches `echo.status` fleet-wide; same tier as run-instruction/echo-execute |
-| Re-enable | `Execution:Execute` | Per-device RBAC visibility check; out-of-scope collapses to same 404 as not-connected (no enumeration oracle) |
-| Purge | `Infrastructure:Delete` | Per-device RBAC visibility check + typed-hostname confirmation (native `prompt()`, CSP-safe). Agent-side `source_not_paused` / `config_unreadable` guard is authoritative (no server-side `SOURCE_NOT_PAUSED` check) |
+| Re-enable | `Execution:Execute` | Per-device scoped gate; a denial collapses to same 404 as not-connected (no enumeration oracle) |
+| Purge | `Infrastructure:Delete` | Per-device scoped gate + typed-hostname confirmation (native `prompt()`, CSP-safe). Agent-side `source_not_paused` / `config_unreadable` guard is authoritative (no server-side `SOURCE_NOT_PAUSED` check) |
 | Echo SQL submit | `Infrastructure:Read` (today) → may tighten later | The current grant is read-only because Echo SQL is bounded to the agent's own DB and runs SELECT-only on a read-only connection behind a SQLite authorizer that allows only registry-known warehouse tables (#760/#631) |
 | Save SQL result as result set | `Infrastructure:Read` + result-set creation quota | Per scope-walking-design §3.3 |
 | Process tree view (frame only) | `Infrastructure:Read` | Frame, host picker, filter bar |
@@ -450,21 +498,17 @@ Per `docs/observability-conventions.md`:
 |---|---|---|---|
 | `yuzu_echo_dashboard_view_total` | counter | `frame` (retention/sql/tree), `result` | shipped (PR-A.A) |
 | `yuzu_echo_retention_paused_devices` | gauge | `source` | shipped (PR-A.A). Set from the rows of the page's own scan read. A cut scan (`result_truncated_by_cap`, see the bounded-read note in §3.1) does not update it, because its rows would under-count; the gauge keeps the last value from an uncut scan, so it can be stale. It is a per-render view, not a fleet total. |
-| `yuzu_echo_source_purge_total` | counter | `result` | **shipped** (Phase 15.A — dashboard fragment + `POST /api/v1/echo/retention-paused/purge`) |
-| `yuzu_echo_source_reenable_total` | counter | `result` | shipped (PR-A.A — dashboard fragment only, no REST twin) |
+| `yuzu_echo_source_purge_total` | counter | `result`, `surface` (`dashboard` / `rest`) | **shipped** (Phase 15.A — dashboard fragment + `POST /api/v1/echo/retention-paused/purge`). Every series of both surfaces exists from boot at 0. |
+| `yuzu_echo_source_reenable_total` | counter | `result`, `surface` (`dashboard`) | shipped (PR-A.A — dashboard fragment only, no REST twin). Every series exists from boot at 0. |
 | `yuzu_echo_scan_dispatched_total` | counter | `result` | shipped (PR-A.A) |
+| `yuzu_echo_sources_push_total` | counter | `result` (`pushed` / `none_applied` / `audit_unavailable` / `permission_revoked` / `dispatch_denied` / `dispatch_exception`) | shipped — Capture-sources push. `pushed` = at least one change reached an agent; `none_applied` = none did (both count only pushes that ran to the end); `audit_unavailable` = the `attempted` row could not be stored (nothing dispatched); `permission_revoked` = a grant or session was withdrawn after that row, before the first source or between two (the rest were not dispatched); `dispatch_denied` = the dispatch chokepoint refused the command; `dispatch_exception` = a dispatch threw (each stops the batch). A request with no valid change is not counted. |
 | `yuzu_echo_process_tree_render_seconds` | histogram | `node_count_bucket` | **planned — not yet emitted** (SRE follow-up) |
 
-> **Do not sum `yuzu_echo_source_purge_total` across surfaces yet.** The dashboard
-> fragment and the REST twin write the same series with different `result` tokens:
-> the fragment distinguishes `scope_violation` from `denied`, while REST folds
-> per-device scope denial, missing wiring, and audit failure all into `denied` and
-> otherwise only ever writes `requested`. `success` and `agent_not_connected` are
-> comparable; nothing else is, and there is no `surface` label to split them.
+> **One closed `result` set on both families.** `success`, `agent_not_connected`, `invalid_input`, `denied`, `scope_violation`, `rate_limited`, `infra_unavailable`, `audit_unavailable`, `store_unavailable`, and the dispatch chokepoint's own refusal reason (`forbidden`, `approval_required`, `anonymous_operator`, `kill_switched`, `unclassified`, `ambiguous`; #7114). `denied` is a refusal (a cross-site POST, a service-scoped token, a session that ended, a recheck refusal); `scope_violation` is a plain denial at admission (a device outside the caller's scope or a caller with no grant on the pair at all: the gate does not tell the two apart), on both surfaces; `infra_unavailable` is an outage of the gate or the dispatch (nothing wired, the gate answered 503); `store_unavailable` is a failed authorization read behind the gate (RBAC or management-group store), written by both surfaces; `audit_unavailable` is an `attempted` or `requested` row that could not be stored. `rate_limited` is the dashboard's repeat bound (§3.5) and is never written by `surface=rest`. The unlabelled `{result}` series these families used to carry no longer move: a query or alert on `result` alone must now name or sum over `surface`. The surface value is `dashboard` (not `fragment`) because that is what the page is called everywhere else. `yuzu_echo_scan_dispatched_total` writes the same six chokepoint tokens when the scan's own dispatch is refused (the scan answers `Not permitted: <token>` and stores no scan state), and the Echo SQL console audits such a refusal as `echo.sql` `result=failure` (#7114).
 
 > The PR-H viewer ships with **no process-tree metrics yet** (a dashboard read surface); the render-duration histogram + a dispatch counter + a node-count histogram are a tracked SRE follow-up. The seed-age gauge from the original design is removed (there is no seed).
 
-Audit actions: `echo.status.scan` (Scan fleet — PR-A.A), `echo.source.reenable` (Re-enable a row — PR-A.A), `echo.source.purge` (purge — **shipped** Phase 15.A; also `csrf.denied`-style cross-origin refusals are audited under `echo.source.purge`/`reenable` with `detail=csrf_cross_origin`), `echo.process_tree.read` (PR-H — emitted at dispatch **and** on a successful reconstruction; the device is `target_id`, never in `detail`; see `docs/user-manual/audit-log.md`). The seed-based `echo.process_tree.reseed` verb is removed (no seed).
+Audit actions: `echo.status.scan` (Scan fleet — PR-A.A), `echo.source.reenable` (Re-enable a row — PR-A.A), `echo.source.purge` (purge — **shipped** Phase 15.A; also `csrf.denied`-style cross-origin refusals are audited under `echo.source.purge`/`reenable` with `detail=csrf_cross_origin`; an authorization that could not be evaluated is `detail=store_unavailable store=<mgmt_group_store|rbac_store>` or `scoped_gate_unavailable`, a repeat inside 30 seconds `rate_limited cooldown=<N>s`, and every row from `attempted` on ends in the request's `cid=<id>`), `echo.process_tree.read` (PR-H — emitted at dispatch **and** on a successful reconstruction; the device is `target_id`, never in `detail`; see `docs/user-manual/audit-log.md`). The seed-based `echo.process_tree.reseed` verb is removed (no seed).
 
 ## 8. Cross-references
 
@@ -495,3 +539,9 @@ Audit actions: `echo.status.scan` (Scan fleet — PR-A.A), `echo.source.reenable
 - Should the retention-paused list also surface `<source>_enabled=true` devices that have *zero* recent rows (silent collector failure)? Useful for SRE but visually noisy in IR; defer to PR-G.
 - The "Purge data" action should ideally be replaced by an "Export then purge" flow that puts the rows into a signed evidence bundle before deletion — a SOC 2 CC7.2 evidence requirement. Defer to a follow-up issue once the retention-paused list ships.
 - Multi-device re-enable (select-many in the table, single click "Re-enable selected") is an obvious affordance once the table has rows; ship in PR-A only if the single-row path is solid.
+
+## Routed-concern invariants
+
+Moved verbatim from the `Echo dashboard` row of `.claude/routed-concerns.md` on 2026-11-12, when that always-loaded row was compressed to its catastrophic clauses plus a pointer here. This text is the authoritative long form of that row.
+
+Echo dashboard — frames, URLs, permissions. New source: CORE pattern (`docs/echo-implementer.md` §8), NOT the self-contained tier pattern; ARP/DNS + Capture-sources frame: ADR-0015 (Windows-first; DNS is usage-class PII). Untrusted `echo.sql` runs only via read-only `EchoDatabase::execute_user_query` (authorizer allowlist), not trusted `execute_query` (#760/#631). Per-source enable/disable fails CLOSED via `canonical_source_enabled`'s tri-state (#560). `EchoDatabase::open` integrity-checks + quarantines a corrupt `echo.db` aside or fails closed — never re-open-and-trust (#559). New streaming sources implement `ProcStreamCollector`, no parallel path (`docs/echo-module-loads.md`).

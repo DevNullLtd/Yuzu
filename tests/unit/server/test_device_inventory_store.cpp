@@ -2,31 +2,58 @@
 // projection — canonical-hash cross-pin (clean + dirty) with the agent, blob parse
 // round-trip, hash-skip ingest (full/touched/need_full), single-row replace,
 // roster read, delete, server-receipt-time stamping (#1685), broken-pool degrade,
-// oversized-blob nack, and the shared ingest seam end-to-end.
+// oversized-blob nack, and the shared ingest seam end-to-end. v2 blob: version-byte
+// parse, scalar-section statuses, list rows + caps + truncation disclosure, the machine-id
+// shape check, the per-version hash, the child-table replace transaction, the REPEATABLE READ
+// sections read, the populated-v1 migration upgrade, and the mixed-version (old-agent)
+// guarantee.
 
 #include <catch2/catch_test_macros.hpp>
 
 #include "agent.pb.h"
 #include "device_ci_ingestion.hpp"
+#include "device_ci_kinds.hpp"
+#include "device_ci_section_digest.hpp"
 #include "device_inventory_store.hpp"
+#include "hardware_ci_page_model.hpp"
+#include "hardware_list_model.hpp"
+#include "pg/pg_exec.hpp"
+#include "pg/pg_migration_runner.hpp"
 #include "pg/pg_pool.hpp"
+#include "sha256_hex.hpp"
+
+#include <yuzu/metrics.hpp>
 
 #include "../test_helpers.hpp"
+#include "../test_log_capture.hpp"
 
+#include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
+#include <functional>
+#include <iterator>
+#include <map>
+#include <latch>
+#include <limits>
 #include <optional>
+#include <set>
 #include <stdexcept>
 #include <string>
+#include <thread>
+#include <utility>
 #include <vector>
 
 using yuzu::server::CiReadError;
 using yuzu::server::DeviceCiRecord;
+using yuzu::server::DeviceCiSection;
 using yuzu::server::DeviceInventoryStore;
 using yuzu::server::InventoryIngestOutcome;
 using yuzu::server::parse_device_ci_blob;
 using yuzu::server::pg::PgPool;
+namespace hcp = yuzu::server::hardware_ci_page;
 namespace agentpb = yuzu::agent::v1;
 
 namespace {
@@ -107,6 +134,279 @@ std::string build_blob(const std::array<std::string, 22>& f) {
 }
 
 std::string sample_blob() { return build_blob(clean_fields()); }
+
+// ── v2 fixtures ────────────────────────────────────────────────────────────────
+// kCrossPinHashV2: sha256 of the fixed v2 blob below. The agent twin
+// (tests/unit/test_device_ci_sync.cpp) assembles the SAME bytes from the SAME literal
+// fields — the forward contract the agent-side device_ci_canonical_blob_v2 must reproduce.
+// Placeholder serials only; the DIMM serial is '-'.
+constexpr const char* kCrossPinHashV2 = "e810ec4a9b2db6286a30f7eddc72beb9090ad52f59d5529be769cec2a3acb36d";
+
+// One 0x1F-joined, 0x1E-terminated record.
+std::string join_rec(const std::vector<std::string>& f) {
+    std::string b;
+    for (std::size_t i = 0; i < f.size(); ++i) {
+        if (i)
+            b += '\x1f';
+        b += f[i];
+    }
+    b += '\x1e';
+    return b;
+}
+
+// 33 scalar positions: the 22 clean v1 fields + the 11 appended identity scalars.
+std::vector<std::string> v2_scalars() {
+    auto base = clean_fields();
+    std::vector<std::string> f(base.begin(), base.end());
+    for (const char* v : {"laptop", "CHS-0001", "AT-0001", "dmi", "Dell Inc.", "0K3CM7",
+                          "BRD-0001", "dmi",
+                          "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899",
+                          "sha256-hmac", "etc_machine_id"})
+        f.emplace_back(v);
+    return f;
+}
+
+// Status records for the three scalar sections + every list kind, and one row per list
+// kind (the swap row has exactly 3 fields — no used_mb).
+std::vector<std::vector<std::string>> v2_records() {
+    return {
+        {"status", "chassis", "ok", ""},
+        {"status", "baseboard", "ok", ""},
+        {"status", "machine_id", "ok", ""},
+        {"status", "cpu", "ok", ""},
+        {"cpu", "0", "Intel(R) Core(TM) i7-1185G7", "4", "8", "2800", "U3E1", "1"},
+        {"status", "dimm", "ok", ""},
+        {"dimm", "DIMM0", "8192", "DDR4", "3200", "Samsung", "M471A1K43", "-"},
+        {"status", "disk", "ok", ""},
+        {"disk", "0", "Samsung SSD 980", "512", "SSD", "NVMe"},
+        {"status", "swap", "ok", ""},
+        {"swap", "/swapfile", "2048", "proc_swaps"},
+        {"status", "volume", "ok", ""},
+        {"volume", "C:", "C:/", "\\\\?\\Volume{1}", "NTFS", "511705088", "-"},
+        {"status", "partition", "ok", ""},
+        {"partition", "0", "1", "536870912", "EFI", "-", "-"},
+        {"status", "topology", "ok", ""},
+        {"topology", "lvm", "vg0", "uuid-0001", "sda2", "-"},
+    };
+}
+
+std::string build_blob_v2(const std::vector<std::string>& scalars,
+                          const std::vector<std::vector<std::string>>& recs) {
+    std::string b(1, '\x02');
+    b += join_rec(scalars);
+    for (const auto& r : recs)
+        b += join_rec(r);
+    return b;
+}
+
+std::string fixture_blob_v2() { return build_blob_v2(v2_scalars(), v2_records()); }
+
+const DeviceCiSection* find_section(const DeviceCiRecord& r, const std::string& kind) {
+    for (const auto& s : r.sections)
+        if (s.kind == kind)
+            return &s;
+    return nullptr;
+}
+const DeviceCiSection* find_section(const std::vector<DeviceCiSection>& v, const std::string& kind) {
+    for (const auto& s : v)
+        if (s.kind == kind)
+            return &s;
+    return nullptr;
+}
+
+// A hand-built v2 record (bypasses the parser): `cpu_rows` cpu rows tagged with `reason`,
+// optionally one dimm row. content_hash is the caller's tag, so replace tests can tell
+// generations apart.
+DeviceCiRecord make_v2_record(const std::string& tag, int cpu_rows, bool with_dimm) {
+    DeviceCiRecord r = parse_device_ci_blob(sample_blob());
+    r.blob_version = 2;
+    r.content_hash = "hash-" + tag;
+    r.chassis_serial = "CHS-" + tag;
+    DeviceCiSection cpu;
+    cpu.kind = "cpu";
+    cpu.level = "ok";
+    cpu.reason = tag;
+    for (int i = 0; i < cpu_rows; ++i)
+        cpu.rows.push_back({std::to_string(i), "Model-" + tag, "4", "8", "2800", "U3E1", "1"});
+    r.sections.push_back(std::move(cpu));
+    if (with_dimm) {
+        DeviceCiSection dimm;
+        dimm.kind = "dimm";
+        dimm.level = "ok";
+        dimm.rows.push_back({"DIMM0", "8192", "DDR4", "3200", "Samsung", "M471A1K43", "-"});
+        r.sections.push_back(std::move(dimm));
+    }
+    return r;
+}
+
+std::string count_sql(const std::string& sql_tail) { return "SELECT count(*) FROM " + sql_tail; }
+
+// COUNT(*) via a fresh lease; -1 on any failure.
+long long count_rows(PgPool& pool, const std::string& sql) {
+    auto lease = pool.acquire();
+    if (!lease)
+        return -1;
+    auto res = yuzu::server::pg::exec_params(lease.get(), sql.c_str(), std::vector<std::string>{});
+    if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) != 1)
+        return -1;
+    return std::atoll(PQgetvalue(res.get(), 0, 0));
+}
+
+// One statement on a fresh lease: fault injection / hand-seeding on a per-test clone.
+void exec_stmt(PgPool& pool, const std::string& sql) {
+    auto lease = pool.acquire();
+    REQUIRE(lease);
+    auto res = yuzu::server::pg::exec_params(lease.get(), sql.c_str(), std::vector<std::string>{});
+    REQUIRE(res.status() == PGRES_COMMAND_OK);
+}
+
+// The server blob ceiling (ADR-0016 update "device_ci blob v2"): 96 KiB. An INDEPENDENT literal,
+// deliberately not read from device_ci_kinds.hpp (the kCrossPinHash pattern): the agent's
+// equal constant is pinned to the same 98304 in tests/unit/test_device_ci_sync.cpp, so a
+// one-sided change to either ceiling fails one of the two tests.
+constexpr std::size_t kBlobCap = 98304;
+
+// The registry, restated as an independent literal table: per list kind the row cap, the wire
+// width (columns per row), the declared row budget (p99.9 row width in wire bytes) and the
+// measured row floor (cpu, dimm, disk, volume from captures; partition and topology ASSUMED, swap
+// its shortest row, none captured). Also never read from the registry: if a cap, a width, a
+// budget or a floor drifts, this table disagrees.
+struct KindExpect {
+    const char* kind;
+    int cap;
+    int width;
+    int budget;
+    int floor;
+};
+constexpr KindExpect kKindExpect[] = {{"cpu", 32, 7, 96, 54},       {"dimm", 64, 7, 96, 75},
+                                      {"disk", 128, 5, 64, 36},     {"swap", 16, 3, 56, 8},
+                                      {"volume", 128, 6, 144, 61},  {"partition", 192, 6, 120, 95},
+                                      {"topology", 96, 5, 144, 110}};
+// The declared scalar record + status records budget, and the registry-derived total:
+// sum(cap x budget) = 73,600, plus 3,072 = 76,672 (78.0% of the ceiling; the build holds <= 80%).
+constexpr std::size_t kScalarStatusBudget = 3072;
+constexpr std::size_t kRegistryTotal = 76672;
+// The clamp-bound worst case of the part a sender never trims: the version byte, a scalar record
+// of 33 fields at the 1,024-byte field clamp (33 x 1024 + 32 separators + 1E), and one status
+// record per section at the clamp (10 x ("status" 1F section 1F 1024 1F 1024 1E) + the 64 bytes
+// of section names): 1 + 33,825 + 20,644 = 54,470, comfortably under the ceiling.
+constexpr std::size_t kUntrimmedWorstCase = 54470;
+
+// Comma-separated registry column list -> names.
+std::vector<std::string> column_names(const char* columns) {
+    std::vector<std::string> out(1);
+    for (const char* p = columns; *p; ++p) {
+        if (*p == ',')
+            out.emplace_back();
+        else
+            out.back().push_back(*p);
+    }
+    return out;
+}
+
+// Every scalar, status and list column carries a value unique to (generation, field), so a
+// blanked, swapped or mis-ordered column cannot round-trip by accident. Two rows per list
+// kind; the swap section's level is cleared in generation A (a blank level must read back
+// blank). Built by hand, bypassing the parser, so the store is what is under test.
+DeviceCiRecord distinct_v2_record(const std::string& g) {
+    DeviceCiRecord r = parse_device_ci_blob(sample_blob());
+    r.blob_version = 2;
+    r.content_hash = "hash-" + g;
+    r.model = "model-" + g; // a v1 column changes too (the ON CONFLICT update path)
+    r.cpu_cores = g == "A" ? "4" : "6";
+    r.chassis_type = "chassis-type-" + g;
+    r.chassis_serial = "chassis-serial-" + g;
+    r.chassis_asset_tag = "chassis-asset-" + g;
+    r.chassis_source = "chassis-source-" + g;
+    r.board_vendor = "board-vendor-" + g;
+    r.board_product = "board-product-" + g;
+    r.board_serial = "board-serial-" + g;
+    r.board_source = "board-source-" + g;
+    r.machine_id_hash = "machine-id-hash-" + g;
+    r.machine_id_algorithm = "machine-id-algo-" + g;
+    r.machine_id_source = "machine-id-source-" + g;
+    for (const auto& d : yuzu::server::kDeviceCiSections) {
+        DeviceCiSection s;
+        s.kind = d.section;
+        s.level = "level-" + g + "-" + d.section;
+        s.reason = "reason-" + g + "-" + d.section;
+        if (d.table != nullptr) {
+            const auto cols = column_names(d.columns);
+            for (int row = 0; row < 2; ++row) {
+                std::vector<std::string> cells;
+                for (const auto& col : cols)
+                    cells.push_back(g + "-" + d.section + "-r" + std::to_string(row) + "-" + col);
+                s.rows.push_back(std::move(cells));
+            }
+        }
+        if (g == "A" && s.kind == "swap")
+            s.level.clear();
+        r.sections.push_back(std::move(s));
+    }
+    return r;
+}
+
+// Every persisted scalar of a record by name (the 22 frozen v1 fields, blob_version and the
+// 11 appended ones).
+std::vector<std::pair<const char*, std::string>> scalar_fields(const DeviceCiRecord& r) {
+    return {{"manufacturer", r.manufacturer},
+            {"model", r.model},
+            {"serial", r.serial},
+            {"system_uuid", r.system_uuid},
+            {"hostname", r.hostname},
+            {"domain", r.domain},
+            {"ou", r.ou},
+            {"bios_vendor", r.bios_vendor},
+            {"bios_version", r.bios_version},
+            {"bios_date", r.bios_date},
+            {"cpu_model", r.cpu_model},
+            {"cpu_cores", r.cpu_cores},
+            {"cpu_threads", r.cpu_threads},
+            {"ram_bytes", r.ram_bytes},
+            {"disks_summary", r.disks_summary},
+            {"primary_mac", r.primary_mac},
+            {"macs_summary", r.macs_summary},
+            {"nic_count", r.nic_count},
+            {"os_name", r.os_name},
+            {"os_version", r.os_version},
+            {"os_build", r.os_build},
+            {"arch", r.arch},
+            {"blob_version", std::to_string(r.blob_version)},
+            {"chassis_type", r.chassis_type},
+            {"chassis_serial", r.chassis_serial},
+            {"chassis_asset_tag", r.chassis_asset_tag},
+            {"chassis_source", r.chassis_source},
+            {"board_vendor", r.board_vendor},
+            {"board_product", r.board_product},
+            {"board_serial", r.board_serial},
+            {"board_source", r.board_source},
+            {"machine_id_hash", r.machine_id_hash},
+            {"machine_id_algorithm", r.machine_id_algorithm},
+            {"machine_id_source", r.machine_id_source}};
+}
+
+void check_scalars_equal(const DeviceCiRecord& got, const DeviceCiRecord& want) {
+    const auto g = scalar_fields(got);
+    const auto w = scalar_fields(want);
+    REQUIRE(g.size() == w.size());
+    for (std::size_t i = 0; i < w.size(); ++i) {
+        INFO("scalar " << w[i].first);
+        CHECK(g[i].second == w[i].second);
+    }
+}
+
+// Full equality, section by section, in order: kind, level, reason and every row cell.
+void check_sections_equal(const std::vector<DeviceCiSection>& got,
+                          const std::vector<DeviceCiSection>& want) {
+    REQUIRE(got.size() == want.size());
+    for (std::size_t i = 0; i < want.size(); ++i) {
+        INFO("section " << want[i].kind);
+        CHECK(got[i].kind == want[i].kind);
+        CHECK(got[i].level == want[i].level);
+        CHECK(got[i].reason == want[i].reason);
+        CHECK(got[i].rows == want[i].rows);
+    }
+}
 } // namespace
 
 TEST_CASE("DeviceInventoryStore canonical_hash matches the cross-pin", "[device_ci][hash]") {
@@ -145,9 +445,820 @@ TEST_CASE("parse_device_ci_blob round-trips fields positionally", "[device_ci][p
         CHECK(p.model == "b");
     }
     SECTION("oversized blob → empty record (defence-in-depth)") {
-        DeviceCiRecord p = parse_device_ci_blob(std::string(70u * 1024, 'x'));
+        DeviceCiRecord p = parse_device_ci_blob(std::string(kBlobCap + 1, 'x'));
         CHECK(p.manufacturer.empty());
     }
+    SECTION("a blob exactly at the 96 KiB ceiling still parses") {
+        DeviceCiRecord p = parse_device_ci_blob(std::string(kBlobCap, 'x'));
+        CHECK(p.manufacturer.size() == 1024); // one clamped field, not rejected
+    }
+}
+
+TEST_CASE("v1 blobs parse unchanged: version 1 with no sections; v1 pins hold (old agent / new server)",
+          "[device_ci][parse][v2]") {
+    // Old agent / new server: a v1 agent's hash must stay byte-identical so it never loops
+    // on need_full.
+    DeviceCiRecord r = parse_device_ci_blob(sample_blob());
+    CHECK(r.blob_version == 1);
+    CHECK(r.sections.empty());
+    CHECK(r.content_hash.empty());
+    CHECK(r.chassis_serial.empty());
+    CHECK(DeviceInventoryStore::canonical_hash(r) == kCrossPinHash);
+    CHECK(DeviceInventoryStore::canonical_hash(parse_device_ci_blob(build_blob(dirty_fields()))) ==
+          kDirtyCrossPinHash);
+}
+
+TEST_CASE("v2 canonical hash is the sha256 of the received blob (kCrossPinHashV2)",
+          "[device_ci][hash][v2]") {
+    const std::string blob = fixture_blob_v2();
+    DeviceCiRecord r = parse_device_ci_blob(blob);
+    REQUIRE(r.blob_version == 2);
+    const auto expect = yuzu::server::sha256_hex(blob);
+    REQUIRE(expect.has_value());
+    CHECK(r.content_hash == *expect);
+    CHECK(DeviceInventoryStore::canonical_hash(r) == *expect);
+    CHECK(DeviceInventoryStore::canonical_hash(r) == kCrossPinHashV2);
+
+    SECTION("a v2 record without a pinned hash has no canonical hash (store nacks)") {
+        DeviceCiRecord bare;
+        bare.blob_version = 2;
+        CHECK(DeviceInventoryStore::canonical_hash(bare).empty());
+    }
+}
+
+TEST_CASE("v2 scalars land positionally in the 33 fields", "[device_ci][parse][v2]") {
+    DeviceCiRecord r = parse_device_ci_blob(fixture_blob_v2());
+    CHECK(r.blob_version == 2);
+    CHECK(r.manufacturer == "Dell Inc.");
+    CHECK(r.arch == "x86_64");
+    CHECK(r.chassis_type == "laptop");
+    CHECK(r.chassis_serial == "CHS-0001");
+    CHECK(r.chassis_asset_tag == "AT-0001");
+    CHECK(r.chassis_source == "dmi");
+    CHECK(r.board_vendor == "Dell Inc.");
+    CHECK(r.board_product == "0K3CM7");
+    CHECK(r.board_serial == "BRD-0001");
+    CHECK(r.board_source == "dmi");
+    CHECK(r.machine_id_hash.size() == 64);
+    CHECK(r.machine_id_algorithm == "sha256-hmac");
+    CHECK(r.machine_id_source == "etc_machine_id");
+
+    SECTION("a v2 blob with only the 22 base fields leaves the appended scalars blank") {
+        auto base = clean_fields();
+        DeviceCiRecord p = parse_device_ci_blob(
+            build_blob_v2(std::vector<std::string>(base.begin(), base.end()), {}));
+        CHECK(p.blob_version == 2);
+        CHECK(p.arch == "x86_64");
+        CHECK(p.chassis_type.empty());
+        CHECK(p.machine_id_source.empty());
+        CHECK(p.sections.empty());
+    }
+    SECTION("the version byte alone is an empty v2 record") {
+        DeviceCiRecord p = parse_device_ci_blob(std::string(1, '\x02'));
+        CHECK(p.blob_version == 2);
+        CHECK(p.manufacturer.empty());
+        CHECK(p.sections.empty());
+        CHECK(p.content_hash.size() == 64);
+    }
+    SECTION("extra scalar positions are ignored") {
+        auto f = v2_scalars();
+        f.emplace_back("extra");
+        DeviceCiRecord p = parse_device_ci_blob(build_blob_v2(f, {}));
+        CHECK(p.machine_id_source == "etc_machine_id");
+    }
+}
+
+TEST_CASE("v2 scalar-section statuses round-trip independently of any list kind",
+          "[device_ci][parse][v2]") {
+    auto recs = std::vector<std::vector<std::string>>{
+        {"status", "chassis", "unsupported", "macos:planned"},
+        {"status", "baseboard", "constrained", "linux:no_dmi"},
+        {"status", "machine_id", "ok", ""},
+        {"status", "nosuchsection", "ok", "ignored"},
+    };
+    DeviceCiRecord r = parse_device_ci_blob(build_blob_v2(v2_scalars(), recs));
+    REQUIRE(r.sections.size() == 3); // the unregistered section is ignored
+    const auto* ch = find_section(r, "chassis");
+    REQUIRE(ch != nullptr);
+    CHECK(ch->level == "unsupported");
+    CHECK(ch->reason == "macos:planned");
+    CHECK(ch->rows.empty());
+    const auto* bb = find_section(r, "baseboard");
+    REQUIRE(bb != nullptr);
+    CHECK(bb->level == "constrained");
+    CHECK(bb->reason == "linux:no_dmi");
+    const auto* mi = find_section(r, "machine_id");
+    REQUIRE(mi != nullptr);
+    CHECK(mi->level == "ok");
+    CHECK(find_section(r, "nosuchsection") == nullptr);
+}
+
+TEST_CASE("v2 list rows attach by kind; short rows pad; long rows truncate; unknown kinds drop",
+          "[device_ci][parse][v2]") {
+    DeviceCiRecord r = parse_device_ci_blob(fixture_blob_v2());
+    REQUIRE(r.sections.size() == 10);
+    // Registry order, deterministic.
+    for (std::size_t i = 0; i < r.sections.size(); ++i)
+        CHECK(r.sections[i].kind == yuzu::server::kDeviceCiSections[i].section);
+    const auto* cpu = find_section(r, "cpu");
+    REQUIRE(cpu != nullptr);
+    CHECK(cpu->level == "ok");
+    REQUIRE(cpu->rows.size() == 1);
+    CHECK(cpu->rows[0][1] == "Intel(R) Core(TM) i7-1185G7");
+    CHECK(cpu->rows[0][6] == "1");
+    const auto* swap = find_section(r, "swap");
+    REQUIRE(swap != nullptr);
+    REQUIRE(swap->rows.size() == 1);
+    CHECK(swap->rows[0].size() == 3); // no used_mb
+    CHECK(swap->rows[0][2] == "proc_swaps");
+    const auto* part = find_section(r, "partition"); // keyed 'partition', not 'partitions'
+    REQUIRE(part != nullptr);
+    CHECK(part->rows.size() == 1);
+    CHECK(find_section(r, "dimm")->rows[0][6] == "-");
+    CHECK(find_section(r, "chassis")->rows.empty()); // status-only: zero rows
+
+    SECTION("short row padded blank, long row truncated, unknown kind and status-only row ignored") {
+        auto recs = std::vector<std::vector<std::string>>{
+            {"cpu", "0", "OnlyModel"},
+            {"swap", "/s", "1", "src", "extra1", "extra2"},
+            {"mystery", "a", "b"},
+            {"chassis", "a", "b"}, // rows for a status-only section are ignored
+        };
+        DeviceCiRecord p = parse_device_ci_blob(build_blob_v2(v2_scalars(), recs));
+        const auto* c = find_section(p, "cpu");
+        REQUIRE(c != nullptr);
+        REQUIRE(c->rows.size() == 1);
+        CHECK(c->rows[0].size() == 7);
+        CHECK(c->rows[0][1] == "OnlyModel");
+        CHECK(c->rows[0][2].empty());
+        CHECK(c->level.empty()); // rows without a status record: blank level
+        const auto* sw = find_section(p, "swap");
+        REQUIRE(sw != nullptr);
+        CHECK(sw->rows[0].size() == 3);
+        CHECK(sw->rows[0][2] == "src");
+        CHECK(find_section(p, "mystery") == nullptr);
+        CHECK(find_section(p, "chassis") == nullptr);
+    }
+}
+
+TEST_CASE("v2 rows past the kind cap are dropped and disclosed as constrained",
+          "[device_ci][parse][v2]") {
+    const int cap = yuzu::server::kDeviceCiSections[3].row_cap; // cpu
+    REQUIRE(std::string(yuzu::server::kDeviceCiSections[3].section) == "cpu");
+    REQUIRE(cap == 32);
+    const auto cpu_row = [](int i) {
+        return std::vector<std::string>{"cpu", std::to_string(i), "M", "1", "1", "1", "s", "1"};
+    };
+
+    SECTION("incoming ok with empty reason -> constrained / server_cap:32") {
+        std::vector<std::vector<std::string>> recs = {{"status", "cpu", "ok", ""}};
+        for (int i = 0; i < cap + 5; ++i)
+            recs.push_back(cpu_row(i));
+        DeviceCiRecord r = parse_device_ci_blob(build_blob_v2(v2_scalars(), recs));
+        const auto* c = find_section(r, "cpu");
+        REQUIRE(c != nullptr);
+        CHECK(static_cast<int>(c->rows.size()) == cap);
+        CHECK(c->level == "constrained");
+        CHECK(c->reason == "server_cap:32");
+    }
+    SECTION("an incoming reason is kept and the cap appended with ';'") {
+        std::vector<std::vector<std::string>> recs = {{"status", "cpu", "ok", "x"}};
+        for (int i = 0; i < cap + 1; ++i)
+            recs.push_back(cpu_row(i));
+        DeviceCiRecord r = parse_device_ci_blob(build_blob_v2(v2_scalars(), recs));
+        const auto* c = find_section(r, "cpu");
+        REQUIRE(c != nullptr);
+        CHECK(c->reason == "x;server_cap:32");
+    }
+    SECTION("exactly at the cap is untouched") {
+        std::vector<std::vector<std::string>> recs = {{"status", "cpu", "ok", ""}};
+        for (int i = 0; i < cap; ++i)
+            recs.push_back(cpu_row(i));
+        DeviceCiRecord r = parse_device_ci_blob(build_blob_v2(v2_scalars(), recs));
+        const auto* c = find_section(r, "cpu");
+        REQUIRE(c != nullptr);
+        CHECK(c->level == "ok");
+        CHECK(c->reason.empty());
+    }
+}
+
+TEST_CASE("v2 row caps hold for every list kind (independent literal table)",
+          "[device_ci][parse][v2]") {
+    // cap+1 rows in -> exactly cap kept, disclosed. The expectations are kKindExpect, NOT the
+    // registry: if a registry cap or width drifts, this table disagrees.
+    for (const auto& e : kKindExpect) {
+        INFO("kind " << e.kind);
+        std::vector<std::vector<std::string>> recs = {{"status", e.kind, "ok", ""}};
+        for (int i = 0; i < e.cap + 1; ++i) {
+            std::vector<std::string> row{e.kind};
+            for (int c = 0; c < e.width; ++c)
+                row.push_back("r" + std::to_string(i) + "c" + std::to_string(c));
+            recs.push_back(std::move(row));
+        }
+        DeviceCiRecord r = parse_device_ci_blob(build_blob_v2(v2_scalars(), recs));
+        const auto* sec = find_section(r, e.kind);
+        REQUIRE(sec != nullptr);
+        CHECK(static_cast<int>(sec->rows.size()) == e.cap);
+        CHECK(sec->level == "constrained");
+        CHECK(sec->reason == "server_cap:" + std::to_string(e.cap));
+        // The kept rows are the FIRST cap rows, full width, in order.
+        CHECK(sec->rows.front().size() == static_cast<std::size_t>(e.width));
+        CHECK(sec->rows.front()[0] == "r0c0");
+        CHECK(sec->rows.back()[0] == "r" + std::to_string(e.cap - 1) + "c0");
+    }
+}
+
+TEST_CASE("v2 registry budgets and the blob ceiling agree with the independent literal table",
+          "[device_ci][parse][v2]") {
+    using yuzu::server::kDeviceCiSections;
+    // The server ceiling is the literal 98304 (the agent twin pins the same number).
+    CHECK(yuzu::server::kDeviceCiMaxBlobBytes == 98304u);
+    CHECK(yuzu::server::kDeviceCiMaxBlobBytes == kBlobCap);
+    CHECK(yuzu::server::kDeviceCiScalarStatusBudget == kScalarStatusBudget);
+
+    std::size_t rows_sum = 0;
+    for (const auto& e : kKindExpect) {
+        INFO("kind " << e.kind);
+        const auto i = yuzu::server::device_ci_section_index(e.kind);
+        REQUIRE(i.has_value());
+        const auto& d = kDeviceCiSections[*i];
+        CHECK(d.row_cap == e.cap);
+        CHECK(d.n_fields == e.width);
+        CHECK(d.row_budget == e.budget);
+        CHECK(d.row_floor == e.floor);
+        rows_sum += static_cast<std::size_t>(e.cap) * static_cast<std::size_t>(e.budget);
+    }
+    // Every registered list kind is in the table (a new kind must be added to it).
+    int list_kinds = 0;
+    for (const auto& d : kDeviceCiSections)
+        list_kinds += d.table != nullptr ? 1 : 0;
+    CHECK(list_kinds == static_cast<int>(std::size(kKindExpect)));
+
+    CHECK(rows_sum == 73600);
+    CHECK(rows_sum + kScalarStatusBudget == kRegistryTotal);
+    CHECK(yuzu::server::device_ci_registry_budget() == kRegistryTotal);
+    // The clamp-bound worst case of the never-trimmed records, against independent literals.
+    CHECK(yuzu::server::kDeviceCiMaxFieldLen == 1024u);
+    CHECK(yuzu::server::device_ci_untrimmed_worst_case() == kUntrimmedWorstCase);
+    CHECK(kUntrimmedWorstCase < kBlobCap);
+    // Real headroom: the declared worst plausible blob stays within 80% of the ceiling.
+    CHECK(kRegistryTotal * 5 <= kBlobCap * 4);
+}
+
+namespace {
+// One list record of exactly `budget` wire bytes (kind token, separators and terminator
+// included) for a kind with `width` columns; column c is filled with letter 'a'+c so a swapped or
+// truncated column cannot round-trip by accident.
+std::vector<std::string> row_at_budget(const char* kind, int width, int budget) {
+    const int total = budget - static_cast<int>(std::string(kind).size()) - width - 1;
+    REQUIRE(total >= width);
+    std::vector<std::string> row{kind};
+    for (int c = 0; c < width; ++c) {
+        const int len = total / width + (c < total % width ? 1 : 0);
+        row.emplace_back(static_cast<std::size_t>(len), static_cast<char>('a' + c));
+    }
+    return row;
+}
+} // namespace
+
+TEST_CASE("v2 blob at the registry-derived maximum fits the ceiling and parses in full",
+          "[device_ci][parse][v2]") {
+    // Every list kind at its cap, every row exactly its declared budget wide: the heaviest blob
+    // the registry plans for. It is past the old 64 KiB bound, under the 96 KiB ceiling, and
+    // nothing is dropped or disclosed. Expectations come from kKindExpect, not the registry.
+    std::vector<std::vector<std::string>> recs = {
+        {"status", "chassis", "ok", ""}, {"status", "baseboard", "ok", ""},
+        {"status", "machine_id", "ok", ""}};
+    std::size_t rows_bytes = 0;
+    for (const auto& e : kKindExpect) {
+        recs.push_back({"status", e.kind, "ok", ""});
+        for (int i = 0; i < e.cap; ++i) {
+            recs.push_back(row_at_budget(e.kind, e.width, e.budget));
+            rows_bytes += static_cast<std::size_t>(e.budget);
+        }
+    }
+    REQUIRE(rows_bytes == 73600);
+    const std::string blob = build_blob_v2(v2_scalars(), recs);
+    // The scalar record and the ten status records are far under their declared 3 KiB budget.
+    REQUIRE(blob.size() > 64u * 1024);
+    REQUIRE(blob.size() <= kRegistryTotal + 1); // +1: the version byte
+    REQUIRE(blob.size() <= kBlobCap);
+
+    DeviceCiRecord r = parse_device_ci_blob(blob);
+    CHECK(r.chassis_serial == "CHS-0001"); // the scalar record survived with them
+    for (const auto& e : kKindExpect) {
+        INFO("kind " << e.kind);
+        const auto* sec = find_section(r, e.kind);
+        REQUIRE(sec != nullptr);
+        CHECK(static_cast<int>(sec->rows.size()) == e.cap);
+        CHECK(sec->level == "ok"); // at the cap exactly: untouched, not disclosed
+        CHECK(sec->reason.empty());
+        const auto want = row_at_budget(e.kind, e.width, e.budget);
+        for (const auto& row : sec->rows) {
+            REQUIRE(row.size() == static_cast<std::size_t>(e.width));
+            CHECK(row[0] == want[1]);
+            CHECK(row.back() == want.back());
+        }
+    }
+}
+
+TEST_CASE("v2 duplicate status records: the last wins; a server disclosure still beats it",
+          "[device_ci][parse][v2]") {
+    SECTION("two conflicting status records around list rows -> the later one") {
+        std::vector<std::vector<std::string>> recs = {
+            {"status", "cpu", "ok", ""},
+            {"cpu", "0", "M", "1", "1", "1", "s", "1"},
+            {"status", "cpu", "constrained", "linux:partial"},
+        };
+        DeviceCiRecord r = parse_device_ci_blob(build_blob_v2(v2_scalars(), recs));
+        const auto* c = find_section(r, "cpu");
+        REQUIRE(c != nullptr);
+        CHECK(c->level == "constrained");
+        CHECK(c->reason == "linux:partial");
+        CHECK(c->rows.size() == 1);
+    }
+    SECTION("a trailing incoming ok cannot hide a server cap disclosure") {
+        std::vector<std::vector<std::string>> recs;
+        for (int i = 0; i < 33; ++i)
+            recs.push_back({"cpu", std::to_string(i), "M", "1", "1", "1", "s", "1"});
+        recs.push_back({"status", "cpu", "ok", ""}); // arrives AFTER the rows
+        DeviceCiRecord r = parse_device_ci_blob(build_blob_v2(v2_scalars(), recs));
+        const auto* c = find_section(r, "cpu");
+        REQUIRE(c != nullptr);
+        CHECK(c->rows.size() == 32);
+        CHECK(c->level == "constrained");
+        CHECK(c->reason == "server_cap:32");
+    }
+}
+
+TEST_CASE("v2 machine_id_hash must be hex or '-': anything else is blanked and disclosed",
+          "[device_ci][parse][v2]") {
+    const auto parse_with_hash = [](const std::string& hash,
+                                    std::vector<std::vector<std::string>> recs = {}) {
+        auto f = v2_scalars();
+        f[30] = hash; // machine_id_hash
+        return parse_device_ci_blob(build_blob_v2(f, recs));
+    };
+    const std::string hex64(64, 'a');
+
+    SECTION("lower-case hex, '-' (absent) and empty pass untouched and add no section") {
+        for (const std::string& ok : {hex64, std::string("-"), std::string()}) {
+            DeviceCiRecord r = parse_with_hash(ok);
+            CHECK(r.machine_id_hash == ok);
+            CHECK(find_section(r, "machine_id") == nullptr);
+        }
+    }
+    SECTION("a GUID-shaped raw platform id is blanked and the section is constrained") {
+        DeviceCiRecord r = parse_with_hash("4C4C4544-0042-1234-5678-AABBCCDDEEFF");
+        CHECK(r.machine_id_hash.empty());
+        const auto* m = find_section(r, "machine_id");
+        REQUIRE(m != nullptr);
+        CHECK(m->level == "constrained");
+        CHECK(m->reason == "server:machine_id_shape");
+        CHECK(m->rows.empty());
+    }
+    SECTION("upper-case hex and a non-hex tail are blanked too") {
+        CHECK(parse_with_hash("ABCDEF0123").machine_id_hash.empty());
+        CHECK(parse_with_hash(hex64.substr(0, 63) + "g").machine_id_hash.empty());
+    }
+    SECTION("the disclosure survives, and composes with, the agent's own machine_id status") {
+        DeviceCiRecord ok = parse_with_hash("{GUID}", {{"status", "machine_id", "ok", ""}});
+        const auto* a = find_section(ok, "machine_id");
+        REQUIRE(a != nullptr);
+        CHECK(a->level == "constrained");
+        CHECK(a->reason == "server:machine_id_shape");
+        DeviceCiRecord why = parse_with_hash("{GUID}", {{"status", "machine_id", "ok", "x"}});
+        const auto* b = find_section(why, "machine_id");
+        REQUIRE(b != nullptr);
+        CHECK(b->reason == "x;server:machine_id_shape");
+    }
+}
+
+TEST_CASE("v2 fields get the same scrub + clamp as v1", "[device_ci][parse][v2]") {
+    std::vector<std::vector<std::string>> recs = {
+        {"status", "cpu", "ok", std::string("bad\xFF") + "reason"},
+        {"cpu", "0", std::string("M\xFF") + "odel", "4", "8", "2800", std::string(1100, 'Z'), "1"},
+    };
+    DeviceCiRecord r = parse_device_ci_blob(build_blob_v2(v2_scalars(), recs));
+    const auto* c = find_section(r, "cpu");
+    REQUIRE(c != nullptr);
+    CHECK(c->reason == "bad\xEF\xBF\xBD"
+                       "reason"); // 0xFF -> U+FFFD
+    REQUIRE(c->rows.size() == 1);
+    CHECK(c->rows[0][1] == "M\xEF\xBF\xBD"
+                           "odel");
+    CHECK(c->rows[0][5].size() == 1024);
+
+    SECTION("a 1100-byte multibyte field clamps on a codepoint boundary") {
+        // 'ü' is 2 bytes: 550 of them = 1100 bytes; the clamp must not split one.
+        std::string u;
+        for (int i = 0; i < 550; ++i)
+            u += "\xC3\xBC";
+        std::vector<std::vector<std::string>> r2 = {{"cpu", "0", u, "1", "1", "1", "s", "1"}};
+        DeviceCiRecord p = parse_device_ci_blob(build_blob_v2(v2_scalars(), r2));
+        const auto* cc = find_section(p, "cpu");
+        REQUIRE(cc != nullptr);
+        REQUIRE(cc->rows.size() == 1);
+        CHECK(cc->rows[0][1].size() == 1024);
+        CHECK(cc->rows[0][1].size() % 2 == 0);
+    }
+    SECTION("1023 ASCII + a 2-byte codepoint straddling the cap drops the whole codepoint") {
+        // The 1024-byte cut lands inside 'ü' (0xC3 0xBC at offsets 1023/1024); a byte
+        // truncation would keep the lone lead byte (size 1024), a boundary-safe clamp 1023.
+        const std::string field = std::string(1023, 'a') + "\xC3\xBC";
+        std::vector<std::vector<std::string>> r2 = {{"cpu", "0", field, "1", "1", "1", "s", "1"}};
+        DeviceCiRecord p = parse_device_ci_blob(build_blob_v2(v2_scalars(), r2));
+        const auto* cc = find_section(p, "cpu");
+        REQUIRE(cc != nullptr);
+        REQUIRE(cc->rows.size() == 1);
+        CHECK(cc->rows[0][1] == std::string(1023, 'a'));
+    }
+    SECTION("an embedded NUL is stripped, a tab is kept") {
+        const std::string field("a\0b\tc", 5);
+        std::vector<std::vector<std::string>> r2 = {{"cpu", "0", field, "1", "1", "1", "s", "1"}};
+        DeviceCiRecord p = parse_device_ci_blob(build_blob_v2(v2_scalars(), r2));
+        const auto* cc = find_section(p, "cpu");
+        REQUIRE(cc != nullptr);
+        REQUIRE(cc->rows.size() == 1);
+        CHECK(cc->rows[0][1] == "ab\tc");
+    }
+}
+
+TEST_CASE("v2 parse names what it ignored in ONE debug line per blob, bounded and neutralised",
+          "[device_ci][parse][v2]") {
+    const auto count_of = [](const std::string& hay, const std::string& needle) {
+        std::size_t n = 0;
+        for (auto p = hay.find(needle); p != std::string::npos; p = hay.find(needle, p + 1))
+            ++n;
+        return n;
+    };
+    const std::string kLine = "ignored unregistered tokens";
+
+    SECTION("unknown kind, unknown status section, a row for a status-only section, extra columns") {
+        std::vector<std::vector<std::string>> recs = {
+            {"status", "nic", "ok", ""},                                // unregistered section
+            {"gpu", "0", "x"},                                          // unknown kind
+            {"gpu", "1", "y"},                                          // same token again
+            {"chassis", "stray"},                                       // row for a status-only kind
+            {"cpu", "0", "M", "1", "1", "1", "s", "1", "extra", "more"}, // 9 columns, cpu has 7
+        };
+        yuzu::test::LogCapture cap(spdlog::level::debug);
+        DeviceCiRecord r = parse_device_ci_blob(build_blob_v2(v2_scalars(), recs));
+        cap.stop();
+        const std::string logs = cap.text();
+        CHECK(count_of(logs, kLine) == 1); // one line for the whole blob
+        CHECK(logs.find("'nic'") != std::string::npos);
+        CHECK(logs.find("'gpu'") != std::string::npos);
+        CHECK(count_of(logs, "'gpu'") == 1); // a repeated token is named once
+        CHECK(logs.find("'chassis'") != std::string::npos);
+        CHECK(logs.find("extra columns on kinds [cpu]") != std::string::npos);
+        const auto* c = find_section(r, "cpu"); // the row itself still stores, columns clipped
+        REQUIRE(c != nullptr);
+        CHECK(c->rows.size() == 1);
+        CHECK(c->rows[0].size() == 7);
+    }
+    SECTION("extra fields on the scalar record alone are named, values unchanged") {
+        auto scalars = v2_scalars();
+        scalars.emplace_back("extra1");
+        scalars.emplace_back("extra2");
+        yuzu::test::LogCapture cap(spdlog::level::debug);
+        DeviceCiRecord r = parse_device_ci_blob(build_blob_v2(scalars, v2_records()));
+        cap.stop();
+        const std::string logs = cap.text();
+        CHECK(count_of(logs, kLine) == 1);
+        CHECK(logs.find("unregistered tokens [] and extra columns on kinds [scalar]") !=
+              std::string::npos);
+        CHECK(r.machine_id_source == "etc_machine_id"); // position 32 is the last one kept
+        CHECK(r.arch == "x86_64");
+        REQUIRE(r.sections.size() == 10);
+        CHECK(find_section(r, "chassis")->level == "ok");
+    }
+    SECTION("extra fields on a status record alone are named, values unchanged") {
+        auto recs = v2_records();
+        recs[3] = {"status", "cpu", "constrained", "kept:3", "extra", "more"};
+        yuzu::test::LogCapture cap(spdlog::level::debug);
+        DeviceCiRecord r = parse_device_ci_blob(build_blob_v2(v2_scalars(), recs));
+        cap.stop();
+        const std::string logs = cap.text();
+        CHECK(count_of(logs, kLine) == 1);
+        CHECK(logs.find("unregistered tokens [] and extra columns on kinds [status:cpu]") !=
+              std::string::npos);
+        const auto* c = find_section(r, "cpu");
+        REQUIRE(c != nullptr);
+        CHECK(c->level == "constrained");
+        CHECK(c->reason == "kept:3");
+        CHECK(r.machine_id_source == "etc_machine_id");
+    }
+    SECTION("scalar, status and row overflow together make ONE line, in registry order") {
+        auto scalars = v2_scalars();
+        scalars.emplace_back("extra");
+        auto recs = v2_records();
+        recs[3] = {"status", "cpu", "ok", "", "extra"};
+        recs.push_back({"status", "nosuchsection", "ok", "", "extra"}); // ignored, not overflow
+        recs[4].push_back("extra");                                     // the cpu row
+        yuzu::test::LogCapture cap(spdlog::level::debug);
+        DeviceCiRecord r = parse_device_ci_blob(build_blob_v2(scalars, recs));
+        cap.stop();
+        const std::string logs = cap.text();
+        CHECK(count_of(logs, kLine) == 1);
+        CHECK(logs.find("'nosuchsection'") != std::string::npos);
+        CHECK(logs.find("extra columns on kinds [scalar, status:cpu, cpu]") != std::string::npos);
+        const auto* c = find_section(r, "cpu");
+        REQUIRE(c != nullptr);
+        CHECK(c->level == "ok");
+        REQUIRE(c->rows.size() == 1);
+        CHECK(c->rows[0].size() == 7);
+        CHECK(r.machine_id_source == "etc_machine_id");
+    }
+    SECTION("a conforming blob logs nothing") {
+        yuzu::test::LogCapture cap(spdlog::level::debug);
+        parse_device_ci_blob(fixture_blob_v2());
+        cap.stop();
+        CHECK(count_of(cap.text(), kLine) == 0);
+    }
+    SECTION("a hostile blob of many unknown kinds is capped and cannot split the line") {
+        std::vector<std::vector<std::string>> recs = {{"bad\nkind\r\ttoken", "v"}};
+        for (int i = 0; i < 50; ++i)
+            recs.push_back({"k" + std::to_string(i), "v"});
+        yuzu::test::LogCapture cap(spdlog::level::debug);
+        parse_device_ci_blob(build_blob_v2(v2_scalars(), recs));
+        cap.stop();
+        const std::string logs = cap.text();
+        REQUIRE(count_of(logs, kLine) == 1);
+        CHECK(logs.find("'bad_kind__token'") != std::string::npos); // control bytes neutralised
+        CHECK(logs.find("'k6'") != std::string::npos);
+        CHECK(logs.find("'k7'") == std::string::npos); // at most 8 distinct tokens in the line
+        // The one captured record is one physical line: only the logger's own terminator.
+        CHECK(count_of(logs, "\n") == 1);
+    }
+}
+
+TEST_CASE("device_ci section registry self-check", "[device_ci][v2]") {
+    using yuzu::server::kDeviceCiSectionCount;
+    using yuzu::server::kDeviceCiSections;
+    CHECK(kDeviceCiSectionCount == 10);
+    int status_only = 0;
+    for (const auto& d : kDeviceCiSections) {
+        if (d.table == nullptr) {
+            ++status_only;
+            CHECK(d.n_fields == 0);
+            CHECK(d.row_cap == 0);
+            CHECK(d.row_budget == 0);
+            CHECK(d.row_floor == 0);
+            continue;
+        }
+        int names = 1;
+        for (const char* p = d.columns; *p; ++p)
+            if (*p == ',')
+                ++names;
+        CHECK(names == d.n_fields);
+        CHECK(d.row_cap > 0);
+    }
+    CHECK(status_only == 3);
+    CHECK(std::string(kDeviceCiSections[0].section) == "chassis");
+}
+
+namespace {
+
+// "name:type:nullable" for every column of a device_inventory_store table, in ordinal order.
+std::vector<std::string> live_columns(PgPool& pool, const std::string& table) {
+    std::vector<std::string> out;
+    auto lease = pool.acquire();
+    REQUIRE(lease);
+    auto res = yuzu::server::pg::exec_params(
+        lease.get(),
+        "SELECT column_name, data_type, is_nullable FROM information_schema.columns "
+        "WHERE table_schema = 'device_inventory_store' AND table_name = $1 "
+        "ORDER BY ordinal_position",
+        std::vector<std::string>{table});
+    REQUIRE(res.status() == PGRES_TUPLES_OK);
+    for (int i = 0; i < PQntuples(res.get()); ++i)
+        out.push_back(std::string(PQgetvalue(res.get(), i, 0)) + ":" +
+                      PQgetvalue(res.get(), i, 1) + ":" + PQgetvalue(res.get(), i, 2));
+    return out;
+}
+
+// "p" (primary key) and "f:c" (foreign key, ON DELETE CASCADE) rows of a device_inventory_store
+// table, sorted, with the constrained columns: e.g. "f:c:agent_id", "p:agent_id,ord".
+std::vector<std::string> live_constraints(PgPool& pool, const std::string& table) {
+    std::vector<std::string> out;
+    auto lease = pool.acquire();
+    REQUIRE(lease);
+    auto res = yuzu::server::pg::exec_params(
+        lease.get(),
+        "SELECT c.contype::text || CASE WHEN c.contype = 'f' THEN ':' || c.confdeltype::text "
+        "ELSE '' END || ':' "
+        "|| (SELECT string_agg(a.attname, ',' ORDER BY k.ord) FROM unnest(c.conkey) "
+        "WITH ORDINALITY AS k(attnum, ord) JOIN pg_attribute a ON a.attrelid = c.conrelid AND "
+        "a.attnum = k.attnum) FROM pg_constraint c WHERE c.conrelid = $1::regclass "
+        "AND c.contype IN ('p', 'f') ORDER BY 1",
+        std::vector<std::string>{"device_inventory_store." + table});
+    REQUIRE(res.status() == PGRES_TUPLES_OK);
+    for (int i = 0; i < PQntuples(res.get()); ++i)
+        out.emplace_back(PQgetvalue(res.get(), i, 0));
+    return out;
+}
+
+} // namespace
+
+// #7164: migration v2 is a frozen literal, so this is the tripwire that a registry edit made
+// WITHOUT a new migration cannot slip past. It runs the literal migrations on a fresh database
+// and compares what they created with what the live registry says the runtime reads. A new
+// table-backed kind, or a changed/reordered column list, fails here until a migration (v4+) and
+// this expectation move together. Expected shapes are written out, not derived, where the
+// registry is not the subject.
+TEST_CASE("device_ci schema created by the frozen migrations matches the section registry",
+          "[pg][device_ci][v2][migration]") {
+    // The pre-migrated template database is built by constructing the store, so it carries exactly
+    // what the frozen literals create; it is used (read-only) instead of a private database.
+    YUZU_REQUIRE_PG_DB_TPL(db, device_ci_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    REQUIRE(pool.valid());
+    DeviceInventoryStore store{pool};
+    REQUIRE(store.is_open());
+
+    int table_backed = 0;
+    for (const auto& d : yuzu::server::kDeviceCiSections) {
+        if (d.table == nullptr)
+            continue;
+        ++table_backed;
+        std::vector<std::string> expected{"agent_id:text:NO", "ord:integer:NO"};
+        std::string cols = d.columns;
+        std::size_t pos = 0;
+        while (true) {
+            const auto comma = cols.find(',', pos);
+            expected.push_back(cols.substr(pos, comma == std::string::npos ? comma : comma - pos) +
+                               ":text:NO");
+            if (comma == std::string::npos)
+                break;
+            pos = comma + 1;
+        }
+        INFO("table " << d.table);
+        CHECK(live_columns(pool, d.table) == expected);
+        // The key shape delete_agent and the ON CONFLICT upserts depend on: one primary key on
+        // (agent_id, ord) and one cascading foreign key on agent_id (confdeltype 'c').
+        CHECK(live_constraints(pool, d.table) ==
+              std::vector<std::string>{"f:c:agent_id", "p:agent_id,ord"});
+    }
+    CHECK(table_backed == 7);
+
+    CHECK(live_columns(pool, "device_ci_section") ==
+          std::vector<std::string>{"agent_id:text:NO", "kind:text:NO", "level:text:NO",
+                                   "reason:text:NO", "row_count:integer:YES",
+                                   "content_digest:text:YES"});
+
+    // The 11 scalars appended to device_ci at wire positions 22-32, after the 26 v1 columns
+    // (v1 ends at last_seen) and blob_version; v5's changed_at is the last column.
+    const auto dev = live_columns(pool, "device_ci");
+    // 26 v1 columns, blob_version, then the appended scalars, then changed_at (v5): tied to the wire
+    // constant, so a new scalar (kDeviceCiScalarFields grows) fails here until a migration adds its
+    // column.
+    REQUIRE(dev.size() == 26 + 1 + (yuzu::server::kDeviceCiScalarFields - 22) + 1);
+    CHECK(dev.back() == "changed_at:bigint:NO");
+    CHECK(dev[26] == "blob_version:smallint:NO");
+    const std::vector<std::string> scalars{
+        "chassis_type",    "chassis_serial",      "chassis_asset_tag", "chassis_source",
+        "board_vendor",    "board_product",       "board_serial",      "board_source",
+        "machine_id_hash", "machine_id_algorithm", "machine_id_source"};
+    for (std::size_t i = 0; i < scalars.size(); ++i)
+        CHECK(dev[27 + i] == scalars[i] + ":text:NO");
+}
+
+// #7164: a database the runner calls current but whose schema lacks something this binary reads
+// (an earlier revision of the unreleased v2/v3, a stamped-by-another-binary schema_meta) must
+// refuse at construction, naming the table, not 503 on the first sections read.
+TEST_CASE("DeviceInventoryStore refuses at construction when the schema lacks a registry table "
+          "or column",
+          "[pg][device_ci][v2][migration]") {
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    REQUIRE(pool.valid());
+    {
+        DeviceInventoryStore first{pool}; // migrates a clean database
+        REQUIRE(first.is_open());
+    }
+    const auto exec = [&](const std::string& sql) {
+        auto lease = pool.acquire();
+        REQUIRE(lease);
+        auto res = yuzu::server::pg::exec_params(lease.get(), sql.c_str(), std::vector<std::string>{});
+        REQUIRE(res.status() == PGRES_COMMAND_OK);
+    };
+
+    struct Case {
+        const char* what;
+        const char* breakage;
+        const char* named; // the table the log must name
+        const char* restore;
+    };
+    const Case cases[] = {
+        {"a registry kind with no table", "DROP TABLE device_inventory_store.device_ci_swap",
+         "device_ci_swap",
+         "CREATE TABLE device_inventory_store.device_ci_swap (agent_id TEXT NOT NULL REFERENCES "
+         "device_inventory_store.device_ci (agent_id) ON DELETE CASCADE, ord INTEGER NOT NULL, "
+         "device TEXT NOT NULL DEFAULT '', total_mb TEXT NOT NULL DEFAULT '', source TEXT NOT NULL "
+         "DEFAULT '', PRIMARY KEY (agent_id, ord))"},
+        {"a missing child-table column",
+         "ALTER TABLE device_inventory_store.device_ci_dimm DROP COLUMN part_number",
+         "device_ci_dimm",
+         "ALTER TABLE device_inventory_store.device_ci_dimm ADD COLUMN part_number TEXT NOT NULL "
+         "DEFAULT ''"},
+        {"the v3 content_digest column absent",
+         "ALTER TABLE device_inventory_store.device_ci_section DROP COLUMN content_digest",
+         "device_ci_section",
+         "ALTER TABLE device_inventory_store.device_ci_section ADD COLUMN content_digest TEXT NULL"},
+        {"the v3 row_count column absent",
+         "ALTER TABLE device_inventory_store.device_ci_section DROP COLUMN row_count",
+         "device_ci_section",
+         "ALTER TABLE device_inventory_store.device_ci_section ADD COLUMN row_count INTEGER NULL"},
+        {"the content_hash column absent",
+         "ALTER TABLE device_inventory_store.device_ci DROP COLUMN content_hash", "device_ci",
+         "ALTER TABLE device_inventory_store.device_ci ADD COLUMN content_hash TEXT NOT NULL "
+         "DEFAULT ''"},
+        {"the v5 changed_at column absent (a v4 schema under a binary that reads it)",
+         "ALTER TABLE device_inventory_store.device_ci DROP COLUMN changed_at", "device_ci",
+         "ALTER TABLE device_inventory_store.device_ci ADD COLUMN changed_at BIGINT NOT NULL "
+         "DEFAULT 0"},
+        {"a missing appended scalar on device_ci",
+         "ALTER TABLE device_inventory_store.device_ci DROP COLUMN machine_id_source",
+         "device_ci",
+         "ALTER TABLE device_inventory_store.device_ci ADD COLUMN machine_id_source TEXT NOT NULL "
+         "DEFAULT ''"},
+    };
+    for (const auto& c : cases) {
+        INFO(c.what);
+        exec(c.breakage);
+        {
+            yuzu::test::LogCapture cap(spdlog::level::err);
+            DeviceInventoryStore broken{pool};
+            CHECK_FALSE(broken.is_open());
+            const std::string logs = cap.text();
+            CHECK(logs.find("projection check failed on " + std::string(c.named) + " (SQLSTATE 42") !=
+                  std::string::npos);
+        }
+        exec(c.restore);
+        DeviceInventoryStore healed{pool};
+        CHECK(healed.is_open()); // each case is isolated: the restore returns a usable store
+    }
+
+    // Every table-backed registry kind, last column dropped in turn: a probe that skipped a table
+    // or a column of the registry's list would let one of these open.
+    for (const auto& d : yuzu::server::kDeviceCiSections) {
+        if (d.table == nullptr)
+            continue;
+        const std::string cols = d.columns;
+        const std::string last = cols.substr(cols.rfind(',') + 1);
+        INFO("kind " << d.section << " column " << last);
+        exec("ALTER TABLE device_inventory_store." + std::string(d.table) + " DROP COLUMN " + last);
+        {
+            yuzu::test::LogCapture cap(spdlog::level::err);
+            DeviceInventoryStore broken{pool};
+            CHECK_FALSE(broken.is_open());
+            CHECK(cap.text().find("projection check failed on " + std::string(d.table) +
+                                  " (SQLSTATE 42703)") != std::string::npos);
+        }
+        exec("ALTER TABLE device_inventory_store." + std::string(d.table) + " ADD COLUMN " + last +
+             " TEXT NOT NULL DEFAULT ''");
+        DeviceInventoryStore healed{pool};
+        CHECK(healed.is_open());
+    }
+
+    // An EXTRA column (an operator addition, or a later migration this binary predates) is
+    // tolerated: the check is presence-only, in line with the ahead-database stance (#3894).
+    exec("ALTER TABLE device_inventory_store.device_ci_cpu ADD COLUMN operator_note TEXT NULL");
+    DeviceInventoryStore ahead{pool};
+    CHECK(ahead.is_open());
+}
+
+// #7164: the stored row_count / content_digest of a kind bind its section name, n_fields and
+// column order (device_ci_section_digest.hpp). Nothing else fails when a registry column list
+// changes, so this pins the shipped lists: an edit here must come WITH a migration that ALTERs the
+// table and NULLs row_count/content_digest for that kind (or a kSectionDigestPrefix bump), per
+// docs/postgres-store-playbook.md "Registry-backed tables". Update the expectation only together
+// with that migration.
+TEST_CASE("device_ci registry column lists are pinned to the stored digest layout",
+          "[device_ci][v2]") {
+    CHECK(std::string(yuzu::server::kSectionDigestPrefix) == "v1:");
+    const std::vector<std::pair<std::string, std::string>> pinned{
+        {"cpu", "idx,model,cores,threads,clock_mhz,socket_designation,stepping"},
+        {"dimm", "slot,size_mb,type,speed_mhz,manufacturer,part_number,serial"},
+        {"disk", "idx,model,size_gb,media_type,interface"},
+        {"swap", "device,total_mb,source"},
+        {"volume", "volume,mount_points,device,fstype,total_bytes,detail"},
+        {"partition", "disk,partition,size_bytes,type,mount_points,detail"},
+        {"topology", "topo_kind,name,uuid,members,detail"},
+    };
+    std::size_t seen = 0;
+    for (const auto& d : yuzu::server::kDeviceCiSections) {
+        if (d.table == nullptr)
+            continue;
+        ++seen;
+        const auto it = std::find_if(pinned.begin(), pinned.end(),
+                                     [&](const auto& p) { return p.first == d.section; });
+        INFO("kind " << d.section);
+        REQUIRE(it != pinned.end());
+        CHECK(it->second == d.columns);
+    }
+    CHECK(seen == pinned.size());
 }
 
 TEST_CASE("DeviceInventoryStore degrades (not empty) on a broken pool", "[device_ci]") {
@@ -163,7 +1274,14 @@ TEST_CASE("DeviceInventoryStore degrades (not empty) on a broken pool", "[device
     auto g = store.get_device_ci("a");
     CHECK(!g.has_value()); // std::unexpected(kDegraded)
     CHECK(g.error() == CiReadError::kDegraded);
-    CHECK(!store.list_device_ci(10).has_value()); // nullopt (degraded), not an empty vector
+    CHECK(!store.list_device_ci_for({"a"}).has_value()); // nullopt (degraded), not an empty vector
+    CHECK(!store.list_device_ci_for({}).has_value());    // a closed store degrades even when nothing was asked
+    auto sec = store.get_device_ci_sections("a");
+    REQUIRE(!sec.has_value()); // unexpected(kDegraded), never an empty success
+    CHECK(sec.error() == CiReadError::kDegraded);
+    auto both = store.get_device_ci_with_sections("a");
+    REQUIRE(!both.has_value()); // a closed store is a degrade, not "no record"
+    CHECK(both.error() == CiReadError::kDegraded);
 }
 
 TEST_CASE("DeviceInventoryStore hash-skip ingest round-trip", "[pg][device_ci]") {
@@ -249,16 +1367,14 @@ TEST_CASE("DeviceInventoryStore hash-skip ingest round-trip", "[pg][device_ci]")
         CHECK((**r).ram_bytes == "0");
     }
 
-    SECTION("roster list + delete + absent") {
+    SECTION("keyed list + delete + absent") {
         REQUIRE(store.apply_device_ci("agent-d", h, std::optional<DeviceCiRecord>{rec}, 1000) ==
                 InventoryIngestOutcome::kStored);
-        auto roster = store.list_device_ci(100);
+        // "nobody" has no CI row: it is simply absent from the result (not yet synced), not an error.
+        auto roster = store.list_device_ci_for({"agent-d", "nobody"});
         REQUIRE(roster.has_value());
-        bool found = false;
-        for (const auto& d : *roster)
-            if (d.agent_id == "agent-d")
-                found = true;
-        CHECK(found);
+        REQUIRE(roster->size() == 1);
+        CHECK(roster->front().agent_id == "agent-d");
 
         CHECK(store.delete_agent("agent-d")); // committed → true
         auto gone = store.get_device_ci("agent-d");
@@ -311,17 +1427,31 @@ TEST_CASE("ingest_device_ci_report end-to-end (all wire shapes)", "[pg][device_c
         CHECK(ack.need_full(0) == "device_ci");
     }
 
-    SECTION("oversized blob is dropped + nacked, nothing stored") {
+    SECTION("oversized blob is dropped + nacked, logged once, counted, nothing stored") {
+        // The backstop for a non-conforming sender (a conforming one trims to fit): the ONE
+        // existing warn line and the `dropped` outcome are the operator's signal, pinned here.
+        yuzu::MetricsRegistry metrics;
+        yuzu::test::LogCapture cap(spdlog::level::warn);
         agentpb::InventoryReport rpt;
         (*rpt.mutable_content_hashes())["device_ci"] = "somehash";
-        (*rpt.mutable_plugin_data())["device_ci"] = std::string(70u * 1024, 'x'); // > 64 KiB
+        (*rpt.mutable_plugin_data())["device_ci"] = std::string(kBlobCap + 1, 'x'); // > 96 KiB
         agentpb::InventoryAck ack;
-        yuzu::server::ingest_device_ci_report(store, "agent-big", rpt, ack, nullptr);
+        yuzu::server::ingest_device_ci_report(store, "agent-big", rpt, ack, &metrics);
+        cap.stop();
         REQUIRE(ack.need_full_size() == 1);
         CHECK(ack.need_full(0) == "device_ci");
         auto r = store.get_device_ci("agent-big");
         REQUIRE(r.has_value());
         CHECK(!r->has_value()); // nothing stored
+        CHECK(metrics
+                  .counter("yuzu_inventory_ingest_total",
+                           {{"source", "device_ci"}, {"outcome", "dropped"}})
+                  .value() == 1.0);
+        const std::string logs = cap.text();
+        const std::string needle = "oversized blob from agent=agent-big";
+        const auto first = logs.find(needle);
+        REQUIRE(first != std::string::npos);
+        CHECK(logs.find(needle, first + 1) == std::string::npos); // once per blob
     }
 
     SECTION("source absent from the report → no-op, no nack") {
@@ -331,4 +1461,3599 @@ TEST_CASE("ingest_device_ci_report end-to-end (all wire shapes)", "[pg][device_c
         yuzu::server::ingest_device_ci_report(store, "agent-f", other, ack, nullptr);
         CHECK(ack.need_full_size() == 0);
     }
+}
+
+// ── v2 store (PG) ─────────────────────────────────────────────────────────────
+
+TEST_CASE("v2 full ingest stores the scalars and the rows of every section", "[pg][device_ci][v2]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, device_ci_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    DeviceInventoryStore store{pool};
+    REQUIRE(store.is_open());
+
+    DeviceCiRecord rec = parse_device_ci_blob(fixture_blob_v2());
+    const std::string h = DeviceInventoryStore::canonical_hash(rec);
+    REQUIRE(!h.empty());
+    REQUIRE(store.apply_device_ci("agent-v2", h, std::optional<DeviceCiRecord>{rec}, 1) ==
+            InventoryIngestOutcome::kStored);
+
+    auto got = store.get_device_ci("agent-v2");
+    REQUIRE(got.has_value());
+    REQUIRE(got->has_value());
+    CHECK((**got).blob_version == 2);
+    CHECK((**got).chassis_serial == "CHS-0001");
+    CHECK((**got).board_product == "0K3CM7");
+    CHECK((**got).machine_id_source == "etc_machine_id");
+    CHECK((**got).serial == "ABC123");
+
+    auto secs = store.get_device_ci_sections("agent-v2");
+    REQUIRE(secs.has_value());
+    REQUIRE(secs->size() == 10);
+    for (std::size_t i = 0; i < secs->size(); ++i)
+        CHECK((*secs)[i].kind == yuzu::server::kDeviceCiSections[i].section);
+    const auto* ch = find_section(*secs, "chassis");
+    REQUIRE(ch != nullptr);
+    CHECK(ch->level == "ok");
+    CHECK(ch->rows.empty());
+    const auto* dimm = find_section(*secs, "dimm");
+    REQUIRE(dimm != nullptr);
+    REQUIRE(dimm->rows.size() == 1);
+    CHECK(dimm->rows[0][0] == "DIMM0");
+    CHECK(dimm->rows[0][6] == "-");
+    const auto* vol = find_section(*secs, "volume");
+    REQUIRE(vol != nullptr);
+    CHECK(vol->rows[0][1] == "C:/");
+
+    SECTION("hash-only with the v2 hash is touched; a stale hash and a cold agent need_full") {
+        CHECK(store.apply_device_ci("agent-v2", h, std::nullopt, 2) ==
+              InventoryIngestOutcome::kTouched);
+        CHECK(store.apply_device_ci("agent-v2", "deadbeef", std::nullopt, 3) ==
+              InventoryIngestOutcome::kNeedFull);
+        CHECK(store.apply_device_ci("agent-cold", h, std::nullopt, 4) ==
+              InventoryIngestOutcome::kNeedFull);
+    }
+    SECTION("a server-capped section stays disclosed across a hash-only ack") {
+        std::vector<std::vector<std::string>> recs = {{"status", "cpu", "ok", ""}};
+        for (int i = 0; i < 40; ++i)
+            recs.push_back({"cpu", std::to_string(i), "M", "1", "1", "1", "s", "1"});
+        DeviceCiRecord capped = parse_device_ci_blob(build_blob_v2(v2_scalars(), recs));
+        const std::string ch2 = DeviceInventoryStore::canonical_hash(capped);
+        REQUIRE(store.apply_device_ci("agent-cap", ch2, std::optional<DeviceCiRecord>{capped}, 1) ==
+                InventoryIngestOutcome::kStored);
+        CHECK(store.apply_device_ci("agent-cap", ch2, std::nullopt, 2) ==
+              InventoryIngestOutcome::kTouched);
+        auto cs = store.get_device_ci_sections("agent-cap");
+        REQUIRE(cs.has_value());
+        const auto* cpu = find_section(*cs, "cpu");
+        REQUIRE(cpu != nullptr);
+        CHECK(cpu->rows.size() == 32);
+        CHECK(cpu->level == "constrained");
+        CHECK(cpu->reason == "server_cap:32");
+    }
+    SECTION("an unknown agent has no sections (empty, not degraded)") {
+        auto none = store.get_device_ci_sections("nobody");
+        REQUIRE(none.has_value());
+        CHECK(none->empty());
+    }
+    SECTION("an empty agent id on an open store is a precondition miss: empty, not degraded") {
+        auto blank = store.get_device_ci_sections("");
+        REQUIRE(blank.has_value());
+        CHECK(blank->empty());
+    }
+}
+
+TEST_CASE("v2 round trip: every scalar and every list column reads back exactly; then updates",
+          "[pg][device_ci][v2]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, device_ci_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 3}};
+    REQUIRE(pool.valid());
+    DeviceInventoryStore store{pool};
+    REQUIRE(store.is_open());
+
+    const DeviceCiRecord a = distinct_v2_record("A");
+    const DeviceCiRecord b = distinct_v2_record("B");
+    // The fixtures really exercise what this case claims to.
+    REQUIRE(a.sections.size() == 10);
+    REQUIRE(find_section(a, "swap")->level.empty());   // a cleared level is part of generation A
+    REQUIRE(!find_section(b, "swap")->level.empty());
+    REQUIRE(find_section(a, "dimm")->rows.size() == 2);
+
+    const auto put = [&](const DeviceCiRecord& r) {
+        return store.apply_device_ci("agent-rt", DeviceInventoryStore::canonical_hash(r),
+                                     std::optional<DeviceCiRecord>{r}, 1);
+    };
+    // Exact read-back: parent scalars (get_device_ci) + status/rows (get_device_ci_sections),
+    // registry order, every cell; and the stored hash is the record's own.
+    const auto verify = [&](const DeviceCiRecord& want) {
+        auto got = store.get_device_ci("agent-rt");
+        REQUIRE(got.has_value());
+        REQUIRE(got->has_value());
+        CHECK((**got).agent_id == "agent-rt");
+        check_scalars_equal(**got, want);
+        auto secs = store.get_device_ci_sections("agent-rt");
+        REQUIRE(secs.has_value());
+        check_sections_equal(*secs, want.sections);
+        CHECK(store.apply_device_ci("agent-rt", DeviceInventoryStore::canonical_hash(want),
+                                    std::nullopt, 2) == InventoryIngestOutcome::kTouched);
+    };
+
+    REQUIRE(put(a) == InventoryIngestOutcome::kStored);
+    verify(a);
+    auto first = store.get_device_ci("agent-rt");
+    REQUIRE(first.has_value());
+    REQUIRE(first->has_value());
+
+    // Second full payload, every value different: the ON CONFLICT update path replaces the
+    // parent scalars and the whole child set; first_seen survives.
+    REQUIRE(put(b) == InventoryIngestOutcome::kStored);
+    verify(b);
+    auto second = store.get_device_ci("agent-rt");
+    REQUIRE(second.has_value());
+    REQUIRE(second->has_value());
+    CHECK((**second).first_seen == (**first).first_seen);
+    CHECK((**second).last_seen >= (**first).last_seen);
+    // Nothing of generation A lingers in any child table.
+    CHECK(count_rows(pool, count_sql("device_inventory_store.device_ci_dimm WHERE agent_id = "
+                                     "'agent-rt' AND slot LIKE 'A-%'")) == 0);
+}
+
+TEST_CASE("get_device_ci_sections on an open store: broken child read degrades; "
+          "a missing or stray status row reconciles",
+          "[pg][device_ci][v2]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, device_ci_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    REQUIRE(pool.valid());
+    DeviceInventoryStore store{pool};
+    REQUIRE(store.is_open());
+
+    const DeviceCiRecord a = make_v2_record("A", 2, false); // one cpu section, two cpu rows
+    REQUIRE(store.apply_device_ci("agent-sr", DeviceInventoryStore::canonical_hash(a),
+                                  std::optional<DeviceCiRecord>{a}, 1) ==
+            InventoryIngestOutcome::kStored);
+
+    SECTION("a failed child SELECT is a degrade, never an empty success") {
+        exec_stmt(pool,
+                  "ALTER TABLE device_inventory_store.device_ci_cpu RENAME COLUMN idx TO idx_x");
+        auto s = store.get_device_ci_sections("agent-sr");
+        REQUIRE(!s.has_value());
+        CHECK(s.error() == CiReadError::kDegraded);
+    }
+    SECTION("rows whose status row is gone still surface, with a blank level") {
+        exec_stmt(pool, "DELETE FROM device_inventory_store.device_ci_section WHERE kind = 'cpu'");
+        auto s = store.get_device_ci_sections("agent-sr");
+        REQUIRE(s.has_value());
+        REQUIRE(s->size() == 1);
+        CHECK((*s)[0].kind == "cpu");
+        CHECK((*s)[0].level.empty());
+        CHECK((*s)[0].reason.empty());
+        CHECK((*s)[0].rows.size() == 2);
+    }
+    SECTION("a stored status for an unregistered kind is never surfaced") {
+        exec_stmt(pool, "INSERT INTO device_inventory_store.device_ci_section "
+                        "(agent_id, kind, level, reason) VALUES ('agent-sr', 'bogus', 'ok', 'x')");
+        auto s = store.get_device_ci_sections("agent-sr");
+        REQUIRE(s.has_value());
+        CHECK(s->size() == 1);
+        CHECK(find_section(*s, "bogus") == nullptr);
+        CHECK(find_section(*s, "cpu") != nullptr);
+    }
+}
+
+// ── get_device_ci_with_sections: the record and its sections from ONE snapshot (H.7) ─────────
+
+TEST_CASE("get_device_ci_with_sections: scalars and sections are the same generation after a replace",
+          "[pg][device_ci][v2]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, device_ci_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 3}};
+    REQUIRE(pool.valid());
+    DeviceInventoryStore store{pool};
+    REQUIRE(store.is_open());
+
+    const DeviceCiRecord a = distinct_v2_record("A");
+    const DeviceCiRecord b = distinct_v2_record("B");
+    const auto put = [&](const DeviceCiRecord& r) {
+        return store.apply_device_ci("agent-ws", DeviceInventoryStore::canonical_hash(r),
+                                     std::optional<DeviceCiRecord>{r}, 1);
+    };
+    const auto verify = [&](const DeviceCiRecord& want) {
+        auto got = store.get_device_ci_with_sections("agent-ws");
+        REQUIRE(got.has_value());
+        CHECK_FALSE(got->sections_failed);
+        REQUIRE(got->record.has_value());
+        CHECK(got->record->agent_id == "agent-ws");
+        check_scalars_equal(*got->record, want);
+        check_sections_equal(got->record->sections, want.sections);
+    };
+
+    REQUIRE(put(a) == InventoryIngestOutcome::kStored);
+    verify(a);
+    REQUIRE(put(b) == InventoryIngestOutcome::kStored);
+    verify(b); // scalars AND every row are generation B; nothing of A is paired with it
+    // The same read through the two single-purpose readers agrees with the combined one.
+    auto secs = store.get_device_ci_sections("agent-ws");
+    REQUIRE(secs.has_value());
+    check_sections_equal(*secs, b.sections);
+    auto only = store.get_device_ci("agent-ws");
+    REQUIRE(only.has_value());
+    REQUIRE(only->has_value());
+    CHECK((**only).sections.empty()); // get_device_ci still does not read sections
+}
+
+TEST_CASE("get_device_ci_with_sections: a v1 record has no sections and no section read is needed",
+          "[pg][device_ci][v2]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, device_ci_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    REQUIRE(pool.valid());
+    DeviceInventoryStore store{pool};
+    REQUIRE(store.is_open());
+
+    const DeviceCiRecord v1 = parse_device_ci_blob(sample_blob());
+    REQUIRE(store.apply_device_ci("agent-v1", DeviceInventoryStore::canonical_hash(v1),
+                                  std::optional<DeviceCiRecord>{v1}, 1) == InventoryIngestOutcome::kStored);
+    // Break every section table: a v1 record must still read fine, proving no section statement ran.
+    exec_stmt(pool, "ALTER TABLE device_inventory_store.device_ci_cpu RENAME COLUMN idx TO idx_x");
+    exec_stmt(pool, "ALTER TABLE device_inventory_store.device_ci_section RENAME COLUMN kind TO kind_x");
+    auto got = store.get_device_ci_with_sections("agent-v1");
+    REQUIRE(got.has_value());
+    CHECK_FALSE(got->sections_failed);
+    REQUIRE(got->record.has_value());
+    CHECK(got->record->blob_version == 1);
+    CHECK(got->record->serial == "ABC123");
+    CHECK(got->record->sections.empty());
+}
+
+TEST_CASE("get_device_ci_with_sections: an absent agent is an answered absence",
+          "[pg][device_ci][v2]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, device_ci_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    REQUIRE(pool.valid());
+    DeviceInventoryStore store{pool};
+    REQUIRE(store.is_open());
+
+    auto none = store.get_device_ci_with_sections("nobody");
+    REQUIRE(none.has_value());
+    CHECK_FALSE(none->record.has_value());
+    CHECK_FALSE(none->sections_failed);
+    auto blank = store.get_device_ci_with_sections("");
+    REQUIRE(blank.has_value());
+    CHECK_FALSE(blank->record.has_value());
+}
+
+TEST_CASE("get_device_ci_with_sections: a failed section statement keeps the record and flags the failure",
+          "[pg][device_ci][v2]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, device_ci_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    REQUIRE(pool.valid());
+    DeviceInventoryStore store{pool};
+    REQUIRE(store.is_open());
+
+    const DeviceCiRecord a = distinct_v2_record("A");
+    REQUIRE(store.apply_device_ci("agent-sf", DeviceInventoryStore::canonical_hash(a),
+                                  std::optional<DeviceCiRecord>{a}, 1) == InventoryIngestOutcome::kStored);
+
+    SECTION("a per-kind SELECT fails") {
+        exec_stmt(pool, "ALTER TABLE device_inventory_store.device_ci_cpu RENAME COLUMN idx TO idx_x");
+        auto got = store.get_device_ci_with_sections("agent-sf");
+        REQUIRE(got.has_value()); // the record read answered
+        CHECK(got->sections_failed);
+        REQUIRE(got->record.has_value());
+        check_scalars_equal(*got->record, a);
+        CHECK(got->record->sections.empty()); // never a partial list read as "the device has none"
+        // the single-purpose reader degrades on the same fault, so the two agree
+        CHECK_FALSE(store.get_device_ci_sections("agent-sf").has_value());
+    }
+    SECTION("the section-status SELECT fails") {
+        exec_stmt(pool, "ALTER TABLE device_inventory_store.device_ci_section RENAME COLUMN kind TO kind_x");
+        auto got = store.get_device_ci_with_sections("agent-sf");
+        REQUIRE(got.has_value());
+        CHECK(got->sections_failed);
+        REQUIRE(got->record.has_value());
+        check_scalars_equal(*got->record, a);
+        CHECK(got->record->sections.empty());
+    }
+    SECTION("a failed record SELECT is a degrade, not a record") {
+        exec_stmt(pool, "ALTER TABLE device_inventory_store.device_ci RENAME COLUMN model TO model_x");
+        auto got = store.get_device_ci_with_sections("agent-sf");
+        REQUIRE_FALSE(got.has_value());
+        CHECK(got.error() == CiReadError::kDegraded);
+    }
+}
+
+TEST_CASE("get_device_ci_with_sections: a concurrent replace never pairs one generation's scalars "
+          "with another's sections",
+          "[pg][device_ci][v2]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, device_ci_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    DeviceInventoryStore store{pool};
+    REQUIRE(store.is_open());
+
+    const DeviceCiRecord a = distinct_v2_record("A");
+    const DeviceCiRecord b = distinct_v2_record("B");
+    const auto put = [&](const DeviceCiRecord& r) {
+        return store.apply_device_ci("agent-race", DeviceInventoryStore::canonical_hash(r),
+                                     std::optional<DeviceCiRecord>{r}, 1);
+    };
+    REQUIRE(put(a) == InventoryIngestOutcome::kStored);
+
+    std::atomic<bool> stop{false};
+    std::atomic<int> torn{0};
+    std::atomic<int> reads{0};
+    std::atomic<int> failures{0};
+    std::atomic<int> puts{0};
+    std::atomic<bool> saw_a{false};
+    std::atomic<bool> saw_b{false};
+    // No Catch macro runs off the main thread: the writer only records into atomics, and an
+    // exception out of put() is counted as a failure rather than reaching std::terminate.
+    // The guard stops the writer BEFORE joining, so a REQUIRE/CHECK throw on the main thread
+    // between the start and the explicit join cannot leave a joinable thread (std::terminate)
+    // or a writer that never stops.
+    std::thread writer;
+    struct StopAndJoin {
+        std::atomic<bool>& stop;
+        std::thread& t;
+        ~StopAndJoin() {
+            stop.store(true);
+            if (t.joinable())
+                t.join();
+        }
+    } guard{stop, writer};
+    writer = std::thread([&] {
+        bool flip = true;
+        while (!stop.load()) {
+            try {
+                if (put(flip ? b : a) == InventoryIngestOutcome::kStored)
+                    puts.fetch_add(1);
+                else
+                    failures.fetch_add(1);
+            } catch (...) {
+                failures.fetch_add(1);
+            }
+            flip = !flip;
+        }
+    });
+    // Read at least kMinReads times; keep going (up to kMaxReads) until both generations have
+    // been observed, so "the writer never ran" cannot pass vacuously.
+    constexpr int kMinReads = 400;
+    constexpr int kMaxReads = 20000;
+    for (int i = 0; i < kMaxReads; ++i) {
+        if (i >= kMinReads && saw_a.load() && saw_b.load())
+            break;
+        auto got = store.get_device_ci_with_sections("agent-race");
+        if (!got || !got->record || got->sections_failed) {
+            failures.fetch_add(1);
+            continue;
+        }
+        reads.fetch_add(1);
+        // Scalars carry the generation in the model; every section reason and every row cell
+        // carries it too (cells look like "<g>-<kind>-r0-<col>").
+        const char gen = got->record->model.back(); // "model-A" / "model-B"
+        (gen == 'A' ? saw_a : saw_b).store(true);
+        const std::string gen_str(1, gen);
+        for (const auto& sec : got->record->sections) {
+            if (sec.reason.find(std::string("reason-") + gen + "-") != 0)
+                torn.fetch_add(1);
+            for (const auto& row : sec.rows)
+                if (row.empty() || row[0].find(gen_str + "-") != 0)
+                    torn.fetch_add(1);
+        }
+        if (got->record->sections.size() != a.sections.size())
+            torn.fetch_add(1);
+    }
+    stop.store(true);
+    writer.join();
+    CHECK(failures.load() == 0);
+    CHECK(reads.load() >= kMinReads);
+    CHECK(torn.load() == 0);
+    // The race actually ran: the writer replaced the record many times, and the readers saw
+    // both generations. A generous floor, not a timing bound.
+    CHECK(puts.load() >= 10);
+    CHECK(saw_a.load());
+    CHECK(saw_b.load());
+}
+
+TEST_CASE("v2 full replace swaps the whole child set; v1 <-> v2 transitions", "[pg][device_ci][v2]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, device_ci_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    DeviceInventoryStore store{pool};
+    REQUIRE(store.is_open());
+
+    const auto put = [&](const DeviceCiRecord& r) {
+        return store.apply_device_ci("agent-r", DeviceInventoryStore::canonical_hash(r),
+                                     std::optional<DeviceCiRecord>{r}, 1);
+    };
+    const auto cpu_rows = [&]() -> long long {
+        return count_rows(pool, count_sql("device_inventory_store.device_ci_cpu WHERE agent_id = 'agent-r'"));
+    };
+
+    REQUIRE(put(make_v2_record("A", 3, true)) == InventoryIngestOutcome::kStored);
+    CHECK(cpu_rows() == 3);
+    auto first = store.get_device_ci("agent-r");
+    REQUIRE(first.has_value());
+    REQUIRE(first->has_value());
+
+    SECTION("a smaller v2 set leaves no stale rows or sections") {
+        REQUIRE(put(make_v2_record("B", 1, false)) == InventoryIngestOutcome::kStored);
+        CHECK(cpu_rows() == 1);
+        auto secs = store.get_device_ci_sections("agent-r");
+        REQUIRE(secs.has_value());
+        CHECK(secs->size() == 1);
+        CHECK(find_section(*secs, "dimm") == nullptr);
+        const auto* cpu = find_section(*secs, "cpu");
+        REQUIRE(cpu != nullptr);
+        CHECK(cpu->reason == "B");
+        auto again = store.get_device_ci("agent-r");
+        REQUIRE(again.has_value());
+        REQUIRE(again->has_value());
+        CHECK((**again).first_seen == (**first).first_seen); // preserved
+    }
+    SECTION("a v1 full after v2 replaces the children with the empty set and blanks the scalars") {
+        DeviceCiRecord v1 = parse_device_ci_blob(sample_blob());
+        REQUIRE(put(v1) == InventoryIngestOutcome::kStored);
+        auto secs = store.get_device_ci_sections("agent-r");
+        REQUIRE(secs.has_value());
+        CHECK(secs->empty());
+        auto got = store.get_device_ci("agent-r");
+        REQUIRE(got.has_value());
+        REQUIRE(got->has_value());
+        CHECK((**got).blob_version == 1);
+        CHECK((**got).chassis_serial.empty());
+        CHECK((**got).first_seen == (**first).first_seen);
+
+        SECTION("and v1 -> v2 again restores the children") {
+            REQUIRE(put(make_v2_record("C", 2, true)) == InventoryIngestOutcome::kStored);
+            auto s2 = store.get_device_ci_sections("agent-r");
+            REQUIRE(s2.has_value());
+            CHECK(s2->size() == 2);
+            CHECK(cpu_rows() == 2);
+        }
+    }
+}
+
+TEST_CASE("v2 record without a pinned hash is refused and nothing is stored",
+          "[pg][device_ci][v2]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, device_ci_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    REQUIRE(pool.valid());
+    DeviceInventoryStore store{pool};
+    REQUIRE(store.is_open());
+
+    DeviceCiRecord r = make_v2_record("X", 1, false);
+    r.content_hash.clear(); // the sha256-failure shape: v2 + empty hash
+    CHECK(store.apply_device_ci("agent-nohash", "whatever", std::optional<DeviceCiRecord>{r}, 1) ==
+          InventoryIngestOutcome::kError);
+    auto got = store.get_device_ci("agent-nohash");
+    REQUIRE(got.has_value());
+    CHECK(!got->has_value());
+}
+
+TEST_CASE("v2 full replace rolls back whole after a child-insert failure", "[pg][device_ci][v2]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, device_ci_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 3}};
+    REQUIRE(pool.valid());
+    DeviceInventoryStore store{pool};
+    REQUIRE(store.is_open());
+
+    const DeviceCiRecord a = make_v2_record("A", 3, false);
+    DeviceCiRecord b = make_v2_record("B", 1, true);
+    for (auto& sec : b.sections)
+        if (sec.kind == "dimm")
+            sec.rows[0][0] = "POISON"; // the one row the injected constraint refuses
+    const std::string ha = DeviceInventoryStore::canonical_hash(a);
+    const std::string hb = DeviceInventoryStore::canonical_hash(b);
+    REQUIRE(store.apply_device_ci("agent-rb", ha, std::optional<DeviceCiRecord>{a}, 1) ==
+            InventoryIngestOutcome::kStored);
+
+    // Fault injection on this per-test clone. A CHECK that rejects only the NEW dimm row lets
+    // every earlier statement of the replace succeed first: the per-kind DELETE loop, the
+    // parent upsert, and the cpu INSERT (registry index 3, before dimm at 4). The failure
+    // therefore lands AFTER a successful child INSERT, which is what the rollback must undo.
+    exec_stmt(pool, "ALTER TABLE device_inventory_store.device_ci_dimm "
+                    "ADD CONSTRAINT yuzu_test_reject CHECK (slot <> 'POISON')");
+
+    CHECK(store.apply_device_ci("agent-rb", hb, std::optional<DeviceCiRecord>{b}, 2) ==
+          InventoryIngestOutcome::kError);
+
+    // The previous set is intact: HA is still the stored hash, 3 cpu rows remain.
+    CHECK(store.apply_device_ci("agent-rb", ha, std::nullopt, 3) ==
+          InventoryIngestOutcome::kTouched);
+    CHECK(store.apply_device_ci("agent-rb", hb, std::nullopt, 3) ==
+          InventoryIngestOutcome::kNeedFull);
+    CHECK(count_rows(pool, count_sql("device_inventory_store.device_ci_cpu WHERE agent_id = 'agent-rb'")) ==
+          3);
+    // ...and they are generation A's rows, not B's half-applied cpu insert.
+    CHECK(count_rows(pool, count_sql("device_inventory_store.device_ci_cpu WHERE agent_id = "
+                                     "'agent-rb' AND model = 'Model-A'")) == 3);
+    CHECK(count_rows(pool, count_sql("device_inventory_store.device_ci_dimm WHERE agent_id = 'agent-rb'")) ==
+          0);
+    CHECK(count_rows(pool, count_sql("device_inventory_store.device_ci_section WHERE agent_id = 'agent-rb'")) ==
+          1);
+    // The old parent scalars survived too (B's upsert was rolled back with the rest).
+    auto got = store.get_device_ci("agent-rb");
+    REQUIRE(got.has_value());
+    REQUIRE(got->has_value());
+    CHECK((**got).chassis_serial == "CHS-A");
+    auto secs = store.get_device_ci_sections("agent-rb");
+    REQUIRE(secs.has_value());
+    REQUIRE(secs->size() == 1);
+    CHECK((*secs)[0].reason == "A");
+    CHECK((*secs)[0].rows.size() == 3);
+}
+
+TEST_CASE("competing v2 replacements never expose a mixed generation", "[pg][device_ci][v2]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, device_ci_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 3}};
+    REQUIRE(pool.valid());
+    DeviceInventoryStore store{pool};
+    REQUIRE(store.is_open());
+
+    const DeviceCiRecord set_a = make_v2_record("A", 3, false);
+    const DeviceCiRecord set_b = make_v2_record("B", 1, false);
+    REQUIRE(store.apply_device_ci("agent-cc", "x", std::optional<DeviceCiRecord>{set_a}, 1) ==
+            InventoryIngestOutcome::kStored);
+
+    constexpr int kIterations = 50;
+    constexpr int kMaxReads = 1000; // bounds the reader if the writers are slow
+    std::atomic<int> writer_failures{0};
+    std::atomic<int> torn_reads{0};
+    // Positive controls: a reader that only ever saw one generation proves nothing about
+    // torn_reads == 0, so both generations must have been observed while the writers ran.
+    std::atomic<int> a_seen{0};
+    std::atomic<int> b_seen{0};
+    std::atomic<int> degraded_reads{0};
+    std::atomic<int> writers_done{0};
+    std::atomic<long long> reads{0};
+    // Start handshake (a blocking wait, no sleep or poll): the writers do not begin until the
+    // reader has completed one successful read, so `reads > 0` cannot depend on how the
+    // scheduler orders the three threads.
+    std::latch reader_primed{1};
+
+    const auto writer = [&](const DeviceCiRecord& mine, const DeviceCiRecord& other) {
+        reader_primed.wait();
+        for (int i = 0; i < kIterations; ++i) {
+            const DeviceCiRecord& r = (i % 2 == 0) ? mine : other;
+            if (store.apply_device_ci("agent-cc", "x", std::optional<DeviceCiRecord>{r}, 1) !=
+                InventoryIngestOutcome::kStored)
+                ++writer_failures;
+        }
+        ++writers_done;
+    };
+    // Tripwire for a mixed-generation read (separate READ COMMITTED SELECTs could pair
+    // generation X's status with generation Y's rows); not a proof of snapshot isolation.
+    // Started first. A degraded read ends the loop: degraded_reads == 0 is asserted below, so
+    // breaking loses nothing and stops a hot spin against a failing store.
+    const auto read_loop = [&] {
+        bool primed = false;
+        for (int n = 0; n < kMaxReads && writers_done.load() < 2; ++n) {
+            auto s = store.get_device_ci_sections("agent-cc");
+            if (!s.has_value()) {
+                ++degraded_reads;
+                break;
+            }
+            const auto* cpu = find_section(*s, "cpu");
+            if (cpu == nullptr)
+                continue;
+            ++reads;
+            if (!primed) {
+                primed = true;
+                reader_primed.count_down();
+            }
+            const bool a_ok = cpu->reason == "A" && cpu->rows.size() == 3;
+            const bool b_ok = cpu->reason == "B" && cpu->rows.size() == 1;
+            if (a_ok)
+                ++a_seen;
+            if (b_ok)
+                ++b_seen;
+            if (!a_ok && !b_ok)
+                ++torn_reads;
+        }
+        if (!primed)
+            reader_primed.count_down(); // never leave the writers blocked on a failed reader
+    };
+    // The threads are default-constructed so the guard below exists before any of them runs: a
+    // throw while starting a later thread (std::system_error) would otherwise destroy a
+    // joinable one (std::terminate, taking the whole shard down). The wait is bounded on every
+    // path: a writer that never starts leaves writers_done < 2, so the reader stops at
+    // kMaxReads, and the reader releases reader_primed if it never primed. No CHECK or REQUIRE
+    // sits between the first start and the joins.
+    std::thread reader;
+    std::thread w1;
+    std::thread w2;
+    struct JoinOnExit {
+        std::thread* ts[3];
+        ~JoinOnExit() {
+            for (std::thread* t : ts)
+                if (t->joinable())
+                    t->join();
+        }
+    } join_all{{&reader, &w1, &w2}};
+    reader = std::thread(read_loop);
+    w1 = std::thread(writer, std::cref(set_a), std::cref(set_b));
+    w2 = std::thread(writer, std::cref(set_b), std::cref(set_a));
+    w1.join();
+    w2.join();
+    reader.join();
+
+    CHECK(writer_failures.load() == 0);
+    CHECK(degraded_reads.load() == 0);
+    CHECK(torn_reads.load() == 0);
+    CHECK(reads.load() > 0);
+    CHECK(a_seen.load() > 0);
+    CHECK(b_seen.load() > 0);
+
+    // Final state is one consistent pair.
+    auto fin = store.get_device_ci_sections("agent-cc");
+    REQUIRE(fin.has_value());
+    const auto* cpu = find_section(*fin, "cpu");
+    REQUIRE(cpu != nullptr);
+    CHECK(((cpu->reason == "A" && cpu->rows.size() == 3) ||
+           (cpu->reason == "B" && cpu->rows.size() == 1)));
+    auto parent = store.get_device_ci("agent-cc");
+    REQUIRE(parent.has_value());
+    REQUIRE(parent->has_value());
+    CHECK((**parent).chassis_serial == "CHS-" + cpu->reason); // parent matches the children
+}
+
+TEST_CASE("populated v1 device_ci upgrades to v2 in place", "[pg][device_ci][migration][v2]") {
+    // A private database (not the pre-migrated template): the test rewrites schema_meta and
+    // hand-seeds the v1 DDL with a populated row, then lets the constructor run migration 2.
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    REQUIRE(pool.valid());
+    {
+        auto lease = pool.acquire();
+        REQUIRE(lease);
+        const auto exec = [&](const char* sql) {
+            auto res = yuzu::server::pg::exec_params(lease.get(), sql, std::vector<std::string>{});
+            REQUIRE(res.status() == PGRES_COMMAND_OK);
+        };
+        exec("CREATE TABLE IF NOT EXISTS public.schema_meta ("
+             "store TEXT PRIMARY KEY, version INTEGER NOT NULL, upgraded_at BIGINT NOT NULL)");
+        exec("CREATE SCHEMA device_inventory_store");
+        // The exact v1 shape (migration 1).
+        exec("CREATE TABLE device_inventory_store.device_ci ("
+             "agent_id TEXT PRIMARY KEY, content_hash TEXT NOT NULL DEFAULT '', "
+             "manufacturer TEXT NOT NULL DEFAULT '', model TEXT NOT NULL DEFAULT '', "
+             "serial TEXT NOT NULL DEFAULT '', system_uuid TEXT NOT NULL DEFAULT '', "
+             "hostname TEXT NOT NULL DEFAULT '', domain TEXT NOT NULL DEFAULT '', "
+             "ou TEXT NOT NULL DEFAULT '', bios_vendor TEXT NOT NULL DEFAULT '', "
+             "bios_version TEXT NOT NULL DEFAULT '', bios_date TEXT NOT NULL DEFAULT '', "
+             "cpu_model TEXT NOT NULL DEFAULT '', cpu_cores BIGINT NOT NULL DEFAULT 0, "
+             "cpu_threads BIGINT NOT NULL DEFAULT 0, ram_bytes BIGINT NOT NULL DEFAULT 0, "
+             "disks_summary TEXT NOT NULL DEFAULT '', primary_mac TEXT NOT NULL DEFAULT '', "
+             "macs_summary TEXT NOT NULL DEFAULT '', nic_count BIGINT NOT NULL DEFAULT 0, "
+             "os_name TEXT NOT NULL DEFAULT '', os_version TEXT NOT NULL DEFAULT '', "
+             "os_build TEXT NOT NULL DEFAULT '', arch TEXT NOT NULL DEFAULT '', "
+             "first_seen BIGINT NOT NULL, last_seen BIGINT NOT NULL)");
+        exec("CREATE INDEX device_ci_hostname_idx ON device_inventory_store.device_ci (hostname)");
+        exec("INSERT INTO device_inventory_store.device_ci (agent_id, content_hash, manufacturer, "
+             "model, hostname, cpu_cores, first_seen, last_seen) "
+             "VALUES ('agent-old', 'oldhash', 'Dell Inc.', 'Latitude 7420', 'WS-OLD', 4, 10, 20)");
+        exec("INSERT INTO public.schema_meta (store, version, upgraded_at) "
+             "VALUES ('device_inventory_store', 1, 0)");
+    }
+
+    DeviceInventoryStore store{pool};
+    REQUIRE(store.is_open());
+
+    auto got = store.get_device_ci("agent-old");
+    REQUIRE(got.has_value());
+    REQUIRE(got->has_value());
+    CHECK((**got).manufacturer == "Dell Inc.");
+    CHECK((**got).hostname == "WS-OLD");
+    CHECK((**got).cpu_cores == "4");
+    CHECK((**got).first_seen == 10);
+    CHECK((**got).blob_version == 1);
+    CHECK((**got).chassis_serial.empty());
+    CHECK((**got).machine_id_hash.empty());
+
+    auto secs = store.get_device_ci_sections("agent-old");
+    REQUIRE(secs.has_value());
+    CHECK(secs->empty());
+
+    // The old agent's v1 hash still compares equal after the upgrade (no need_full storm).
+    CHECK(store.apply_device_ci("agent-old", "oldhash", std::nullopt, 1) ==
+          InventoryIngestOutcome::kTouched);
+}
+
+TEST_CASE("ingest seam: a full v2 report stores; the next hash-only report does not nack",
+          "[pg][device_ci][ingest][v2]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, device_ci_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    DeviceInventoryStore store{pool};
+    REQUIRE(store.is_open());
+
+    const std::string blob = fixture_blob_v2();
+    // The agent claims the sha256 of its blob; the server derives its own and agrees.
+    const std::string h = DeviceInventoryStore::canonical_hash(parse_device_ci_blob(blob));
+
+    agentpb::InventoryReport full;
+    (*full.mutable_content_hashes())["device_ci"] = h;
+    (*full.mutable_plugin_data())["device_ci"] = blob;
+    agentpb::InventoryAck ack;
+    yuzu::server::ingest_device_ci_report(store, "agent-i2", full, ack, nullptr);
+    CHECK(ack.need_full_size() == 0);
+    auto secs = store.get_device_ci_sections("agent-i2");
+    REQUIRE(secs.has_value());
+    CHECK(secs->size() == 10);
+
+    agentpb::InventoryReport hashonly;
+    (*hashonly.mutable_content_hashes())["device_ci"] = h;
+    agentpb::InventoryAck ack2;
+    yuzu::server::ingest_device_ci_report(store, "agent-i2", hashonly, ack2, nullptr);
+    CHECK(ack2.need_full_size() == 0);
+
+    SECTION("an oversized v2 blob is dropped and nacked") {
+        std::string big(1, '\x02');
+        big += std::string(kBlobCap, 'x'); // version byte + cap bytes = cap + 1
+        agentpb::InventoryReport rpt;
+        (*rpt.mutable_content_hashes())["device_ci"] = "somehash";
+        (*rpt.mutable_plugin_data())["device_ci"] = big;
+        agentpb::InventoryAck nack;
+        yuzu::server::ingest_device_ci_report(store, "agent-big2", rpt, nack, nullptr);
+        REQUIRE(nack.need_full_size() == 1);
+        auto r = store.get_device_ci("agent-big2");
+        REQUIRE(r.has_value());
+        CHECK(!r->has_value());
+    }
+}
+
+TEST_CASE("mixed version: an old 22-field blob and a v2 blob for different agents coexist",
+          "[pg][device_ci][v2]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, device_ci_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    DeviceInventoryStore store{pool};
+    REQUIRE(store.is_open());
+
+    const std::string old_blob = sample_blob();
+    agentpb::InventoryReport old_full;
+    (*old_full.mutable_content_hashes())["device_ci"] = kCrossPinHash; // the v1 agent's own hash
+    (*old_full.mutable_plugin_data())["device_ci"] = old_blob;
+    agentpb::InventoryAck a1;
+    yuzu::server::ingest_device_ci_report(store, "agent-old", old_full, a1, nullptr);
+    CHECK(a1.need_full_size() == 0);
+
+    agentpb::InventoryReport old_hash;
+    (*old_hash.mutable_content_hashes())["device_ci"] = kCrossPinHash;
+    agentpb::InventoryAck a2;
+    yuzu::server::ingest_device_ci_report(store, "agent-old", old_hash, a2, nullptr);
+    CHECK(a2.need_full_size() == 0); // v1 hash matched: no need_full loop
+
+    agentpb::InventoryReport new_full;
+    const std::string nb = fixture_blob_v2();
+    (*new_full.mutable_content_hashes())["device_ci"] =
+        DeviceInventoryStore::canonical_hash(parse_device_ci_blob(nb));
+    (*new_full.mutable_plugin_data())["device_ci"] = nb;
+    agentpb::InventoryAck a3;
+    yuzu::server::ingest_device_ci_report(store, "agent-new", new_full, a3, nullptr);
+    CHECK(a3.need_full_size() == 0);
+
+    auto old_secs = store.get_device_ci_sections("agent-old");
+    REQUIRE(old_secs.has_value());
+    CHECK(old_secs->empty());
+    auto new_secs = store.get_device_ci_sections("agent-new");
+    REQUIRE(new_secs.has_value());
+    CHECK(new_secs->size() == 10);
+}
+
+// ── The persisted per-section row count (migration v3, up-2) ───────────────────────────────────
+
+namespace {
+
+// kind -> the persisted row_count as text ("NULL" for SQL NULL), straight from the table.
+std::map<std::string, std::string> persisted_row_counts(PgPool& pool, const std::string& agent) {
+    std::map<std::string, std::string> out;
+    auto lease = pool.acquire();
+    REQUIRE(lease);
+    auto res = yuzu::server::pg::exec_params(
+        lease.get(), "SELECT kind, row_count FROM device_inventory_store.device_ci_section WHERE agent_id = $1",
+        std::vector<std::string>{agent});
+    REQUIRE(res.status() == PGRES_TUPLES_OK);
+    for (int i = 0; i < PQntuples(res.get()); ++i)
+        out[PQgetvalue(res.get(), i, 0)] = PQgetisnull(res.get(), i, 1) ? "NULL" : PQgetvalue(res.get(), i, 1);
+    return out;
+}
+
+// kind -> the persisted content_digest ("NULL" for SQL NULL), straight from the table.
+std::map<std::string, std::string> persisted_digests(PgPool& pool, const std::string& agent) {
+    std::map<std::string, std::string> out;
+    auto lease = pool.acquire();
+    REQUIRE(lease);
+    auto res = yuzu::server::pg::exec_params(
+        lease.get(),
+        "SELECT kind, content_digest FROM device_inventory_store.device_ci_section WHERE agent_id = $1",
+        std::vector<std::string>{agent});
+    REQUIRE(res.status() == PGRES_TUPLES_OK);
+    for (int i = 0; i < PQntuples(res.get()); ++i)
+        out[PQgetvalue(res.get(), i, 0)] = PQgetisnull(res.get(), i, 1) ? "NULL" : PQgetvalue(res.get(), i, 1);
+    return out;
+}
+
+// The section the wire serves for one device and kind, read through the real store snapshot and
+// the real mapping (the path GET /api/v1/hardware/{id} and MCP get_hardware_ci take).
+nlohmann::json served_section(DeviceInventoryStore& store, const std::string& agent, const std::string& kind) {
+    auto got = store.get_device_ci_with_sections(agent);
+    REQUIRE(got.has_value());
+    REQUIRE_FALSE(got->sections_failed);
+    yuzu::server::HardwareCiDetail d;
+    yuzu::server::apply_ci_with_sections_read(d, std::move(*got));
+    const auto j = yuzu::server::hardware_ci_json(d, 0);
+    for (const auto& sec : j["ci"]["sections"])
+        if (sec["kind"] == kind)
+            return sec;
+    return nlohmann::json();
+}
+
+DeviceCiRecord blob_with_rows(int cpu_rows, int dimm_rows) {
+    std::vector<std::vector<std::string>> recs = {
+        {"status", "chassis", "ok", ""}, {"status", "cpu", "ok", ""}, {"status", "dimm", "ok", ""},
+        {"status", "swap", "ok", ""}};
+    for (int i = 0; i < cpu_rows; ++i)
+        recs.push_back({"cpu", std::to_string(i), "M", "1", "1", "1", "s", "1"});
+    for (int i = 0; i < dimm_rows; ++i)
+        recs.push_back({"dimm", "DIMM" + std::to_string(i), "8192", "DDR4", "3200", "Samsung", "M471", "-"});
+    return parse_device_ci_blob(build_blob_v2(v2_scalars(), recs));
+}
+
+InventoryIngestOutcome put_record(DeviceInventoryStore& store, const std::string& agent, const DeviceCiRecord& r) {
+    return store.apply_device_ci(agent, DeviceInventoryStore::canonical_hash(r), std::optional<DeviceCiRecord>{r},
+                                 1);
+}
+
+} // namespace
+
+// Kills (by mutation: disable the read-side check) the up-2 defect - a child table emptied out of
+// band served as a complete section.
+TEST_CASE("v2 ingest persists the stored row count and an out-of-band child delete is served constrained",
+          "[pg][device_ci][v2][row_count]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, device_ci_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 3}};
+    REQUIRE(pool.valid());
+    DeviceInventoryStore store{pool};
+    REQUIRE(store.is_open());
+
+    // 40 cpu rows against a cap of 32: the count is what was STORED (32), not what was sent.
+    REQUIRE(put_record(store, "agent-rc", blob_with_rows(40, 2)) == InventoryIngestOutcome::kStored);
+    const auto counts = persisted_row_counts(pool, "agent-rc");
+    CHECK(counts.at("cpu") == "32");
+    CHECK(counts.at("dimm") == "2");
+    CHECK(counts.at("swap") == "0");       // table-backed, nothing sent: a verified empty
+    CHECK(counts.at("chassis") == "NULL"); // status-only: not verifiable
+
+    SECTION("an intact device serves exactly as before") {
+        const auto dimm = served_section(store, "agent-rc", "dimm");
+        CHECK(dimm["status"] == "ok");
+        CHECK(dimm["complete"] == true);
+        CHECK(dimm["reason"].is_null());
+        CHECK(dimm["rows"].size() == 2);
+        const auto cpu = served_section(store, "agent-rc", "cpu");
+        CHECK(cpu["status"] == "constrained");
+        CHECK(cpu["reason"] == "server_cap:32");
+        CHECK(cpu["rows"].size() == 32);
+        CHECK(served_section(store, "agent-rc", "swap")["complete"] == true);
+        CHECK(served_section(store, "agent-rc", "chassis")["complete"] == true);
+    }
+    SECTION("deleting the dimm rows out of band is served as constrained and incomplete") {
+        exec_stmt(pool, "DELETE FROM device_inventory_store.device_ci_dimm WHERE agent_id = 'agent-rc'");
+        const auto dimm = served_section(store, "agent-rc", "dimm");
+        CHECK(dimm["status"] == "constrained");
+        CHECK(dimm["complete"] == false);
+        CHECK(dimm["reason"] == "server:row_count_mismatch");
+        CHECK(dimm["rows"].empty());
+        // The sibling sections are untouched by the loss.
+        const auto cpu = served_section(store, "agent-rc", "cpu");
+        CHECK(cpu["reason"] == "server_cap:32");
+        CHECK(cpu["rows"].size() == 32);
+        CHECK(served_section(store, "agent-rc", "swap")["complete"] == true);
+        // The raw store read still carries the stored status + count for the mapping to decide on.
+        auto secs = store.get_device_ci_sections("agent-rc");
+        REQUIRE(secs.has_value());
+        const auto* raw = find_section(*secs, "dimm");
+        REQUIRE(raw != nullptr);
+        CHECK(raw->row_count == std::optional<int>(2));
+        CHECK(raw->rows.empty());
+    }
+    SECTION("a PARTIAL loss (one of two dimm rows) is caught too, and the surviving row is withheld (#7165)") {
+        exec_stmt(pool, "DELETE FROM device_inventory_store.device_ci_dimm "
+                        "WHERE agent_id = 'agent-rc' AND ord = 1");
+        const auto dimm = served_section(store, "agent-rc", "dimm");
+        CHECK(dimm["status"] == "constrained");
+        CHECK(dimm["complete"] == false);
+        CHECK(dimm["reason"] == "server:row_count_mismatch");
+        CHECK(dimm["rows"].empty());
+    }
+    SECTION("a capped section that also loses rows keeps server_cap and gains the mismatch token") {
+        exec_stmt(pool, "DELETE FROM device_inventory_store.device_ci_cpu "
+                        "WHERE agent_id = 'agent-rc' AND ord >= 10");
+        const auto cpu = served_section(store, "agent-rc", "cpu");
+        CHECK(cpu["status"] == "constrained");
+        CHECK(cpu["reason"] == "server_cap:32;server:row_count_mismatch");
+        CHECK(cpu["rows"].empty()); // the ten rows that remain are withheld (#7165)
+    }
+}
+
+TEST_CASE("a full replace rewrites the persisted row count (never stale)", "[pg][device_ci][v2][row_count]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, device_ci_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 3}};
+    REQUIRE(pool.valid());
+    DeviceInventoryStore store{pool};
+    REQUIRE(store.is_open());
+
+    REQUIRE(put_record(store, "agent-rp", blob_with_rows(3, 2)) == InventoryIngestOutcome::kStored);
+    auto c1 = persisted_row_counts(pool, "agent-rp");
+    CHECK(c1.at("cpu") == "3");
+    CHECK(c1.at("dimm") == "2");
+
+    REQUIRE(put_record(store, "agent-rp", blob_with_rows(1, 0)) == InventoryIngestOutcome::kStored);
+    auto c2 = persisted_row_counts(pool, "agent-rp");
+    CHECK(c2.at("cpu") == "1");
+    CHECK(c2.at("dimm") == "0"); // the section is still reported, now with no rows
+    CHECK(served_section(store, "agent-rp", "cpu")["complete"] == true);
+    CHECK(served_section(store, "agent-rp", "dimm")["complete"] == true);
+
+    REQUIRE(put_record(store, "agent-rp", blob_with_rows(5, 1)) == InventoryIngestOutcome::kStored);
+    auto c3 = persisted_row_counts(pool, "agent-rp");
+    CHECK(c3.at("cpu") == "5");
+    CHECK(c3.at("dimm") == "1");
+    CHECK(served_section(store, "agent-rp", "cpu")["rows"].size() == 5);
+}
+
+TEST_CASE("a v2 database upgrades to v3 in place and existing sections have no count and read as before",
+          "[pg][device_ci][migration][v3][row_count]") {
+    // A private database: a v3 store seeds a v2-shaped device, the test rolls the schema back to v2
+    // (drops the additive column and rewinds schema_meta), and a new store runs migration 3.
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
+    PgPool pool{{.conninfo = db.dsn(), .size = 3}};
+    REQUIRE(pool.valid());
+    {
+        DeviceInventoryStore seed{pool};
+        REQUIRE(seed.is_open());
+        REQUIRE(put_record(seed, "agent-up", blob_with_rows(2, 2)) == InventoryIngestOutcome::kStored);
+    }
+    exec_stmt(pool, "ALTER TABLE device_inventory_store.device_ci_section DROP COLUMN row_count, "
+                    "DROP COLUMN content_digest");
+    exec_stmt(pool, "UPDATE public.schema_meta SET version = 2 WHERE store = 'device_inventory_store'");
+
+    DeviceInventoryStore store{pool}; // runs migration 3
+    REQUIRE(store.is_open());
+
+    // Every pre-v3 section row has no count and no digest.
+    for (const auto& [kind, n] : persisted_row_counts(pool, "agent-up")) {
+        INFO(kind);
+        CHECK(n == "NULL");
+    }
+    for (const auto& [kind, d] : persisted_digests(pool, "agent-up")) {
+        INFO(kind);
+        CHECK(d == "NULL");
+    }
+    // Reads exactly as before - no mismatch is ever raised for an unverifiable section, even one
+    // that lost its rows.
+    exec_stmt(pool, "DELETE FROM device_inventory_store.device_ci_dimm WHERE agent_id = 'agent-up'");
+    const auto dimm = served_section(store, "agent-up", "dimm");
+    CHECK(dimm["status"] == "ok");
+    CHECK(dimm["complete"] == true);
+    CHECK(dimm["reason"].is_null());
+    CHECK(served_section(store, "agent-up", "cpu")["rows"].size() == 2);
+
+    // The next full replace (hardware change, Sync now or the weekly floor) arms the check.
+    REQUIRE(put_record(store, "agent-up", blob_with_rows(2, 2)) == InventoryIngestOutcome::kStored);
+    CHECK(persisted_row_counts(pool, "agent-up").at("dimm") == "2");
+    CHECK(persisted_digests(pool, "agent-up").at("dimm").size() == 3 + 64);
+    CHECK(persisted_digests(pool, "agent-up").at("dimm").substr(0, 3) == "v1:");
+    CHECK(served_section(store, "agent-up", "dimm")["complete"] == true);
+    exec_stmt(pool, "DELETE FROM device_inventory_store.device_ci_dimm WHERE agent_id = 'agent-up'");
+    CHECK(served_section(store, "agent-up", "dimm")["reason"] == "server:row_count_mismatch");
+}
+
+// Kills: migration 3 without IF NOT EXISTS. The runner's apply decision is the recorded version
+// number (its hash check, #7158, only refuses edited text), so a database that already has the
+// columns but is rewound to version 2 (the fix for a
+// database that ran an earlier build of v3) must run migration 3 again without failing.
+TEST_CASE("migration 3 is re-runnable over a database that already has its columns",
+          "[pg][device_ci][migration][v3][digest]") {
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
+    PgPool pool{{.conninfo = db.dsn(), .size = 3}};
+    REQUIRE(pool.valid());
+    {
+        DeviceInventoryStore seed{pool};
+        REQUIRE(seed.is_open());
+        REQUIRE(put_record(seed, "agent-rr", blob_with_rows(2, 2)) == InventoryIngestOutcome::kStored);
+    }
+    exec_stmt(pool, "UPDATE public.schema_meta SET version = 2 WHERE store = 'device_inventory_store'");
+    DeviceInventoryStore store{pool}; // runs migration 3 over the existing columns
+    REQUIRE(store.is_open());
+    // Data written before the re-run is untouched and the columns still work.
+    CHECK(persisted_row_counts(pool, "agent-rr").at("dimm") == "2");
+    CHECK(served_section(store, "agent-rr", "dimm")["complete"] == true);
+    REQUIRE(put_record(store, "agent-rr", blob_with_rows(2, 2)) == InventoryIngestOutcome::kStored);
+}
+
+// ── The persisted per-section content digest (migration v3, up2r-up-3) ─────────────────────────
+
+namespace {
+
+// Same shape as blob_with_rows, but every dimm row carries `size_mb`, so two "generations" with the
+// SAME row counts differ only in content.
+DeviceCiRecord blob_with_dimm_size(int cpu_rows, int dimm_rows, const std::string& size_mb) {
+    auto rec = blob_with_rows(cpu_rows, dimm_rows);
+    for (auto& sec : rec.sections)
+        if (sec.kind == "dimm")
+            for (auto& row : sec.rows)
+                row[1] = size_mb;
+    return rec;
+}
+
+} // namespace
+
+TEST_CASE("v2 ingest persists a server-computed content digest per table-backed section",
+          "[pg][device_ci][v2][digest]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, device_ci_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 3}};
+    REQUIRE(pool.valid());
+    DeviceInventoryStore store{pool};
+    REQUIRE(store.is_open());
+
+    const auto rec = blob_with_rows(3, 2);
+    REQUIRE(put_record(store, "agent-dg", rec) == InventoryIngestOutcome::kStored);
+    const auto digests = persisted_digests(pool, "agent-dg");
+    CHECK(digests.at("chassis") == "NULL"); // status-only: nothing to hash
+    for (const auto& sec : rec.sections) {
+        const auto idx = yuzu::server::device_ci_section_index(sec.kind);
+        REQUIRE(idx.has_value());
+        const auto& def = yuzu::server::kDeviceCiSections[*idx];
+        if (def.table == nullptr)
+            continue;
+        INFO(sec.kind);
+        // The stored digest is the shared function over the rows that were sent.
+        CHECK(digests.at(sec.kind) == yuzu::server::section_content_digest(def, sec.rows).value());
+    }
+    // An empty table-backed section still carries a digest (a verified empty).
+    CHECK(digests.at("swap").size() == 3 + 64);
+    CHECK(digests.at("swap").substr(0, 3) == "v1:");
+    // An untouched device serves exactly as before.
+    CHECK(served_section(store, "agent-dg", "dimm")["complete"] == true);
+    CHECK(served_section(store, "agent-dg", "cpu")["complete"] == true);
+    CHECK(served_section(store, "agent-dg", "swap")["complete"] == true);
+}
+
+// Kills (by mutation: the verifier ignores the digest) the same-count blind spot of the row count.
+TEST_CASE("a same-count out-of-band edit of a child row is served constrained with the digest reason",
+          "[pg][device_ci][v2][digest]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, device_ci_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 3}};
+    REQUIRE(pool.valid());
+    DeviceInventoryStore store{pool};
+    REQUIRE(store.is_open());
+    REQUIRE(put_record(store, "agent-ed", blob_with_rows(3, 2)) == InventoryIngestOutcome::kStored);
+
+    exec_stmt(pool, "UPDATE device_inventory_store.device_ci_dimm SET part_number = 'EDITED' "
+                    "WHERE agent_id = 'agent-ed' AND ord = 1");
+    const auto dimm = served_section(store, "agent-ed", "dimm");
+    CHECK(dimm["status"] == "constrained");
+    CHECK(dimm["complete"] == false);
+    CHECK(dimm["reason"] == "server:content_digest_mismatch");
+    CHECK(dimm["rows"].empty()); // withheld: not the reported generation (#7165)
+    // The row COUNT still agrees: the count rule alone would have said complete.
+    auto raw = store.get_device_ci_sections("agent-ed");
+    REQUIRE(raw.has_value());
+    const auto* r = find_section(*raw, "dimm");
+    REQUIRE(r != nullptr);
+    CHECK(r->row_count == std::optional<int>(2));
+    CHECK(r->rows.size() == 2);
+    CHECK(yuzu::server::verify_section_row_count(*r).level == "ok");
+    // Siblings are untouched.
+    CHECK(served_section(store, "agent-ed", "cpu")["complete"] == true);
+    CHECK(served_section(store, "agent-ed", "swap")["complete"] == true);
+
+    SECTION("a full replace heals it") {
+        REQUIRE(put_record(store, "agent-ed", blob_with_rows(3, 2)) == InventoryIngestOutcome::kStored);
+        const auto healed = served_section(store, "agent-ed", "dimm");
+        CHECK(healed["complete"] == true);
+        CHECK(healed["status"] == "ok");
+        CHECK(healed["reason"].is_null());
+    }
+    SECTION("a hash-only report does NOT heal it (only a full replace does)") {
+        const auto rec = blob_with_rows(3, 2);
+        CHECK(store.apply_device_ci("agent-ed", DeviceInventoryStore::canonical_hash(rec), std::nullopt, 1) ==
+              InventoryIngestOutcome::kTouched);
+        CHECK(served_section(store, "agent-ed", "dimm")["reason"] == "server:content_digest_mismatch");
+    }
+}
+
+TEST_CASE("rows swapped for another generation of the same size are served constrained",
+          "[pg][device_ci][v2][digest]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, device_ci_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 3}};
+    REQUIRE(pool.valid());
+    DeviceInventoryStore store{pool};
+    REQUIRE(store.is_open());
+    // Two generations with identical counts and different content, under two agents.
+    REQUIRE(put_record(store, "agent-g1", blob_with_dimm_size(2, 2, "8192")) == InventoryIngestOutcome::kStored);
+    REQUIRE(put_record(store, "agent-g2", blob_with_dimm_size(2, 2, "16384")) == InventoryIngestOutcome::kStored);
+    CHECK(persisted_digests(pool, "agent-g1").at("dimm") != persisted_digests(pool, "agent-g2").at("dimm"));
+    CHECK(served_section(store, "agent-g1", "dimm")["complete"] == true);
+
+    // A restore that put generation 2's dimm rows under agent-g1 (counts agree, content does not).
+    exec_stmt(pool, "DELETE FROM device_inventory_store.device_ci_dimm WHERE agent_id = 'agent-g1'");
+    exec_stmt(pool, "INSERT INTO device_inventory_store.device_ci_dimm "
+                    "(agent_id, ord, slot, size_mb, type, speed_mhz, manufacturer, part_number, serial) "
+                    "SELECT 'agent-g1', ord, slot, size_mb, type, speed_mhz, manufacturer, part_number, serial "
+                    "FROM device_inventory_store.device_ci_dimm WHERE agent_id = 'agent-g2'");
+    const auto dimm = served_section(store, "agent-g1", "dimm");
+    CHECK(dimm["status"] == "constrained");
+    CHECK(dimm["complete"] == false);
+    CHECK(dimm["reason"] == "server:content_digest_mismatch");
+    CHECK(dimm["rows"].empty());
+    // The device that was never touched still serves complete.
+    CHECK(served_section(store, "agent-g2", "dimm")["complete"] == true);
+}
+
+TEST_CASE("a lost row is still reported by the row count token alone",
+          "[pg][device_ci][v2][digest]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, device_ci_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 3}};
+    REQUIRE(pool.valid());
+    DeviceInventoryStore store{pool};
+    REQUIRE(store.is_open());
+    REQUIRE(put_record(store, "agent-lr", blob_with_rows(3, 2)) == InventoryIngestOutcome::kStored);
+    exec_stmt(pool, "DELETE FROM device_inventory_store.device_ci_dimm WHERE agent_id = 'agent-lr' AND ord = 1");
+    CHECK(served_section(store, "agent-lr", "dimm")["reason"] == "server:row_count_mismatch");
+}
+
+TEST_CASE("a section stored before the digest existed (NULL digest) reads exactly as before",
+          "[pg][device_ci][v2][digest]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, device_ci_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 3}};
+    REQUIRE(pool.valid());
+    DeviceInventoryStore store{pool};
+    REQUIRE(store.is_open());
+    REQUIRE(put_record(store, "agent-nd", blob_with_rows(3, 2)) == InventoryIngestOutcome::kStored);
+    exec_stmt(pool, "UPDATE device_inventory_store.device_ci_section SET content_digest = NULL "
+                    "WHERE agent_id = 'agent-nd'");
+    exec_stmt(pool, "UPDATE device_inventory_store.device_ci_dimm SET part_number = 'EDITED' "
+                    "WHERE agent_id = 'agent-nd'");
+    const auto dimm = served_section(store, "agent-nd", "dimm");
+    CHECK(dimm["status"] == "ok");
+    CHECK(dimm["complete"] == true);
+    CHECK(dimm["reason"].is_null());
+    // The row count (still present) keeps guarding on its own.
+    exec_stmt(pool, "DELETE FROM device_inventory_store.device_ci_dimm WHERE agent_id = 'agent-nd' AND ord = 1");
+    CHECK(served_section(store, "agent-nd", "dimm")["reason"] == "server:row_count_mismatch");
+}
+
+TEST_CASE("a full replace rewrites the content digest (never stale)", "[pg][device_ci][v2][digest]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, device_ci_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 3}};
+    REQUIRE(pool.valid());
+    DeviceInventoryStore store{pool};
+    REQUIRE(store.is_open());
+    REQUIRE(put_record(store, "agent-rw", blob_with_dimm_size(2, 2, "8192")) == InventoryIngestOutcome::kStored);
+    const auto d1 = persisted_digests(pool, "agent-rw").at("dimm");
+    REQUIRE(put_record(store, "agent-rw", blob_with_dimm_size(2, 2, "16384")) == InventoryIngestOutcome::kStored);
+    const auto d2 = persisted_digests(pool, "agent-rw").at("dimm");
+    CHECK(d1 != d2);
+    CHECK(served_section(store, "agent-rw", "dimm")["complete"] == true);
+    // The same content again gives the same digest (deterministic).
+    REQUIRE(put_record(store, "agent-rw", blob_with_dimm_size(2, 2, "16384")) == InventoryIngestOutcome::kStored);
+    CHECK(persisted_digests(pool, "agent-rw").at("dimm") == d2);
+}
+
+// Kills: a verifier that early-returns (reads as verified) on a damaged stored digest - the wrong
+// length, a bare hex value, an empty or whitespace column, a malformed version - or that compares
+// only the head of it. Every non-NULL stored value other than a well-formed digest of another layout
+// version is a mismatch: a damaged column must not let a same-count edit read as complete.
+TEST_CASE("a damaged stored content digest is served constrained with the digest reason",
+          "[pg][device_ci][v2][digest]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, device_ci_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 3}};
+    REQUIRE(pool.valid());
+    DeviceInventoryStore store{pool};
+    REQUIRE(store.is_open());
+
+    const std::pair<const char*, const char*> corruptions[] = {
+        {"garbage", "'v1:deadbeef'"},
+        {"prefix only", "'v1:'"},
+        {"truncated to 8 hex", "left(content_digest, 11)"},
+        {"one char short", "left(content_digest, 66)"},
+        {"right head wrong tail", "left(content_digest, 11) || repeat('0', 56)"},
+        {"upper-cased hex", "'v1:' || upper(substr(content_digest, 4))"},
+        {"empty string", "''"},
+        {"whitespace", "' '"},
+        {"leading space on a valid value", "' ' || content_digest"},
+        {"trailing space on a valid value", "content_digest || ' '"},
+        {"V1 prefix", "'V1:' || substr(content_digest, 4)"},
+        {"bare 64 hex", "substr(content_digest, 4)"},
+        {"65 chars after the prefix", "content_digest || 'a'"},
+        {"v: only", "'v:'"},
+        {"vx: garbage", "'vx:abc'"},
+        {"v01: leading zero", "'v01:abc'"},
+        {"v0: version zero", "'v0:abc'"},
+        {"v1 with no colon", "'v1'"},
+        {"v2: with nothing after it", "'v2:'"},
+    };
+    for (const auto& [what, expr] : corruptions) {
+        INFO(what);
+        REQUIRE(put_record(store, "agent-cd", blob_with_rows(3, 2)) == InventoryIngestOutcome::kStored);
+        const auto stored = persisted_digests(pool, "agent-cd").at("dimm");
+        // The upper-casing case is only a change if the hex has a letter in it: pin that.
+        REQUIRE(stored.find_first_of("abcdef", 3) != std::string::npos);
+        REQUIRE(served_section(store, "agent-cd", "dimm")["complete"] == true);
+        exec_stmt(pool, std::string("UPDATE device_inventory_store.device_ci_section SET content_digest = ") +
+                            expr + " WHERE agent_id = 'agent-cd' AND kind = 'dimm'");
+        const auto dimm = served_section(store, "agent-cd", "dimm");
+        CHECK(dimm["status"] == "constrained");
+        CHECK(dimm["complete"] == false);
+        CHECK(dimm["reason"] == "server:content_digest_mismatch");
+        CHECK(dimm["rows"].empty()); // withheld on a digest mismatch (#7165)
+        // Siblings keep their own digest.
+        CHECK(served_section(store, "agent-cd", "cpu")["complete"] == true);
+    }
+}
+
+// Kills: reading a well-formed digest of another layout version as drift. That is the one case a
+// stored value is unverified instead of a mismatch (a future layout bump); NULL is the other.
+TEST_CASE("a well-formed digest of another layout version is unverified and the section reads as before",
+          "[pg][device_ci][v2][digest]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, device_ci_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 3}};
+    REQUIRE(pool.valid());
+    DeviceInventoryStore store{pool};
+    REQUIRE(store.is_open());
+    REQUIRE(put_record(store, "agent-up2", blob_with_rows(3, 2)) == InventoryIngestOutcome::kStored);
+    const char* forms[] = {"'v2:' || substr(content_digest, 4)", "'v10:abc'"};
+    for (const char* expr : forms) {
+        INFO(expr);
+        exec_stmt(pool, std::string("UPDATE device_inventory_store.device_ci_section SET content_digest = ") +
+                            expr + " WHERE agent_id = 'agent-up2' AND kind = 'dimm'");
+        exec_stmt(pool, "UPDATE device_inventory_store.device_ci_dimm SET part_number = 'EDITED' "
+                        "WHERE agent_id = 'agent-up2'");
+        const auto dimm = served_section(store, "agent-up2", "dimm");
+        CHECK(dimm["status"] == "ok");
+        CHECK(dimm["complete"] == true);
+        CHECK(dimm["reason"].is_null());
+    }
+    // The row count keeps guarding on its own.
+    exec_stmt(pool, "DELETE FROM device_inventory_store.device_ci_dimm WHERE agent_id = 'agent-up2' AND ord = 1");
+    CHECK(served_section(store, "agent-up2", "dimm")["reason"] == "server:row_count_mismatch");
+}
+
+// Kills: a digest taken over the cell with its NUL while the table keeps it without (permanent
+// false mismatch for a hand-built record, which the ingest seam never produces).
+TEST_CASE("a cell with a NUL byte is stored without it and still verifies",
+          "[pg][device_ci][v2][digest]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, device_ci_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 3}};
+    REQUIRE(pool.valid());
+    DeviceInventoryStore store{pool};
+    REQUIRE(store.is_open());
+    auto rec = blob_with_rows(1, 2);
+    bool patched = false;
+    for (auto& sec : rec.sections)
+        if (sec.kind == "dimm") {
+            REQUIRE_FALSE(sec.rows.empty());
+            sec.rows[0][4] = std::string("Sam\0sung", 8); // manufacturer
+            REQUIRE(sec.rows[0][4].size() == 8);
+            patched = true;
+        }
+    REQUIRE(patched);
+    REQUIRE(put_record(store, "agent-nul", rec) == InventoryIngestOutcome::kStored);
+    const auto dimm = served_section(store, "agent-nul", "dimm");
+    REQUIRE(dimm["rows"].size() == 2);
+    CHECK(dimm["rows"][0]["manufacturer"] == "Samsung"); // the NUL is not stored
+    CHECK(dimm["status"] == "ok");
+    CHECK(dimm["complete"] == true);
+    CHECK(dimm["reason"].is_null());
+}
+
+// Every registered kind goes through the same write path. Iterates the WHOLE registry, so a kind
+// added later (or one whose digest write is skipped) fails here instead of reading unverified
+// forever. Status-only kinds persist NULL for both columns.
+TEST_CASE("every registered kind persists its row count and a v1 digest and status-only kinds persist neither",
+          "[pg][device_ci][v2][digest]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, device_ci_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 3}};
+    REQUIRE(pool.valid());
+    DeviceInventoryStore store{pool};
+    REQUIRE(store.is_open());
+
+    std::vector<std::vector<std::string>> recs;
+    for (const auto& d : yuzu::server::kDeviceCiSections) {
+        recs.push_back({"status", d.section, "ok", ""});
+        if (d.table == nullptr)
+            continue;
+        std::vector<std::string> row{d.section};
+        for (int k = 0; k < d.n_fields; ++k)
+            row.push_back("v" + std::to_string(k));
+        recs.push_back(std::move(row));
+    }
+    const auto rec = parse_device_ci_blob(build_blob_v2(v2_scalars(), recs));
+    REQUIRE(put_record(store, "agent-all", rec) == InventoryIngestOutcome::kStored);
+
+    const auto counts = persisted_row_counts(pool, "agent-all");
+    const auto digests = persisted_digests(pool, "agent-all");
+    for (const auto& d : yuzu::server::kDeviceCiSections) {
+        INFO(d.section);
+        REQUIRE(counts.count(d.section) == 1);
+        REQUIRE(digests.count(d.section) == 1);
+        if (d.table == nullptr) {
+            CHECK(counts.at(d.section) == "NULL");
+            CHECK(digests.at(d.section) == "NULL");
+            continue;
+        }
+        CHECK(counts.at(d.section) == "1");
+        const auto& dg = digests.at(d.section);
+        REQUIRE(dg.size() == 3 + 64);
+        CHECK(dg.substr(0, 3) == "v1:");
+        CHECK(dg.find_first_not_of("0123456789abcdef", 3) == std::string::npos);
+        CHECK(served_section(store, "agent-all", d.section)["complete"] == true);
+    }
+}
+
+// ── #7163: the writer's digest-provider failure, through the DigestFn test seam ──────────────────
+
+namespace {
+// As sha256_hex behaves when EVP_Digest fails: no digest, never a digest of zeros.
+std::optional<std::string> failing_digest_provider(std::string_view) {
+    return std::nullopt;
+}
+} // namespace
+
+// Kills: a writer that stores a section without its digest when the provider fails (a section the
+// reader could then never verify), or one that leaves a half-replaced set. The whole full replace
+// aborts: kError, the previous rows, record hash and section statuses survive intact, and the
+// cause is named in the log.
+TEST_CASE("a failing digest provider aborts the full replace and leaves the previous set intact",
+          "[pg][device_ci][v2][digest]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, device_ci_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 3}};
+    REQUIRE(pool.valid());
+    DeviceInventoryStore store{pool};
+    REQUIRE(store.is_open());
+
+    const auto first = blob_with_rows(3, 2);
+    REQUIRE(put_record(store, "agent-dp", first) == InventoryIngestOutcome::kStored);
+    const auto digests_before = persisted_digests(pool, "agent-dp");
+    const auto counts_before = persisted_row_counts(pool, "agent-dp");
+    auto before = store.get_device_ci_with_sections("agent-dp");
+    REQUIRE(before.has_value());
+    REQUIRE(before->record.has_value());
+
+    const auto second = blob_with_rows(1, 4); // different content AND counts
+    InventoryIngestOutcome outcome{};
+    std::string logs;
+    {
+        yuzu::test::LogCapture cap(spdlog::level::warn);
+        store.set_digest_provider_for_test(&failing_digest_provider);
+        outcome = put_record(store, "agent-dp", second);
+        store.set_digest_provider_for_test(nullptr);
+        cap.stop();
+        logs = cap.text();
+    }
+    CHECK(outcome == InventoryIngestOutcome::kError);
+    CHECK(logs.find("digest_provider_failed") != std::string::npos);
+    CHECK(logs.find("stage=digest") != std::string::npos);
+
+    // Nothing partially stored: statuses, counts and digests are the first generation's.
+    CHECK(persisted_digests(pool, "agent-dp") == digests_before);
+    CHECK(persisted_row_counts(pool, "agent-dp") == counts_before);
+    auto after = store.get_device_ci_with_sections("agent-dp");
+    REQUIRE(after.has_value());
+    REQUIRE_FALSE(after->sections_failed);
+    REQUIRE(after->record.has_value());
+    CHECK(DeviceInventoryStore::canonical_hash(*after->record) ==
+          DeviceInventoryStore::canonical_hash(*before->record));
+    CHECK(after->record->sections.size() == before->record->sections.size());
+    CHECK(served_section(store, "agent-dp", "cpu")["complete"] == true);
+    CHECK(served_section(store, "agent-dp", "cpu")["rows"].size() == 3);
+    CHECK(served_section(store, "agent-dp", "dimm")["rows"].size() == 2);
+
+    // The provider is healthy again: the same replace now stores (the abort left no lock or state).
+    REQUIRE(put_record(store, "agent-dp", second) == InventoryIngestOutcome::kStored);
+    CHECK(served_section(store, "agent-dp", "dimm")["rows"].size() == 4);
+}
+
+// ── #7159: the sections-read degrade reason is its own ──────────────────────────────────────────
+
+// Kills: both failures counting under one reason (an operator cannot tell "the record read failed"
+// from "the record read but its sections did not", which are answered differently), and a
+// failure that moves no counter at all. The standalone sections reader takes the sections reason.
+TEST_CASE("the read-degrade counter tells a failed record read from a failed sections read",
+          "[pg][device_ci][v2][metrics]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, device_ci_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    REQUIRE(pool.valid());
+    DeviceInventoryStore store{pool};
+    REQUIRE(store.is_open());
+    yuzu::MetricsRegistry metrics;
+    store.set_metrics(&metrics);
+    const auto degrades = [&](const char* reason) {
+        return metrics
+            .counter("yuzu_inventory_read_degrade_total",
+                     {{"reason", reason}, {"source", "device_ci"}})
+            .value();
+    };
+
+    const DeviceCiRecord a = distinct_v2_record("A");
+    REQUIRE(store.apply_device_ci("agent-dg2", DeviceInventoryStore::canonical_hash(a),
+                                  std::optional<DeviceCiRecord>{a},
+                                  1) == InventoryIngestOutcome::kStored);
+    CHECK(degrades("query_error") == 0.0);
+    CHECK(degrades("sections_query_error") == 0.0);
+
+    SECTION("a failed sections statement counts sections_query_error, keeps the record") {
+        exec_stmt(pool,
+                  "ALTER TABLE device_inventory_store.device_ci_cpu RENAME COLUMN idx TO idx_x");
+        auto got = store.get_device_ci_with_sections("agent-dg2");
+        REQUIRE(got.has_value());
+        CHECK(got->sections_failed);
+        CHECK(degrades("sections_query_error") == 1.0);
+        CHECK(degrades("query_error") == 0.0);
+        // The single-purpose sections reader fails on the same fault and counts the same reason.
+        CHECK_FALSE(store.get_device_ci_sections("agent-dg2").has_value());
+        CHECK(degrades("sections_query_error") == 2.0);
+        CHECK(degrades("query_error") == 0.0);
+    }
+    SECTION("a failed record statement counts query_error and no sections reason") {
+        exec_stmt(pool,
+                  "ALTER TABLE device_inventory_store.device_ci RENAME COLUMN model TO model_x");
+        auto got = store.get_device_ci_with_sections("agent-dg2");
+        REQUIRE_FALSE(got.has_value());
+        CHECK(degrades("query_error") == 1.0);
+        CHECK(degrades("sections_query_error") == 0.0);
+    }
+}
+
+TEST_CASE("DeviceInventoryStore::list_device_ci_for reads exactly the named agents, at every chunk boundary",
+          "[pg][device_ci][keyed]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, device_ci_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    REQUIRE(pool.valid());
+    DeviceInventoryStore store{pool};
+    REQUIRE(store.is_open());
+
+    // Seven agents whose hostnames sort in the REVERSE of their ids, so a result that happened to
+    // depend on hostname order would show. (The 100,000-row cut itself cannot be reproduced at this
+    // size; the chunk boundaries below are what pin that no id is dropped or repeated.)
+    constexpr int kAgents = 7;
+    std::vector<std::string> all_ids;
+    for (int i = 0; i < kAgents; ++i) {
+        DeviceCiRecord rec = parse_device_ci_blob(sample_blob());
+        rec.hostname = "host-" + std::to_string(kAgents - i);
+        rec.serial = "SN-" + std::to_string(i);
+        const std::string id = "agent-k" + std::to_string(i);
+        REQUIRE(store.apply_device_ci(id, DeviceInventoryStore::canonical_hash(rec),
+                                      std::optional<DeviceCiRecord>{rec}, 100 + i) ==
+                InventoryIngestOutcome::kStored);
+        all_ids.push_back(id);
+    }
+
+    const auto ids_of = [](const std::vector<DeviceCiRecord>& v) {
+        std::vector<std::string> out;
+        for (const auto& r : v)
+            out.push_back(r.agent_id);
+        std::sort(out.begin(), out.end());
+        return out;
+    };
+
+    // chunk = 3: N = chunk (1 statement), chunk + 1 (2, the last holding one id) and 2 x chunk + 1 (3).
+    for (const std::size_t n : {std::size_t{3}, std::size_t{4}, std::size_t{7}}) {
+        CAPTURE(n);
+        const std::vector<std::string> asked(all_ids.begin(), all_ids.begin() + static_cast<std::ptrdiff_t>(n));
+        auto got = store.list_device_ci_for(asked, {.chunk = 3});
+        REQUIRE(got.has_value());
+        CHECK(ids_of(*got) == asked); // every asked id, none missing, none twice
+    }
+
+    SECTION("only the named agents come back; an unknown id is absent, not an error") {
+        auto got = store.list_device_ci_for({"agent-k5", "no-such-agent", "agent-k1"}, {.chunk = 2});
+        REQUIRE(got.has_value());
+        CHECK(ids_of(*got) == std::vector<std::string>{"agent-k1", "agent-k5"});
+    }
+    SECTION("an empty id list is an empty success and takes no connection") {
+        // Hold EVERY connection of the 2-connection pool: a read that took a lease before checking
+        // for an empty list would wait out the 3 s acquire timeout and come back nullopt.
+        auto held_a = pool.try_acquire_for(std::chrono::seconds{2});
+        auto held_b = pool.try_acquire_for(std::chrono::seconds{2});
+        REQUIRE(held_a);
+        REQUIRE(held_b);
+        auto got = store.list_device_ci_for({});
+        REQUIRE(got.has_value());
+        CHECK(got->empty());
+    }
+    SECTION("an id list longer than the table is fine and the record content survives") {
+        auto got = store.list_device_ci_for(all_ids);
+        REQUIRE(got.has_value());
+        REQUIRE(got->size() == static_cast<std::size_t>(kAgents));
+        for (const auto& r : *got)
+            CHECK(r.serial == "SN-" + r.agent_id.substr(std::string("agent-k").size()));
+    }
+}
+
+TEST_CASE("DeviceInventoryStore::list_device_ci_for is all-or-nothing: a spent budget or a failed statement degrades the whole read",
+          "[pg][device_ci][keyed][metrics]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, device_ci_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    REQUIRE(pool.valid());
+    DeviceInventoryStore store{pool};
+    REQUIRE(store.is_open());
+    yuzu::MetricsRegistry metrics;
+    store.set_metrics(&metrics);
+    const auto degrades = [&](const char* reason) {
+        return metrics
+            .counter("yuzu_inventory_read_degrade_total",
+                     {{"reason", reason}, {"source", "device_ci"}})
+            .value();
+    };
+
+    std::vector<std::string> ids;
+    for (int i = 0; i < 5; ++i) {
+        DeviceCiRecord rec = parse_device_ci_blob(sample_blob());
+        rec.serial = "SN-B" + std::to_string(i);
+        const std::string id = "agent-b" + std::to_string(i);
+        REQUIRE(store.apply_device_ci(id, DeviceInventoryStore::canonical_hash(rec),
+                                      std::optional<DeviceCiRecord>{rec}, 1 + i) ==
+                InventoryIngestOutcome::kStored);
+        ids.push_back(id);
+    }
+
+    SECTION("budget spent between chunks: nullopt, never the chunks already read") {
+        auto got = store.list_device_ci_for(ids, {.chunk = 2, .budget = std::chrono::milliseconds{0}});
+        CHECK_FALSE(got.has_value());
+        CHECK(degrades("keyed_read_budget") == 1.0);
+        CHECK(degrades("query_error") == 0.0);
+    }
+    SECTION("the budget is only checked BETWEEN chunks: a single-chunk read always runs") {
+        auto got = store.list_device_ci_for(ids, {.chunk = 10, .budget = std::chrono::milliseconds{0}});
+        REQUIRE(got.has_value());
+        CHECK(got->size() == ids.size());
+        CHECK(degrades("keyed_read_budget") == 0.0);
+    }
+    SECTION("an effectively unlimited budget is clamped, not an overflow, and the read completes") {
+        auto got = store.list_device_ci_for(ids, {.chunk = 2, .budget = std::chrono::milliseconds::max()});
+        REQUIRE(got.has_value());
+        CHECK(got->size() == ids.size());
+        CHECK(degrades("keyed_read_budget") == 0.0);
+    }
+    SECTION("a hugely negative budget is clamped to zero, not an overflow: it degrades after the first chunk") {
+        auto got = store.list_device_ci_for(ids, {.chunk = 2, .budget = std::chrono::milliseconds::min()});
+        CHECK_FALSE(got.has_value());
+        CHECK(degrades("keyed_read_budget") == 1.0);
+    }
+    SECTION("a failed statement is nullopt and counts query_error") {
+        exec_stmt(pool, "ALTER TABLE device_inventory_store.device_ci RENAME COLUMN model TO model_x");
+        auto got = store.list_device_ci_for(ids, {.chunk = 2});
+        CHECK_FALSE(got.has_value());
+        CHECK(degrades("query_error") == 1.0);
+        CHECK(degrades("keyed_read_budget") == 0.0);
+    }
+    SECTION("a statement that fails in a MIDDLE chunk is nullopt for the whole read, never the earlier chunks") {
+        // The failure above hits chunk one, so it would also pass if a later chunk's failure were
+        // swallowed. Here chunk one (two real agents) succeeds and returns rows; chunk two carries
+        // an id the server rejects (a lone 0xff is not valid UTF-8), so only that statement fails.
+        const std::vector<std::string> mixed{"agent-b0", "agent-b1", std::string("bad\xff"), "agent-b2"};
+        auto got = store.list_device_ci_for(mixed, {.chunk = 2});
+        CHECK_FALSE(got.has_value());
+        CHECK(degrades("query_error") == 1.0);
+        CHECK(degrades("keyed_read_budget") == 0.0);
+        // The pooled connection came back healthy: the same store reads normally straight away.
+        auto again = store.list_device_ci_for(ids, {.chunk = 2});
+        REQUIRE(again.has_value());
+        CHECK(again->size() == ids.size());
+    }
+}
+
+// ── list_device_ci_after: the keyset read behind GET /api/v1/hardware-ci ──────────────────────
+
+TEST_CASE("list_device_ci_after pages the stored rows by agent_id and narrows in SQL",
+          "[pg][device_ci][keyset]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, device_ci_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 3}};
+    REQUIRE(pool.valid());
+    DeviceInventoryStore store{pool};
+    REQUIRE(store.is_open());
+
+    // Five agents stored out of key order; agent-c is a v1 record, the rest are v2. Every id
+    // carries its own content hash so a row can be told from its neighbour by it.
+    std::map<std::string, std::string> hash_of;
+    for (const char* id : {"agent-d", "agent-b", "agent-e", "agent-a", "agent-c"}) {
+        DeviceCiRecord r = std::string(id) == "agent-c" ? parse_device_ci_blob(sample_blob())
+                                                        : distinct_v2_record("A");
+        r.hostname = std::string("host-") + id;
+        if (r.blob_version >= 2)
+            r.content_hash = std::string("hash-") + id;
+        hash_of[id] = DeviceInventoryStore::canonical_hash(r);
+        REQUIRE(store.apply_device_ci(id, hash_of[id], std::optional<DeviceCiRecord>{r}, 1) ==
+                InventoryIngestOutcome::kStored);
+    }
+    const auto ids_of = [](const std::vector<DeviceCiRecord>& rows) {
+        std::vector<std::string> out;
+        for (const auto& r : rows)
+            out.push_back(r.agent_id);
+        return out;
+    };
+
+    SECTION("walking with after = the last id visits every row once, in agent_id order") {
+        std::vector<std::string> seen;
+        std::string after;
+        int pages = 0;
+        for (;;) {
+            yuzu::server::DeviceCiKeysetQuery q;
+            q.after = after;
+            q.limit = 2;
+            const auto page = store.list_device_ci_after(q);
+            REQUIRE(page.has_value());
+            REQUIRE(++pages < 10);
+            if (page->empty())
+                break;
+            for (const auto& r : *page)
+                seen.push_back(r.agent_id);
+            after = page->back().agent_id;
+        }
+        CHECK(seen == std::vector<std::string>{"agent-a", "agent-b", "agent-c", "agent-d", "agent-e"});
+        CHECK(pages == 4); // 2 + 2 + 1, then the empty read that ends the walk
+    }
+
+    SECTION("a row carries its scalar fields, the stored hash and its blob version") {
+        yuzu::server::DeviceCiKeysetQuery q;
+        q.limit = 10;
+        const auto page = store.list_device_ci_after(q);
+        REQUIRE(page.has_value());
+        REQUIRE(page->size() == 5);
+        for (const auto& r : *page) {
+            INFO(r.agent_id);
+            CHECK(r.content_hash == hash_of[r.agent_id]);
+            CHECK(r.hostname == "host-" + r.agent_id);
+            CHECK(r.serial == "ABC123");
+            CHECK(r.sections.empty()); // scalars only: the sections stay on the per-id read
+        }
+        const auto& v1 = (*page)[2];
+        REQUIRE(v1.agent_id == "agent-c");
+        CHECK(v1.blob_version == 1);
+        CHECK(v1.chassis_type.empty());
+        CHECK(v1.machine_id_hash.empty());
+        const auto& v2 = (*page)[0];
+        CHECK(v2.blob_version == 2);
+        CHECK(v2.chassis_type == "chassis-type-A");
+        // the keyset read and the per-id read agree on the scalars
+        const auto one = store.get_device_ci("agent-a");
+        REQUIRE(one.has_value());
+        REQUIRE(one->has_value());
+        CHECK((**one).serial == v2.serial);
+        CHECK((**one).last_seen == v2.last_seen);
+    }
+
+    SECTION("after is exclusive, and a limit bounds the page") {
+        yuzu::server::DeviceCiKeysetQuery q;
+        q.after = "agent-b";
+        q.limit = 2;
+        auto page = store.list_device_ci_after(q);
+        REQUIRE(page.has_value());
+        CHECK(ids_of(*page) == std::vector<std::string>{"agent-c", "agent-d"});
+        q.after = "agent-e"; // the last key: nothing follows
+        page = store.list_device_ci_after(q);
+        REQUIRE(page.has_value());
+        CHECK(page->empty());
+        q.after = "agent-bz"; // between two keys: the next key above it
+        q.limit = 1;
+        page = store.list_device_ci_after(q);
+        REQUIRE(page.has_value());
+        CHECK(ids_of(*page) == std::vector<std::string>{"agent-c"});
+    }
+
+    // Kills: dropping `agent_id > after` when an agent_id filter is also set (the combined WHERE
+    // is built from independent clauses, so each must survive the other).
+    SECTION("agent_id and after combine: the named device is served only beyond the bound") {
+        yuzu::server::DeviceCiKeysetQuery q;
+        q.limit = 10;
+        q.agent_id = "agent-d";
+        q.after = "agent-c";
+        auto page = store.list_device_ci_after(q);
+        REQUIRE(page.has_value());
+        CHECK(ids_of(*page) == std::vector<std::string>{"agent-d"});
+        q.after = "agent-d";
+        page = store.list_device_ci_after(q);
+        REQUIRE(page.has_value());
+        CHECK(page->empty());
+    }
+
+    SECTION("agent_id and agent_ids narrow the read") {
+        yuzu::server::DeviceCiKeysetQuery q;
+        q.limit = 10;
+        q.agent_id = "agent-d";
+        auto page = store.list_device_ci_after(q);
+        REQUIRE(page.has_value());
+        CHECK(ids_of(*page) == std::vector<std::string>{"agent-d"});
+
+        q.agent_id = "no-such-agent";
+        page = store.list_device_ci_after(q);
+        REQUIRE(page.has_value());
+        CHECK(page->empty());
+
+        q.agent_id.reset();
+        q.agent_ids = std::vector<std::string>{"agent-e", "agent-a", "ghost"};
+        page = store.list_device_ci_after(q);
+        REQUIRE(page.has_value());
+        CHECK(ids_of(*page) == std::vector<std::string>{"agent-a", "agent-e"});
+
+        q.after = "agent-a"; // the keyset bound and the id set compose
+        page = store.list_device_ci_after(q);
+        REQUIRE(page.has_value());
+        CHECK(ids_of(*page) == std::vector<std::string>{"agent-e"});
+
+        // agent_id inside agent_ids is an intersection
+        q.after.clear();
+        q.agent_id = "agent-b";
+        page = store.list_device_ci_after(q);
+        REQUIRE(page.has_value());
+        CHECK(page->empty());
+    }
+
+    SECTION("a present-empty agent_ids is an empty page") {
+        yuzu::server::DeviceCiKeysetQuery q;
+        q.agent_ids = std::vector<std::string>{};
+        const auto page = store.list_device_ci_after(q);
+        REQUIRE(page.has_value());
+        CHECK(page->empty());
+    }
+
+    // The ceiling itself (100000) is proved by its own test below; with five rows this only shows
+    // that a non-positive limit is not read as "zero rows".
+    SECTION("a limit of zero or below is not zero rows") {
+        for (const int bad : {0, -1}) {
+            yuzu::server::DeviceCiKeysetQuery q;
+            q.limit = bad;
+            const auto page = store.list_device_ci_after(q);
+            REQUIRE(page.has_value());
+            CHECK(page->size() == 5);
+        }
+    }
+
+    SECTION("ids with quote, backslash, comma and brace characters travel as data") {
+        const std::string odd = "we\"ird,\\id{}";
+        DeviceCiRecord r = distinct_v2_record("A");
+        r.hostname = "odd-host";
+        r.content_hash = "hash-odd";
+        REQUIRE(store.apply_device_ci(odd, DeviceInventoryStore::canonical_hash(r),
+                                      std::optional<DeviceCiRecord>{r}, 1) ==
+                InventoryIngestOutcome::kStored);
+        yuzu::server::DeviceCiKeysetQuery q;
+        q.limit = 10;
+        q.agent_ids = std::vector<std::string>{odd, "agent-a"};
+        auto page = store.list_device_ci_after(q);
+        REQUIRE(page.has_value());
+        CHECK(page->size() == 2);
+        q.agent_ids.reset();
+        q.agent_id = odd;
+        page = store.list_device_ci_after(q);
+        REQUIRE(page.has_value());
+        REQUIRE(page->size() == 1);
+        CHECK((*page)[0].agent_id == odd);
+        q.agent_id.reset();
+        q.after = odd;
+        page = store.list_device_ci_after(q);
+        REQUIRE(page.has_value()); // a bound parameter, not SQL text
+    }
+}
+
+namespace {
+
+std::vector<std::string> keyset_ids(const std::optional<std::vector<DeviceCiRecord>>& page) {
+    std::vector<std::string> out;
+    if (page)
+        for (const auto& r : *page)
+            out.push_back(r.agent_id);
+    return out;
+}
+
+// Stores one v2 record under `id` with the given hostname.
+void store_ci(DeviceInventoryStore& store, const std::string& id, const std::string& hostname) {
+    DeviceCiRecord r = distinct_v2_record("A");
+    r.hostname = hostname;
+    r.content_hash = "hash-" + id;
+    REQUIRE(store.apply_device_ci(id, DeviceInventoryStore::canonical_hash(r),
+                                  std::optional<DeviceCiRecord>{r}, 1) == InventoryIngestOutcome::kStored);
+}
+
+// A limit-1 walk by `after`, the harshest page size for a keyset (every row is a boundary).
+std::vector<std::string> keyset_walk(DeviceInventoryStore& store, int limit) {
+    std::vector<std::string> seen;
+    std::string after;
+    for (int guard = 0; guard < 1000; ++guard) {
+        yuzu::server::DeviceCiKeysetQuery q;
+        q.after = after;
+        q.limit = limit;
+        const auto page = store.list_device_ci_after(q);
+        REQUIRE(page.has_value());
+        if (page->empty())
+            break;
+        for (const auto& r : *page)
+            seen.push_back(r.agent_id);
+        after = page->back().agent_id;
+    }
+    return seen;
+}
+
+} // namespace
+
+// Kills: dropping `COLLATE "C"` from the `>` bound or from the ORDER BY. The test database is
+// created from template1 and takes the server's default collation; on the runners checked that is
+// en_US.UTF-8, under which `Agent-1`, `agent_1`, `a b`, `a-b`, `a_b` and the digit strings sort in
+// an order that is not their byte order, so a keyset compared bytewise by the client's cursor
+// skips or repeats rows. Each id is served exactly once, in byte order, at every page size. Under
+// a database whose default collation is C or C.UTF-8 this test cannot tell (it SKIPs, visibly, when
+// the two orders of its own ids agree); the drift measurement (24% of 50,030 ids skipped at limit
+// 1 after a collation change under the primary key) is the evidence for the fix itself. The
+// `= ANY` comparison is an equality, which a deterministic collation decides bytewise, so no test
+// here can tell its `COLLATE "C"` from its absence; it is spelled for the v4 index.
+TEST_CASE("list_device_ci_after walks ids a locale would reorder exactly once each, in byte order",
+          "[pg][device_ci][keyset][order]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, device_ci_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 3}};
+    REQUIRE(pool.valid());
+    DeviceInventoryStore store{pool};
+    REQUIRE(store.is_open());
+
+    const std::vector<std::string> ids = {
+        "Agent-1", "agent_1", "agent-1", "agent1", "PC-1",   "pc-0042", "Zeta",
+        "zeta",    "AB",      "ab",      "a b",    "a-b",    "a_b",     "-x",
+        "_x",      "10",      "2",       "\xC3\xA9t\xC3\xA9", "Z\xC3\xA9", "agent-10", "agent-2"};
+    for (const auto& id : ids)
+        store_ci(store, id, "host-" + id);
+    std::vector<std::string> expected = ids;
+    std::sort(expected.begin(), expected.end()); // unsigned byte order
+
+    // Is the database's default collation distinguishable from byte order over THESE ids? If the
+    // two orders agree the assertions below would pass vacuously, so say so and skip.
+    {
+        const auto ordered = [&](const char* order_by) {
+            auto lease = pool.acquire();
+            REQUIRE(lease);
+            auto res = yuzu::server::pg::exec_params(
+                lease.get(),
+                (std::string("SELECT agent_id FROM device_inventory_store.device_ci ORDER BY ") +
+                 order_by).c_str(),
+                std::vector<std::string>{});
+            REQUIRE(res.status() == PGRES_TUPLES_OK);
+            std::vector<std::string> out;
+            for (int i = 0; i < PQntuples(res.get()); ++i)
+                out.emplace_back(PQgetvalue(res.get(), i, 0));
+            return out;
+        };
+        if (ordered("agent_id") == ordered("agent_id COLLATE \"C\""))
+            SKIP("this database's default collation orders the test ids as bytes (C or C.UTF-8), "
+                 "so the byte-order walk cannot tell the fix from the old query here");
+    }
+
+    for (const int limit : {1, 2, 7, 1000}) {
+        INFO("limit " << limit);
+        CHECK(keyset_walk(store, limit) == expected);
+    }
+    // the one-page read agrees, and the bound is compared bytewise too: after `Zeta` come the
+    // lower-case ids and `_x`, never `Agent-1` (which a case-insensitive locale puts before it)
+    yuzu::server::DeviceCiKeysetQuery q;
+    q.after = "Zeta";
+    q.limit = 1000;
+    const auto tail = keyset_ids(store.list_device_ci_after(q));
+    REQUIRE_FALSE(tail.empty());
+    CHECK(std::ranges::find(tail, "Agent-1") == tail.end());
+    CHECK(std::ranges::find(tail, "AB") == tail.end());
+    CHECK(tail.front() == "Z\xC3\xA9"); // 'Z' then 0xC3: the next byte string after "Zeta"
+    // and an agent_ids set matches whole ids (an id differing only by case is a different id)
+    q.after.clear();
+    q.agent_ids = std::vector<std::string>{"agent-1", "AGENT-1", "Zeta"};
+    CHECK(keyset_ids(store.list_device_ci_after(q)) == std::vector<std::string>{"Zeta", "agent-1"});
+}
+
+// Kills: dropping `COLLATE "C"` from the ORDER BY or from the named read's equality of the keyset
+// statement (each mutation checked: the walk and the named read fail). It does NOT kill dropping it
+// from the `>` bound alone: under the default plan, with the ORDER BY on the C index, the bound is
+// a row filter, decided bytewise once the database collation is C (a plan that pushes the bound
+// into the stale primary key as an index condition would see it), so only the byte-order walk
+// above can see that one, and only under a collation that is not C. This reproduces the drift the
+// evidence note measures: the primary key index is built under the database's collation, the
+// database's collation is then changed under it
+// with no REINDEX, and a NEW connection (the old one keeps the old rules) reads through a stale
+// index. Control first, so the test cannot pass vacuously: the naive default-collation keyset,
+// forced onto the stale primary key, must skip ids on this server; if it does not, the emulation
+// did not take effect here and the test SKIPs. Then the production keyset must serve every id once,
+// in byte order, and the named read must find every id.
+// The throwaway database is the fixture's own (dropped by the fixture); only its pg_database row is
+// changed, by the admin connection, and only when that connection may do so (else SKIP).
+TEST_CASE("list_device_ci_after and the named read survive a collation change under the primary key",
+          "[pg][device_ci][keyset][drift]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, device_ci_tpl);
+
+    std::vector<std::string> ids = {"Agent-1", "agent_1", "agent-1", "agent1", "PC-1", "pc-0042",
+                                    "Zeta",    "zeta",    "AB",      "ab",     "a b",  "a-b",
+                                    "a_b",     "-x",      "_x",      "10",     "2",    "B-1",
+                                    "b-1",     "b_1",     "Z-9",     "z-9",    "A1",   "a1"};
+    for (int g = 1; g <= 400; ++g) {
+        std::string id;
+        switch (g % 4) {
+            case 0: id = "agent-" + std::to_string(g); break;
+            case 1: id = "PC-" + std::to_string(g); break;
+            case 2: id = "Host_" + std::to_string(g); break;
+            default: id = "a-B" + std::to_string(g) + "-z"; break;
+        }
+        if (std::ranges::find(ids, id) == ids.end()) // the fixed ids above include "PC-1"
+            ids.push_back(std::move(id));
+    }
+    std::vector<std::string> expected = ids;
+    std::sort(expected.begin(), expected.end()); // unsigned byte order
+    REQUIRE(std::ranges::adjacent_find(expected) == expected.end()); // ids are distinct
+
+    {
+        // Load through the real write path under the ORIGINAL collation, so the primary key index
+        // is built under it. This pool is closed before the flip.
+        PgPool pool{{.conninfo = db.dsn(), .size = 3}};
+        REQUIRE(pool.valid());
+        DeviceInventoryStore store{pool};
+        REQUIRE(store.is_open());
+        for (const auto& id : ids)
+            store_ci(store, id, "host-" + id);
+
+        // Is the database's default collation distinguishable from byte order over these ids?
+        const auto ordered = [&](const char* order_by) {
+            auto lease = pool.acquire();
+            REQUIRE(lease);
+            auto res = yuzu::server::pg::exec_params(
+                lease.get(),
+                (std::string("SELECT agent_id FROM device_inventory_store.device_ci ORDER BY ") +
+                 order_by).c_str(),
+                std::vector<std::string>{});
+            REQUIRE(res.status() == PGRES_TUPLES_OK);
+            std::vector<std::string> out;
+            for (int i = 0; i < PQntuples(res.get()); ++i)
+                out.emplace_back(PQgetvalue(res.get(), i, 0));
+            return out;
+        };
+        if (ordered("agent_id") == ordered("agent_id COLLATE \"C\""))
+            SKIP("this database's default collation orders the test ids as bytes (C or C.UTF-8), "
+                 "so a collation change under the primary key cannot be emulated here");
+    }
+
+    // Flip THIS database's collation under the existing primary key index, no REINDEX.
+    {
+        yuzu::server::pg::PgConn admin{PQconnectdb(yuzu::test::pg_admin_dsn_env())};
+        if (PQstatus(admin.get()) != CONNECTION_OK)
+            SKIP("admin connection failed, cannot flip the collation: " << PQerrorMessage(admin.get()));
+        const std::string flip =
+            "UPDATE pg_database SET datcollate = 'C', datctype = 'C' WHERE datname = '" +
+            db.db_name() + "'";
+        yuzu::server::pg::PgResult res{PQexec(admin.get(), flip.c_str())};
+        if (res.status() != PGRES_COMMAND_OK || std::string(PQcmdTuples(res.get())) != "1")
+            SKIP("the admin connection may not update pg_database (not a superuser?), so the "
+                 "collation drift cannot be emulated: "
+                 << PQerrorMessage(admin.get()));
+    }
+
+    // CONTROL: the naive keyset a default-collation implementation would run, forced onto the stale
+    // primary key (a table this small would otherwise be read by a sequential scan), on a NEW
+    // connection (it takes the new collation).
+    std::size_t control_served = 0;
+    {
+        yuzu::server::pg::PgConn c{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(c.get()) == CONNECTION_OK);
+        for (const char* set : {"SET enable_seqscan = off", "SET enable_bitmapscan = off",
+                                "SET enable_sort = off"}) {
+            yuzu::server::pg::PgResult r{PQexec(c.get(), set)};
+            REQUIRE(r.status() == PGRES_COMMAND_OK);
+        }
+        std::string after;
+        for (std::size_t guard = 0; guard < ids.size() + 10; ++guard) {
+            const char* vals[1] = {after.c_str()};
+            yuzu::server::pg::PgResult r{PQexecParams(
+                c.get(),
+                "SELECT agent_id FROM device_inventory_store.device_ci WHERE agent_id > $1 "
+                "ORDER BY agent_id LIMIT 1",
+                1, nullptr, vals, nullptr, nullptr, 0)};
+            REQUIRE(r.status() == PGRES_TUPLES_OK);
+            if (PQntuples(r.get()) == 0)
+                break;
+            ++control_served;
+            after = PQgetvalue(r.get(), 0, 0);
+        }
+    }
+    INFO("the default-collation keyset served " << control_served << " of " << ids.size());
+    if (control_served >= ids.size())
+        SKIP("the emulated collation drift did not make the default-collation keyset skip any id on "
+             "this server, so this test cannot tell the fix from the old query here");
+
+    // A fresh pool and store: every connection opened from here has the new collation.
+    PgPool pool{{.conninfo = db.dsn(), .size = 3}};
+    REQUIRE(pool.valid());
+    DeviceInventoryStore store{pool};
+    REQUIRE(store.is_open());
+    for (const int limit : {1, 7, 1000}) {
+        INFO("limit " << limit);
+        CHECK(keyset_walk(store, limit) == expected);
+    }
+    // the named read: every stored id is found by `agent_id` (a plain `=` through the stale primary
+    // key would miss many of them)
+    std::size_t named_missed = 0;
+    for (const auto& id : ids) {
+        yuzu::server::DeviceCiKeysetQuery q;
+        q.agent_id = id;
+        q.limit = 10;
+        const auto page = store.list_device_ci_after(q);
+        REQUIRE(page.has_value());
+        if (page->size() != 1 || (*page)[0].agent_id != id)
+            ++named_missed;
+    }
+    CHECK(named_missed == 0);
+}
+
+// Kills: an `ORDER BY hostname, agent_id` (or any order that is not the keyset key): here the
+// hostnames sort AGAINST the agent_id order, so only a walk ordered by agent_id serves the rows in
+// agent_id order and a cursor made of the last agent_id never skips one.
+TEST_CASE("list_device_ci_after orders by agent_id even when the hostnames sort the other way",
+          "[pg][device_ci][keyset][order]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, device_ci_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 3}};
+    REQUIRE(pool.valid());
+    DeviceInventoryStore store{pool};
+    REQUIRE(store.is_open());
+    // agent-a has the LAST hostname, agent-e the first
+    const std::vector<std::pair<std::string, std::string>> rows = {
+        {"agent-a", "zz-host"}, {"agent-b", "yy-host"}, {"agent-c", "xx-host"},
+        {"agent-d", "ww-host"}, {"agent-e", "vv-host"}};
+    for (const auto& [id, host] : rows)
+        store_ci(store, id, host);
+    const std::vector<std::string> by_id = {"agent-a", "agent-b", "agent-c", "agent-d", "agent-e"};
+    for (const int limit : {1, 2, 5})
+        CHECK(keyset_walk(store, limit) == by_id);
+    yuzu::server::DeviceCiKeysetQuery q;
+    q.limit = 10;
+    CHECK(keyset_ids(store.list_device_ci_after(q)) == by_id);
+}
+
+// Kills: a keyset that repeats, skips or reorders when a row appears ahead of the cursor or the
+// cursor's own row goes away between two reads. The second page is compared exactly.
+TEST_CASE("list_device_ci_after's second page is exact when a row is inserted or the cursor row deleted",
+          "[pg][device_ci][keyset][walk]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, device_ci_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 3}};
+    REQUIRE(pool.valid());
+    DeviceInventoryStore store{pool};
+    REQUIRE(store.is_open());
+    for (const char* id : {"d1", "d2", "d3", "d4", "d5", "d6"})
+        store_ci(store, id, std::string("h-") + id);
+    const auto second_page = [&](const std::string& cursor) {
+        yuzu::server::DeviceCiKeysetQuery q;
+        q.after = cursor;
+        q.limit = 2;
+        return keyset_ids(store.list_device_ci_after(q));
+    };
+    REQUIRE(second_page("") == std::vector<std::string>{"d1", "d2"});
+
+    SECTION("a row inserted ahead of the cursor is served where it sorts") {
+        store_ci(store, "d25", "h-d25");
+        CHECK(second_page("d2") == std::vector<std::string>{"d25", "d3"});
+    }
+    SECTION("a row inserted behind the cursor is not served on this walk, and nothing repeats") {
+        store_ci(store, "d15", "h-d15");
+        CHECK(second_page("d2") == std::vector<std::string>{"d3", "d4"});
+    }
+    SECTION("the cursor row deleted: the walk continues after its key") {
+        REQUIRE(store.delete_agent("d2"));
+        CHECK(second_page("d2") == std::vector<std::string>{"d3", "d4"});
+    }
+    SECTION("every later row deleted: an empty page") {
+        for (const char* id : {"d3", "d4", "d5", "d6"})
+            REQUIRE(store.delete_agent(id));
+        CHECK(second_page("d2").empty());
+    }
+}
+
+// Kills: dropping or renaming migration v6 (the keyset index behind the bulk read), or leaving v4's
+// index behind. That the keyset statement really plans on this index is the EXPLAIN test below;
+// this one pins the definition and what v6 replaced. v4 built `device_ci_agent_id_c_idx`; v6 builds
+// `(agent_id COLLATE "C", changed_at)` and drops it, so a plan can test `changed_at` inside the index.
+TEST_CASE("device_inventory_store has the composite C-collated keyset index behind the bulk read",
+          "[pg][device_ci][keyset][migration]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, device_ci_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    REQUIRE(pool.valid());
+    DeviceInventoryStore store{pool};
+    REQUIRE(store.is_open());
+    auto lease = pool.acquire();
+    REQUIRE(lease);
+    auto res = yuzu::server::pg::exec_params(
+        lease.get(),
+        "SELECT indexdef FROM pg_indexes WHERE schemaname = 'device_inventory_store' "
+        "AND tablename = 'device_ci' AND indexname = 'device_ci_agent_id_c_changed_idx'",
+        std::vector<std::string>{});
+    REQUIRE(res.status() == PGRES_TUPLES_OK);
+    REQUIRE(PQntuples(res.get()) == 1);
+    const std::string def = PQgetvalue(res.get(), 0, 0);
+    CHECK(def.find("(agent_id COLLATE \"C\", changed_at)") != std::string::npos);
+    CHECK(def.find("CONCURRENTLY") == std::string::npos);
+    // the primary key, the hostname index and the v5 changed_at index are still there beside it, and
+    // v4's index is gone (the composite serves every query it served)
+    auto all = yuzu::server::pg::exec_params(
+        lease.get(),
+        "SELECT string_agg(indexname, ',' ORDER BY indexname) FROM pg_indexes "
+        "WHERE schemaname = 'device_inventory_store' AND tablename = 'device_ci'",
+        std::vector<std::string>{});
+    REQUIRE(all.status() == PGRES_TUPLES_OK);
+    CHECK(std::string(PQgetvalue(all.get(), 0, 0)) ==
+          "device_ci_agent_id_c_changed_idx,device_ci_changed_at_idx,device_ci_hostname_idx,"
+          "device_ci_pkey");
+}
+
+namespace {
+
+// The plan of the REAL keyset statement for `q` (the store's own builder, not a copy of its text),
+// as one string. `ANALYZE` has run by the time a caller asks, so the planner has row counts.
+std::string keyset_plan(PgPool& pool, const yuzu::server::DeviceCiKeysetQuery& q) {
+    const auto st = yuzu::server::device_ci_keyset_statement(q);
+    auto lease = pool.acquire();
+    REQUIRE(lease);
+    auto res = yuzu::server::pg::exec_params(lease.get(), ("EXPLAIN " + st.sql).c_str(), st.params);
+    REQUIRE(res.status() == PGRES_TUPLES_OK);
+    std::string plan;
+    for (int i = 0; i < PQntuples(res.get()); ++i)
+        plan += std::string(PQgetvalue(res.get(), i, 0)) + "\n";
+    return plan;
+}
+
+} // namespace
+
+// Kills: spelling the single-device filter `agent_id = $n` again. That equality is served by the
+// PRIMARY KEY, whose index follows the database collation: after a collation change under an
+// existing volume it missed 32,764 existing ids (measured on PG 18.4), while `agent_id COLLATE "C"
+// = $n` missed none, and the docs tell a CMDB to confirm a device with `?agent_id=` before
+// retiring it. A test cannot make a fresh database drift, so the assertion is the PLAN: the named
+// read must use the C-collated index and not the primary key. Reverting the clause makes the plan
+// use device_ci_pkey and this fails. The results are checked too, over ids a case-folding or
+// punctuation-skipping comparison would confuse.
+TEST_CASE("list_device_ci_after's single-device read is byte-exact and plans on the C-collated index",
+          "[pg][device_ci][keyset][named]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, device_ci_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 3}};
+    REQUIRE(pool.valid());
+    DeviceInventoryStore store{pool};
+    REQUIRE(store.is_open());
+    const std::vector<std::string> ids = {"Agent-1", "agent-1", "AGENT-1", "agent_1", "agent1",
+                                          "a b",     "a-b",     "-x",      "_x"};
+    for (const auto& id : ids)
+        store_ci(store, id, "host-" + id);
+    exec_stmt(pool, "INSERT INTO device_inventory_store.device_ci (agent_id, hostname, first_seen, "
+                    "last_seen) SELECT 'g-' || lpad(i::text, 6, '0'), 'h' || i, 1, 1 "
+                    "FROM generate_series(1, 50000) AS i");
+    exec_stmt(pool, "ANALYZE device_inventory_store.device_ci");
+
+    SECTION("each stored id is found by exactly itself") {
+        for (const auto& id : ids) {
+            INFO(id);
+            yuzu::server::DeviceCiKeysetQuery q;
+            q.agent_id = id;
+            CHECK(keyset_ids(store.list_device_ci_after(q)) == std::vector<std::string>{id});
+        }
+        yuzu::server::DeviceCiKeysetQuery q;
+        q.agent_id = "agent-2";
+        CHECK(keyset_ids(store.list_device_ci_after(q)).empty());
+    }
+    SECTION("the named read plans on the C-collated index, not the primary key") {
+        yuzu::server::DeviceCiKeysetQuery q;
+        q.agent_id = "agent-1";
+        q.limit = 2;
+        const std::string plan = keyset_plan(pool, q);
+        INFO(plan);
+        CHECK(plan.find("device_ci_agent_id_c_changed_idx") != std::string::npos);
+        CHECK(plan.find("device_ci_pkey") == std::string::npos);
+    }
+    SECTION("a page by bound and a scope-membership page plan on the same index") {
+        yuzu::server::DeviceCiKeysetQuery after;
+        after.after = "g-025000";
+        after.limit = 101;
+        const std::string after_plan = keyset_plan(pool, after);
+        INFO(after_plan);
+        CHECK(after_plan.find("device_ci_agent_id_c_changed_idx") != std::string::npos);
+        CHECK(after_plan.find("device_ci_pkey") == std::string::npos);
+        yuzu::server::DeviceCiKeysetQuery scoped;
+        scoped.agent_ids = std::vector<std::string>{"g-000010", "g-000020", "agent-1"};
+        scoped.limit = 101;
+        const std::string scoped_plan = keyset_plan(pool, scoped);
+        INFO(scoped_plan);
+        CHECK(scoped_plan.find("device_ci_agent_id_c_changed_idx") != std::string::npos);
+        CHECK(scoped_plan.find("device_ci_pkey") == std::string::npos);
+    }
+}
+
+// Kills: a v4 without its transaction-local settings. The migration runner applies a migration in
+// a transaction on a pooled connection that carries a 30 s statement_timeout and a 10 s
+// lock_timeout; a lock wait or a build past those fails the migration, the server then refuses to
+// start, and it repeats on every restart. The text carries `SET LOCAL` (it ends with the
+// transaction, so nothing leaks onto the pooled connection) for both, before the build, and still
+// creates the index idempotently and without CONCURRENTLY (the runner's transaction refuses it).
+TEST_CASE("migration v4 lifts the statement timeout and allows a longer lock wait for its index build",
+          "[device_ci][migration][v4]") {
+    const auto& all = yuzu::server::device_inventory_migrations();
+    REQUIRE(all.size() >= 6); // v7+ (the removals feed) append; indices below stay valid
+    REQUIRE(all[3].version == 4);
+    const std::string& sql = all[3].sql;
+    const auto at = [&](const char* needle) { return sql.find(needle); };
+    REQUIRE(at("SET LOCAL lock_timeout = '30s'") != std::string::npos);
+    REQUIRE(at("SET LOCAL statement_timeout = 0") != std::string::npos);
+    REQUIRE(at("CREATE INDEX IF NOT EXISTS device_ci_agent_id_c_idx") != std::string::npos);
+    CHECK(at("SET LOCAL lock_timeout") < at("CREATE INDEX"));
+    CHECK(at("SET LOCAL statement_timeout") < at("CREATE INDEX"));
+    CHECK(sql.find("CONCURRENTLY") == std::string::npos);
+    CHECK(sql.find("COLLATE \"C\"") != std::string::npos);
+}
+
+// Kills: a v4 that does not tolerate a lock wait longer than the pool's lock_timeout. The pool here
+// allows 1 s; another session holds a lock that conflicts with the index build's SHARE lock (a
+// long ingest transaction) for 2.5 s. The migration must wait it out under its own SET LOCAL
+// lock_timeout, build the index over the EXISTING rows (a v3 database being upgraded) and open.
+// Without the setting the 1 s pool timeout fails the migration and the store does not open.
+TEST_CASE("a v3 database upgrades through v6 behind a lock held longer than the pool's lock timeout",
+          "[pg][device_ci][migration][v4]") {
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
+    PgPool pool{{.conninfo = db.dsn(), .size = 3}};
+    REQUIRE(pool.valid());
+    {
+        DeviceInventoryStore seed{pool};
+        REQUIRE(seed.is_open());
+        store_ci(seed, "agent-up-1", "h1");
+        store_ci(seed, "Agent-up-2", "h2");
+    }
+    // a database as v3 left it: no keyset index and no changed_at column (dropping the column drops
+    // the two indexes that use it), recorded version 3. The open then runs v4, v5 and v6 in turn.
+    exec_stmt(pool, "ALTER TABLE device_inventory_store.device_ci DROP COLUMN changed_at");
+    exec_stmt(pool, "UPDATE public.schema_meta SET version = 3 WHERE store = 'device_inventory_store'");
+
+    PgPool short_lock_pool{{.conninfo = db.dsn(), .size = 2, .lock_timeout_ms = 1000}};
+    REQUIRE(short_lock_pool.valid());
+
+    // No Catch macro runs off the main thread: the holder records a failure into an atomic flag and
+    // a message, ALWAYS counts the latch down (also on failure, so the main thread never hangs on
+    // it) and swallows every exception (so nothing reaches std::terminate). The jthread joins when
+    // this scope unwinds, so a REQUIRE that throws on the main thread cannot leave it joinable.
+    std::latch holding{1};
+    std::atomic<bool> holder_failed{false};
+    std::string holder_error; // written by the holder before it exits, read after the join
+    const auto exec_holder = [&](PGconn* conn, const char* sql) {
+        auto r = yuzu::server::pg::exec_params(conn, sql, std::vector<std::string>{});
+        if (r.status() != PGRES_COMMAND_OK) {
+            holder_failed.store(true);
+            holder_error += std::string(sql) + ": " + PQerrorMessage(conn) + "; ";
+            return false;
+        }
+        return true;
+    };
+    std::jthread holder([&] {
+        try {
+            auto lease = pool.acquire();
+            if (!lease) {
+                holder_failed.store(true);
+                holder_error += "acquire failed; ";
+                holding.count_down();
+                return;
+            }
+            const bool locked =
+                exec_holder(lease.get(), "BEGIN") &&
+                exec_holder(lease.get(), "LOCK TABLE device_inventory_store.device_ci IN ROW EXCLUSIVE MODE");
+            holding.count_down();
+            if (!locked) {
+                (void)yuzu::server::pg::exec_params(lease.get(), "ROLLBACK", std::vector<std::string>{});
+                return;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(2500));
+            (void)exec_holder(lease.get(), "COMMIT");
+        } catch (...) {
+            holder_failed.store(true);
+            holder_error += "exception; ";
+            if (!holding.try_wait()) // only this thread counts down, so this cannot race
+                holding.count_down();
+        }
+    });
+    holding.wait();
+    const auto t0 = std::chrono::steady_clock::now();
+    DeviceInventoryStore store{short_lock_pool}; // runs v4 over the existing rows, waiting for the lock
+    const auto waited = std::chrono::steady_clock::now() - t0;
+    holder.join();
+    INFO("holder: " << holder_error);
+    REQUIRE_FALSE(holder_failed.load());
+
+    REQUIRE(store.is_open());
+    CHECK(waited > std::chrono::milliseconds(1500)); // it really did wait past the pool's 1 s
+    // v4 built its index over the existing rows and v6 then replaced it with the composite keyset
+    // index, so the open ends with the composite and without v4's; the pre-existing rows are served
+    // in byte order
+    auto lease = pool.acquire();
+    REQUIRE(lease);
+    auto res = yuzu::server::pg::exec_params(
+        lease.get(),
+        "SELECT string_agg(indexname, ',' ORDER BY indexname) FROM pg_indexes "
+        "WHERE schemaname = 'device_inventory_store' AND tablename = 'device_ci' "
+        "AND indexname LIKE 'device_ci_%_idx' AND indexname <> 'device_ci_hostname_idx'",
+        std::vector<std::string>{});
+    REQUIRE(res.status() == PGRES_TUPLES_OK);
+    CHECK(std::string(PQgetvalue(res.get(), 0, 0)) ==
+          "device_ci_agent_id_c_changed_idx,device_ci_changed_at_idx");
+    yuzu::server::DeviceCiKeysetQuery q;
+    CHECK(keyset_ids(store.list_device_ci_after(q)) ==
+          std::vector<std::string>{"Agent-up-2", "agent-up-1"});
+}
+
+// Kills: a v6 that trusts a same-named composite left by a cancelled hand build and then drops v4's
+// index, which would leave NO usable keyset index (every page a scan plus a sort) behind a WARN. The
+// fixture is a database stamped v5 that still has v4's index and a same-named composite that is
+// misdefined or invalid; opening must end with a valid composite of the migration's definition, no
+// v4 index and no WARN.
+TEST_CASE("migration v6 replaces a misdefined or invalid same-named composite instead of trusting it",
+          "[pg][device_ci][migration][v6][index_check]") {
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
+    PgPool pool{{.conninfo = db.dsn(), .size = 3}};
+    REQUIRE(pool.valid());
+    {
+        DeviceInventoryStore seed{pool};
+        REQUIRE(seed.is_open());
+        store_ci(seed, "b-2", "h2");
+        store_ci(seed, "A-1", "h1");
+    }
+    // a database as v5 left it: v4's index present, no composite, recorded version 5
+    exec_stmt(pool, "DROP INDEX device_inventory_store.device_ci_agent_id_c_changed_idx");
+    exec_stmt(pool, "CREATE INDEX device_ci_agent_id_c_idx ON device_inventory_store.device_ci "
+                    "((agent_id COLLATE \"C\"))");
+    exec_stmt(pool, "UPDATE public.schema_meta SET version = 5 WHERE store = 'device_inventory_store'");
+    const auto composite_def = [&] {
+        auto lease = pool.acquire();
+        REQUIRE(lease);
+        auto res = yuzu::server::pg::exec_params(
+            lease.get(),
+            "SELECT pg_get_indexdef(i.indexrelid) || '|' || i.indisvalid::text FROM pg_index i "
+            "JOIN pg_class c ON c.oid = i.indexrelid JOIN pg_namespace n ON n.oid = c.relnamespace "
+            "WHERE n.nspname = 'device_inventory_store' AND c.relname = 'device_ci_agent_id_c_changed_idx'",
+            std::vector<std::string>{});
+        REQUIRE(res.status() == PGRES_TUPLES_OK);
+        REQUIRE(PQntuples(res.get()) == 1);
+        return std::string(PQgetvalue(res.get(), 0, 0));
+    };
+    const auto open_and_check = [&] {
+        yuzu::test::LogCapture cap(spdlog::level::warn);
+        DeviceInventoryStore store{pool};
+        cap.stop();
+        REQUIRE(store.is_open());
+        CHECK(cap.text().find("DeviceInventoryStore:") == std::string::npos); // no index WARN, and no "could not check"
+        const std::string def = composite_def();
+        INFO(def);
+        CHECK(def.find("USING btree (agent_id COLLATE \"C\", changed_at)|true") != std::string::npos);
+        CHECK(count_rows(pool, "SELECT count(*) FROM pg_indexes WHERE schemaname = 'device_inventory_store' "
+                               "AND indexname = 'device_ci_agent_id_c_idx'") == 0);
+        yuzu::server::DeviceCiKeysetQuery q;
+        CHECK(keyset_ids(store.list_device_ci_after(q)) == std::vector<std::string>{"A-1", "b-2"});
+    };
+
+    SECTION("a same-named composite on the plain column") {
+        exec_stmt(pool, "CREATE INDEX device_ci_agent_id_c_changed_idx ON device_inventory_store.device_ci "
+                        "(agent_id, changed_at)");
+        open_and_check();
+    }
+    SECTION("a same-named composite with the columns the other way round") {
+        exec_stmt(pool, "CREATE INDEX device_ci_agent_id_c_changed_idx ON device_inventory_store.device_ci "
+                        "(changed_at, agent_id COLLATE \"C\")");
+        open_and_check();
+    }
+    SECTION("an invalid same-named composite (a cancelled build)") {
+        exec_stmt(pool, "CREATE INDEX device_ci_agent_id_c_changed_idx ON device_inventory_store.device_ci "
+                        "(agent_id COLLATE \"C\", changed_at)");
+        {
+            auto lease = pool.acquire();
+            REQUIRE(lease);
+            auto res = yuzu::server::pg::exec_params(
+                lease.get(),
+                "UPDATE pg_index SET indisvalid = false WHERE indexrelid = "
+                "'device_inventory_store.device_ci_agent_id_c_changed_idx'::regclass",
+                std::vector<std::string>{});
+            if (res.status() != PGRES_COMMAND_OK)
+                SKIP("the test role cannot update pg_index (not a superuser): "
+                     << PQresultErrorMessage(res.get()));
+        }
+        open_and_check();
+    }
+    SECTION("control: a correct pre-existing composite is rebuilt to the same definition") {
+        exec_stmt(pool, "CREATE INDEX device_ci_agent_id_c_changed_idx ON device_inventory_store.device_ci "
+                        "(agent_id COLLATE \"C\", changed_at)");
+        open_and_check();
+    }
+    // Kills: v6 re-run state "composite present, v4's index already absent, stamped v5" (a restore, or
+    // a partial hand drop): it must still open clean and end with ONE valid composite.
+    SECTION("re-run: the composite is already there and v4's index is already gone") {
+        exec_stmt(pool, "DROP INDEX device_inventory_store.device_ci_agent_id_c_idx");
+        exec_stmt(pool, "CREATE INDEX device_ci_agent_id_c_changed_idx ON device_inventory_store.device_ci "
+                        "(agent_id COLLATE \"C\", changed_at)");
+        // with v4's index already gone from the store schema, an UNQUALIFIED second drop would fall
+        // through to `public`: a foreign index of v4's name there must survive too
+        exec_stmt(pool, "CREATE TABLE public.yuzu_test_v6_foreign2 (agent_id text)");
+        exec_stmt(pool, "CREATE INDEX device_ci_agent_id_c_idx ON public.yuzu_test_v6_foreign2 (agent_id)");
+        open_and_check();
+        CHECK(count_rows(pool, "SELECT count(*) FROM pg_indexes WHERE schemaname = 'public' AND tablename = "
+                               "'yuzu_test_v6_foreign2' AND indexname = 'device_ci_agent_id_c_idx'") == 1);
+        exec_stmt(pool, "DROP TABLE public.yuzu_test_v6_foreign2");
+    }
+    // Kills: an UNQUALIFIED `DROP INDEX IF EXISTS` in v6. The runner's search_path is
+    // "<store>", public, so a name that does not exist in the store schema falls through to `public`
+    // and a same-named index there is dropped (verified on PostgreSQL 18.4). Same-named indexes on
+    // a table in `public` must survive v6; the store's own pair is still handled.
+    SECTION("same-named indexes in the public schema are not touched") {
+        exec_stmt(pool, "CREATE TABLE public.yuzu_test_v6_foreign (agent_id text, changed_at bigint)");
+        exec_stmt(pool, "CREATE INDEX device_ci_agent_id_c_idx ON public.yuzu_test_v6_foreign (agent_id)");
+        exec_stmt(pool, "CREATE INDEX device_ci_agent_id_c_changed_idx ON public.yuzu_test_v6_foreign "
+                        "(agent_id, changed_at)");
+        open_and_check();
+        CHECK(count_rows(pool, "SELECT count(*) FROM pg_indexes WHERE schemaname = 'public' AND tablename = "
+                               "'yuzu_test_v6_foreign' AND indexname IN ('device_ci_agent_id_c_idx', "
+                               "'device_ci_agent_id_c_changed_idx')") == 2);
+        exec_stmt(pool, "DROP TABLE public.yuzu_test_v6_foreign");
+    }
+}
+
+// Kills: no runtime check of the v6 keyset index and the v5 changed_at index. `schema_meta` saying v6
+// is not proof the indexes exist (a restore, a hand-run DROP INDEX, a same-named index of another
+// definition that IF NOT EXISTS accepted). Each case below leaves the store OPEN (the read is still
+// correct) and logs one WARN that names the index, the cost and the statement to run; a healthy open
+// logs none. The walk is checked after each, so "stays correct" is observed and not just claimed.
+TEST_CASE("opening the store warns when a read index is missing, invalid or defined differently",
+          "[pg][device_ci][migration][v6][index_check]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, device_ci_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 3}};
+    REQUIRE(pool.valid());
+    {
+        DeviceInventoryStore seed{pool};
+        REQUIRE(seed.is_open());
+        store_ci(seed, "b-2", "h2");
+        store_ci(seed, "A-1", "h1");
+    }
+    const auto open_and_capture = [&](std::string& warn_text) {
+        yuzu::test::LogCapture cap(spdlog::level::warn);
+        DeviceInventoryStore reopened{pool};
+        cap.stop();
+        warn_text = cap.text();
+        REQUIRE(reopened.is_open());
+        yuzu::server::DeviceCiKeysetQuery q;
+        CHECK(keyset_ids(reopened.list_device_ci_after(q)) == std::vector<std::string>{"A-1", "b-2"});
+    };
+    const auto replace_keyset = [&](const char* ddl_tail) {
+        exec_stmt(pool, "DROP INDEX device_inventory_store.device_ci_agent_id_c_changed_idx");
+        exec_stmt(pool, std::string("CREATE INDEX device_ci_agent_id_c_changed_idx ON "
+                                    "device_inventory_store.device_ci ") +
+                            ddl_tail);
+    };
+    const auto replace_changed_at = [&](const char* ddl_tail) {
+        exec_stmt(pool, "DROP INDEX device_inventory_store.device_ci_changed_at_idx");
+        exec_stmt(pool, std::string("CREATE INDEX device_ci_changed_at_idx ON "
+                                    "device_inventory_store.device_ci ") +
+                            ddl_tail);
+    };
+    std::string warn;
+
+    SECTION("healthy indexes: no warning for either") {
+        open_and_capture(warn);
+        CHECK(warn.find("device_ci_agent_id_c_changed_idx") == std::string::npos);
+        CHECK(warn.find("device_ci_changed_at_idx") == std::string::npos);
+    }
+    SECTION("a dropped keyset index") {
+        exec_stmt(pool, "DROP INDEX device_inventory_store.device_ci_agent_id_c_changed_idx");
+        open_and_capture(warn);
+        CHECK(warn.find("device_ci_agent_id_c_changed_idx is missing") != std::string::npos);
+        CHECK(warn.find("scan plus a sort") != std::string::npos);
+        CHECK(warn.find("CREATE INDEX IF NOT EXISTS device_ci_agent_id_c_changed_idx ON "
+                        "device_inventory_store.device_ci (agent_id COLLATE \"C\", changed_at)") !=
+              std::string::npos);
+        CHECK(warn.find("device_ci_changed_at_idx") == std::string::npos); // the other one is fine
+        // a missing index has nothing to drop, and the line points at the manual
+        CHECK(warn.find("must be dropped first") == std::string::npos);
+        CHECK(warn.find("DROP INDEX") == std::string::npos);
+        CHECK(warn.find("CREATE INDEX IF NOT EXISTS device_ci_agent_id_c_changed_idx ON "
+                        "device_inventory_store.device_ci (agent_id COLLATE \"C\", changed_at); See ") !=
+              std::string::npos); // the statement is terminated, so it pastes as written
+        CHECK(warn.find("docs/user-manual/upgrading.md") != std::string::npos);
+    }
+    SECTION("v4's old index left beside a healthy composite is not a problem") {
+        exec_stmt(pool, "CREATE INDEX device_ci_agent_id_c_idx ON device_inventory_store.device_ci "
+                        "((agent_id COLLATE \"C\"))");
+        open_and_capture(warn);
+        CHECK(warn.find("DeviceInventoryStore:") == std::string::npos);
+    }
+    // The index NAME contains "agent_id", so a check that looks for that word in the definition
+    // text accepts these; the check compares the printed key list whole.
+    SECTION("a same-named index on the plain column") {
+        replace_keyset("(agent_id, changed_at)");
+        open_and_capture(warn);
+        CHECK(warn.find("is defined differently") != std::string::npos);
+        // an index that exists but differs must be dropped before `IF NOT EXISTS` can build it
+        CHECK(warn.find("the existing index must be dropped first") != std::string::npos);
+        CHECK(warn.find("DROP INDEX device_inventory_store.device_ci_agent_id_c_changed_idx; CREATE INDEX IF "
+                        "NOT EXISTS device_ci_agent_id_c_changed_idx ON device_inventory_store.device_ci "
+                        "(agent_id COLLATE \"C\", changed_at);") != std::string::npos);
+    }
+    SECTION("a same-named index without changed_at (v4's definition under the new name)") {
+        replace_keyset("((agent_id COLLATE \"C\"))");
+        open_and_capture(warn);
+        CHECK(warn.find("is defined differently") != std::string::npos);
+    }
+    SECTION("a same-named index with another second column") {
+        replace_keyset("(agent_id COLLATE \"C\", hostname)");
+        open_and_capture(warn);
+        CHECK(warn.find("is defined differently") != std::string::npos);
+    }
+    SECTION("a same-named index with the columns the other way round") {
+        replace_keyset("(changed_at, agent_id COLLATE \"C\")");
+        open_and_capture(warn);
+        CHECK(warn.find("is defined differently") != std::string::npos);
+    }
+    SECTION("a same-named index with an INCLUDE column") {
+        replace_keyset("(agent_id COLLATE \"C\", changed_at) INCLUDE (hostname)");
+        open_and_capture(warn);
+        CHECK(warn.find("is defined differently") != std::string::npos);
+    }
+    SECTION("a same-named index on lower(agent_id) in C collation") {
+        replace_keyset("((lower(agent_id) COLLATE \"C\"), changed_at)");
+        open_and_capture(warn);
+        CHECK(warn.find("is defined differently") != std::string::npos);
+    }
+    SECTION("a descending second column") {
+        replace_keyset("(agent_id COLLATE \"C\", changed_at DESC)");
+        open_and_capture(warn);
+        CHECK(warn.find("is defined differently") != std::string::npos);
+    }
+    SECTION("the operator's own statement from the warning is the same index and stays silent") {
+        replace_keyset("(agent_id COLLATE \"C\", changed_at)");
+        open_and_capture(warn);
+        CHECK(warn.find("device_ci_agent_id_c_changed_idx") == std::string::npos);
+    }
+    SECTION("an operator-tuned storage parameter does not read as a different definition") {
+        replace_keyset("(agent_id COLLATE \"C\", changed_at) WITH (fillfactor = 70)");
+        open_and_capture(warn);
+        CHECK(warn.find("device_ci_agent_id_c_changed_idx") == std::string::npos);
+    }
+    SECTION("a storage parameter does not hide an INCLUDE list") {
+        replace_keyset("(agent_id COLLATE \"C\", changed_at) INCLUDE (hostname) WITH (fillfactor = 70)");
+        open_and_capture(warn);
+        CHECK(warn.find("is defined differently") != std::string::npos);
+    }
+    SECTION("a partial index of the right columns") {
+        replace_keyset("(agent_id COLLATE \"C\", changed_at) WHERE blob_version >= 2");
+        open_and_capture(warn);
+        CHECK(warn.find("is defined differently") != std::string::npos);
+    }
+    SECTION("an invalid keyset index (an interrupted build)") {
+        // Writing pg_index needs a superuser. Skip on any other role, as the pg_index and
+        // pg_database writes in test_pg_collation_check.cpp do: a least-privilege test role
+        // (scripts/setup-rhel9.sh grants CREATEDB and pg_signal_backend only) is a supported setup.
+        {
+            auto lease = pool.acquire();
+            REQUIRE(lease);
+            auto res = yuzu::server::pg::exec_params(
+                lease.get(),
+                "UPDATE pg_index SET indisvalid = false WHERE indexrelid = "
+                "'device_inventory_store.device_ci_agent_id_c_changed_idx'::regclass",
+                std::vector<std::string>{});
+            if (res.status() != PGRES_COMMAND_OK)
+                SKIP("the test role cannot update pg_index (not a superuser): "
+                     << PQresultErrorMessage(res.get()));
+        }
+        open_and_capture(warn);
+        CHECK(warn.find("is invalid") != std::string::npos);
+        CHECK(warn.find("or a concurrent build still running") != std::string::npos);
+    }
+
+    // The v5 index: nothing warned about it before. A delta is correct without it, so the line says
+    // what is lost (a sparse delta is served from the keyset index) and how to build it.
+    SECTION("a dropped changed_at index") {
+        exec_stmt(pool, "DROP INDEX device_inventory_store.device_ci_changed_at_idx");
+        open_and_capture(warn);
+        CHECK(warn.find("device_ci_changed_at_idx is missing") != std::string::npos);
+        CHECK(warn.find("sparse delta") != std::string::npos);
+        CHECK(warn.find("scan plus a sort") == std::string::npos); // that is the keyset index's cost
+        CHECK(warn.find("CREATE INDEX IF NOT EXISTS device_ci_changed_at_idx ON "
+                        "device_inventory_store.device_ci (changed_at)") != std::string::npos);
+        CHECK(warn.find("device_ci_agent_id_c_changed_idx") == std::string::npos); // that one is fine
+    }
+    SECTION("a same-named changed_at index on another column") {
+        replace_changed_at("(last_seen)");
+        open_and_capture(warn);
+        CHECK(warn.find("device_ci_changed_at_idx is defined differently") != std::string::npos);
+    }
+    SECTION("a descending changed_at index is defined differently") {
+        replace_changed_at("(changed_at DESC)");
+        open_and_capture(warn);
+        CHECK(warn.find("device_ci_changed_at_idx is defined differently") != std::string::npos);
+    }
+    SECTION("a partial changed_at index") {
+        replace_changed_at("(changed_at) WHERE blob_version >= 2");
+        open_and_capture(warn);
+        CHECK(warn.find("device_ci_changed_at_idx is defined differently") != std::string::npos);
+    }
+    SECTION("both indexes dropped: one warning for each") {
+        exec_stmt(pool, "DROP INDEX device_inventory_store.device_ci_agent_id_c_changed_idx");
+        exec_stmt(pool, "DROP INDEX device_inventory_store.device_ci_changed_at_idx");
+        open_and_capture(warn);
+        CHECK(warn.find("device_ci_agent_id_c_changed_idx is missing") != std::string::npos);
+        CHECK(warn.find("device_ci_changed_at_idx is missing") != std::string::npos);
+    }
+}
+
+// Kills: reading a non-positive or oversized limit as anything but the store's row ceiling
+// (100000), and the title of an earlier section that claimed to prove the ceiling with five rows.
+// 100001 rows are inserted in one statement, so the test reads exactly the ceiling.
+TEST_CASE("list_device_ci_after reads the 100000-row ceiling for a limit of zero, below zero or above it",
+          "[pg][device_ci][keyset][ceiling]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, device_ci_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    REQUIRE(pool.valid());
+    DeviceInventoryStore store{pool};
+    REQUIRE(store.is_open());
+    exec_stmt(pool,
+              "INSERT INTO device_inventory_store.device_ci (agent_id, first_seen, last_seen) "
+              "SELECT 'g-' || lpad(i::text, 6, '0'), 1, 1 FROM generate_series(1, 100001) AS i");
+    for (const int limit : {0, -1, 100000 + 1, std::numeric_limits<int>::max()}) {
+        INFO("limit " << limit);
+        yuzu::server::DeviceCiKeysetQuery q;
+        q.limit = limit;
+        const auto page = store.list_device_ci_after(q);
+        REQUIRE(page.has_value());
+        CHECK(page->size() == 100000);
+        CHECK(page->front().agent_id == "g-000001");
+        CHECK(page->back().agent_id == "g-100000");
+    }
+    // a limit below the ceiling is honoured
+    yuzu::server::DeviceCiKeysetQuery q;
+    q.limit = 3;
+    CHECK(keyset_ids(store.list_device_ci_after(q)) ==
+          std::vector<std::string>{"g-000001", "g-000002", "g-000003"});
+}
+
+// Kills: a deny-all scope that runs SQL (it would be a degrade here, where the only connection is
+// held elsewhere) instead of answering empty with no lease at all.
+TEST_CASE("list_device_ci_after answers a deny-all scope without taking a connection",
+          "[pg][device_ci][keyset]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, device_ci_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 1}};
+    REQUIRE(pool.valid());
+    DeviceInventoryStore store{pool};
+    REQUIRE(store.is_open());
+    auto held = pool.acquire(); // the pool's only connection
+    REQUIRE(held);
+    yuzu::server::DeviceCiKeysetQuery deny_all;
+    deny_all.agent_ids = std::vector<std::string>{};
+    const auto page = store.list_device_ci_after(deny_all);
+    REQUIRE(page.has_value()); // not a degrade: no lease was needed
+    CHECK(page->empty());
+    // the same pool with the same held lease DOES degrade a read that needs SQL
+    CHECK_FALSE(store.list_device_ci_after({}).has_value());
+}
+
+// Kills: setting the timeout with a session-level SET (it would leak onto the pooled connection
+// every other store shares).
+TEST_CASE("list_device_ci_after's statement timeout is transaction-local",
+          "[pg][device_ci][keyset]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, device_ci_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 1}};
+    REQUIRE(pool.valid());
+    DeviceInventoryStore store{pool};
+    REQUIRE(store.is_open());
+
+    const auto show_timeout = [&]() -> std::string {
+        auto lease = pool.acquire();
+        REQUIRE(lease);
+        auto res = yuzu::server::pg::exec_params(lease.get(), "SHOW statement_timeout",
+                                                 std::vector<std::string>{});
+        REQUIRE(res.status() == PGRES_TUPLES_OK);
+        return PQgetvalue(res.get(), 0, 0);
+    };
+    const std::string before = show_timeout();
+    REQUIRE(store.list_device_ci_after({}).has_value()); // the one connection runs the read
+    CHECK(show_timeout() == before);
+}
+
+// Kills: removing the SET LOCAL statement_timeout, which would let a stalled read hold one of the
+// shared pool's connections for the pool's own (longer) default. The stall is a table lock held by
+// another connection; the read gives up at the store's cap (5 s), which costs this test about 5 s.
+TEST_CASE("list_device_ci_after gives up at its statement timeout and reads again afterwards",
+          "[pg][device_ci][keyset]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, device_ci_tpl);
+    // The pool's own lock_timeout (10 s by default) is switched off so only a statement timeout can
+    // end the stall: with it on, the lock wait would end the read at 10 s whatever the store sets.
+    PgPool pool{{.conninfo = db.dsn(), .size = 3, .lock_timeout_ms = 0}};
+    REQUIRE(pool.valid());
+    DeviceInventoryStore store{pool};
+    REQUIRE(store.is_open());
+    DeviceCiRecord r = distinct_v2_record("A");
+    r.content_hash = "hash-t";
+    REQUIRE(store.apply_device_ci("agent-t", DeviceInventoryStore::canonical_hash(r),
+                                  std::optional<DeviceCiRecord>{r}, 1) == InventoryIngestOutcome::kStored);
+
+    auto holder = pool.acquire();
+    REQUIRE(holder);
+    const auto run = [&](const char* sql) {
+        auto res = yuzu::server::pg::exec_params(holder.get(), sql, std::vector<std::string>{});
+        REQUIRE(res.status() == PGRES_COMMAND_OK);
+    };
+    run("BEGIN");
+    run("LOCK TABLE device_inventory_store.device_ci IN ACCESS EXCLUSIVE MODE");
+
+    const auto t0 = std::chrono::steady_clock::now();
+    const auto stalled = store.list_device_ci_after({});
+    const auto waited = std::chrono::steady_clock::now() - t0;
+    CHECK_FALSE(stalled.has_value()); // a timeout is a degrade, never an empty page
+    CHECK(waited >= std::chrono::seconds(4));
+    CHECK(waited < std::chrono::seconds(15)); // the pool's own statement timeout is 30 s
+
+    run("ROLLBACK");
+    const auto after = store.list_device_ci_after({});
+    REQUIRE(after.has_value());
+    CHECK(after->size() == 1);
+}
+
+TEST_CASE("list_device_ci_after degrades (not empty) on a closed store", "[device_ci][keyset]") {
+    PgPool pool{{.conninfo = "host=127.0.0.1 port=1 connect_timeout=1 dbname=x user=x", .size = 1}};
+    DeviceInventoryStore store{pool};
+    REQUIRE(!store.is_open());
+    CHECK_FALSE(store.list_device_ci_after({}).has_value());
+    yuzu::server::DeviceCiKeysetQuery deny_all;
+    deny_all.agent_ids = std::vector<std::string>{};
+    // a closed store is a degrade even for a deny-all read
+    CHECK_FALSE(store.list_device_ci_after(deny_all).has_value());
+}
+
+namespace {
+
+double ci_read_degrades(yuzu::MetricsRegistry& m, const char* reason) {
+    return m.counter("yuzu_inventory_read_degrade_total", {{"reason", reason}, {"source", "device_ci"}})
+        .value();
+}
+
+} // namespace
+
+// The keyset read's three degrade causes are counted under three different reason labels, which is
+// what lets an operator tell a closed store from a saturated pool from a failing query.
+TEST_CASE("list_device_ci_after counts a closed store as store_not_open", "[device_ci][keyset]") {
+    PgPool pool{{.conninfo = "host=127.0.0.1 port=1 connect_timeout=1 dbname=x user=x", .size = 1}};
+    DeviceInventoryStore store{pool};
+    yuzu::MetricsRegistry metrics;
+    store.set_metrics(&metrics);
+    REQUIRE(!store.is_open());
+    CHECK_FALSE(store.list_device_ci_after({}).has_value());
+    CHECK(ci_read_degrades(metrics, "store_not_open") == 1.0);
+    CHECK(ci_read_degrades(metrics, "pool_acquire_timeout") == 0.0);
+    CHECK(ci_read_degrades(metrics, "query_error") == 0.0);
+}
+
+TEST_CASE("list_device_ci_after counts a saturated pool as pool_acquire_timeout and a failing query as query_error",
+          "[pg][device_ci][keyset]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, device_ci_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 1}};
+    REQUIRE(pool.valid());
+    DeviceInventoryStore store{pool};
+    REQUIRE(store.is_open());
+    yuzu::MetricsRegistry metrics;
+    store.set_metrics(&metrics);
+
+    SECTION("the only connection is held elsewhere") {
+        auto held = pool.acquire();
+        REQUIRE(held);
+        CHECK_FALSE(store.list_device_ci_after({}).has_value());
+        CHECK(ci_read_degrades(metrics, "pool_acquire_timeout") == 1.0);
+        CHECK(ci_read_degrades(metrics, "query_error") == 0.0);
+        CHECK(ci_read_degrades(metrics, "store_not_open") == 0.0);
+    }
+    SECTION("the SELECT itself fails") {
+        {
+            auto lease = pool.acquire();
+            REQUIRE(lease);
+            auto res = yuzu::server::pg::exec_params(
+                lease.get(),
+                "ALTER TABLE device_inventory_store.device_ci RENAME TO device_ci_renamed_away",
+                std::vector<std::string>{});
+            REQUIRE(res.status() == PGRES_COMMAND_OK);
+        }
+        CHECK_FALSE(store.list_device_ci_after({}).has_value());
+        CHECK(ci_read_degrades(metrics, "query_error") == 1.0);
+        CHECK(ci_read_degrades(metrics, "pool_acquire_timeout") == 0.0);
+        CHECK(ci_read_degrades(metrics, "store_not_open") == 0.0);
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// changed_at / the `changed_since` delta filter (migration v5)
+// ---------------------------------------------------------------------------------------------
+
+namespace {
+
+// The PostgreSQL clock in epoch seconds, spelled as the store spells it.
+long long db_now_secs(PgPool& pool) {
+    return count_rows(pool, "SELECT EXTRACT(EPOCH FROM clock_timestamp())::bigint");
+}
+
+// One bigint column of one row; -1 when the row is absent or the read fails.
+long long ci_column(PgPool& pool, const std::string& id, const std::string& column) {
+    return count_rows(pool, "SELECT " + column + " FROM device_inventory_store.device_ci WHERE agent_id = '" +
+                                id + "'");
+}
+
+// Stores one v2 record under `id` whose pinned content hash is `hash`.
+InventoryIngestOutcome put_ci(DeviceInventoryStore& store, const std::string& id, const std::string& hash) {
+    DeviceCiRecord r = distinct_v2_record("A");
+    r.content_hash = hash;
+    return store.apply_device_ci(id, DeviceInventoryStore::canonical_hash(r), std::optional<DeviceCiRecord>{r}, 1);
+}
+
+// The ids of a changed_since page, in served order.
+std::vector<std::string> since_ids(DeviceInventoryStore& store, yuzu::server::DeviceCiKeysetQuery q) {
+    return keyset_ids(store.list_device_ci_after(q));
+}
+
+} // namespace
+
+// Kills: changed_at stamped from the replica clock, stamped on every upsert, not stamped on insert,
+// or moved by a hash-skip touch (the defect that makes last_seen useless as a change marker).
+// Backdating both columns to 1000 makes "left alone" and "moved to now" unmistakable on a fast box.
+TEST_CASE("changed_at is stamped from the database clock on insert and moves only when the content hash changes",
+          "[pg][device_ci][changed_since]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, device_ci_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 3}};
+    REQUIRE(pool.valid());
+    DeviceInventoryStore store{pool};
+    REQUIRE(store.is_open());
+
+    const long long before = db_now_secs(pool);
+    REQUIRE(put_ci(store, "agent-1", "hash-1") == InventoryIngestOutcome::kStored);
+    const long long after = db_now_secs(pool);
+    REQUIRE(before > 0);
+
+    SECTION("a first store is stamped inside the database clock's window and the record carries it") {
+        const long long at = ci_column(pool, "agent-1", "changed_at");
+        CHECK(at >= before);
+        CHECK(at <= after);
+        auto got = store.get_device_ci("agent-1");
+        REQUIRE(got.has_value());
+        REQUIRE(got->has_value());
+        CHECK((**got).changed_at == at);
+    }
+
+    // From here every section starts with both timestamps in the past.
+    exec_stmt(pool, "UPDATE device_inventory_store.device_ci SET changed_at = 1000, last_seen = 1000");
+
+    SECTION("a full re-send of unchanged content leaves changed_at alone and still moves last_seen") {
+        REQUIRE(put_ci(store, "agent-1", "hash-1") == InventoryIngestOutcome::kStored);
+        CHECK(ci_column(pool, "agent-1", "changed_at") == 1000);
+        CHECK(ci_column(pool, "agent-1", "last_seen") > 1000);
+    }
+    SECTION("a full replace with a different content hash moves changed_at forward to the database clock") {
+        const long long b = db_now_secs(pool);
+        REQUIRE(put_ci(store, "agent-1", "hash-2") == InventoryIngestOutcome::kStored);
+        const long long a = db_now_secs(pool);
+        const long long at = ci_column(pool, "agent-1", "changed_at");
+        CHECK(at >= b);
+        CHECK(at <= a);
+        // and the new hash is the baseline: re-sending it does not move the marker again
+        exec_stmt(pool, "UPDATE device_inventory_store.device_ci SET changed_at = 1000");
+        REQUIRE(put_ci(store, "agent-1", "hash-2") == InventoryIngestOutcome::kStored);
+        CHECK(ci_column(pool, "agent-1", "changed_at") == 1000);
+    }
+    SECTION("a hash-skip touch moves last_seen and leaves changed_at alone") {
+        REQUIRE(store.apply_device_ci("agent-1", "hash-1", std::nullopt, 1) == InventoryIngestOutcome::kTouched);
+        CHECK(ci_column(pool, "agent-1", "changed_at") == 1000);
+        CHECK(ci_column(pool, "agent-1", "last_seen") > 1000);
+    }
+    SECTION("changed_at is not part of the content hash") {
+        DeviceCiRecord r = distinct_v2_record("A");
+        r.changed_at = 12345; // a record field a caller might set must not reach the stored marker
+        r.content_hash = "hash-1";
+        REQUIRE(store.apply_device_ci("agent-1", DeviceInventoryStore::canonical_hash(r),
+                                      std::optional<DeviceCiRecord>{r}, 1) == InventoryIngestOutcome::kStored);
+        CHECK(ci_column(pool, "agent-1", "changed_at") == 1000);
+        DeviceCiRecord v1 = parse_device_ci_blob(sample_blob());
+        DeviceCiRecord v1b = v1;
+        v1b.changed_at = 99;
+        CHECK(DeviceInventoryStore::canonical_hash(v1) == DeviceInventoryStore::canonical_hash(v1b));
+    }
+}
+
+// Kills: a filter that is `>`, that is ignored when combined with another narrowing, or that does
+// not compose with the cursor. The seeded stamps are 100, 200, 300, 400 on ids a..d in byte order.
+TEST_CASE("changed_since returns exactly the rows with changed_at >= since, alone and combined",
+          "[pg][device_ci][changed_since][keyset]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, device_ci_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 3}};
+    REQUIRE(pool.valid());
+    DeviceInventoryStore store{pool};
+    REQUIRE(store.is_open());
+    for (const char* id : {"a", "b", "c", "d"})
+        REQUIRE(put_ci(store, id, std::string("hash-") + id) == InventoryIngestOutcome::kStored);
+    exec_stmt(pool, "UPDATE device_inventory_store.device_ci SET changed_at = "
+                    "CASE agent_id WHEN 'a' THEN 100 WHEN 'b' THEN 200 WHEN 'c' THEN 300 ELSE 400 END");
+    using Ids = std::vector<std::string>;
+    yuzu::server::DeviceCiKeysetQuery q;
+
+    q.changed_since = 300;
+    CHECK(since_ids(store, q) == Ids{"c", "d"}); // inclusive at the boundary
+    q.changed_since = 301;
+    CHECK(since_ids(store, q) == Ids{"d"});
+    q.changed_since = 401;
+    auto none = store.list_device_ci_after(q);
+    REQUIRE(none.has_value()); // an answered empty page, not a degrade
+    CHECK(none->empty());
+    q.changed_since = 0;
+    CHECK(since_ids(store, q) == Ids{"a", "b", "c", "d"});
+    q.changed_since = std::numeric_limits<std::int64_t>::min() + 1;
+    CHECK(since_ids(store, q).size() == 4);
+
+    SECTION("with the cursor, the limit and the byte order") {
+        q.changed_since = 200;
+        q.after = "b";
+        CHECK(since_ids(store, q) == Ids{"c", "d"});
+        q.after = "";
+        q.limit = 2;
+        CHECK(since_ids(store, q) == Ids{"b", "c"});
+        q.after = "c";
+        CHECK(since_ids(store, q) == Ids{"d"});
+    }
+    SECTION("with a single-device read") {
+        q.changed_since = 300;
+        q.agent_id = "d";
+        CHECK(since_ids(store, q) == Ids{"d"});
+        q.agent_id = "a"; // exists but is older than the filter: absent, and answered
+        auto page = store.list_device_ci_after(q);
+        REQUIRE(page.has_value());
+        CHECK(page->empty());
+    }
+    SECTION("with a scope-membership list") {
+        q.changed_since = 200;
+        q.agent_ids = Ids{"a", "c", "zzz"};
+        CHECK(since_ids(store, q) == Ids{"c"});
+        q.agent_ids = Ids{}; // deny-all stays deny-all: no SQL, an empty answered page
+        auto page = store.list_device_ci_after(q);
+        REQUIRE(page.has_value());
+        CHECK(page->empty());
+    }
+    SECTION("every served row carries its own changed_at") {
+        q.changed_since = 300;
+        auto page = store.list_device_ci_after(q);
+        REQUIRE(page.has_value());
+        REQUIRE(page->size() == 2);
+        CHECK((*page)[0].changed_at == 300);
+        CHECK((*page)[1].changed_at == 400);
+    }
+    SECTION("the keyed read carries it too") {
+        auto keyed = store.list_device_ci_for({"b"});
+        REQUIRE(keyed.has_value());
+        REQUIRE(keyed->size() == 1);
+        CHECK((*keyed)[0].changed_at == 200);
+    }
+}
+
+// Kills: a no-filter statement that changed (text or parameters), a filter bound by interpolation
+// instead of a parameter, or a placeholder renumbering that shifts the LIMIT. The unfiltered tail is
+// pinned literally; the select list differs from before ONLY by the appended `changed_at` column.
+TEST_CASE("the keyset statement without changed_since is the unfiltered statement, and with it adds one bound clause",
+          "[device_ci][changed_since][keyset]") {
+    using yuzu::server::device_ci_keyset_statement;
+    yuzu::server::DeviceCiKeysetQuery plain;
+    const auto base = device_ci_keyset_statement(plain);
+    // The unfiltered text from FROM onward and its parameters, exactly as before this change.
+    constexpr const char* kTail =
+        " FROM device_inventory_store.device_ci WHERE true ORDER BY agent_id COLLATE \"C\" ASC LIMIT $1::bigint";
+    CHECK(base.sql.ends_with(std::string(", content_hash") + kTail));
+    CHECK(base.sql.find("machine_id_source, changed_at, content_hash FROM") != std::string::npos);
+    CHECK(base.sql.find("changed_since") == std::string::npos);
+    CHECK(base.sql.find("changed_at >=") == std::string::npos);
+    CHECK(base.params == std::vector<std::string>{"100"});
+
+    SECTION("alone: one clause, one bound parameter, before the LIMIT") {
+        auto q = plain;
+        q.changed_since = 1234567890123LL;
+        const auto st = device_ci_keyset_statement(q);
+        std::string expected = base.sql;
+        const auto at = expected.find(" ORDER BY");
+        REQUIRE(at != std::string::npos);
+        expected.insert(at, " AND changed_at >= $1::bigint");
+        expected.replace(expected.find("LIMIT $1::bigint"), 16, "LIMIT $2::bigint");
+        CHECK(st.sql == expected);
+        CHECK(st.params == std::vector<std::string>{"1234567890123", "100"});
+        CHECK(st.sql.find("1234567890123") == std::string::npos); // never interpolated
+    }
+    SECTION("with the cursor and both narrowings the placeholders stay in order") {
+        auto q = plain;
+        q.after = "m";
+        q.agent_id = "x";
+        q.agent_ids = std::vector<std::string>{"y"};
+        const auto without = device_ci_keyset_statement(q);
+        q.changed_since = 7;
+        const auto with = device_ci_keyset_statement(q);
+        REQUIRE(without.params.size() == 4); // after, agent_id, agent_ids, limit
+        REQUIRE(with.params.size() == 5);
+        CHECK(with.params[3] == "7");
+        CHECK(with.params[4] == "100");
+        CHECK(with.params[0] == without.params[0]);
+        CHECK(with.params[1] == without.params[1]);
+        CHECK(with.params[2] == without.params[2]);
+        CHECK(with.sql.find(" AND changed_at >= $4::bigint ORDER BY") != std::string::npos);
+        CHECK(with.sql.find("LIMIT $5::bigint") != std::string::npos);
+    }
+    SECTION("a negative or zero filter is still a bound parameter") {
+        auto q = plain;
+        q.changed_since = -5;
+        CHECK(device_ci_keyset_statement(q).params == std::vector<std::string>{"-5", "100"});
+    }
+}
+
+// Kills: a v5 that rewrites the table (a volatile default), builds its index without v4's
+// transaction-local settings, is not idempotent, or uses CONCURRENTLY (the runner's transaction
+// refuses it). The default must be the STABLE `now()`, never `clock_timestamp()` (volatile).
+TEST_CASE("migration v5 adds changed_at with a stable default and builds its index under transaction-local timeouts",
+          "[device_ci][migration][v5][changed_since]") {
+    const auto& all = yuzu::server::device_inventory_migrations();
+    REQUIRE(all.size() >= 6); // v7+ (the removals feed) append; indices below stay valid
+    REQUIRE(all[4].version == 5);
+    const std::string& sql = all[4].sql;
+    const auto at = [&](const char* needle) { return sql.find(needle); };
+    REQUIRE(at("SET LOCAL lock_timeout = '30s'") != std::string::npos);
+    REQUIRE(at("SET LOCAL statement_timeout = 0") != std::string::npos);
+    REQUIRE(at("ALTER TABLE device_ci ADD COLUMN IF NOT EXISTS changed_at BIGINT NOT NULL "
+               "DEFAULT (EXTRACT(EPOCH FROM now()))::bigint") != std::string::npos);
+    REQUIRE(at("CREATE INDEX IF NOT EXISTS device_ci_changed_at_idx ON device_ci (changed_at)") !=
+            std::string::npos);
+    CHECK(at("SET LOCAL lock_timeout") < at("ALTER TABLE"));
+    CHECK(at("SET LOCAL statement_timeout") < at("ALTER TABLE"));
+    CHECK(at("ALTER TABLE") < at("CREATE INDEX"));
+    // the type guard sits between the two: after the ADD COLUMN it inspects, before the index
+    REQUIRE(at("DO $v5guard$") != std::string::npos);
+    CHECK(at("ALTER TABLE") < at("DO $v5guard$"));
+    CHECK(at("DO $v5guard$") < at("CREATE INDEX"));
+    CHECK(sql.find("RAISE EXCEPTION 'device_inventory_store.device_ci.changed_at must be bigint NOT NULL") !=
+          std::string::npos);
+    CHECK(sql.find("CONCURRENTLY") == std::string::npos);
+    CHECK(sql.find("clock_timestamp") == std::string::npos);
+    CHECK(sql.find("DROP") == std::string::npos);
+    CHECK(yuzu::server::kChangedSinceMarginSecs == 300);
+}
+
+// Kills: a v6 that can drop v4's index while the composite is absent or unusable, loses the
+// transaction-local settings (the runner's pooled connection carries a 30 s statement_timeout and a
+// 10 s lock_timeout, and a failed migration refuses to start the server on every restart), is not
+// idempotent, or uses CONCURRENTLY (the runner's transaction refuses it). The statement ORDER is the
+// point: drop any pre-existing composite, create it, then drop v4's, so a same-named index left by a
+// cancelled hand build is replaced and not trusted. The whole texts of v4, v5 and v6 are pinned by
+// SHA-256 because their hashes are recorded in every database that ran them (v4's is on dev; v5 and
+// v6 are unshipped and pinned to freeze them); changing one is a deliberate act that needs a drift
+// recipe, and these pins make it fail here first. (Within one
+// transaction the order does not change what a concurrent reader sees; it changes only the locks taken.)
+TEST_CASE("migration v6 locks first, rebuilds the composite keyset index under transaction-local timeouts, then drops v4's",
+          "[device_ci][migration][v6][changed_since]") {
+    const auto& all = yuzu::server::device_inventory_migrations();
+    REQUIRE(all.size() >= 6); // v7+ (the removals feed) append; indices below stay valid
+    REQUIRE(all[5].version == 6);
+    const std::string& sql = all[5].sql;
+    const auto at = [&](const char* needle) { return sql.find(needle); };
+    REQUIRE(at("SET LOCAL lock_timeout = '30s'") != std::string::npos);
+    REQUIRE(at("SET LOCAL statement_timeout = 0") != std::string::npos);
+    // the strongest lock FIRST: a build that took SHARE and upgraded to ACCESS EXCLUSIVE at the drop
+    // can deadlock against a session that has read the table and then writes it
+    REQUIRE(at("LOCK TABLE device_ci IN ACCESS EXCLUSIVE MODE") != std::string::npos);
+    // the drops are schema-qualified: the runner's search_path is "<store>", public, so an
+    // unqualified DROP INDEX IF EXISTS would fall through to `public`
+    REQUIRE(at("DROP INDEX IF EXISTS device_inventory_store.device_ci_agent_id_c_changed_idx") !=
+            std::string::npos);
+    REQUIRE(at("CREATE INDEX IF NOT EXISTS device_ci_agent_id_c_changed_idx ON device_ci "
+               "(agent_id COLLATE \"C\", changed_at)") != std::string::npos);
+    REQUIRE(at("DROP INDEX IF EXISTS device_inventory_store.device_ci_agent_id_c_idx") != std::string::npos);
+    CHECK(sql.find("DROP INDEX IF EXISTS device_ci_") == std::string::npos); // no unqualified drop
+    CHECK(at("SET LOCAL lock_timeout") < at("LOCK TABLE"));
+    CHECK(at("SET LOCAL statement_timeout") < at("LOCK TABLE"));
+    CHECK(at("LOCK TABLE") < at("DROP INDEX"));
+    // the composite is dropped, then built, and only then is v4's dropped
+    CHECK(at("DROP INDEX IF EXISTS device_inventory_store.device_ci_agent_id_c_changed_idx") <
+          at("CREATE INDEX"));
+    CHECK(at("CREATE INDEX") < at("DROP INDEX IF EXISTS device_inventory_store.device_ci_agent_id_c_idx"));
+    CHECK(sql.find("CONCURRENTLY") == std::string::npos);
+    // nothing else: the changed_at index and the column are v5's
+    CHECK(sql.find("device_ci_changed_at_idx") == std::string::npos);
+    CHECK(sql.find("ALTER") == std::string::npos);
+
+    // whole-text pins: v4 shipped (it is on dev and its hash is recorded in every database that ran
+    // it); v5 and v6 are not shipped yet and are pinned to freeze them, so a later edit is deliberate
+    const auto sha = [](const std::string& t) {
+        const auto d = yuzu::server::sha256_hex(t);
+        REQUIRE(d.has_value());
+        return *d;
+    };
+    CHECK(sha(all[3].sql) == "c3278af7579d58415f02d5cedad350bf60df93b17082f10be589355956a37b4e");
+    CHECK(sha(all[4].sql) == "dc82eed9947d2d2e776144f04a59b29c30b0cff8a4e1bc143b35999b541bfccb");
+    CHECK(sha(all[5].sql) == "5fed893100124de59616bcaecb6e82a48115abae862f3b62cb0d924bfc131585");
+}
+
+// Kills: a v5 that fails on a populated v4 database, rewrites the table (the relfilenode changes
+// when it does), loses the rows' content, or leaves the index out. The existing rows read
+// "changed at the migration" (the stable default's evaluation time), not 0 and not their last_seen.
+TEST_CASE("a v4 database upgrades to v5 in place without a table rewrite and backfills the migration time",
+          "[pg][device_ci][migration][v5][changed_since]") {
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
+    PgPool pool{{.conninfo = db.dsn(), .size = 3}};
+    REQUIRE(pool.valid());
+    {
+        DeviceInventoryStore seed{pool};
+        REQUIRE(seed.is_open());
+        REQUIRE(put_ci(seed, "agent-v4-1", "h1") == InventoryIngestOutcome::kStored);
+        REQUIRE(put_ci(seed, "agent-v4-2", "h2") == InventoryIngestOutcome::kStored);
+    }
+    exec_stmt(pool, "INSERT INTO device_inventory_store.device_ci (agent_id, first_seen, last_seen) "
+                    "SELECT 'bulk-' || i, 5, 5 FROM generate_series(1, 20000) AS i");
+    // a database as v4 left it: no column, no changed_at index, v4's own keyset index, recorded
+    // version 4 (dropping the column also drops the composite index that includes it)
+    exec_stmt(pool, "DROP INDEX device_inventory_store.device_ci_changed_at_idx");
+    exec_stmt(pool, "ALTER TABLE device_inventory_store.device_ci DROP COLUMN changed_at");
+    exec_stmt(pool, "CREATE INDEX device_ci_agent_id_c_idx ON device_inventory_store.device_ci "
+                    "((agent_id COLLATE \"C\"))");
+    exec_stmt(pool, "UPDATE public.schema_meta SET version = 4 WHERE store = 'device_inventory_store'");
+    const long long rows = count_rows(pool, "SELECT count(*) FROM device_inventory_store.device_ci");
+    REQUIRE(rows == 20002);
+    const long long file_before =
+        count_rows(pool, "SELECT pg_relation_filenode('device_inventory_store.device_ci')::bigint");
+    REQUIRE(file_before > 0);
+
+    const long long t0 = db_now_secs(pool);
+    DeviceInventoryStore store{pool}; // runs v5 and v6 over the populated table
+    const long long t1 = db_now_secs(pool);
+    REQUIRE(store.is_open());
+
+    CHECK(count_rows(pool, "SELECT pg_relation_filenode('device_inventory_store.device_ci')::bigint") ==
+          file_before); // metadata-only: the heap file was not rewritten
+    CHECK(count_rows(pool, "SELECT count(*) FROM device_inventory_store.device_ci") == rows);
+    CHECK(count_rows(pool, "SELECT count(*) FROM pg_indexes WHERE schemaname = 'device_inventory_store' "
+                           "AND indexname = 'device_ci_changed_at_idx'") == 1);
+    // v6 then replaced v4's keyset index with the composite one over the populated table
+    CHECK(count_rows(pool, "SELECT count(*) FROM pg_indexes WHERE schemaname = 'device_inventory_store' "
+                           "AND indexname = 'device_ci_agent_id_c_changed_idx'") == 1);
+    CHECK(count_rows(pool, "SELECT count(*) FROM pg_indexes WHERE schemaname = 'device_inventory_store' "
+                           "AND indexname = 'device_ci_agent_id_c_idx'") == 0);
+    // every row reads the migration time (statement-start now(), inside the window around the open)
+    CHECK(count_rows(pool, "SELECT count(*) FROM device_inventory_store.device_ci WHERE changed_at < " +
+                               std::to_string(t0 - 1) + " OR changed_at > " + std::to_string(t1 + 1)) == 0);
+    auto got = store.get_device_ci("agent-v4-1");
+    REQUIRE(got.has_value());
+    REQUIRE(got->has_value());
+    CHECK((**got).changed_at >= t0 - 1);
+    // and a delta pull from before the upgrade sees every pre-existing row (nothing is silently old)
+    yuzu::server::DeviceCiKeysetQuery q;
+    q.changed_since = t0 - 5;
+    q.agent_id = "agent-v4-2";
+    CHECK(since_ids(store, q) == std::vector<std::string>{"agent-v4-2"});
+}
+
+// Kills: a watermark from the replica clock, one that omits the margin, or a nullopt that is
+// really a guess. The window is the database clock read before and after the call.
+TEST_CASE("device_ci_watermark is the database clock minus the margin, and absent when it cannot be read",
+          "[pg][device_ci][changed_since]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, device_ci_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    REQUIRE(pool.valid());
+    DeviceInventoryStore store{pool};
+    REQUIRE(store.is_open());
+
+    const long long lo = db_now_secs(pool) - yuzu::server::kChangedSinceMarginSecs;
+    const auto w = store.device_ci_watermark();
+    const long long hi = db_now_secs(pool) - yuzu::server::kChangedSinceMarginSecs;
+    REQUIRE(w.has_value());
+    CHECK(*w >= lo);
+    CHECK(*w <= hi);
+
+    SECTION("a saturated pool is nullopt, not a stale or guessed value") {
+        PgPool one{{.conninfo = db.dsn(), .size = 1}};
+        REQUIRE(one.valid());
+        DeviceInventoryStore s2{one};
+        REQUIRE(s2.is_open());
+        auto held = one.acquire();
+        REQUIRE(held);
+        CHECK_FALSE(s2.device_ci_watermark().has_value());
+    }
+}
+
+// Kills: a watermark that set its statement timeout with a plain SET (it would leak onto the pooled
+// connection for every later user). The pool's one connection runs the read, then its own `SHOW
+// statement_timeout` is what it was before. This does NOT prove the cap is applied at all (a read
+// with no cap leaves the setting untouched too): the cap's presence is pinned by the lexical test
+// on the statement text.
+TEST_CASE("device_ci_watermark's statement timeout is transaction-local",
+          "[pg][device_ci][changed_since][watermark]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, device_ci_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 1}};
+    REQUIRE(pool.valid());
+    DeviceInventoryStore store{pool};
+    REQUIRE(store.is_open());
+    const auto show_timeout = [&]() -> std::string {
+        auto lease = pool.acquire();
+        REQUIRE(lease);
+        auto res = yuzu::server::pg::exec_params(lease.get(), "SHOW statement_timeout", std::vector<std::string>{});
+        REQUIRE(res.status() == PGRES_TUPLES_OK);
+        return PQgetvalue(res.get(), 0, 0);
+    };
+    const std::string before = show_timeout();
+    REQUIRE(before != std::string(yuzu::server::kDeviceCiWatermarkStatementTimeout)); // the check must be able to fail
+    REQUIRE(store.device_ci_watermark().has_value());
+    CHECK(show_timeout() == before);
+}
+
+TEST_CASE("device_ci_watermark on a closed store is nullopt", "[device_ci][changed_since]") {
+    PgPool pool{{.conninfo = "host=127.0.0.1 port=1 connect_timeout=1 dbname=x user=x", .size = 1}};
+    DeviceInventoryStore store{pool};
+    REQUIRE_FALSE(store.is_open());
+    CHECK_FALSE(store.device_ci_watermark().has_value());
+}
+
+// Kills: a v5 whose changed_at index the planner cannot use for a sparse delta (a delta pull would
+// then walk the whole agent_id index per page and, on a large fleet, run into the 5 s statement
+// cap), and a filter spelling that defeats the agent_id index for a dense delta. The REAL statement
+// is explained. Measured on PostgreSQL 18.4 at 1,000,000 rows: a 0.1% delta plans on the
+// changed_at index (about 6 ms) and a 90% delta on the agent_id index (about 6 ms a page); the
+// planner's one known bad case (a mid-density delta whose rows cluster at the END of agent_id order)
+// is documented in the security review, not asserted here.
+TEST_CASE("changed_since plans a sparse delta on the changed_at index and a dense one on the agent_id index",
+          "[pg][device_ci][changed_since][keyset]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, device_ci_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 3}};
+    REQUIRE(pool.valid());
+    DeviceInventoryStore store{pool};
+    REQUIRE(store.is_open());
+    // 50,000 rows; every 1000th (0.1%) changed after the cutoff, the rest long ago. Ids are
+    // zero-padded so byte order is numeric order.
+    exec_stmt(pool, "INSERT INTO device_inventory_store.device_ci (agent_id, hostname, first_seen, last_seen, "
+                    "changed_at) SELECT 'g-' || lpad(i::text, 6, '0'), 'h' || i, 1, 1, "
+                    "CASE WHEN i % 1000 = 0 THEN 2000000000 ELSE 1000 END FROM generate_series(1, 50000) AS i");
+    exec_stmt(pool, "ANALYZE device_inventory_store.device_ci");
+
+    SECTION("a sparse delta, first page and mid-walk page, plans on the changed_at index") {
+        yuzu::server::DeviceCiKeysetQuery q;
+        q.changed_since = 1500000000;
+        q.limit = 1001;
+        const std::string first = keyset_plan(pool, q);
+        INFO(first);
+        CHECK(first.find("device_ci_changed_at_idx") != std::string::npos);
+        q.after = "g-025000";
+        const std::string mid = keyset_plan(pool, q);
+        INFO(mid);
+        CHECK(mid.find("device_ci_changed_at_idx") != std::string::npos);
+        // and it returns exactly the 50 changed rows, in byte order
+        q.after.clear();
+        const auto ids = keyset_ids(store.list_device_ci_after(q));
+        REQUIRE(ids.size() == 50);
+        CHECK(ids.front() == "g-001000");
+        CHECK(ids.back() == "g-050000");
+        CHECK(std::is_sorted(ids.begin(), ids.end()));
+    }
+    SECTION("a dense delta plans on the agent_id index and still pages in byte order") {
+        exec_stmt(pool, "UPDATE device_inventory_store.device_ci SET changed_at = CASE WHEN i_ok THEN "
+                        "2000000000 ELSE 1000 END FROM (SELECT agent_id AS a, (random() < 0.9) AS i_ok "
+                        "FROM device_inventory_store.device_ci) s WHERE agent_id = s.a");
+        exec_stmt(pool, "ANALYZE device_inventory_store.device_ci");
+        yuzu::server::DeviceCiKeysetQuery q;
+        q.changed_since = 1500000000;
+        q.limit = 101;
+        const std::string plan = keyset_plan(pool, q);
+        INFO(plan);
+        CHECK(plan.find("device_ci_agent_id_c_changed_idx") != std::string::npos);
+        const auto ids = keyset_ids(store.list_device_ci_after(q));
+        REQUIRE(ids.size() == 101);
+        CHECK(std::is_sorted(ids.begin(), ids.end()));
+    }
+}
+
+// Kills: the keyset index losing `changed_at` (v4's `agent_id`-only index) or the delta filter being
+// spelled so the planner cannot test it inside the index. HWCI-DELTA-PLAN-FLIP: with an index on
+// `agent_id` alone, a delta of a few percent of the table that sits at the head of agent_id order
+// made the planner walk that index for the rest of the table and test `changed_at` against each heap
+// row (a `Filter:` line): 3.6 to 3.8 s on the terminal page at 1M rows in one review's measurement,
+// 262 to 268 ms in a later re-measure on a heap ordered like agent_id (a random heap reproduced 2.5 s; the record
+// gives all three).
+// With `(agent_id COLLATE "C", changed_at)` the test is an `Index Cond:` on the index itself. The
+// assertion is on the plan's CONDITION LINE, not on a timing, so it is deterministic: the same
+// statement that planned `Filter: (changed_at >= ...)` on v4's index plans `Index Cond: (... AND
+// (changed_at >= ...))` here. Prototyped on PostgreSQL 18.4 at this table shape.
+TEST_CASE("a clustered delta's terminal page tests changed_at inside the keyset index, not row by row",
+          "[pg][device_ci][changed_since][keyset]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, device_ci_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 3}};
+    REQUIRE(pool.valid());
+    DeviceInventoryStore store{pool};
+    REQUIRE(store.is_open());
+    // 100,000 rows; the first 5,000 (5%, the head of agent_id order) changed after the cutoff
+    exec_stmt(pool, "INSERT INTO device_inventory_store.device_ci (agent_id, hostname, first_seen, last_seen, "
+                    "changed_at) SELECT 'g-' || lpad(i::text, 6, '0'), 'h' || i, 1, 1, "
+                    "CASE WHEN i <= 5000 THEN 2000000000 ELSE 1000 END FROM generate_series(1, 100000) AS i");
+    // Without the v5 index the planner has only the keyset index to choose from, so the assertion is
+    // about THAT index carrying `changed_at` as a condition and cannot fail on a cost-model change that
+    // prefers `device_ci_changed_at_idx` plus a sort for this shape.
+    exec_stmt(pool, "DROP INDEX device_inventory_store.device_ci_changed_at_idx");
+    exec_stmt(pool, "ANALYZE device_inventory_store.device_ci");
+    yuzu::server::DeviceCiKeysetQuery q;
+    q.changed_since = 1500000000;
+    q.after = "g-004000"; // the last page of the delta: 1,000 matching rows, then 95,000 that do not
+    q.limit = 1001;
+    const std::string plan = keyset_plan(pool, q);
+    INFO(plan);
+    CHECK(plan.find("device_ci_agent_id_c_changed_idx") != std::string::npos);
+    // the bound AND the delta test are both index conditions
+    const auto cond = plan.find("Index Cond:");
+    REQUIRE(cond != std::string::npos);
+    const auto cond_end = plan.find('\n', cond);
+    CHECK(plan.substr(cond, cond_end - cond).find("changed_at") != std::string::npos);
+    CHECK(plan.find("Filter:") == std::string::npos);
+    // and the page is right: the 1,000 changed rows after the cursor, in byte order
+    const auto ids = keyset_ids(store.list_device_ci_after(q));
+    REQUIRE(ids.size() == 1000);
+    CHECK(ids.front() == "g-004001");
+    CHECK(ids.back() == "g-005000");
+    CHECK(std::is_sorted(ids.begin(), ids.end()));
+}
+
+// ---------------------------------------------------------------------------------------------
+// Governance fix round (hardware-CI changed_since): v5 type guard, watermark error arm, a real-PG
+// multi-page delta walk through read_page, and the v1 hash path.
+// ---------------------------------------------------------------------------------------------
+
+// Kills: a v5 that is stamped as applied over a pre-existing `changed_at` of the wrong type or
+// nullability (ADD COLUMN IF NOT EXISTS skips it silently; every content upsert then fails with
+// `CASE types text and bigint cannot be matched` and every delta 503s). The guard must refuse the
+// open with a reason that names the column and what was found, and leave v5 UNSTAMPED. The positive
+// control (a correct hand-made column) must still open, so the guard is not simply refusing all.
+TEST_CASE("migration v5 refuses a pre-existing changed_at that is not bigint NOT NULL and does not stamp v5",
+          "[pg][device_ci][migration][v5][changed_since]") {
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
+    PgPool pool{{.conninfo = db.dsn(), .size = 3}};
+    REQUIRE(pool.valid());
+    {
+        DeviceInventoryStore seed{pool};
+        REQUIRE(seed.is_open());
+        REQUIRE(put_ci(seed, "agent-g-1", "h1") == InventoryIngestOutcome::kStored);
+    }
+    // a database as v4 left it, then a hand-made column of another shape
+    exec_stmt(pool, "DROP INDEX device_inventory_store.device_ci_changed_at_idx");
+    exec_stmt(pool, "ALTER TABLE device_inventory_store.device_ci DROP COLUMN changed_at");
+    exec_stmt(pool, "UPDATE public.schema_meta SET version = 4 WHERE store = 'device_inventory_store'");
+    // ... whose runner table (public.yuzu_schema_migrations: one row per applied version, written in
+    // the same transaction as the version stamp) has no v5 row either; the seed above recorded one
+    exec_stmt(pool, "DELETE FROM public.yuzu_schema_migrations WHERE store = 'device_inventory_store' "
+                    "AND version >= 5");
+
+    const auto stored_version = [&] {
+        return count_rows(pool, "SELECT version FROM public.schema_meta WHERE store = 'device_inventory_store'");
+    };
+    const auto v5_hash_rows = [&] {
+        return count_rows(pool, "SELECT count(*) FROM public.yuzu_schema_migrations "
+                                "WHERE store = 'device_inventory_store' AND version = 5");
+    };
+    REQUIRE(v5_hash_rows() == 0); // the fixture is a v4 database
+    const auto try_open = [&](std::string& log_text) {
+        yuzu::test::LogCapture cap(spdlog::level::err);
+        DeviceInventoryStore store{pool};
+        cap.stop();
+        log_text = cap.text();
+        return store.is_open();
+    };
+    std::string log;
+
+    SECTION("a TEXT column") {
+        exec_stmt(pool, "ALTER TABLE device_inventory_store.device_ci ADD COLUMN changed_at TEXT NOT NULL "
+                        "DEFAULT ''");
+        CHECK_FALSE(try_open(log));
+        CHECK(log.find("migration v5 failed for device_inventory_store") != std::string::npos);
+        CHECK(log.find("device_inventory_store.device_ci.changed_at must be bigint NOT NULL") != std::string::npos);
+        CHECK(log.find("found type text, not null true") != std::string::npos);
+        CHECK(stored_version() == 4);
+        CHECK(v5_hash_rows() == 0); // the refused v5 recorded no hash either
+        // nothing was built behind the refusal (the transaction rolled back as a whole)
+        CHECK(count_rows(pool, "SELECT count(*) FROM pg_indexes WHERE schemaname = 'device_inventory_store' "
+                               "AND indexname = 'device_ci_changed_at_idx'") == 0);
+        // and a restart repeats the refusal rather than stamping it
+        CHECK_FALSE(try_open(log));
+        CHECK(stored_version() == 4);
+        CHECK(v5_hash_rows() == 0);
+    }
+    SECTION("a nullable BIGINT column") {
+        exec_stmt(pool, "ALTER TABLE device_inventory_store.device_ci ADD COLUMN changed_at BIGINT");
+        CHECK_FALSE(try_open(log));
+        CHECK(log.find("changed_at must be bigint NOT NULL") != std::string::npos);
+        CHECK(log.find("found type bigint, not null false") != std::string::npos);
+        CHECK(stored_version() == 4);
+        CHECK(v5_hash_rows() == 0);
+    }
+    SECTION("an INTEGER column") {
+        exec_stmt(pool, "ALTER TABLE device_inventory_store.device_ci ADD COLUMN changed_at INTEGER NOT NULL "
+                        "DEFAULT 0");
+        CHECK_FALSE(try_open(log));
+        CHECK(log.find("found type integer, not null true") != std::string::npos);
+        CHECK(stored_version() == 4);
+        CHECK(v5_hash_rows() == 0);
+    }
+    SECTION("control: a hand-made bigint NOT NULL column is accepted and v5 is stamped") {
+        exec_stmt(pool, "ALTER TABLE device_inventory_store.device_ci ADD COLUMN changed_at BIGINT NOT NULL "
+                        "DEFAULT 0");
+        CHECK(try_open(log));
+        CHECK(log.find("migration v5 failed") == std::string::npos);
+        CHECK(stored_version() == 6); // v5 accepted the column, then v6 ran after it
+        CHECK(v5_hash_rows() == 1); // the control: an accepted v5 DOES record its hash
+        CHECK(count_rows(pool, "SELECT count(*) FROM pg_indexes WHERE schemaname = 'device_inventory_store' "
+                               "AND indexname = 'device_ci_changed_at_idx'") == 1);
+    }
+}
+
+// Kills: a watermark whose query-error arm answers a value (a guess), or answers nullopt without
+// being counted as a query error. The backend of the pool's only idle connection is terminated, so
+// the next statement on it fails on a live pool lease (not a closed store and not a saturated pool).
+TEST_CASE("device_ci_watermark is nullopt and counted as query_error when its statement fails",
+          "[pg][device_ci][changed_since]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, device_ci_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 1}};
+    PgPool admin{{.conninfo = db.dsn(), .size = 1}};
+    REQUIRE(pool.valid());
+    REQUIRE(admin.valid());
+    DeviceInventoryStore store{pool};
+    REQUIRE(store.is_open());
+    yuzu::MetricsRegistry metrics;
+    store.set_metrics(&metrics);
+    REQUIRE(store.device_ci_watermark().has_value()); // healthy first
+
+    long long pid = -1;
+    {
+        auto lease = pool.acquire();
+        REQUIRE(lease);
+        auto res = yuzu::server::pg::exec_params(lease.get(), "SELECT pg_backend_pid()", std::vector<std::string>{});
+        REQUIRE(res.status() == PGRES_TUPLES_OK);
+        pid = std::atoll(PQgetvalue(res.get(), 0, 0));
+    } // the lease goes back to the pool, idle
+    REQUIRE(pid > 0);
+    REQUIRE(count_rows(admin, "SELECT pg_terminate_backend(" + std::to_string(pid) + ")::int") == 1);
+    // wait until the backend is really gone (the terminate is asynchronous), and REQUIRE it: a
+    // loop that fell through silently would run the statement on a live backend and flake red
+    const auto backend_gone = [&] {
+        return count_rows(admin, "SELECT count(*) FROM pg_stat_activity WHERE pid = " + std::to_string(pid)) == 0;
+    };
+    for (int i = 0; i < 250 && !backend_gone(); ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    REQUIRE(backend_gone());
+
+    CHECK_FALSE(store.device_ci_watermark().has_value());
+    CHECK(ci_read_degrades(metrics, "query_error") == 1.0);
+    CHECK(ci_read_degrades(metrics, "pool_acquire_timeout") == 0.0);
+    CHECK(ci_read_degrades(metrics, "store_not_open") == 0.0);
+}
+
+// Kills (QE-F1): a delta walk that skips or doubles a row where `changed_at` stamps are TIED across
+// a page cut (the keyset is agent_id, the filter changed_at; a bug that paged on changed_at would
+// split a tie), a watermark on a cursor page, and none on the first. Runs the REAL page model over
+// the REAL store on PostgreSQL, with the production wiring shape: the store's own list and watermark.
+TEST_CASE("a real-PostgreSQL delta walk through read_page returns every changed row once across tied stamps, "
+          "and only its first page carries next_changed_since",
+          "[pg][device_ci][changed_since][ci_page][hardware_ci_page]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, device_ci_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 3}};
+    REQUIRE(pool.valid());
+    DeviceInventoryStore store{pool};
+    REQUIRE(store.is_open());
+    // d1..d9 by byte order; a TIE of five rows at 300 straddles every limit-2 page cut
+    const std::vector<std::pair<std::string, long long>> stamps = {
+        {"d1", 100}, {"d2", 300}, {"d3", 300}, {"d4", 300}, {"d5", 100},
+        {"d6", 300}, {"d7", 300}, {"d8", 50},  {"d9", 400}};
+    for (const auto& [id, at] : stamps)
+        REQUIRE(put_ci(store, id, "hash-" + id) == InventoryIngestOutcome::kStored);
+    for (const auto& [id, at] : stamps)
+        exec_stmt(pool, "UPDATE device_inventory_store.device_ci SET changed_at = " + std::to_string(at) +
+                            " WHERE agent_id = '" + id + "'");
+
+    yuzu::server::BulkReadSlots slots(2);
+    int watermark_calls = 0;
+    const hcp::Reader reader = [&](const yuzu::server::DeviceCiKeysetQuery& q) { return store.list_device_ci_after(q); };
+    const hcp::Watermark watermark = [&]() {
+        ++watermark_calls;
+        return store.device_ci_watermark();
+    };
+    const auto walk = [&](hcp::Request rq, std::vector<bool>& had_watermark) {
+        std::vector<std::string> served;
+        for (int guard = 0; guard < 50; ++guard) {
+            auto page = hcp::with_watermark(
+                hcp::read_page(reader, rq, std::nullopt, nullptr, &slots, hcp::kRestRowBudgetBytes), rq, watermark);
+            REQUIRE(page.has_value());
+            had_watermark.push_back(page->next_changed_since.has_value());
+            for (const auto& r : page->rows)
+                served.push_back(r.agent_id);
+            const std::string next = page->next_cursor;
+            page->release_slot();
+            if (next.empty())
+                return served;
+            rq.cursor = next;
+        }
+        FAIL("the walk did not end");
+        return served;
+    };
+
+    SECTION("a delta walk at 300, limit 2") {
+        hcp::Request rq;
+        rq.limit = 2;
+        rq.changed_since = 300;
+        std::vector<bool> marks;
+        const auto served = walk(rq, marks);
+        CHECK(served == std::vector<std::string>{"d2", "d3", "d4", "d6", "d7", "d9"}); // exactly the set, once each
+        CHECK(std::set<std::string>(served.begin(), served.end()).size() == served.size()); // no duplicates
+        REQUIRE(marks.size() == 3);
+        CHECK(marks == std::vector<bool>{true, false, false}); // the first page only
+        CHECK(watermark_calls == 1);
+    }
+    SECTION("a delta walk at 301 (the tie is excluded) and a full walk agree with the table") {
+        hcp::Request rq;
+        rq.limit = 2;
+        rq.changed_since = 301;
+        std::vector<bool> marks;
+        CHECK(walk(rq, marks) == std::vector<std::string>{"d9"});
+        CHECK(marks == std::vector<bool>{true});
+        hcp::Request full;
+        full.limit = 2;
+        std::vector<bool> fmarks;
+        const auto all = walk(full, fmarks);
+        CHECK(all == std::vector<std::string>{"d1", "d2", "d3", "d4", "d5", "d6", "d7", "d8", "d9"});
+        CHECK(fmarks == std::vector<bool>{true, false, false, false, false});
+        CHECK(watermark_calls == 2);
+    }
+    SECTION("the first page's value is the database clock minus the margin") {
+        hcp::Request rq;
+        rq.changed_since = 300;
+        const long long lo = db_now_secs(pool) - yuzu::server::kChangedSinceMarginSecs;
+        auto page = hcp::with_watermark(
+            hcp::read_page(reader, rq, std::nullopt, nullptr, &slots, hcp::kRestRowBudgetBytes), rq, watermark);
+        const long long hi = db_now_secs(pool) - yuzu::server::kChangedSinceMarginSecs;
+        REQUIRE(page.has_value());
+        REQUIRE(page->next_changed_since.has_value());
+        CHECK(*page->next_changed_since >= lo);
+        CHECK(*page->next_changed_since <= hi);
+    }
+}
+
+// Kills (QE-F2): changed_at moving on every full send of a v1 record (the 22-field blob, hashed by
+// the same canonical_hash), or never moving on a real v1 content change. The v2 path is covered above.
+TEST_CASE("changed_at on the v1 (blob_version 1) hash path moves on a hash change and stays on an equal hash",
+          "[pg][device_ci][changed_since]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, device_ci_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 3}};
+    REQUIRE(pool.valid());
+    DeviceInventoryStore store{pool};
+    REQUIRE(store.is_open());
+
+    DeviceCiRecord v1 = parse_device_ci_blob(sample_blob());
+    REQUIRE(v1.blob_version == 1);
+    const auto send = [&](const DeviceCiRecord& r) {
+        DeviceCiRecord copy = r;
+        const std::string hash = DeviceInventoryStore::canonical_hash(copy);
+        REQUIRE_FALSE(hash.empty());
+        copy.content_hash = hash;
+        return store.apply_device_ci("agent-v1", hash, std::optional<DeviceCiRecord>{copy}, 1);
+    };
+    REQUIRE(send(v1) == InventoryIngestOutcome::kStored);
+    REQUIRE(ci_column(pool, "agent-v1", "blob_version") == 1);
+    exec_stmt(pool, "UPDATE device_inventory_store.device_ci SET changed_at = 1000, last_seen = 1000");
+
+    // the same v1 content again: the marker stays, the receipt time moves
+    REQUIRE(send(v1) == InventoryIngestOutcome::kStored);
+    CHECK(ci_column(pool, "agent-v1", "changed_at") == 1000);
+    CHECK(ci_column(pool, "agent-v1", "last_seen") > 1000);
+
+    // a changed v1 field is a different hash: the marker moves to the database clock
+    DeviceCiRecord changed = v1;
+    changed.model += "-rev2";
+    const long long b = db_now_secs(pool);
+    REQUIRE(send(changed) == InventoryIngestOutcome::kStored);
+    const long long a = db_now_secs(pool);
+    const long long at = ci_column(pool, "agent-v1", "changed_at");
+    CHECK(at >= b);
+    CHECK(at <= a);
+    // and the new content is the baseline
+    exec_stmt(pool, "UPDATE device_inventory_store.device_ci SET changed_at = 1000");
+    REQUIRE(send(changed) == InventoryIngestOutcome::kStored);
+    CHECK(ci_column(pool, "agent-v1", "changed_at") == 1000);
 }

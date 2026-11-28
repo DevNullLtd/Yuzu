@@ -10,11 +10,16 @@
 
 #include <array>
 #include <cstddef>
+#include <regex>
 #include <string>
 #include <string_view>
 
 // Page HTML constant (its own TU at global scope, like kVizFleetPageHtml).
 extern const char* const kSettingsHtml;
+
+namespace yuzu::server {
+extern const std::string kYuzuTokensJs; // the AUDIT_FAILED sentence's home (#6749)
+}
 
 namespace {
 
@@ -127,4 +132,102 @@ TEST_CASE("Settings page shows the refreshed list a stale enrolment action retur
     CHECK(count_of(html, "indexOf('text/html') !== -1") == 1);
     CHECK(count_of(html, "d.shouldSwap = true;") == 1);
     CHECK(count_of(html, "d.isError = false;") == 1);
+}
+
+TEST_CASE("Settings page tells a caller the Engine Principals panel refused why, not 'Loading...' "
+          "forever",
+          "[settings][settings_page][engine_principal]") {
+    // The panel gates on EnginePrincipal:Read (#5882), which the page's own administrator gate
+    // does not imply, and htmx does not swap a 4xx body. A body listener scoped to the panel
+    // says so. CSP-safe: no hx-on, no eval, text only.
+    const std::string html = kSettingsHtml;
+    CHECK(count_of(html, "'htmx:responseError'") == 1);
+    CHECK(count_of(html, "el.id !== 'engine-principals-section'") == 1);
+    CHECK(count_of(html, "It needs the EnginePrincipal:Read permission.") == 1);
+    CHECK(count_of(html, "Sign in again to view this panel.") == 1);
+    CHECK(count_of(html, "(HTTP ' + x.status + ')") == 1);
+    // The 5xx/429 note offers the in-page Retry (kEngineRetryControl's wording) and never tells
+    // the caller to reload: a reload discards a credential secret shown outside the section.
+    CHECK(count_of(html, "Retry here instead of reloading the page, which would discard a "
+                         "credential secret shown above.") == 1);
+    CHECK(count_of(html, "htmx.trigger(document.body, 'refreshEnginePrincipals')") >= 1);
+    CHECK(count_of(html, "Reload the page to try again.") == 0);
+    // The note is written as text, never parsed as markup.
+    const auto at = html.find("'htmx:responseError'");
+    REQUIRE(at != std::string::npos);
+    const auto end = html.find("\n    });", at); // the listener's own close, not a nested one
+    REQUIRE(end != std::string::npos);
+    const auto body = html.substr(at, end - at);
+    CHECK(count_of(body, "el.textContent = ") == 3);
+    CHECK(count_of(body, "innerHTML") == 0);
+    // The listener writes only to the panel's own section, never to the secret-reveal element
+    // that sits outside it (a mint or rotate response is shown there and must survive).
+    CHECK(count_of(body, "engine-principal-reveal") == 0);
+    CHECK(count_of(body, "getElementById") == 0);
+    CHECK(count_of(body, "hx-on") == 0);
+    CHECK(count_of(body, "new Function") == 0);
+    CHECK(count_of(body, "eval(") == 0);
+    // No element on the page carries an hx-on attribute (CSP has no 'unsafe-eval'; htmx compiles
+    // hx-on:* with new Function() and the handler silently does nothing). Comments may name it.
+    CHECK_FALSE(std::regex_search(html, std::regex{R"(<[a-zA-Z][^<>]*\shx-on[:\-])"}));
+}
+
+TEST_CASE("Settings page says so, once, when the Engine Principals roster read's audit row was not "
+          "saved (#6749)",
+          "[settings][settings_page][engine_principal]") {
+    // The roster read answers 200 with `Sec-Audit-Failed: true` when its audit write failed: the
+    // data is current, the evidence is missing. A body listener shows the same sentence the
+    // Tokens and principals page shows. CSP-safe: no hx-on, no eval, text only.
+    const std::string html = kSettingsHtml;
+    constexpr std::string_view kSentence =
+        "An audit record for this read could not be saved. The data shown is still current.";
+
+    // The notice target is a sibling placed BEFORE the refreshing section and after the reveal
+    // element, so neither the section's innerHTML swap nor the reveal's content touches it.
+    const std::string target = "<div id=\"engine-principals-notices\"></div>";
+    REQUIRE(count_of(html, target) == 1);
+    const auto reveal = html.find("<div id=\"engine-principal-reveal\"></div>");
+    const auto notices = html.find(target);
+    const auto section = html.find("<div id=\"engine-principals-section\"");
+    REQUIRE(reveal != std::string::npos);
+    REQUIRE(section != std::string::npos);
+    CHECK(reveal < notices);
+    CHECK(notices < section);
+
+    // Keyed on the REQUEST PATH (the section is the only requester of it), not on an element id,
+    // and only on a 200: a 403 never claims "the data shown is still current".
+    CHECK(count_of(html, "d.pathInfo.requestPath") == 1);
+    CHECK(count_of(html,
+                   "d.pathInfo.requestPath !== '/fragments/settings/engine-principals'") == 1);
+
+    // The listener's slice: from its addEventListener to its own close.
+    const auto at = html.find("document.getElementById('engine-principals-notices')");
+    REQUIRE(at != std::string::npos);
+    const auto start = html.rfind("addEventListener('htmx:afterRequest'", at);
+    REQUIRE(start != std::string::npos);
+    const auto end = html.find("\n    });", at);
+    REQUIRE(end != std::string::npos);
+    const auto body = html.substr(start, end - start);
+    CHECK(count_of(body, "x.status !== 200") == 1);
+    CHECK(count_of(body, "getResponseHeader('Sec-Audit-Failed') !== 'true'") == 1);
+    CHECK(count_of(body, "notices.firstChild") == 1); // insert-once: repeated failures, one note
+    CHECK(count_of(body, "className = 'failbox'") == 1);
+    CHECK(count_of(body, "setAttribute('role', 'alert')") == 1);
+    CHECK(count_of(body, "box.textContent = ") == 1);
+    CHECK(count_of(body, "notices.appendChild(box)") == 1);
+    // Exactly four guards, each ending in `return;` (their order is covered by ui-smoke).
+    CHECK(count_of(body, ") return;") == 4);
+    // Text only; never markup, never the secret-reveal element, never eval.
+    CHECK(count_of(body, "innerHTML") == 0);
+    CHECK(count_of(body, "engine-principal-reveal") == 0);
+    CHECK(count_of(body, "hx-on") == 0);
+    CHECK(count_of(body, "new Function") == 0);
+    CHECK(count_of(body, "eval(") == 0);
+    // getElementById is how the notices div is found (insert-once needs the lookup).
+    CHECK(count_of(body, "getElementById('engine-principals-notices')") == 1);
+
+    // The sentence is the Tokens and principals page's AUDIT_FAILED, byte for byte (a hand copy).
+    CHECK(count_of(body, std::string("'") + std::string(kSentence) + "'") == 1);
+    CHECK(count_of(yuzu::server::kYuzuTokensJs,
+                   std::string("var AUDIT_FAILED = '") + std::string(kSentence) + "';") == 1);
 }

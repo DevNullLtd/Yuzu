@@ -99,14 +99,16 @@
  * swap or copy, takes nothing inside (a replaced clock is destroyed after it is released),
  * may be taken under persist_mu_, and is never reached in production.
  *
- * HEARTBEAT: failure_signals() takes no lock (atomics only, no mtx_), so reading THIS tag
- * cannot be blocked by a long apply_rules. That is a property of this accessor only: the same
- * heartbeat tick also calls GuardianEngine getters that do take mtx_ (policy_generation(),
- * journal_stats(), ...), so the tick as a whole can still wait. The engine reads this object
- * through an atomic pointer published at wire time; the object lives until the engine's
- * destructor, which runs after the heartbeat thread is gone and after the drain worker is
- * joined (agent.cpp declares kv_store_ before guardian_). The runtime's drop counter is held by
- * shared_ptr, so it stays valid regardless of runtime teardown order.
+ * HEARTBEAT: failure_signals() and pending_captures() take no lock (atomics only, no mtx_), so
+ * reading THESE tags cannot be blocked by a long apply_rules. That is a property of these
+ * accessors only: the same heartbeat tick also calls GuardianEngine getters that do take mtx_
+ * (policy_generation(), journal_stats(), ...), so the tick as a whole can still wait. The
+ * engine reads this object through an atomic pointer published at wire time (a rollback of a
+ * failed wiring unpublishes the pointer, #5605, but never destroys the object); the object
+ * lives until the engine's destructor, which runs after the heartbeat thread is gone and after
+ * the drain worker is joined (agent.cpp declares kv_store_ before guardian_). The runtime's
+ * drop counter is held by shared_ptr, as is the runtime's staging-size mirror, so both stay
+ * valid regardless of runtime teardown order.
  *
  * CALLERS of persist_staged (exactly three, and NEVER only from a connection-gated thread, or
  * a pre-network boot re-arm would lose its capture on a crash): GuardianEngine::apply_rules
@@ -286,9 +288,14 @@ public:
     /// `kv` is BORROWED (may be null) and must outlive this object. `staging_drops` is the
     /// runtime's drop counter (GuardianSparkRuntime::staged_baseline_drops_source()); it is
     /// folded into failure_signals() and may be null (nothing to fold).
+    /// `staging_count` (#5605) is the runtime's staging-map size mirror
+    /// (GuardianSparkRuntime::staged_baseline_count_source()); it backs pending_captures() and
+    /// may be null (reads 0).
     explicit GuardianBaselinePersister(
-        KvStore* kv, std::shared_ptr<const std::atomic<std::uint64_t>> staging_drops = {}) noexcept
-        : kv_(kv), staging_drops_(std::move(staging_drops)) {}
+        KvStore* kv, std::shared_ptr<const std::atomic<std::uint64_t>> staging_drops = {},
+        std::shared_ptr<const std::atomic<std::uint64_t>> staging_count = {}) noexcept
+        : kv_(kv), staging_drops_(std::move(staging_drops)),
+          staging_count_(std::move(staging_count)) {}
     GuardianBaselinePersister(const GuardianBaselinePersister&) = delete;
     GuardianBaselinePersister& operator=(const GuardianBaselinePersister&) = delete;
 
@@ -463,6 +470,18 @@ public:
                (staging_drops_ ? staging_drops_->load(std::memory_order_relaxed) : 0);
     }
 
+    /// #5605: the number of baseline-on-arm captures CURRENTLY staged in the runtime and not
+    /// yet erased after their KV write (the runtime's staging-map size, mirrored). A current
+    /// count, not a pass-end count: it reads the backlog even when every pass has been throwing
+    /// before its first write (a pass-end count would read a false zero there), and it includes
+    /// a capture staged after the last snapshot. Falls as captures are written or refused by the
+    /// #4021 overwrite guard. A capture that could not even be staged (an allocation failure) is
+    /// NOT in it; that is counted in failure_signals() instead. Lock-free (one relaxed atomic
+    /// load, no mtx_), so it is safe from the heartbeat thread under a long apply_rules.
+    [[nodiscard]] std::uint64_t pending_captures() const noexcept {
+        return staging_count_ ? staging_count_->load(std::memory_order_relaxed) : 0;
+    }
+
     /// The persist-before-seed fence: hold persist_mu_ for the lifetime of the returned lock.
     /// Blocks until any in-flight persist_staged pass has finished (its wall budget plus one
     /// in-flight write at worst, see the class comment), and keeps the next one out. REQUIRED
@@ -593,6 +612,7 @@ private:
 
     KvStore* kv_;
     const std::shared_ptr<const std::atomic<std::uint64_t>> staging_drops_; ///< runtime drops
+    const std::shared_ptr<const std::atomic<std::uint64_t>> staging_count_; ///< #5605 size mirror
     std::mutex persist_mu_; ///< LEAF, see LOCKING above
     std::atomic<std::uint64_t> persist_failures_{0};
     std::atomic<std::uint64_t> no_store_pending_{0};

@@ -102,8 +102,8 @@ inline constexpr std::string_view kSameSiteDenyRemediation =
     "Behind a reverse proxy that rewrites Host, declare the public origin with "
     "--csrf-trusted-origin (or YUZU_CSRF_TRUSTED_ORIGIN) and restart; see "
     "docs/user-manual/server-admin.md.";
-/// Stands in for a repeated `Sec-Fetch-Site` header (httplib decides on the LAST value, so the
-/// gate refuses rather than trust one of several). Never a legal header value.
+/// Stands in for a repeated `Sec-Fetch-Site` header (httplib returns only the first line, so the
+/// gate refuses rather than trust one). Never a legal header value.
 inline constexpr std::string_view kSameSiteRepeatedFetchMetadata = "<repeated>";
 /// Last-resort body when the A4 envelope cannot be rendered. Constant, no per-request bytes.
 inline constexpr std::string_view kSameSiteDenyFallbackBody =
@@ -211,7 +211,7 @@ apply_same_site_write_gate(const httplib::Request& req, httplib::Response& res,
 
     try {
         // A repeated Sec-Fetch-Site is decided as a non-matching value: httplib would return
-        // only the last one, which a client could arrange to be benign.
+        // only the first, which a client could arrange to be benign.
         const std::string fetch_site = req.get_header_value_count("Sec-Fetch-Site") > 1
                                            ? std::string(kSameSiteRepeatedFetchMetadata)
                                            : req.get_header_value("Sec-Fetch-Site");

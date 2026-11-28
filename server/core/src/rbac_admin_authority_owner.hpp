@@ -34,14 +34,39 @@
 /// ALSO takes it via `write_rbac_enabled_in_txn`'s UPSERT's own implicit
 /// row lock, not a preceding explicit read, same relative order, no
 /// inversion between the two), then `rbac_store.principal_roles` rows FOR
-/// UPDATE OF pr, in `ORDER BY pr.principal_id` order (unassign always;
-/// `deactivate_account` always; `set_enforcement`'s ENABLE direction only), then
-/// one `auth.users` row (unassign, `deactivate_account` and `set_local_role`), then the
-/// `rbac_meta` write_generation row (the grant mutators only: `deactivate_account` and
-/// `set_local_role` change no `principal_roles` row and never bump it). A path that
-/// holds an `auth.users` row lock and then touches those would invert it.
-/// `provision_first_admin` is a DISJOINT lock path: it never touches the
-/// `rbac_enabled` row at all, and its `auth.users` interaction is a plain
+/// UPDATE OF pr, in `ORDER BY pr.principal_id` order (the Administrator `unassign_role` only,
+/// over EVERY active-user Administrator grant, not just the target's; `deactivate_account`
+/// always; `set_enforcement`'s ENABLE direction only), then
+/// one `auth.users` row (unassign, only when the removed grant was not already in the locked
+/// set; `deactivate_account` and `set_local_role` always), then, for the user Administrator
+/// `unassign_role` in `SessionGenerationMode::kBumpSessionGeneration` only, ALL of the target's
+/// `session_store.sessions` rows FOR UPDATE (ordered by `token_hash`), then the `rbac_meta`
+/// write_generation row (the grant mutators only: `deactivate_account` and `set_local_role`
+/// change no `principal_roles` row and never bump it), then, for `deactivate_account` in
+/// `SessionGenerationMode::kBumpSessionGeneration` and for that unassign when it cleared at
+/// least one elevation, the `session_store.session_meta` `write_generation` row, LAST (each lock
+/// wait in the transaction is bounded by the lifecycle `lock_timeout`: `deactivate_account`,
+/// `set_local_role` and the user Administrator `unassign_role` install it as their first
+/// statement, see `set_txn_timeouts`), then COMMIT. A path that
+/// holds an `auth.users` row lock and then touches those would invert it. The `session_meta` row is
+/// the one lock every session create/revoke in the fleet shares, so nothing in the deactivation or
+/// the unassign may wait after taking it. That edge is acyclic because no single-row session
+/// writer takes an RBAC or account lock (session_store.cpp touches the `session_store` schema
+/// only) and `CredentialChangeOwner` takes `auth.users` before `session_meta` too. Two multi-row
+/// writers on one user's sessions (the unassign's row lock, `invalidate_user`, the reaper's
+/// DELETE, `delete_user_sessions_in_txn`, `SessionStore::clear_user_elevations`, which the
+/// eligibility revoke runs) can still deadlock on row order; Postgres aborts one
+/// victim, which can be either writer (the session reaper, for example, and not the unassign);
+/// when it is the unassign it rolls back as a retryable store failure.
+///
+/// The user Administrator unassign also ENDS the target's live JIT elevation in this same
+/// transaction (`session_sql::lock_user_session_rows_in_txn`, then
+/// `session_sql::clear_user_elevations_in_txn`, then the `session_meta` bump when any row
+/// changed): any failure rolls the grant removal back (fail closed). The clear runs only when the
+/// DELETE actually removed a grant row (`removed`); an unassign of an Administrator grant the user
+/// does not hold removes nothing, clears nothing and still succeeds. All of that SQL lives in
+/// session_store_sql_helpers.hpp, never in the owner. `provision_first_admin` is a DISJOINT lock path:
+/// it never touches the `rbac_enabled` row at all, and its `auth.users` interaction is a plain
 /// INSERT of a NEW row (there is nothing existing to lock; the table is, by
 /// construction, empty at that point), so it cannot participate in the
 /// inversion this order guards against; its own ordering is just its own
@@ -81,6 +106,11 @@ public:
         bool removed{false};
         std::optional<std::uint64_t> new_gen;
         std::string err;
+        /// Durable session rows whose elevation this unassign cleared (rows matching
+        /// `elevated_until_ms <> 0`, an expired nonzero window included). Meaningful only
+        /// when `ok`; 0 for every unassign that is not a user Administrator removal in
+        /// `kBumpSessionGeneration` mode.
+        int elevations_cleared{0};
     };
 
     /// Outcome of `set_enforcement`. Carries everything
@@ -120,9 +150,13 @@ public:
     RbacAdminAuthorityOwner(const RbacAdminAuthorityOwner&) = delete;
     RbacAdminAuthorityOwner& operator=(const RbacAdminAuthorityOwner&) = delete;
 
+    /// `session_mode` has no default (the PR-S1 intent: every caller states it). In
+    /// `kBumpSessionGeneration` a user Administrator removal also clears the target's durable
+    /// elevations inside the transaction (see the banner); `kNoSessionStore` issues no
+    /// `session_store` SQL at all (tests with no session schema only).
     UnassignOutcome unassign_role(const std::string& principal_type,
-                                  const std::string& principal_id,
-                                  const std::string& role_name) const;
+                                  const std::string& principal_id, const std::string& role_name,
+                                  SessionGenerationMode session_mode) const;
 
     /// A1: `RbacStore::set_rbac_enforcement`'s entire guarded transition,
     /// moved here (A1/A2 rebase Step 2) so it shares
@@ -196,7 +230,11 @@ public:
     ///      sees this transaction's own write) recounts the authenticatable Administrator grants,
     ///      only when the target was a counted grant or held a grant at all; zero refuses;
     ///   7. COLUMN floor, BOTH regimes: a separate recount of the active local `role='admin'`
-    ///      accounts, only when the target was one; zero refuses.
+    ///      accounts, only when the target was one; zero refuses;
+    ///   8. in `SessionGenerationMode::kBumpSessionGeneration` only, as the LAST statement, the
+    ///      session write-generation bump (`session_sql::bump_generation_in_txn`), reached only
+    ///      when an account was deactivated. A failed bump aborts the transaction (the account
+    ///      stays active, `kStoreFailure`).
     /// A refusal rolls the whole transaction back (`kLastAdministratorRefused`, the account is
     /// still active). The floors are independent and a refusal from either aborts. Each rejects
     /// only a mutation that removes a member of ITS population and leaves it empty: a population
@@ -212,11 +250,15 @@ public:
     /// Not closed (disclosed): a grant INSERTed for the target after step 3 is not seen by this
     /// transaction; it lands on an account that is inactive once this commits, which
     /// `kAuthenticatableAdminGrantsFrom` does not count.
+    /// `session_mode` is required (no default) and states whether a `SessionStore` is wired; see
+    /// `SessionGenerationMode`. With `kNoSessionStore` the transaction touches no `session_store`
+    /// object.
     /// A `username` that `is_valid_username` rejects (empty, over 64 bytes, an embedded NUL or any
     /// other character outside `[A-Za-z0-9._-]`) can never be a stored account: it answers
     /// `kNotFound` before any statement runs, as do `set_local_role` and (as "not a member",
     /// `ok` with `would_strand` false) `would_strand_last_administrator` below.
-    [[nodiscard]] AccountDeactivationResult deactivate_account(const std::string& username) const;
+    [[nodiscard]] AccountDeactivationResult
+    deactivate_account(const std::string& username, SessionGenerationMode session_mode) const;
 
     /// #4966: the guarded role-column write behind `AuthManager::update_role_checked`. ONE
     /// transaction: the transaction-local `lock_timeout`; `rbac_enabled` FOR UPDATE on EVERY call

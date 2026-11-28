@@ -27,6 +27,7 @@
 
 #include <cstdint>
 #include <limits>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -100,6 +101,23 @@ struct GuaranteedStateEventRow {
     int64_t detection_latency_us{0};
     int64_t remediation_latency_us{0};
     std::string timestamp;         // ISO-8601
+    // Census ordering inputs (schema v4, set by the ingest boundary; a direct store caller may
+    // leave both 0). `agent_ns` is the validated agent stamp in nanoseconds, 0 when absent or
+    // unusable; `received_ns` is the server receipt in nanoseconds, 0 = the store substitutes its
+    // own clock. They feed the store's derived key `min(agent_ns, received_ns + 300 s)` and stay
+    // OUT of the duplicate identity. `query_events` does not populate them.
+    std::int64_t agent_ns{0};
+    std::int64_t received_ns{0};
+    // The agent's emit-order pair (schema v5), set by the ingest boundary from the wire
+    // `boot_epoch`/`emit_seq` ONLY when both are set and each is in [1, 2^62): both set or both
+    // unset, never one. Unset = unpaired (NULL columns). The store writes them to the event row
+    // and to the census row (re-validated by `census_pair`, so a half pair is never stored). The
+    // agent order step decides a MODE from them and the agent's pair clock (counting it on the
+    // per-agent regression, straggler, recovery and retired-event counters), and the census
+    // statements order the verdict by that mode: a paired event over a paired row follows the
+    // pair, not the key. Like the key inputs above they stay OUT of the duplicate identity.
+    std::optional<std::int64_t> boot_epoch;
+    std::optional<std::int64_t> emit_seq;
 };
 
 struct GuaranteedStateEventQuery {
@@ -133,6 +151,51 @@ struct GuardianStatusRollup {
     std::int64_t compliant_rules{0};
     std::int64_t drifted_rules{0};
     std::int64_t errored_rules{0};
+    std::int64_t uncertain_rules{0}; // rules with an order-uncertain or pending represented pair
+    /// Agents currently unordered (see `GuardianAgentOrder::currently_unordered`) inside the
+    /// caller's scope: the exact count, and the first `kUnorderedAgentIdCap` ids in byte order.
+    /// `unordered_agents > unordered_agent_ids.size()` means the list is truncated. 0 does not
+    /// establish that every agent sends an order pair: an agent that sent no census-bearing event
+    /// has no order row and is in neither figure.
+    std::int64_t unordered_agents{0};
+    std::vector<std::string> unordered_agent_ids;
+};
+
+/// One row of `guardian_agent_order` (schema v5): the per-agent pair clock and its counters, as the
+/// store holds them. Nullable columns are optionals; NULL epoch means no paired event was ever
+/// accepted for the agent. Times are the database clock in nanoseconds (`epoch_recv_ns` moves with
+/// the pair clock, `unpaired_recv_ns` with the latest accepted unpaired census-bearing event).
+struct GuardianAgentOrder {
+    std::string agent_id;
+    std::optional<std::int64_t> epoch;
+    std::optional<std::int64_t> emit_seq_hwm;
+    std::optional<std::int64_t> epoch_recv_ns;
+    std::optional<std::int64_t> retired_epoch;
+    std::optional<std::int64_t> unpaired_recv_ns;
+    std::int64_t unpaired_events{0};
+    std::int64_t unpaired_held{0};
+    std::int64_t pair_regressions{0};
+    std::int64_t pair_stragglers{0};
+    std::int64_t pair_recoveries{0};
+    std::int64_t pair_duplicates{0};
+    std::int64_t retired_events{0};
+
+    /// "Currently unordered" (UP-5), as the DATABASE decided it in the read that produced this row:
+    /// the latest accepted unpaired census-bearing event is later than the pair clock (a NULL clock
+    /// reads as 0), or the pair clock is recorded further than 300 s in the database's future. The
+    /// store sets it from the same SQL text the fleet count and the id list use, so the three
+    /// cannot disagree; nothing in C++ derives it. It depends on the database clock, so it can
+    /// change with no event. A row built without a store carries `false` until a caller sets it.
+    bool currently_unordered{false};
+};
+
+/// Agents "currently unordered" (see `GuardianAgentOrder::currently_unordered`: one SQL definition,
+/// including the future-clock arm) inside the caller's scope: the exact `count`, and the first
+/// `kUnorderedAgentIdCap` agent ids in byte order. `count > ids.size()` means the list is
+/// truncated.
+struct UnorderedAgentsSummary {
+    std::int64_t count{0};
+    std::vector<std::string> ids;
 };
 
 /// Per-agent Guaranteed State status rollup — shared by
@@ -146,6 +209,7 @@ struct GuardianAgentStatusRollup {
     std::int64_t compliant_rules{0};
     std::int64_t drifted_rules{0};
     std::int64_t errored_rules{0};
+    std::int64_t uncertain_rules{0}; // rules with an order-uncertain or pending represented pair
 };
 
 /// Per-guard fleet-wide agent-status drilldown row — one row per agent that
@@ -156,6 +220,8 @@ struct GuardianRuleAgentStatusRow {
     std::string agent_id;
     std::string state;      // "compliant" | "drifted" | "errored"
     std::string updated_at; // ISO-8601 of the event that set it
+    bool order_uncertain{false};
+    bool projection_pending{false};
 };
 
 /// Per-device all-guards view row — one row per guard this device has
@@ -168,6 +234,8 @@ struct GuardianDeviceGuardRow {
                              // rule has since been deleted from the catalogue
     std::string state;      // "compliant" | "drifted" | "errored"
     std::string updated_at; // ISO-8601 of the event that set it
+    bool order_uncertain{false};
+    bool projection_pending{false};
 };
 
 /// Per-baseline device-compliance rollup — shared by
@@ -179,6 +247,12 @@ struct GuardianDeviceComplianceGuardRow {
                              // rule has since been deleted from the catalogue
     std::string status;     // "compliant" | "drifted" | "errored" | "pending"
     std::string updated_at; // ISO-8601 of the last reported verdict; empty if none
+    /// Sticky: the ordering of the persisted verdict for this (device, guard) pair cannot be
+    /// proven. false does not prove the verdict is fresh.
+    bool order_uncertain{false};
+    /// A retained event for this pair is not yet reflected in the census row. false does not
+    /// prove the row is complete.
+    bool projection_pending{false};
 };
 
 struct GuardianDeviceComplianceRollup {
@@ -193,7 +267,51 @@ struct GuardianDeviceComplianceRollup {
     std::int64_t errored{0};
     std::int64_t pending{0};
     std::string last_updated; // max reported updated_at across guards; empty if none
+                              // (census-only: never advanced by an unrepresented pending event)
     std::vector<GuardianDeviceComplianceGuardRow> guards;
+    /// Emitted guards whose row has order_uncertain OR projection_pending, counted once per
+    /// guard. Overlaps the verdict counts (compliant/drifted/errored/pending): a drifted guard
+    /// with order_uncertain is counted in both. 0 does not establish freshness.
+    std::int64_t uncertain_guards{0};
+    /// Distinct rule_ids (deployed-snapshot members only) that have retained pending events for
+    /// this device and NO census row. Excluded from guards[], total_guards and every verdict
+    /// count. The count is exact; the id list is capped by the store. The ids may name a rule no
+    /// longer in the catalogue. 0 does not establish completeness.
+    std::int64_t unrepresented_pending_guards{0};
+    std::vector<std::string> unrepresented_pending_rule_ids;
+};
+
+/// Why a per-device Guardian read could not answer (#7217). Reported through the `fault` out-parameter
+/// of `GuardianApi::device_guards` / `device_compliance` alongside the existing degrade signal (a
+/// `nullopt` result, and `*store_degraded` on compliance). `kTransient` means a retry can succeed
+/// (store not open, pool timeout, a failed statement). `kStatementTimeout` means the unrepresented
+/// pending read exceeded its time budget (SQLSTATE 57014): the most likely cause is the size of the
+/// retained pending backlog, so retrying the same request usually fails identically until the cause
+/// clears and the transports must NOT advertise a retry interval. `kNone` is the value when the read answered.
+/// An implementation that returns `nullopt` without setting a fault is read by the transports as
+/// `kNone`, which they treat as a retryable degrade (the safe default); a seam implementation MUST
+/// set `kTransient` or `kStatementTimeout` on every degrade except a genuine Baseline miss on
+/// compliance.
+enum class GuardianReadFault : std::uint8_t { kNone = 0, kTransient, kStatementTimeout };
+
+/// Per-device all-guards report - the rows of `GuardianDeviceGuardRow` plus the unrepresented
+/// pending summary. Shared by `GET /api/v1/guaranteed-state/agents/{agent_id}/rules` and MCP
+/// `get_guardian_device_guards`.
+struct GuardianDeviceGuardsReport {
+    /// One row per guard this device has a census row for; each row carries its own
+    /// order_uncertain / projection_pending flags.
+    std::vector<GuardianDeviceGuardRow> guards;
+    /// Distinct rule_ids (ANY rule, not limited to a Baseline) with retained pending events for
+    /// this device and NO census row. Excluded from guards[]. The count is exact; the id list is
+    /// capped by the store and may name a rule no longer in the catalogue. 0 does not establish
+    /// completeness.
+    std::int64_t unrepresented_pending_guards{0};
+    std::vector<std::string> unrepresented_pending_rule_ids;
+    /// The device's `guardian_agent_order` row (the stored emit-order pair clock and its
+    /// counters), or `nullopt` when the device never had a census-bearing event accepted (or was
+    /// decommissioned). The clock and counters the census ordering decides by: an unpaired event is
+    /// held, and a pair-mode event refused or re-based, from this row.
+    std::optional<GuardianAgentOrder> ordering;
 };
 
 } // namespace yuzu::server

@@ -453,6 +453,23 @@ FAMILIES = {
             # own presentation surface, just a second TU.
             "server/core/src/device_lens_routes.cpp",
             "server/core/src/device_lens_routes.hpp",
+            # live_model.{hpp,cpp} — the pure live-read kind table, typed row
+            # models and plugin-output parsers hoisted out of device_routes.cpp
+            # (#2146); shared with the REST v1 live route.
+            "server/core/src/live_model.cpp",
+            "server/core/src/live_model.hpp",
+            # live_result_json.{hpp,cpp} + live_outcome.hpp: the shared REST+MCP `data` JSON
+            # builder and the closed live-read outcome vocabulary (both pure). live_read_poll is
+            # deliberately NOT enrolled: it reads the response store.
+            "server/core/src/live_result_json.cpp",
+            "server/core/src/live_result_json.hpp",
+            "server/core/src/live_outcome.hpp",
+            # live_admission.hpp + utf8_clamp.hpp + live_zero_reach_outcome.hpp: the shared
+            # held-open admission step, the UTF-8 boundary clamp and the zero-reach/gate to
+            # outcome mapping (all pure decision code; none reaches a store).
+            "server/core/src/live_admission.hpp",
+            "server/core/src/utf8_clamp.hpp",
+            "server/core/src/live_zero_reach_outcome.hpp",
         ],
     },
     "network": {
@@ -512,14 +529,17 @@ FAMILIES = {
     # `DexApi`; `device_lens_routes.cpp`'s `/fragments/device/dex` lens is ALSO
     # now rewired onto `DexApi` (issue #4576) and is enforced too — but via the
     # `device` family's TU set above (it is that family's own second
-    # presentation TU), not this one, since `dex`'s enforced set here is
-    # header-only.
+    # presentation TU), not this one. The Apps tab renderer (`dex_apps_ui.*`,
+    # AP-3.2) is this family's one enforced presentation TU: it reads
+    # `DexApi::apps` through a pure model, so it cannot reach the store.
     "dex": {
         "tus": [
             "server/core/src/dex_types.hpp",
             "server/core/src/dex_read_model.hpp",
             "server/core/src/dex_api.hpp",
             "server/core/src/dex_api_local.hpp",
+            "server/core/src/dex_apps_ui.hpp",
+            "server/core/src/dex_apps_ui.cpp",
         ],
     },
     # dex_perf: the SIXTH family — DexPerfApi, the DEX app-perf-over-time
@@ -797,7 +817,7 @@ STORE_DEFINITION_FREE_TUS = [
 # out of them into its own enforced file is the "WS-A4 per-family carve-out sub-tasks
 # (#6558)" table in docs/presentation-core-split-delivery-matrix.md.
 MCP_REGISTRY_TU_GLOB = "mcp_tools_*.cpp"
-MCP_REGISTRY_EXPECTED_TU_COUNT = 4
+MCP_REGISTRY_EXPECTED_TU_COUNT = 5
 MCP_REGISTRY_REGISTRY_HEADER = "server/core/src/mcp_tool_registry.hpp"
 MCP_REGISTRY_HEADERS = [
     "server/core/src/mcp_tool_deps.hpp",
@@ -805,6 +825,7 @@ MCP_REGISTRY_HEADERS = [
     MCP_REGISTRY_REGISTRY_HEADER,
 ]
 MCP_REGISTRY_TYPES_HEADERS = [
+    "server/core/src/collation_gate_types.hpp",
     "server/core/src/device_inventory_types.hpp",
     "server/core/src/discover_catalog_types.hpp",
     "server/core/src/inventory_types.hpp",

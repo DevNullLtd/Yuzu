@@ -8,6 +8,8 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <array>
+#include <cctype>
 #include <charconv>
 #include <cstdint>
 #include <limits>
@@ -22,9 +24,13 @@ namespace {
 constexpr const char* kDeclaredColumnsKey = "declared_columns";
 constexpr const char* kPluginKey = "plugin";
 constexpr const char* kRowDiscriminatorKey = "row_discriminator";
+constexpr const char* kPartialWhenConstrainedKey = "partial_when_constrained";
 
 // Split `text` on '\n' into non-owning views, dropping a trailing empty
-// fragment. Bounded by the caller's output size (responses are retention-
+// fragment. Deliberately keeps EVERY '\r' (even a trailing one): the cells decide result-set
+// MEMBERSHIP (eq/in/contains over cell text), so changing this would silently change which
+// devices are members. It is therefore NOT the same splitter as `split_output_lines`
+// (deletes all '\r') or `live::split_lines` (drops a trailing '\r'); pinned by a test. Bounded by the caller's output size (responses are retention-
 // capped) so no DoS surface here.
 std::vector<std::string_view> split_lines(std::string_view text) {
     std::vector<std::string_view> out;
@@ -58,26 +64,38 @@ std::vector<std::string_view> split_cells(std::string_view line) {
     return out;
 }
 
-bool cell_satisfies(std::string_view cell, const std::string& op, const nlohmann::json& matcher) {
+// A matcher's `value_set` strings, built once by ParsedMatcher (`in_set_` says why ordered).
+using ValueSet = std::set<std::string_view>;
+
+bool cell_satisfies(std::string_view cell, const std::string& op, const nlohmann::json& matcher,
+                    const ValueSet& in_set) {
     if (op == "exists")
         return !cell.empty();
     if (op == "eq") {
         if (!matcher.contains("value") || !matcher["value"].is_string())
             return false;
-        return cell == matcher["value"].get<std::string>();
+        return cell == matcher["value"].get_ref<const std::string&>();
     }
     if (op == "contains") {
         if (!matcher.contains("value") || !matcher["value"].is_string())
             return false;
-        return cell.find(matcher["value"].get<std::string>()) != std::string_view::npos;
+        return cell.find(matcher["value"].get_ref<const std::string&>()) != std::string_view::npos;
     }
-    if (op == "in") {
-        if (!matcher.contains("value_set") || !matcher["value_set"].is_array())
-            return false;
-        for (const auto& v : matcher["value_set"])
-            if (v.is_string() && cell == v.get<std::string>())
-                return true;
-        return false;
+    return op == "in" && in_set.contains(cell);
+}
+
+// True when `output` carries an echo `__schema__` header line that does not name `column`
+// (the agent answered from a table without it). False with no header line at all (a JSON or
+// plain-row shape), and false when the header names the column, even over zero data rows.
+bool echo_schema_lacks_column(std::string_view output, const std::string& column) {
+    for (const auto& line : split_lines(output)) {
+        if (!line.starts_with("__schema__"))
+            continue;
+        auto cells = split_cells(line);
+        for (size_t i = 1; i < cells.size(); ++i)
+            if (cells[i] == column)
+                return false;
+        return true;
     }
     return false;
 }
@@ -85,7 +103,7 @@ bool cell_satisfies(std::string_view cell, const std::string& op, const nlohmann
 // Column matcher over the echo `__schema__` / row / `__total__` shape. Returns
 // true iff any data row's named column satisfies the op.
 bool echo_column_match(std::string_view output, const std::string& column, const std::string& op,
-                      const nlohmann::json& matcher) {
+                      const nlohmann::json& matcher, const ValueSet& in_set) {
     auto lines = split_lines(output);
     int col_idx = -1;
     for (const auto& line : lines) {
@@ -108,7 +126,7 @@ bool echo_column_match(std::string_view output, const std::string& column, const
         auto cells = split_cells(line);
         if (static_cast<size_t>(col_idx) >= cells.size())
             continue;
-        if (cell_satisfies(cells[col_idx], op, matcher))
+        if (cell_satisfies(cells[col_idx], op, matcher, in_set))
             return true;
     }
     return false;
@@ -118,7 +136,7 @@ bool echo_column_match(std::string_view output, const std::string& column, const
 // Best-effort fallback for instructions that emit structured JSON rather than
 // the echo pipe format. Returns true iff any object's column satisfies the op.
 bool json_column_match(std::string_view output, const std::string& column, const std::string& op,
-                       const nlohmann::json& matcher) {
+                       const nlohmann::json& matcher, const ValueSet& in_set) {
     auto doc = nlohmann::json::parse(output, nullptr, false);
     if (doc.is_discarded())
         return false;
@@ -146,7 +164,7 @@ bool json_column_match(std::string_view output, const std::string& column, const
             cell = field.get<bool>() ? "true" : "false";
         else
             continue;
-        if (cell_satisfies(cell, op, matcher))
+        if (cell_satisfies(cell, op, matcher, in_set))
             return true;
     }
     return false;
@@ -162,7 +180,7 @@ bool json_column_match(std::string_view output, const std::string& column, const
 // declared width: a line of any other width (status|not_found, not_available|<reason>, a longer
 // trailer, a malformed row) or that equals the header is skipped.
 bool declared_column_match(std::string_view output, const std::string& column, const std::string& op,
-                           const nlohmann::json& matcher) {
+                           const nlohmann::json& matcher, const ValueSet& in_set) {
     std::vector<std::string> declared;
     for (const auto& c : matcher[kDeclaredColumnsKey])
         declared.push_back(c.get<std::string>());
@@ -185,7 +203,7 @@ bool declared_column_match(std::string_view output, const std::string& column, c
                                      : yuzu::server::split_fields(plugin, line);
         if (cells.size() != declared.size() || cells == declared)
             continue;
-        if (cell_satisfies(cells[idx], op, matcher))
+        if (cell_satisfies(cells[idx], op, matcher, in_set))
             return true;
     }
     return false;
@@ -240,6 +258,8 @@ std::optional<std::string> column_shape_defect(const nlohmann::json& m) {
         return "matcher.plugin must be a string";
     if (m.contains(kRowDiscriminatorKey) && !m[kRowDiscriminatorKey].is_boolean())
         return "matcher.row_discriminator must be a boolean";
+    if (m.contains(kPartialWhenConstrainedKey) && !m[kPartialWhenConstrainedKey].is_boolean())
+        return "matcher.partial_when_constrained must be a boolean";
     return std::nullopt;
 }
 
@@ -261,17 +281,25 @@ bool declares_row_discriminator(const std::string& result_schema_json) {
            first["discriminator"].get<bool>();
 }
 
+// True when `j` is an object whose `key` is the boolean true. Never throws on a wrong type.
+bool flag_is_true(const nlohmann::json& j, const char* key) {
+    return j.is_object() && j.contains(key) && j[key].is_boolean() && j[key].get<bool>();
+}
+
 } // namespace
 
 std::optional<std::string> validate_matcher(std::string_view matcher_json) {
     if (matcher_json.empty())
         return std::nullopt;
+    if (matcher_json.size() > kMatcherMaxBytes)
+        return std::string(kMatcherTooLargeMessage);
     const auto m = nlohmann::json::parse(matcher_json, nullptr, false);
     if (m.is_discarded() || !m.is_object())
         return std::nullopt; // the unrecognised-shape default is unchanged
     if (m.contains("kind") && !m["kind"].is_string())
         return "matcher.kind must be a string";
-    for (const char* key : {kDeclaredColumnsKey, kPluginKey, kRowDiscriminatorKey})
+    for (const char* key :
+         {kDeclaredColumnsKey, kPluginKey, kRowDiscriminatorKey, kPartialWhenConstrainedKey})
         if (m.contains(key))
             return std::string("matcher.") + key + " is server-authored and cannot be supplied";
     if (!m.contains("kind"))
@@ -297,6 +325,16 @@ std::optional<std::string> validate_matcher(std::string_view matcher_json) {
 std::optional<std::string> validate_matcher_object(const nlohmann::json& matcher) {
     if (!matcher.is_object())
         return "matcher must be a JSON object";
+    // The per-field bounds, read from the parsed value before it is serialised. Only a string
+    // has a length here; a key of any other type is not measured.
+    const auto too_long = [&matcher](const char* key, std::size_t bound) {
+        const auto it = matcher.find(key);
+        return it != matcher.end() && it->is_string() &&
+               it->get_ref<const std::string&>().size() > bound;
+    };
+    if (too_long("column", kMatcherColumnMaxBytes) || too_long("op", kMatcherOpMaxBytes) ||
+        too_long("value", kMatcherValueMaxBytes))
+        return std::string(kMatcherFieldTooLargeMessage);
     return validate_matcher(matcher.dump());
 }
 
@@ -320,6 +358,11 @@ void bind_declared_columns(nlohmann::json& matcher, const std::string& result_sc
     matcher[kPluginKey] = plugin;
     if (declares_row_discriminator(result_schema_json))
         matcher[kRowDiscriminatorKey] = true;
+    // `partialWhenConstrained: true` on the result schema (object form; search_dir): opt-in only,
+    // so a definition without it, a stored one that predates the key included, binds as before.
+    if (flag_is_true(nlohmann::json::parse(result_schema_json, nullptr, false),
+                     "partialWhenConstrained"))
+        matcher[kPartialWhenConstrainedKey] = true;
 }
 
 int echo_row_count(std::string_view output) {
@@ -345,15 +388,41 @@ int echo_row_count(std::string_view output) {
     return n;
 }
 
-bool response_matches(std::string_view matcher_json, int status, std::string_view output) {
+// The one parse of a stored matcher. Text that does not parse, the empty default included, is
+// held as a discarded value, which every member below reads as the default matcher.
+ParsedMatcher::ParsedMatcher(std::string_view matcher_json)
+    : matcher_(std::make_unique<const nlohmann::json>(
+          nlohmann::json::parse(matcher_json, nullptr, false))) {
+    // `value_set` is walked here, once. An entry that is not a string never matched: left out.
+    const auto& m = *matcher_;
+    if (m.is_object() && m.contains("value_set") && m["value_set"].is_array())
+        for (const auto& v : m["value_set"])
+            if (v.is_string())
+                in_set_.insert(v.get_ref<const std::string&>());
+}
+
+ParsedMatcher::~ParsedMatcher() = default;
+
+bool ParsedMatcher::answer_lacks_matcher_column(std::string_view output) const {
+    const auto& m = *matcher_;
+    if (m.is_discarded() || !m.is_object() || m.contains("kind") || !m.contains("column") ||
+        !m["column"].is_string())
+        return false;
+    return echo_schema_lacks_column(output, m["column"].get<std::string>());
+}
+
+bool ParsedMatcher::constrained_answer_is_unresolved(int plugin_result_status) const {
+    return plugin_result_status == kPluginResultConstrained &&
+           flag_is_true(*matcher_, kPartialWhenConstrainedKey);
+}
+
+bool ParsedMatcher::response_matches(int status, std::string_view output) const {
     // A non-success response is never a hit, whatever the matcher says.
     if (status != kStatusSuccess)
         return false;
 
-    // Empty matcher → default: any SUCCESS responder qualifies.
-    if (matcher_json.empty())
-        return true;
-    auto m = nlohmann::json::parse(matcher_json, nullptr, false);
+    // Empty or unparseable matcher → default: any SUCCESS responder qualifies.
+    const auto& m = *matcher_;
     if (m.is_discarded() || !m.is_object() || m.empty())
         return true;
 
@@ -387,14 +456,147 @@ bool response_matches(std::string_view matcher_json, int status, std::string_vie
         const auto op = m["op"].get<std::string>();
         // Try the echo pipe shape first (its schema line is unambiguous),
         // then the JSON array-of-objects fallback.
-        if (echo_column_match(output, column, op, m) || json_column_match(output, column, op, m))
+        if (echo_column_match(output, column, op, m, in_set_) ||
+            json_column_match(output, column, op, m, in_set_))
             return true;
-        return m.contains(kDeclaredColumnsKey) && declared_column_match(output, column, op, m);
+        return m.contains(kDeclaredColumnsKey) &&
+               declared_column_match(output, column, op, m, in_set_);
     }
 
     // Matcher present but a recognised key is MISSING (or no recognised key at all) → fall back to
     // default so a typo can't silently empty the set; the operator still gets responders.
     return true;
+}
+
+bool answer_lacks_matcher_column(std::string_view matcher_json, std::string_view output) {
+    return ParsedMatcher(matcher_json).answer_lacks_matcher_column(output);
+}
+
+bool constrained_answer_is_unresolved(std::string_view matcher_json, int plugin_result_status) {
+    return ParsedMatcher(matcher_json).constrained_answer_is_unresolved(plugin_result_status);
+}
+
+bool response_matches(std::string_view matcher_json, int status, std::string_view output) {
+    return ParsedMatcher(matcher_json).response_matches(status, output);
+}
+
+bool references_raw_capture_table(std::string_view sql) {
+    static constexpr std::array<std::string_view, 16> kRealNames{
+        "process_live",  "tcp_live",     "service_live",   "user_live",
+        "perf_live",     "procperf_live", "netqual_live",   "module_live",
+        "software_live", "arp_live",     "dns_live",       "netconn_live",
+        "mapdrive_live", "power_live",   "removable_live", "registry_live"};
+    const auto is_word = [](char c) {
+        return std::isalnum(static_cast<unsigned char>(c)) != 0 || c == '_';
+    };
+    // Single pass over SQLite's tokens: a '...' literal ('' escapes), a quoted identifier
+    // ("..." and `...` double their delimiter, [...] ends at the first ']'), a -- line comment
+    // and a /* block comment are each one token, so a `'`, `--` or `/*` INSIDE a quoted
+    // identifier never opens a literal or comment that would hide the code after it. Literals
+    // and comments are blanked; a quoted identifier's content is kept and read like code. Then
+    // read maximal [A-Za-z0-9_] runs: '$' is not a word character, so `$Process_Live` reads as
+    // the run `process_live`, and every registry dollar name lowercases to its real table name.
+    // An unterminated token runs to the end of the input, as SQLite reads it.
+    // A '...' token whose whole content is a raw table name (one leading '$' allowed,
+    // case-folded) is a reference WHEREVER it stands. SQLite reads such a token as the table in
+    // more positions than a keyword list can enumerate (`FROM 'process_live'`,
+    // `JOIN 'tcp_live'`, `main.'process_live'`, `FROM ('process_live')`, `x IN 'process_live'`,
+    // `NOT IN 'tcp_live'`, each verified on sqlite3; a position rule missed the IN forms), so
+    // the rule has no look-behind and the scan stays one linear pass. The price is a documented
+    // over-refusal: a string literal that is exactly a raw table name (`WHERE name =
+    // 'process_live'`) is refused; a literal that merely contains one (`'see process_live'`)
+    // is not.
+    // The agent's scan_sql (echo_sql_executor.cpp) knows '...', -- and /* */ only and reads a
+    // double-quoted, backtick or bracket token as code, so the two scanners disagree only where
+    // this one refuses more, never less.
+    // Two more shapes are refused although SQLite would never read the shim: a name inside a
+    // double-quoted string literal (`SELECT "$Process_Live"`, read here as an identifier), and
+    // a CTE that shadows a shim name (`WITH process_live AS (...) SELECT ... FROM process_live`).
+    // Accepted: the predicate fails closed, and `"process_live"` must still be caught when it
+    // is a quoted identifier, which only a real SQL parse could tell from the literal.
+    std::string text(sql);
+    const auto is_real_name = [&](std::string_view content) {
+        if (!content.empty() && content.front() == '$')
+            content.remove_prefix(1);
+        std::string word(content);
+        for (auto& c : word)
+            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        return std::find(kRealNames.begin(), kRealNames.end(), word) != kRealNames.end();
+    };
+    const auto quoted_end = [&](std::size_t i, char close, bool doubles) {
+        std::size_t j = i + 1;
+        while (j < text.size()) {
+            if (text[j] == close) {
+                if (doubles && j + 1 < text.size() && text[j + 1] == close) {
+                    j += 2;
+                    continue;
+                }
+                return j + 1;
+            }
+            ++j;
+        }
+        return text.size();
+    };
+    for (std::size_t i = 0; i < text.size();) {
+        std::size_t end = i;
+        bool blank = true;
+        if (text[i] == '\'') {
+            end = quoted_end(i, '\'', true);
+            std::string_view content(text.data() + i + 1, end - i - 1);
+            if (!content.empty() && text[end - 1] == '\'')
+                content.remove_suffix(1); // the closing quote (absent when unterminated)
+            if (is_real_name(content))
+                return true;
+        } else if (text[i] == '"' || text[i] == '`') {
+            end = quoted_end(i, text[i], true);
+            blank = false;
+        } else if (text[i] == '[') {
+            end = quoted_end(i, ']', false);
+            blank = false;
+        } else if (text.compare(i, 2, "--") == 0) {
+            end = text.find('\n', i);
+            end = end == std::string::npos ? text.size() : end;
+        } else if (text.compare(i, 2, "/*") == 0) {
+            end = text.find("*/", i + 2);
+            end = end == std::string::npos ? text.size() : end + 2;
+        } else {
+            ++i;
+            continue;
+        }
+        if (blank)
+            text.replace(i, end - i, end - i, ' ');
+        i = end;
+    }
+    for (std::size_t i = 0; i < text.size();) {
+        if (!is_word(text[i])) {
+            ++i;
+            continue;
+        }
+        std::size_t j = i;
+        while (j < text.size() && is_word(text[j]))
+            ++j;
+        std::string word = text.substr(i, j - i);
+        for (auto& c : word)
+            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        if (std::find(kRealNames.begin(), kRealNames.end(), word) != kRealNames.end())
+            return true;
+        i = j;
+    }
+    return false;
+}
+
+bool instruction_reads_raw_capture_table(const nlohmann::json& params,
+                                         std::string_view parameter_schema) {
+    if (params.is_object() && params.contains("sql") && params["sql"].is_string())
+        return references_raw_capture_table(params["sql"].get_ref<const std::string&>());
+    const auto schema = nlohmann::json::parse(parameter_schema, nullptr, false);
+    if (!schema.is_object() || !schema.contains("properties") ||
+        !schema["properties"].is_object() || !schema["properties"].contains("sql"))
+        return false;
+    const auto& prop = schema["properties"]["sql"];
+    if (!prop.is_object() || !prop.contains("default") || !prop["default"].is_string())
+        return false;
+    return references_raw_capture_table(prop["default"].get_ref<const std::string&>());
 }
 
 } // namespace yuzu::server::rs_matcher

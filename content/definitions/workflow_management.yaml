@@ -209,7 +209,12 @@ metadata:
     are executed sequentially. Each step dispatches an instruction to
     the target agents and waits for results. Steps with conditions are
     evaluated against the previous step's output. Steps with foreach
-    expand into multiple dispatches per result item.
+    expand into multiple dispatches per result item. Over REST
+    (POST /api/v1/workflows/{id}/execute) and MCP (execute_workflow) a run
+    is synchronous: the call returns once every step has been sent, a
+    principal may have at most 2 runs in progress, a run stops at 60
+    seconds, and MCP requires an idempotency key so a lost answer is never
+    retried blind. A supervised-tier MCP token needs an approval ticket.
   tags: [workflow, orchestration, execution]
 
 spec:

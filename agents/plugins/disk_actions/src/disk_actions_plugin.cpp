@@ -7,8 +7,12 @@
  *               where the OS exposes it, wear indicators.
  *   "volumes" — The mapping between physical drives and the logical volumes
  *               they back.
- *   "partitions", "topology" — PLANNED on every OS: each answers one
- *               `status|<action>|unsupported|<os>:planned` row until its leg lands.
+ *   "partitions" — read on Windows (Win32_DiskPartition + Win32_LogicalDiskToPartition,
+ *               cross-checked against Win32_LogicalDisk, through bounded WMI); PLANNED on
+ *               Linux and macOS.
+ *   "topology"   — PLANNED on every OS.
+ *               A planned action answers one `status|<action>|unsupported|<os>:planned` row
+ *               until its leg lands.
  *
  * SCOPE, decided deliberately (Alex ruling, Wave 6 planning). `volumes` is NOT
  * a third volume inventory. `hardware.disks` already enumerates physical
@@ -114,8 +118,11 @@ const YuzuActionDescriptor kActionDescriptors[] = {
         {YUZU_SUPPORT_PLANNED, 1, "diskutil list + getmntinfo",
          "not read yet: one unsupported status row, macos:planned"},
         /* .windows_leg = */
-        {YUZU_SUPPORT_PLANNED, 1, "Win32_DiskPartition + Win32_LogicalDisk",
-         "not read yet: one unsupported status row, windows:planned"},
+        {YUZU_SUPPORT_CONSTRAINED, 1,
+         "WMI Win32_DiskPartition + Win32_LogicalDiskToPartition + Win32_LogicalDisk (bounded)",
+         "one row per partition Windows exposes through Win32_DiskPartition, with its drive "
+         "letters; the 16 MiB Microsoft Reserved partition is not listed by that class, and a "
+         "volume mounted on a folder rather than a drive letter shows no mount point"},
     },
     {
         /* .action      = */ "topology",

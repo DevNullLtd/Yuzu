@@ -1,12 +1,14 @@
 %% -*- mode: erlang -*-
-%% rebar3 config for ONE shard of the gateway EUnit suite. Read only when
+%% rebar3 config for ONE shard of the gateway EUnit suite. Read when
 %% scripts/test_gateway.py runs `eunit --shard K/N` (the Meson
-%% `gateway eunit shard <X>` tests): the wrapper points REBAR_CONFIG at this
-%% file and passes the shard's modules, comma-separated, in
+%% `gateway eunit shard <X>` tests) and by scripts/ci/check-gateway-eunit-order.sh
+%% (a local diagnostic, not wired into any workflow): each points REBAR_CONFIG at
+%% this file and passes the modules, comma-separated, in
 %% YUZU_GW_EUNIT_SHARD_MODULES. Every other rebar3 run reads rebar.config as
 %% usual and never sees this file.
 %%
-%% The result is rebar.config unchanged plus one `eunit_tests` entry, which
+%% The result is rebar.config with the test profile's `cover_enabled` set to
+%% false (below) plus one `eunit_tests` entry, which
 %% rebar3 runs when no test is named on the command line. Each module is
 %% wrapped in `{spawn, {module, M}}` so it runs in its own test process, as
 %% it does under the whole-suite `rebar3 eunit --dir apps/yuzu_gw/test`
@@ -16,6 +18,15 @@
 %% module's tests (measured: a shard cancelled in yuzu_gw_planned_stop_tests'
 %% setup with `::shutdown`). Why the module list is faithful to `--dir`:
 %% scripts/gateway_eunit_shards.py.
+%%
+%% Cover is OFF in a shard: the test profile's `cover_enabled` (true in
+%% rebar.config, so a plain `rebar3 eunit --dir ...` still covers) is set to
+%% false here. With cover on, meck preserves cover data on every
+%% `meck:new`/`meck:unload` of a cover-compiled src module (a coverdata
+%% export, a cover recompile, an import), which made the suite take 459s
+%% instead of 268s with the same tests passing. Nothing reads a shard's cover
+%% data. `rebar3 eunit --cover false` cannot do this: rebar3 only ever turns
+%% cover ON from the flag. Measurements: scripts/gateway_eunit_shards.py.
 %%
 %% SCRIPT is bound by rebar3 to this file's path; CONFIG (the terms of a
 %% sibling `eunit_shard.config`, which does not exist) is ignored.
@@ -29,4 +40,12 @@ case Mods of
     [] -> erlang:error({eunit_shard_config, no_modules_in_YUZU_GW_EUNIT_SHARD_MODULES});
     _ -> ok
 end,
-lists:keystore(eunit_tests, 1, Base, {eunit_tests, [{spawn, {module, M}} || M <- Mods]}).
+NoCover = fun(Cfg) ->
+              Profiles = proplists:get_value(profiles, Cfg, []),
+              Test = proplists:get_value(test, Profiles, []),
+              Test1 = lists:keystore(cover_enabled, 1, Test, {cover_enabled, false}),
+              lists:keystore(profiles, 1, Cfg,
+                             {profiles, lists:keystore(test, 1, Profiles, {test, Test1})})
+          end,
+lists:keystore(eunit_tests, 1, NoCover(Base),
+               {eunit_tests, [{spawn, {module, M}} || M <- Mods]}).

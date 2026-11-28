@@ -28,8 +28,10 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <barrier>
 #include <chrono>
 #include <format>
+#include <future>
 #include <stdexcept>
 #include <string>
 #include <unordered_set>
@@ -500,6 +502,116 @@ TEST_CASE("ResultSetStore: async create -> materialize", "[pg][result_set][async
     CHECK(contains_ok(store, rs->id, "dev-1"));
 }
 
+TEST_CASE("ResultSetStore: a failed second insert batch rolls back and can be retried",
+          "[pg][result_set][bulk_insert]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResultSetStore store(pool);
+    REQUIRE(store.is_open());
+
+    // A statement trigger observes each actual batch. nextval survives rollback,
+    // so only the second batch fails and the same request can then be retried.
+    exec_sql(db.dsn(), R"SQL(
+        CREATE SEQUENCE batch_number;
+        CREATE FUNCTION check_batch() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN
+            IF (SELECT count(*) FROM inserted) > 1000 THEN
+                RAISE EXCEPTION 'unbounded member insert';
+            END IF;
+            IF nextval('batch_number') = 2 THEN
+                RAISE EXCEPTION 'second batch failed';
+            END IF;
+            RETURN NULL;
+        END $$;
+        CREATE TRIGGER check_batch AFTER INSERT ON result_set_store.result_set_members
+        REFERENCING NEW TABLE AS inserted FOR EACH STATEMENT EXECUTE FUNCTION check_batch();
+    )SQL");
+
+    std::vector<std::string> ids;
+    for (int i = 0; i < 2001; ++i)
+        ids.push_back(std::format("device-{}", i));
+    ids.emplace_back("device-0");
+    ids.emplace_back("");
+    std::string id;
+    SECTION("ordinary creation rolls back its header and every member") {
+        const auto request = req("alice", "bulk");
+        const auto failed = store.create_materialized(request, ids);
+        REQUIRE_FALSE(failed.has_value());
+        CHECK(failed.error() == ResultSetError::DbError);
+        CHECK_FALSE(resolve_alias_ok(store, "alice", "bulk").has_value());
+        CHECK(query_scalar(db.dsn(), "SELECT count(*) FROM result_set_store.result_set_members") ==
+              "0");
+        CHECK(query_scalar(db.dsn(), "SELECT last_value FROM batch_number") == "2");
+        const auto retried = store.create_materialized(request, ids);
+        REQUIRE(retried.has_value());
+        id = retried->id;
+    }
+    SECTION("asynchronous fill leaves the original set pending and empty") {
+        const auto pending = store.create_pending(req("alice", "bulk"), "exec-bulk");
+        REQUIRE(pending.has_value());
+        id = pending->id;
+        const auto failed = store.materialize(id, ids, 2, 3);
+        REQUIRE_FALSE(failed.has_value());
+        CHECK(failed.error() == ResultSetError::DbError);
+        const auto header = get_ok(store, id);
+        REQUIRE(header.has_value());
+        CHECK(header->status == ResultSetStatus::Pending);
+        CHECK(header->device_count == 0);
+        CHECK(header->agents_failed == 0);
+        CHECK(header->agents_unanswered == 0);
+        CHECK(query_scalar(db.dsn(), "SELECT count(*) FROM result_set_store.result_set_members") ==
+              "0");
+        CHECK(query_scalar(db.dsn(), "SELECT last_value FROM batch_number") == "2");
+        REQUIRE(store.materialize(id, ids, 2, 3).has_value());
+        const auto retried = get_ok(store, id);
+        REQUIRE(retried.has_value());
+        CHECK(retried->agents_failed == 2);
+        CHECK(retried->agents_unanswered == 3);
+    }
+    const auto stored = get_ok(store, id);
+    REQUIRE(stored.has_value());
+    CHECK(stored->status == ResultSetStatus::Materialized);
+    CHECK(stored->device_count == 2001);
+    ids.pop_back(); // Remove the empty ID, keeping the duplicate.
+    CHECK(member_set_owned_ok(store, id, "alice") ==
+          std::unordered_set<std::string>(ids.begin(), ids.end()));
+    CHECK(query_scalar(db.dsn(), "SELECT last_value FROM batch_number") == "5");
+}
+
+TEST_CASE("ResultSetStore: concurrent bulk fills publish just the winning producer's membership",
+          "[pg][result_set][bulk_insert][async]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResultSetStore store(pool);
+    const auto pending = store.create_pending(req("alice", "bulk"), "exec-bulk");
+    REQUIRE(pending.has_value());
+    std::vector<std::string> left, right;
+    for (int i = 0; i < 1001; ++i) {
+        left.push_back(std::format("left-{}", i));
+        right.push_back(std::format("right-{}", i));
+    }
+
+    std::barrier start{2};
+    auto first = std::async(std::launch::async, [&] {
+        start.arrive_and_wait();
+        return store.materialize(pending->id, left, 1, 2);
+    });
+    start.arrive_and_wait();
+    const auto right_result = store.materialize(pending->id, right, 3, 4);
+    const auto left_result = first.get();
+    REQUIRE(left_result.has_value() != right_result.has_value());
+    const auto& loser = left_result ? right_result : left_result;
+    CHECK(loser.error() == ResultSetError::NotFound);
+    const auto& winners = left_result ? left : right;
+    CHECK(member_set_owned_ok(store, pending->id, "alice") ==
+          std::unordered_set<std::string>(winners.begin(), winners.end()));
+    const auto stored = get_ok(store, pending->id);
+    REQUIRE(stored.has_value());
+    CHECK(stored->device_count == 1001);
+    CHECK(stored->agents_failed == (left_result ? 1 : 3));
+    CHECK(stored->agents_unanswered == (left_result ? 2 : 4));
+}
+
 // UP-6 (2026-07-26 hardening round, S2): materialize() must dedup + drop
 // empty-string device_ids exactly like insert_row_impl — pre-fix,
 // device_count reflected the raw request size (over-reporting on
@@ -527,6 +639,123 @@ TEST_CASE("ResultSetStore: materialize dedups members and drops empty ids",
     auto members = store.members(rs->id, "", 100, cursor);
     REQUIRE(members.size() == 1);
     CHECK(members[0] == "a");
+}
+
+// agents_failed: how many agents never matched and answered with a failure. It is persisted
+// with the membership so a reader can tell "no match" from "the query failed".
+TEST_CASE("ResultSetStore: materialize persists agents_failed and every read returns it",
+          "[pg][result_set][async][agents_failed]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    ResultSetStore store(pool);
+
+    CreateRequest r = req("alice", "partial");
+    r.source_kind = std::string(source_kind::kEchoQuery);
+    r.source_payload = R"({"sql":"SELECT 1"})";
+    auto rs = store.create_pending(r, "exec-failed");
+    REQUIRE(rs.has_value());
+    CHECK(rs->agents_failed == 0); // a pending set has counted nothing yet
+
+    REQUIRE(store.materialize(rs->id, {"dev-1"}, 3).has_value());
+    auto got = get_ok(store, rs->id);
+    REQUIRE(got.has_value());
+    CHECK(got->device_count == 1);
+    CHECK(got->agents_failed == 3);
+
+    // The default is no failures, and a sync set never has any.
+    CreateRequest r2 = req("alice", "complete");
+    r2.source_kind = std::string(source_kind::kEchoQuery);
+    r2.source_payload = R"({"sql":"SELECT 1"})";
+    auto rs2 = store.create_pending(r2, "exec-clean");
+    REQUIRE(rs2.has_value());
+    REQUIRE(store.materialize(rs2->id, {"dev-1"}).has_value());
+    CHECK(get_ok(store, rs2->id)->agents_failed == 0);
+    auto sync = store.create_materialized(req("alice", "sync"), {"dev-1"});
+    REQUIRE(sync.has_value());
+    CHECK(sync->agents_failed == 0);
+}
+
+// Migration v4 adds the column. Roll the recorded version back to 3 and drop the column, as a
+// database last opened by the previous build would be, then open the store twice: the first
+// open applies v4 and keeps the old row's count at 0, the second applies nothing and keeps data.
+TEST_CASE("ResultSetStore: migration v4 applies on a v3 database and is a no-op on re-run",
+          "[pg][result_set][migration][agents_failed]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    std::string old_id;
+    {
+        PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+        REQUIRE(pool.valid());
+        ResultSetStore store(pool);
+        REQUIRE(store.is_open());
+        auto rs = store.create_materialized(req("alice", "old-row"), {"dev-1", "dev-2"});
+        REQUIRE(rs.has_value());
+        old_id = rs->id;
+    }
+    exec_sql(db.dsn(), "ALTER TABLE result_set_store.result_sets DROP COLUMN agents_failed");
+    exec_sql(db.dsn(), "UPDATE public.schema_meta SET version = 3 WHERE store = 'result_set_store'");
+    REQUIRE(query_scalar(db.dsn(),
+                         "SELECT count(*) FROM information_schema.columns WHERE table_schema = "
+                         "'result_set_store' AND table_name = 'result_sets' AND column_name = "
+                         "'agents_failed'") == "0");
+
+    for (int open = 0; open < 2; ++open) {
+        INFO("open " << open);
+        PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+        REQUIRE(pool.valid());
+        ResultSetStore store(pool);
+        REQUIRE(store.is_open());
+        auto got = get_ok(store, old_id);
+        REQUIRE(got.has_value());
+        CHECK(got->device_count == 2);
+        CHECK(got->agents_failed == 0);
+        CHECK(query_scalar(db.dsn(), "SELECT version FROM public.schema_meta WHERE store = "
+                                     "'result_set_store'") == "5");
+    }
+}
+
+// Migration v5 adds agents_unanswered. Roll the recorded version back to 4 and drop the column,
+// as a database last opened by the previous build would be, then open the store twice: the first
+// open applies v5 and reads the old row as complete, the second applies nothing and keeps data.
+// A migration-in-substance case, so it takes the migration macro (a fresh database, skipped on
+// Windows by default) rather than the pre-migrated template.
+TEST_CASE("ResultSetStore: migration v5 applies on a v4 database and old rows read complete",
+          "[pg][result_set][migration][agents_unanswered]") {
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
+    std::string old_id;
+    {
+        PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+        REQUIRE(pool.valid());
+        ResultSetStore store(pool);
+        REQUIRE(store.is_open());
+        auto rs = store.create_materialized(req("alice", "old-row"), {"dev-1", "dev-2"});
+        REQUIRE(rs.has_value());
+        old_id = rs->id;
+    }
+    exec_sql(db.dsn(), "ALTER TABLE result_set_store.result_sets DROP COLUMN agents_unanswered");
+    exec_sql(db.dsn(), "UPDATE public.schema_meta SET version = 4 WHERE store = 'result_set_store'");
+    const std::string column_count_sql =
+        "SELECT count(*) FROM information_schema.columns WHERE table_schema = "
+        "'result_set_store' AND table_name = 'result_sets' AND column_name = "
+        "'agents_unanswered'";
+    REQUIRE(query_scalar(db.dsn(), column_count_sql) == "0");
+
+    for (int open = 0; open < 2; ++open) {
+        INFO("open " << open);
+        PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+        REQUIRE(pool.valid());
+        ResultSetStore store(pool);
+        REQUIRE(store.is_open());
+        CHECK(query_scalar(db.dsn(), column_count_sql) == "1");
+        auto got = get_ok(store, old_id);
+        REQUIRE(got.has_value());
+        CHECK(got->agents_unanswered == 0);
+        CHECK(query_scalar(db.dsn(), "SELECT version FROM public.schema_meta WHERE store = "
+                                     "'result_set_store'") == "5");
+        auto owned = store.member_set_owned(old_id, "alice");
+        REQUIRE(owned.has_value());
+        CHECK(owned->complete);
+    }
 }
 
 TEST_CASE("ResultSetStore: touch extends TTL", "[pg][result_set][ttl]") {
@@ -831,6 +1060,209 @@ TEST_CASE("ResultSetStore: member_set_owned's four outcomes (#4981 PR-1 A1 rewri
         REQUIRE_FALSE(r.has_value());
         CHECK(r.error() == ResultSetError::NotOwner);
     }
+}
+
+TEST_CASE("ResultSetStore: member_set_owned refuses a set that is not materialized and flags an "
+          "incomplete one",
+          "[pg][result_set][owner][incomplete]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    ResultSetStore store(pool);
+    REQUIRE(store.is_open());
+
+    auto pending_req = [](const char* name) {
+        CreateRequest r = req("alice", name);
+        r.source_kind = std::string(source_kind::kEchoQuery);
+        r.source_payload = R"({"sql":"SELECT 1"})";
+        return r;
+    };
+
+    SECTION("pending -> NotReady, not an empty success") {
+        auto rs = store.create_pending(pending_req("pending-set"), "exec-p");
+        REQUIRE(rs.has_value());
+        auto r = store.member_set_owned(rs->id, "alice");
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error() == ResultSetError::NotReady);
+    }
+    SECTION("failed -> Failed and distinct from pending") {
+        auto rs = store.create_pending(pending_req("failed-set"), "exec-f");
+        REQUIRE(rs.has_value());
+        store.mark_failed(rs->id, "bound exceeded");
+        auto r = store.member_set_owned(rs->id, "alice");
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error() == ResultSetError::Failed);
+    }
+    SECTION("a non-owner of a pending set still sees NotOwner") {
+        auto rs = store.create_pending(pending_req("foreign-pending"), "exec-o");
+        REQUIRE(rs.has_value());
+        auto r = store.member_set_owned(rs->id, "bob");
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error() == ResultSetError::NotOwner);
+    }
+    SECTION("materialized and complete") {
+        auto rs = store.create_pending(pending_req("complete-set"), "exec-c");
+        REQUIRE(rs.has_value());
+        REQUIRE(store.materialize(rs->id, {"dev-1", "dev-2"}).has_value());
+        auto r = store.member_set_owned(rs->id, "alice");
+        REQUIRE(r.has_value());
+        CHECK(r->size() == 2);
+        CHECK(r->complete);
+    }
+    SECTION("a synchronous set is complete") {
+        auto rs = store.create_materialized(req("alice", "sync-set"), {"dev-1"});
+        REQUIRE(rs.has_value());
+        auto r = store.member_set_owned(rs->id, "alice");
+        REQUIRE(r.has_value());
+        CHECK(r->complete);
+    }
+    SECTION("materialized with a failed agent is incomplete") {
+        auto rs = store.create_pending(pending_req("partial-set"), "exec-a");
+        REQUIRE(rs.has_value());
+        REQUIRE(store.materialize(rs->id, {"dev-1"}, 2, 0).has_value());
+        auto r = store.member_set_owned(rs->id, "alice");
+        REQUIRE(r.has_value());
+        CHECK(r->size() == 1);
+        CHECK_FALSE(r->complete);
+    }
+    SECTION("materialized with an unanswered agent is incomplete and the count is stored") {
+        auto rs = store.create_pending(pending_req("timeout-set"), "exec-u");
+        REQUIRE(rs.has_value());
+        REQUIRE(store.materialize(rs->id, {"dev-1"}, 0, 4).has_value());
+        auto r = store.member_set_owned(rs->id, "alice");
+        REQUIRE(r.has_value());
+        CHECK_FALSE(r->complete);
+        auto got = get_ok(store, rs->id);
+        REQUIRE(got.has_value());
+        CHECK(got->agents_unanswered == 4);
+    }
+    SECTION("a child created from an incomplete parent reads incomplete") {
+        auto parent = store.create_pending(pending_req("incomplete-parent"), "exec-ip");
+        REQUIRE(parent.has_value());
+        REQUIRE(store.materialize(parent->id, {"dev-1", "dev-2"}, 1, 2).has_value());
+        auto parent_row = get_ok(store, parent->id);
+        REQUIRE(parent_row.has_value());
+        REQUIRE(parent_may_seed(*parent_row));
+
+        CreateRequest child_req = req("alice", "inherited-child");
+        child_req.parent_id = parent->id;
+        inherit_completeness(child_req, *parent_row);
+        auto child = store.create_materialized(child_req, {"dev-1"});
+        REQUIRE(child.has_value());
+
+        auto got = get_ok(store, child->id);
+        REQUIRE(got.has_value());
+        CHECK(got->agents_failed == 1);
+        CHECK(got->agents_unanswered == 2);
+        auto r = store.member_set_owned(child->id, "alice");
+        REQUIRE(r.has_value());
+        CHECK_FALSE(r->complete);
+    }
+    SECTION("a child created from a complete parent reads complete") {
+        auto parent = store.create_materialized(req("alice", "complete-parent"), {"dev-1"});
+        REQUIRE(parent.has_value());
+        CreateRequest child_req = req("alice", "complete-child");
+        child_req.parent_id = parent->id;
+        inherit_completeness(child_req, *parent);
+        auto child = store.create_materialized(child_req, {"dev-1"});
+        REQUIRE(child.has_value());
+        auto r = store.member_set_owned(child->id, "alice");
+        REQUIRE(r.has_value());
+        CHECK(r->complete);
+    }
+    SECTION("an async child of an incomplete parent is incomplete from birth and stays so") {
+        auto parent = store.create_pending(pending_req("async-parent"), "exec-ap");
+        REQUIRE(parent.has_value());
+        REQUIRE(store.materialize(parent->id, {"dev-1", "dev-2"}, 1, 2).has_value());
+        auto parent_row = get_ok(store, parent->id);
+        REQUIRE(parent_row.has_value());
+
+        // The async producers snapshot the parent's counters onto the pending row.
+        CreateRequest child_req = pending_req("async-child");
+        child_req.parent_id = parent->id;
+        inherit_completeness(child_req, *parent_row);
+        auto child = store.create_pending(child_req, "exec-ac");
+        REQUIRE(child.has_value());
+
+        // Before the fill: the pending row already carries the parent's counters.
+        auto before = get_ok(store, child->id);
+        REQUIRE(before.has_value());
+        CHECK(before->status == ResultSetStatus::Pending);
+        CHECK(before->agents_failed == 1);
+        CHECK(before->agents_unanswered == 2);
+
+        // The fill adds its own counts to the inherited ones.
+        REQUIRE(store.materialize(child->id, {"dev-1"}, 3, 4).has_value());
+        auto after = get_ok(store, child->id);
+        REQUIRE(after.has_value());
+        CHECK(after->agents_failed == 4);
+        CHECK(after->agents_unanswered == 6);
+        auto r = store.member_set_owned(child->id, "alice");
+        REQUIRE(r.has_value());
+        CHECK_FALSE(r->complete);
+
+        // Deleting the parent afterwards changes nothing on the child.
+        REQUIRE(store.delete_set(parent->id).has_value());
+        auto orphan = get_ok(store, child->id);
+        REQUIRE(orphan.has_value());
+        CHECK(orphan->agents_failed == 4);
+        CHECK(orphan->agents_unanswered == 6);
+        auto r2 = store.member_set_owned(child->id, "alice");
+        REQUIRE(r2.has_value());
+        CHECK_FALSE(r2->complete);
+    }
+    SECTION("a parentless async set's counters are exactly the fill's own") {
+        auto rs = store.create_pending(pending_req("parentless-async"), "exec-pl");
+        REQUIRE(rs.has_value());
+        REQUIRE(store.materialize(rs->id, {"dev-1"}, 0, 0).has_value());
+        auto got = get_ok(store, rs->id);
+        REQUIRE(got.has_value());
+        CHECK(got->agents_failed == 0);
+        CHECK(got->agents_unanswered == 0);
+        auto r = store.member_set_owned(rs->id, "alice");
+        REQUIRE(r.has_value());
+        CHECK(r->complete);
+    }
+    SECTION("a failed set reads zero counters even when it inherited some") {
+        auto parent = store.create_pending(pending_req("fail-parent"), "exec-fp");
+        REQUIRE(parent.has_value());
+        REQUIRE(store.materialize(parent->id, {"dev-1"}, 2, 1).has_value());
+        auto parent_row = get_ok(store, parent->id);
+        REQUIRE(parent_row.has_value());
+        CreateRequest child_req = pending_req("fail-child");
+        child_req.parent_id = parent->id;
+        inherit_completeness(child_req, *parent_row);
+        auto child = store.create_pending(child_req, "exec-fc");
+        REQUIRE(child.has_value());
+        store.mark_failed(child->id, "test");
+        auto got = get_ok(store, child->id);
+        REQUIRE(got.has_value());
+        CHECK(got->status == ResultSetStatus::Failed);
+        CHECK(got->agents_failed == 0);
+        CHECK(got->agents_unanswered == 0);
+    }
+}
+
+TEST_CASE("parent_may_seed admits only a materialized parent", "[result_set][parent_seed]") {
+    ResultSet row;
+    row.status = ResultSetStatus::Materialized;
+    CHECK(parent_may_seed(row));
+    row.status = ResultSetStatus::Pending;
+    CHECK_FALSE(parent_may_seed(row));
+    row.status = ResultSetStatus::Failed;
+    CHECK_FALSE(parent_may_seed(row));
+    // The refusal says what to do: re-create a failed parent, wait for a pending one.
+    CHECK(parent_not_ready_message(row) == kParentFailedMessage);
+    row.status = ResultSetStatus::Pending;
+    CHECK(parent_not_ready_message(row) == kParentPendingMessage);
+
+    ResultSet parent;
+    parent.agents_failed = 3;
+    parent.agents_unanswered = 5;
+    CreateRequest child;
+    inherit_completeness(child, parent);
+    CHECK(child.agents_failed == 3);
+    CHECK(child.agents_unanswered == 5);
 }
 
 TEST_CASE("ResultSetStore: member_set_owned reports DbError on a genuine store failure, "

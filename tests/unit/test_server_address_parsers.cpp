@@ -42,3 +42,50 @@ TEST_CASE("looks_like_ip_literal accepts IPv4/IPv6-shaped charsets and rejects "
     CHECK_FALSE(looks_like_ip_literal(""));
     CHECK_FALSE(looks_like_ip_literal(std::string(46, '1'))); // over the 45-char cap
 }
+
+TEST_CASE("grpc_peer_literal reduces a gRPC peer string to the host:port literal the agent "
+          "publishes as agent.server_peer, and to nothing for anything that is not one",
+          "[agent][server_address_parsers]") {
+    // what ClientContext::peer() reports after a call
+    CHECK(grpc_peer_literal("ipv4:198.51.100.7:50051") == "198.51.100.7:50051");
+    CHECK(grpc_peer_literal("ipv4:10.0.0.5:443") == "10.0.0.5:443");
+    CHECK(grpc_peer_literal("ipv6:[2001:db8::1]:50051") == "[2001:db8::1]:50051");
+    CHECK(grpc_peer_literal("ipv6:[::1]:8443") == "[::1]:8443");
+    // some gRPC versions percent-encode the brackets; both spellings read the same
+    CHECK(grpc_peer_literal("ipv6:%5B2001:db8::1%5D:50051") == "[2001:db8::1]:50051");
+    CHECK(grpc_peer_literal("ipv6:%5b2001:db8::1%5d:50051") == "[2001:db8::1]:50051");
+    // a v4-mapped v6 address keeps its dotted tail
+    CHECK(grpc_peer_literal("ipv6:[::ffff:198.51.100.7]:50051") == "[::ffff:198.51.100.7]:50051");
+
+    // a peer that is not a usable literal publishes nothing: never a guess, never a name
+    CHECK(grpc_peer_literal("").empty());
+    CHECK(grpc_peer_literal("dns:server.example.com:50051").empty());
+    CHECK(grpc_peer_literal("unix:/run/yuzu.sock").empty());
+    CHECK(grpc_peer_literal("uds:/run/yuzu.sock").empty());
+    CHECK(grpc_peer_literal("198.51.100.7:50051").empty()); // no scheme
+    CHECK(grpc_peer_literal("ipv4:198.51.100.7:50051,ipv4:198.51.100.8:50051").empty()); // a list
+    // ports: present, numeric, 1..65535
+    CHECK(grpc_peer_literal("ipv4:198.51.100.7").empty());
+    CHECK(grpc_peer_literal("ipv4:198.51.100.7:").empty());
+    CHECK(grpc_peer_literal("ipv4:198.51.100.7:0").empty());
+    CHECK(grpc_peer_literal("ipv4:198.51.100.7:65536").empty());
+    CHECK(grpc_peer_literal("ipv4:198.51.100.7:http").empty());
+    CHECK(grpc_peer_literal("ipv4:198.51.100.7:65535") == "198.51.100.7:65535");
+    // v4 shape: four octets of at most 255
+    CHECK(grpc_peer_literal("ipv4:198.51.100:50051").empty());
+    CHECK(grpc_peer_literal("ipv4:198.51.100.7.1:50051").empty());
+    CHECK(grpc_peer_literal("ipv4:198.51.100.256:50051").empty());
+    CHECK(grpc_peer_literal("ipv4:198.51.100.x:50051").empty());
+    CHECK(grpc_peer_literal("ipv4:server.example.com:50051").empty());
+    // v6 shape: bracketed, hex/colon/dot only, a zone id or any other escape is refused
+    CHECK(grpc_peer_literal("ipv6:2001:db8::1:50051").empty());              // no brackets
+    CHECK(grpc_peer_literal("ipv6:[2001:db8::1:50051").empty());              // unclosed
+    CHECK(grpc_peer_literal("ipv6:[fe80::1%25eth0]:50051").empty());          // zone id
+    CHECK(grpc_peer_literal("ipv6:[fe80::1%eth0]:50051").empty());
+    CHECK(grpc_peer_literal("ipv6:[2001:db8::g]:50051").empty());
+    CHECK(grpc_peer_literal("ipv6:[1.2.3.4]:50051").empty());                 // not a v6 literal
+    CHECK(grpc_peer_literal("ipv6:[]:50051").empty());
+    CHECK(grpc_peer_literal("ipv6:[2001:db8::1]").empty());
+    CHECK(grpc_peer_literal("ipv6:[2001:db8::1]:0").empty());
+    CHECK(grpc_peer_literal("ipv6:%5B2001:db8::1]:50051").empty());           // mixed spellings
+}

@@ -21,11 +21,31 @@ endif
 
 fuzz_args = ['-fsanitize=fuzzer,address,undefined', '-fno-sanitize-recover=all']
 
-server_src_inc = include_directories('../../server/core/src')
+server_src_inc = include_directories('../../server/core/src', '../../agents/shared')
 
 fuzz_targets = {
   'fuzz_preflight_parse': {
     'sources': files('fuzz_preflight_parse.cpp'),
+    'deps': [],
+  },
+  'fuzz_component_zip': {
+    'sources': files('fuzz_component_zip.cpp'),
+    'deps': [],
+  },
+  'fuzz_binary_header_pe': {
+    'sources': files('fuzz_binary_header_pe.cpp'),
+    'deps': [],
+  },
+  'fuzz_binary_header_elf': {
+    'sources': files('fuzz_binary_header_elf.cpp'),
+    'deps': [],
+  },
+  'fuzz_binary_header_macho': {
+    'sources': files('fuzz_binary_header_macho.cpp'),
+    'deps': [],
+  },
+  'fuzz_component_native': {
+    'sources': files('fuzz_component_native.cpp'),
     'deps': [],
   },
   'fuzz_deployment_parse': {
@@ -45,13 +65,36 @@ fuzz_targets = {
     ),
     'deps': [nlohmann_dep],
   },
+  'fuzz_file_search_cursor': {
+    'sources': files('fuzz_file_search_cursor.cpp'),
+    'deps': [],
+  },
+  'fuzz_file_search_names': {
+    'sources': files('fuzz_file_search_names.cpp'),
+    'deps': [],
+  },
+  'fuzz_file_search_glob': {
+    'sources': files('fuzz_file_search_glob.cpp'),
+    'deps': [],
+  },
+  'fuzz_file_search_volume_cursor': {
+    'sources': files('fuzz_file_search_volume_cursor.cpp'),
+    'deps': [],
+    # file_search_volumes.hpp includes the shared file_search headers and the walker by bare name.
+    # Mirror these -I paths in .clusterfuzzlite/build.sh.
+    'inc': [include_directories(
+      '../../agents/shared',
+      '../../agents/plugins/file_search/src',
+      '../../agents/plugins/component_inventory/src',
+    )],
+  },
 }
 
 foreach name, spec : fuzz_targets
   exe = executable(
     name,
     spec['sources'],
-    include_directories: server_src_inc,
+    include_directories: [server_src_inc] + spec.get('inc', []),
     cpp_args: fuzz_args,
     link_args: fuzz_args,
     dependencies: spec['deps'],

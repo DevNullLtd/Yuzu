@@ -4,10 +4,10 @@
 
 /// @file echo_tree_routes.hpp
 /// The Echo process-tree viewer route module — Frame 3 of the `/echo` dashboard page.
-/// Picks ONE live host, dispatches two canned read-only `echo.sql` queries to it
-/// ($Process_Live + $TCP_Live), polls the response store (the device-page "Get live
-/// info" dispatch/poll seam), reconstructs a per-host process tree over a chosen
-/// timescale (echo_process_tree.hpp), and renders the HTMX fragments.
+/// Picks ONE live host, dispatches three canned read-only `echo.sql` queries to it (the
+/// window's hour list, then $Process_Hourly + $TCP_Hourly for ONE hour), polls the response
+/// store (the device-page "Get live info" dispatch/poll seam), builds a per-host name-level
+/// process tree for that hour (echo_process_tree.hpp), and renders the HTMX fragments.
 ///
 /// Product UI: HTMX, server-rendered, dark-theme only; htmx core attrs only (CSP
 /// blocks hx-on). Per-host only; data from the agent's local echo.db only.
@@ -37,18 +37,19 @@
 /// cache `token` is a CSPRNG value minted and cached ONLY by `/result` itself
 /// (`cache_render_detail`/`ReconEntry`, principal-bound) — no other path mints
 /// one, so a `/detail` twin genuinely has no input to accept today. `/result`'s
-/// `pcmd`/`tcmd` command-ids are ordinary `echo sql` dispatch results
+/// `pcmd`/`tcmd`/`hcmd` command-ids are ordinary `echo sql` dispatch results
 /// (`plugin_action_catalogue_a.hpp`: `Infrastructure:Read`, `execute_gate=None`)
 /// and COULD in principle be minted by an operator through the already-twinned
 /// generic dispatch surface (`execute_instruction` / `POST /api/command`) by
-/// reproducing the two canned `$Process_Live`/`$TCP_Live` SELECTs verbatim —
+/// reproducing the three canned `$Process_Hourly`/`$TCP_Hourly` SELECTs verbatim —
 /// there is no dedicated API path, only that indirect route, so shipping a real
 /// `/result` twin would still need a caller to hand-derive those exact queries
 /// AND a new async "not ready yet" polling contract (REST/MCP have no htmx
 /// auto-reissue mechanism to lean on). Deferred as scope for now — see the
 /// #4027 ledger row for the recorded `exception:` reasoning. Revisit once Batch C
-/// lands a `/run` twin that mints pcmd/tcmd (and a token) directly over the API.
+/// lands a `/run` twin that mints pcmd/tcmd/hcmd (and a token) directly over the API.
 
+#include <yuzu/metrics.hpp>
 #include <yuzu/server/auth.hpp>
 
 #include "authz_gates.hpp"     // yuzu::server::authz::FleetReadGate (#4027 fix round — CDX-P1-01/K4)
@@ -94,8 +95,9 @@ class HttpRouteSink;
 /// and stamps `online=true` unconditionally, so in production every row this
 /// builder actually sees is online — `online` is honest per-row but the list is
 /// NOT offline-inclusive today despite the builder's own online-agnostic contract.
-/// Wiring a genuinely offline-inclusive producer (the pattern at
-/// `server.cpp:20057-20091`, `OfflineEndpointStore::query_stale_within`) is a
+/// Wiring a genuinely offline-inclusive producer (the pattern in
+/// `build_hw_roster`, server.cpp: `OfflineEndpointStore::query_stale_within`, which returns a
+/// capped roster with a `truncated` flag, #5712) is a
 /// tracked follow-up, not done in this fix round.
 std::string echo_process_tree_frame_json(const std::vector<DeviceRow>& devices);
 
@@ -115,7 +117,8 @@ struct EchoPausedSourceRow {
     std::string agent_display;
     std::string source;
     std::int64_t paused_at = 0;
-    std::int64_t live_rows = -1; ///< -1 = unknown (older agent)
+    /// Hourly roll-up row count; -1 = unknown (no `<source>_rows` key).
+    std::int64_t hourly_rows = -1;
     std::int64_t oldest_ts = 0;
     bool value_error = false;    ///< #560: `<source>_enabled` held a non-canonical value
     std::string enabled_raw;     ///< the offending value, when value_error
@@ -151,7 +154,7 @@ std::string echo_retention_paused_json(const EchoRetentionPausedScan& scan);
 /// now owns THREE operator surfaces, all sharing the same scoped-Read + Execute-probe
 /// + dispatch/poll seam and the eight providers below:
 ///   1. Process-tree viewer   — `/fragments/echo/process-tree[/run|/result|/detail]`
-///   2. Device DNS/ARP panels — `/fragments/echo/process-tree/device-net` (ADR-0015)
+///   2. Device DNS/ARP panels — `/fragments/echo/process-tree/device-net` (ADR-0015), hourly
 ///   3. Capture-sources frame — `/fragments/echo/capture-sources[/load|/push]` (ADR-0015)
 /// (A rename to `EchoFrameRoutes` + a split of the capture-sources surface is tracked
 /// as a deferred follow-up; folding them here avoids a second server.cpp registration.)
@@ -194,6 +197,32 @@ public:
                                            const std::string& securable_type,
                                            const std::string& operation)>;
     void set_fleet_read_fn(FleetReadFn fn) { fleet_read_fn_ = std::move(fn); }
+
+    /// Counts the capture-sources push by outcome (`yuzu_echo_sources_push_total{result}`:
+    /// pushed / none_applied / audit_unavailable / permission_revoked / dispatch_denied /
+    /// dispatch_exception). Post-registration setter like set_fleet_read_fn; every use is
+    /// guarded, so an unset registry counts nothing.
+    void set_metrics(yuzu::MetricsRegistry* m);
+
+    /// Audit writer for a session the handler already resolved, used by the capture-sources push
+    /// for every row it writes: the request-resolving `AuditFn` stamps an empty principal once
+    /// the session is gone, which is exactly when the push writes its `permission_revoked` row.
+    /// Same `std::function` type as `AuthRoutes::AuditAsSessionFn`; server.cpp binds
+    /// `AuthRoutes::audit_as_session_fn()`. Unset = the push refuses (503), like an `attempted`
+    /// row that cannot be stored. No other route reads it.
+    using AuditAsSessionFn = std::function<bool(
+        const httplib::Request&, const auth::Session&, const std::string& principal_role,
+        const std::string& action, const std::string& result, const std::string& target_type,
+        const std::string& target_id, const std::string& detail)>;
+    void set_audit_as_session_fn(AuditAsSessionFn fn) { audit_as_session_fn_ = std::move(fn); }
+
+    /// HTTP status of a push whose dispatch the chokepoint refused (`ConfinedDispatchOutcome::denied`):
+    /// 403 for the permission-class reasons, 500 for an unclassified or ambiguous catalogue fault.
+    /// Injected so this TU stays store-definition-free (the classifier lives in
+    /// dispatch_denial_text.hpp, whose closure reaches the store headers); server.cpp binds it.
+    /// Unset = 500.
+    using DenialStatusFn = std::function<int(const ConfinedDispatchOutcome&)>;
+    void set_denial_status_fn(DenialStatusFn fn) { denial_status_fn_ = std::move(fn); }
 
     /// External colleague review on PR #4143 (Doomgoose, BLOCKING, confirmed
     /// against ADR-0017 INV-4/INV-7 by direct source inspection): the two REST
@@ -263,7 +292,7 @@ public:
 
 private:
     /// One cached reconstruction. Holds the rendered tree (node-id addressable by the
-    /// detail route) + the host's connection set (filtered per-pid at detail time) +
+    /// detail route) + the shown hour's connection set (filtered per-name at detail time) +
     /// the device_id/os used for the per-detail scoped re-check and the names-only
     /// caption + the originating principal (the detail route fails closed unless the
     /// requesting session matches, so a predicted/leaked token can't be replayed under
@@ -273,13 +302,13 @@ private:
         std::string principal; ///< session->username that created this reconstruction
         std::string os;
         EchoProcTree tree;
-        std::vector<EchoTcpConn> conns;
+        std::vector<EchoTcpHourRow> conns;
         std::int64_t created = 0;
     };
 
     /// Bounded (kCacheCap) + TTL (kCacheTtlSeconds) reconstruction cache. Token is an
     /// unguessable random hex; insertion-ordered for eviction. Guarded by cache_mu_.
-    /// Cap kept modest: each entry can hold up to a 50k-node tree + 5k conns, so 32 ×
+    /// Cap kept modest: each entry can hold up to a 50k-node tree + 20k conns, so 32 ×
     /// worst-case bounds peak cache RSS (~0.8 GB ceiling; typical trees are far smaller).
     /// NOTE (multi-server): this cache is node-local — a future multi-server deployment
     /// must NOT assume a token resolves on another node.
@@ -325,6 +354,9 @@ private:
     ResponsesFn responses_fn_;
     AuditFn audit_fn_;
     CallerFn caller_fn_;
+    yuzu::MetricsRegistry* metrics_{nullptr};
+    AuditAsSessionFn audit_as_session_fn_;
+    DenialStatusFn denial_status_fn_;
 
     std::mutex cache_mu_;
     std::unordered_map<std::string, ReconEntry> cache_;

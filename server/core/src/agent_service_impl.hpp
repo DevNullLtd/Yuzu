@@ -28,6 +28,7 @@
 #include <yuzu/server/auto_approve.hpp>
 #include "agent.grpc.pb.h"
 #include "agent_registry.hpp"
+#include "agent_reregistration_gate.hpp"
 #include "bounded_audit_budget.hpp"
 #include "cert_issuance_source.hpp"
 #include "event_bus.hpp"
@@ -37,6 +38,7 @@
 #include "rate_limiter.hpp"
 #include "response_provenance.hpp"
 #include "rundown_gate.hpp"
+#include "unverified_frame_registry.hpp"
 
 namespace yuzu::server {
 
@@ -371,6 +373,22 @@ public:
     }
     void set_require_client_identity(bool v) { require_client_identity_ = v; }
 
+    /// WP01: proof of identity when an already-enrolled agent id re-registers (see
+    /// agent_reregistration_gate.hpp). `hooks` is wired by ServerImpl only when this install has
+    /// its own issuing CA (null = the gate is inert); `mode` is `--agent-reregistration-proof`.
+    /// Both are set once during bring-up, before the dispatcher accepts traffic, and cleared at
+    /// shutdown, exactly like `set_agent_cert_signer`.
+    void set_agent_identity_hooks(std::shared_ptr<const AgentIdentityHooks> hooks) {
+        agent_identity_hooks_ = std::move(hooks);
+    }
+    void set_reregistration_proof_mode(ReregistrationProofMode m) { reregistration_mode_ = m; }
+    /// TEST SEAM (empty in production, like `override_command_record_lookup`): a unit test cannot
+    /// build a gRPC auth context carrying a peer certificate, so it supplies the verdict "the
+    /// presented client certificate proves this agent id" directly.
+    void override_cert_proof_for_test(std::function<bool(const std::string& agent_id)> fn) {
+        cert_proof_override_for_test_ = std::move(fn);
+    }
+
     grpc::Status Register(grpc::ServerContext* context, const pb::RegisterRequest* request,
                           pb::RegisterResponse* response) override;
 
@@ -540,6 +558,20 @@ private:
     /// Publishes the current `cmd_send_times_.size()` to the pending-count
     /// gauge. Caller holds `cmd_times_mu_`.
     void publish_send_times_gauge_locked();
+
+    /// Answers that may be missing from the response store (a non-terminal frame whose provenance
+    /// lookup failed, or a frame the store did not keep whose tracker row could not be written),
+    /// per (command id, agent id), until a tracker row of the same pair records them as a lost
+    /// answer (`response_dropped`). Bounded, fails closed, self-locking
+    /// (unverified_frame_registry.hpp); lives and dies with this service.
+    UnverifiedFrameRegistry unverified_frames_;
+    /// Records such a pair; counts an eviction as
+    /// `yuzu_server_response_ingest_dropped_total{reason="unverified_registry_overflow"}`.
+    void note_unverified_frame(const std::string& command_id, const std::string& agent_id);
+    /// True when the pair's answer must be reported as not fully stored. Erases nothing:
+    /// `notify_exec_tracker` forgets the pair once a tracker row has recorded the flag.
+    [[nodiscard]] bool unverified_frame_seen(const std::string& command_id,
+                                             const std::string& agent_id);
     // The former in-process `cmd_execution_ids_` map (command_id ->
     // execution_id) moved to Postgres (HA WS-1(1b), ADR-2002 section 5) —
     // see ExecutionTracker::record_command_dispatch /
@@ -677,6 +709,9 @@ private:
 
     // PR3 per-agent mTLS (set post-bootstrap; empty = disabled / legacy path).
     AgentCertSigner agent_cert_signer_;
+    std::shared_ptr<const AgentIdentityHooks> agent_identity_hooks_;
+    ReregistrationProofMode reregistration_mode_{ReregistrationProofMode::Audit};
+    std::function<bool(const std::string&)> cert_proof_override_for_test_;
     std::function<bool(const std::string&)> revocation_checker_;
     std::function<bool(const std::string&)> peer_cert_recognizer_;
 
@@ -725,8 +760,18 @@ private:
     /// `renew_concurrency_claim_by_command`, keyed on `command_id` alone
     /// (rides the wire response independent of the correlation table). See
     /// those methods' doc comments.
+    ///
+    /// `response_dropped` is true when the frame the response store was given for this response
+    /// was not kept (a failed write, a lost terminal answer, or a cap-refused non-terminal frame);
+    /// the tracker records it with the agent's status (same upsert) and never clears it, so the
+    /// fill of a result set can count that agent as unanswered. A terminal frame also reports an
+    /// earlier non-terminal frame of the same agent whose provenance lookup failed (stored under
+    /// the unverified label, so absent from the fill's read); once the tracker row has recorded a
+    /// true flag, the record of that frame is forgotten (never earlier, and never on an early
+    /// return or a failed upsert). Keepalive callers pass false.
     void notify_exec_tracker(const std::string& command_id, const std::string& agent_id,
-                             const pb::CommandResponse& resp, const ResponseProvenance& prov);
+                             const pb::CommandResponse& resp, const ResponseProvenance& prov,
+                             bool response_dropped);
 
     /// #4990: the failure text of a terminal frame in the form the server's own derived sinks may
     /// carry: the execution tracker (and through it the drawer, the event stream and the outbox),

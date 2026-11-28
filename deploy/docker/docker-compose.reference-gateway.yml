@@ -66,14 +66,15 @@
 ## Mgmt-plane reachability: the gateway co-hosts the agent edge (:50051) and the
 ## privileged mgmt plane (:50063) on 0.0.0.0, so on this single demo bridge an
 ## agent could reach :50063 at the network layer. Two controls reject it: strict
-## mutual TLS (#1314 — no CA-issued cert, no handshake) and the SPKI peer pin
-## (#1422 — a CA-issued cert that is not the server's default-server leaf, an
+## mutual TLS (#1314 — no CA-issued cert, no handshake) and peer authorization
+## (the server identity, or an SPKI pin: see docs/user-manual/gateway.md; #1422 —
+## a CA-issued cert that is not the server's default-server leaf, an
 ## enrolled agent's included, gets UNAUTHENTICATED before any handler runs). A
 ## *production* deployment additionally isolates/firewalls the mgmt plane from
 ## agents at the infra layer.
 ##
 ## Usage:
-##   export YUZU_VERSION=0.15.0
+##   export YUZU_VERSION=0.16.0
 ##   # the server REQUIRES Postgres (fails closed otherwise) — set the two
 ##   # DISTINCT db passwords (superuser + app role):
 ##   export YUZU_POSTGRES_PASSWORD="$(openssl rand -hex 24)"
@@ -97,7 +98,7 @@
 
 services:
   server:
-    image: ghcr.io/devnullltd/yuzu-server:${YUZU_VERSION:-0.15.0}
+    image: ghcr.io/devnullltd/yuzu-server:${YUZU_VERSION:-0.16.0}
     container_name: yuzu-server
     restart: unless-stopped
     # MCP streamed POST ships ON by default (docs/user-manual/server-admin.md
@@ -142,7 +143,7 @@ services:
       start_period: 10s
 
   gateway:
-    image: ghcr.io/devnullltd/yuzu-gateway:${YUZU_VERSION:-0.15.0}
+    image: ghcr.io/devnullltd/yuzu-gateway:${YUZU_VERSION:-0.16.0}
     # Planned stop: the gateway ends its agent sessions and sends their
     # DISCONNECTED notices to the server before it exits, within
     # shutdown_flush_budget_ms (default 20 s), then stops its processes. The
@@ -161,9 +162,12 @@ services:
         max-size: "50m"
         max-file: "5"
     environment:
-      # Single-node, ephemeral — accept the default Erlang distribution cookie
-      # (the gateway fail-closes on it otherwise). NEVER set this in a clustered
-      # production gateway; set a strong YUZU_GW_COOKIE instead.
+      # Single-node, ephemeral — no operator cookie: the entrypoint generates a
+      # random per-boot cookie (never the published default). This node advertises
+      # a routable address, so it is protected by that secret cookie, not by a
+      # loopback bind. Replicas on this override are singletons that cannot
+      # cluster. NEVER set this in a clustered production gateway; set a strong
+      # shared YUZU_GW_COOKIE instead.
       YUZU_GW_ALLOW_DEFAULT_COOKIE: "1"
     volumes:
       # The listeners come from sys.config, not env — mount the TLS sys.config (#1291 follow-up).
@@ -177,7 +181,7 @@ services:
     # agent in docker-publish-chisel only, never in the plain docker-publish
     # matrix, so `yuzu-agent` has never existed at any tag and this service
     # could never start. Same binary and entrypoint as the other images.
-    image: ghcr.io/devnullltd/yuzu-agent-chisel:${YUZU_VERSION:-0.15.0}
+    image: ghcr.io/devnullltd/yuzu-agent-chisel:${YUZU_VERSION:-0.16.0}
     command:
       - "--server=gateway:50051"
       # No --ca-cert: the agent auto-discovers the install CA at
@@ -209,7 +213,7 @@ services:
   # (yuzu-pki) so it can traverse the 0750 cert dir and no capabilities at all.
   # It re-runs on every `up`, so a re-rooted CA is picked up.
   ca-export:
-    image: ghcr.io/devnullltd/yuzu-server:${YUZU_VERSION:-0.15.0}
+    image: ghcr.io/devnullltd/yuzu-server:${YUZU_VERSION:-0.16.0}
     container_name: yuzu-ca-export
     restart: "no"
     user: "0:2000"
@@ -238,7 +242,7 @@ services:
   # An external/managed Postgres is first-class — point the server's
   # YUZU_POSTGRES_DSN at it and drop this service + the server depends_on.
   postgres:
-    image: ghcr.io/devnullltd/yuzu-postgres:${YUZU_VERSION:-0.15.0}
+    image: ghcr.io/devnullltd/yuzu-postgres:${YUZU_VERSION:-0.16.0}
     container_name: yuzu-postgres
     restart: unless-stopped
     environment:

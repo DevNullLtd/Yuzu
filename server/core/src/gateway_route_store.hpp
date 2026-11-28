@@ -363,6 +363,7 @@
 ///     eventually wins per the anti-replay fence) still announces the
 ///     matching `cluster_id` and self-heals the row.
 
+#include "offline_endpoint_types.hpp" // PluginAbsence: the (agent, session) claim of confirm_sessions
 #include "pg/pg_migration_runner.hpp"
 
 #include <cstdint>
@@ -564,12 +565,6 @@ struct RouteRow {
     /// operator re-home) — the NEXT `announce_connected` binds it (TOFU). See
     /// the file header "AGENT<->CLUSTER AFFINITY" note.
     std::optional<std::string> home_cluster_id;
-    /// Echo rename, upgrade window (removed with the other legacy-name shims; the column
-    /// stays): the agent registered with the pre-rename plugin name `tar`.
-    /// `lookup_route`/`lookup_routes` fill it; it exists so the HA directory dispatch path,
-    /// which has no AgentSession, can still write the legacy plugin name on the wire. Written
-    /// only by `register_fresh`.
-    bool legacy_echo_wire_name{false};
 };
 
 /// A route paired with the `routable` verdict computed by `lookup_routes`.
@@ -608,8 +603,7 @@ public:
     /// forward a superseded connection's cluster/node/home-id until its own
     /// CONNECTED confirms them.
     [[nodiscard]] std::expected<RegisterFreshResult, GatewayRouteStoreError>
-    register_fresh(std::string_view agent_id, std::string_view session_id,
-                   bool legacy_echo_wire_name = false);
+    register_fresh(std::string_view agent_id, std::string_view session_id);
 
     /// Record that `session_id`'s connection is fully established on
     /// `cluster_id`/`gateway_node`, with a lease valid for `lease_ttl_secs`.
@@ -789,6 +783,19 @@ public:
     /// `RoutableRoute` for the `routable` computation.
     [[nodiscard]] std::expected<std::vector<RoutableRoute>, GatewayRouteStoreError>
     lookup_routes(std::span<const std::string> agent_ids);
+
+    /// Which (agent, session) claims the directory still confirms (#5685 follow-up, plugin
+    /// visibility): the ids whose ROUTABLE row (`session_id IS NOT NULL AND lease_until >= now()
+    /// AND cluster_id IS NOT NULL`, the same predicate as `lookup_routes`' `routable`, on the DB
+    /// clock) names EXACTLY the claimed session. An agent with no row, a tombstone, an expired or
+    /// unplaced row, or a different session is simply absent from the result. ONE statement
+    /// (`unnest` of two parallel text arrays joined to the primary key) on one lease bounded by
+    /// `kReadTimeout` and the statement itself bounded to 2 s by `SET LOCAL statement_timeout` (the pool default is 30 s), returning only the matches, so a fleet-sized claim list neither builds a
+    /// full `RouteRow` per agent nor returns the unmatched ones. Empty claims return empty with no
+    /// lease. A failure is a typed error (the caller fails open). Logged at debug only: the
+    /// caller counts the outcome per dispatch (`yuzu_server_plugin_absence_confirm_total`).
+    [[nodiscard]] std::expected<std::vector<std::string>, GatewayRouteStoreError>
+    confirm_sessions(std::span<const PluginAbsence> claims);
 
     /// Batched SESSION-keyed read (WS-5, #4246 #3): every row whose
     /// `session_id` is in `session_ids`. Empty ids and ids longer than 64

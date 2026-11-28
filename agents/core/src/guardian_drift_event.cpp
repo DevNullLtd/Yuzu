@@ -39,4 +39,8 @@ void apply_drift_to_event(const GuardDrift& d, gpb::GuaranteedStateEvent& ev) {
         ev.set_drift_rate(static_cast<double>(d.collapsed_count));
 }
 
+bool guardian_event_refused_by_server(const ::yuzu::guardian::v1::GuaranteedStateEvent& ev) {
+    return ev.rule_id().empty();
+}
+
 } // namespace yuzu::agent

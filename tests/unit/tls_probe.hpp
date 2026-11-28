@@ -9,15 +9,18 @@
  * the first to need one, and Part B (agents/core) reuses this file
  * unchanged.
  *
- * WHY EVERY SYSCALL IS SOCKET-DEADLINED, NOT FUTURE-BOUNDED: a
+ * WHY HANDSHAKES USE SOCKET TIMEOUTS, NOT FUTURE-BOUNDED TASKS: a
  * std::future's destructor blocks on whatever the async task is doing, so a
  * probe stalled inside a BIO call would hang the whole test binary rather
- * than fail a single case. Every blocking call here is bounded at the
- * SOCKET (SO_RCVTIMEO/SO_SNDTIMEO — the idiom in test_mcp_body_cap.cpp:
+ * than fail a single case. Connected sockets use
+ * SO_RCVTIMEO/SO_SNDTIMEO (the idiom in test_mcp_body_cap.cpp:
  * 277-284; Windows wants a DWORD of MILLISECONDS there, not a `timeval`)
- * plus a steady_clock deadline around every BIO_should_retry loop, so a
- * silent peer yields `timed_out = true` rather than a hang. No std::async,
- * no detached threads for client probes.
+ * plus a steady_clock deadline around retry loops. These are NOT hard
+ * end-to-end deadlines: blocking TCP connect/accept precedes the socket
+ * timeout setup, and a blocking call can overrun a retry-loop deadline.
+ * RawTlsServer::stop() uses a loopback poison connection to wake accept
+ * before joining; it cannot promise bounded teardown if that wakeup fails.
+ * No std::async or detached threads are used by client probes.
  *
  * WHAT `alert_received` MEANS: the TLS alert DESCRIPTION the PEER sent,
  * captured via SSL_set_info_callback on SSL_CB_ALERT|SSL_CB_READ. A genuine
@@ -153,7 +156,7 @@ struct ProbeResult {
     bool connect_ok = false;
     bool handshake_ok = false;
     bool timed_out = false;
-    std::string version, cipher;
+    std::string version, cipher, alpn;
     int err_reason = 0;
     std::string err_text;
     int alert_received = -1; ///< TLS alert description the PEER sent, or -1
@@ -285,6 +288,11 @@ struct ProbeResult {
     result.version = SSL_get_version(ssl);
     const SSL_CIPHER* c = SSL_get_current_cipher(ssl);
     result.cipher = c ? SSL_CIPHER_get_name(c) : "";
+    const unsigned char* alpn = nullptr;
+    unsigned int alpn_len = 0;
+    SSL_get0_alpn_selected(ssl, &alpn, &alpn_len);
+    if (alpn_len != 0)
+        result.alpn.assign(reinterpret_cast<const char*>(alpn), alpn_len);
     return result;
 }
 
@@ -424,10 +432,15 @@ public:
             ctx_.get(),
             [](SSL*, const unsigned char** out, unsigned char* outlen, const unsigned char* in,
                unsigned int inlen, void*) -> int {
-                static const unsigned char kH2[] = "h2";
-                if (SSL_select_next_proto(const_cast<unsigned char**>(out), outlen, kH2, 2, in,
-                                          inlen) != OPENSSL_NPN_NEGOTIATED)
+                // SSL_select_next_proto takes a length-prefixed protocol
+                // list, not the bare protocol name. The selected bytes
+                // borrow this static array for the handshake's lifetime.
+                static const unsigned char kH2[] = {2, 'h', '2'};
+                unsigned char* selected = nullptr;
+                if (SSL_select_next_proto(&selected, outlen, kH2, sizeof(kH2), in, inlen) !=
+                    OPENSSL_NPN_NEGOTIATED)
                     return SSL_TLSEXT_ERR_NOACK;
+                *out = selected;
                 return SSL_TLSEXT_ERR_OK;
             },
             nullptr);
@@ -550,6 +563,11 @@ private:
             observed.version = SSL_get_version(ssl.get());
             const SSL_CIPHER* c = SSL_get_current_cipher(ssl.get());
             observed.cipher = c ? SSL_CIPHER_get_name(c) : "";
+            const unsigned char* alpn = nullptr;
+            unsigned int alpn_len = 0;
+            SSL_get0_alpn_selected(ssl.get(), &alpn, &alpn_len);
+            if (alpn_len != 0)
+                observed.alpn.assign(reinterpret_cast<const char*>(alpn), alpn_len);
         } else {
             observed.err_reason = ERR_GET_REASON(ERR_peek_last_error());
             char buf[256];

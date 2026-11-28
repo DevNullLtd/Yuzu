@@ -207,6 +207,11 @@ JournalReject validate_record(const JournalRecord& r) {
     if (r.enqueued_ns % kNsPerSec < 0) --secs; // floor toward -inf, as set_common does
     if (secs <= 0) return JournalReject::SkewedClock;
 
+    // After the clock, before the field scan, so the loss-channel taxonomy keeps the clock
+    // fault first. Also the replay gate (guardian_lifecycle_journal.cpp), which quarantines a
+    // batch holding such a row instead of replaying an event the server would refuse.
+    if (r.rule_id.empty()) return JournalReject::EmptyRuleId;
+
     for (const std::string_view f : {std::string_view{r.rule_id}, std::string_view{r.event_id},
                                      std::string_view{r.kind}, std::string_view{r.guard_type},
                                      std::string_view{r.rule_name}}) {

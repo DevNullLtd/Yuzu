@@ -1,5 +1,7 @@
 #include "agent_service_impl.hpp"
 
+#include "agent_reregistration_apply.hpp"
+
 #include "ota_signature_sidecar.hpp"
 
 #include "ota_audit_key.hpp"
@@ -83,6 +85,10 @@ namespace {
 // bound as one agent, plugin_result_audit.hpp).
 static_assert(kRegistryAuditBudgetKeyBytes >= auth::kMaxAgentIdLength,
               "the registry audit budget must key on a whole agent id");
+// The unverified-frame registry keeps exact agent ids up to the enrolment bound (a longer one is
+// never stored and fails closed).
+static_assert(UnverifiedFrameRegistry::kMaxAgentIdBytes == auth::kMaxAgentIdLength,
+              "the unverified-frame registry must keep every enrolled agent id whole");
 
 // Persists the `registry.write` audit rows one stored output frame owes (see
 // plugin_result_audit.hpp for the binding: a minted registry command id AND an agent-stamped
@@ -247,6 +253,9 @@ AgentServiceImpl::AgentServiceImpl(AgentRegistry& registry, EventBus& bus,
     // constructs this service directly. set_ota_bound_config() replaces it.
     set_ota_bound_config(ota_cfg_);
     registry_audit_budget_ = make_registry_audit_budget();
+    if (unverified_frames_.salt_fell_back())
+        spdlog::warn("[ingest] no random salt could be drawn for the unverified-frame record: its "
+                     "command-id digest runs unsalted in this process");
 }
 
 // -- Register -----------------------------------------------------------------
@@ -305,6 +314,10 @@ grpc::Status AgentServiceImpl::Register(grpc::ServerContext* context,
     // client cert (it obtains one via this very call), so a no-cert Register is
     // permitted even when mTLS identity is required. But a PRESENTED cert (re-auth
     // after enrollment) MUST match the claimed agent_id and must not be revoked.
+    // WP01: set only when the presented certificate is a Yuzu-issued, CN-matching, unrevoked
+    // leaf for THIS agent id (the end of the block below, after every refusal). The re-registration
+    // gate treats nothing else as proof of the existing identity.
+    bool cert_proves_identity = false;
     if (require_client_identity_ && context) {
         const auto idents = extract_peer_identities(*context);
         if (!idents.empty()) {
@@ -331,9 +344,17 @@ grpc::Status AgentServiceImpl::Register(grpc::ServerContext* context,
                     return grpc::Status(grpc::StatusCode::UNAUTHENTICATED,
                                         "client certificate is revoked");
                 }
+                // With a recognizer wired (our own CA is active) reaching here means the leaf
+                // chains to OUR CA, names this agent and is unrevoked. Without one this is the
+                // legacy operator-CA posture, which has no ca_issued leaf and so no gate (the
+                // hooks are only wired together with the recognizer).
+                cert_proves_identity = peer_cert_recognizer_ != nullptr;
             }
         }
     }
+
+    if (cert_proof_override_for_test_)
+        cert_proves_identity = cert_proof_override_for_test_(info.agent_id());
 
     // -- Tiered enrollment -------------------------------------------------------
 
@@ -349,6 +370,37 @@ grpc::Status AgentServiceImpl::Register(grpc::ServerContext* context,
             .increment();
         return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT,
                             "agent_id may only contain letters, digits, '.', '_', ':' and '-'");
+    };
+
+    // WP01: an already-enrolled id whose live leaf is not proven re-enrols through the token
+    // block below, as a re-enrolment (single-use token required, older leaf superseded).
+    bool reenrol_via_token = false;
+    bool reenrolled_with_token = false; // the token block accepted a re-enrolment
+    // The refusal of an unusable re-enrolment token: a gRPC status, NEVER accepted=false (a
+    // permanent rejection to the agent), so the agent keeps retrying until it holds a good token.
+    const auto reenrol_token_refusal = [&](std::string_view reason) {
+        metrics_.counter("yuzu_register_reenrol_token_refused_total", {{"reason", std::string(reason)}})
+            .increment();
+        spdlog::warn("Register: re-enrolment token refused for agent {} ({})", safe_agent_id,
+                     reason);
+        return grpc::Status(grpc::StatusCode::UNAUTHENTICATED,
+                            std::string(yuzu::server::kReregistrationRefusalPublicMessage));
+    };
+
+    const auto run_reregistration_gate = [&]() {
+        return yuzu::server::apply_reregistration_gate(
+            reregistration_mode_, require_client_identity_ ? agent_identity_hooks_.get() : nullptr,
+            "direct", info.agent_id(), safe_agent_id,
+            yuzu::server::ReregistrationEvidence{
+                .cert_proves_identity = cert_proves_identity,
+                .token_presented = !request->enrollment_token().empty(),
+                .transport_can_prove = true},
+            &metrics_,
+            yuzu::server::make_reregistration_audit_sink(
+                audit_store_, "direct", info.agent_id(),
+                context ? extract_peer_ip(context->peer()) : std::string{}, nullptr,
+                [&] { signal_grpc_audit_failed(context); }, &metrics_),
+            context ? extract_peer_ip(context->peer()) : std::string{});
     };
 
     // Fast path: agent already enrolled from a prior connection — skip enrollment
@@ -378,7 +430,32 @@ grpc::Status AgentServiceImpl::Register(grpc::ServerContext* context,
         if (prior && *prior == auth::PendingStatus::approved) {
             spdlog::info("Agent {} re-registering (already enrolled)", safe_agent_id);
             is_reauth = true;
-            goto enrolled;
+            // WP01: the approved row is not proof of WHO is calling. Decide it here, before
+            // registry_.register_agent (which would replace the live session and revoke device
+            // tokens), so a refused caller cannot displace the real agent. Plain-TLS and
+            // --no-tls listeners (no client identity required) have no proof to offer: inert.
+            const auto verdict = run_reregistration_gate();
+            if (verdict.route == yuzu::server::ReregistrationVerdict::Route::Refuse)
+                return *verdict.refusal;
+            if (verdict.route == yuzu::server::ReregistrationVerdict::Route::TokenReenrol)
+                reenrol_via_token = true; // fall through to the token block
+            else
+                goto enrolled;
+        }
+        // WP01 / UP-2: the gate keys on the LEAF STATE, not on the pending row. An operator who
+        // deleted the enrollment row of an id that still holds a live leaf must not make that id
+        // enrol afresh (auto-approve or a token) and be issued a second live leaf without proof:
+        // an absent row runs the same decision, and so does a PENDING one (a leftover or
+        // attacker-provoked pending row, or one created while still in audit mode, must not let a
+        // token or auto-approve issue a second live leaf: a pending row with NO leaf is the
+        // normal first-enrolment path and falls through as NoLeafOnRecord, unchanged). The result only matters when it refuses or asks
+        // for a single-use token; a proven/no-leaf verdict continues the ordinary flow below.
+        if (!prior || *prior == auth::PendingStatus::pending) {
+            const auto verdict = run_reregistration_gate();
+            if (verdict.route == yuzu::server::ReregistrationVerdict::Route::Refuse)
+                return *verdict.refusal;
+            if (verdict.route == yuzu::server::ReregistrationVerdict::Route::TokenReenrol)
+                reenrol_via_token = true;
         }
         // #1067: reject an admin-DENIED agent BEFORE consuming any enrollment
         // token. Previously the consume happened first and the admin-deny check
@@ -454,6 +531,8 @@ grpc::Status AgentServiceImpl::Register(grpc::ServerContext* context,
                                      {"token_length", enrollment_token.size()}};
                     analytics_store->emit(std::move(ae));
                 }
+                if (reenrol_via_token)
+                    return reenrol_token_refusal("invalid_input_length");
                 response->set_accepted(false);
                 response->set_reject_reason(
                     std::string(yuzu::server::kEnrollmentTokenRejectionPublicMessage));
@@ -484,7 +563,8 @@ grpc::Status AgentServiceImpl::Register(grpc::ServerContext* context,
                           yuzu::server::sanitize_enrollment_text(info.platform().os()),
                           yuzu::server::sanitize_enrollment_text(info.platform().arch()),
                           yuzu::server::sanitize_enrollment_text(info.agent_version()),
-                          /*enforce_new_id_charset=*/true)
+                          /*enforce_new_id_charset=*/true,
+                          /*require_single_use=*/reenrol_via_token)
                     : std::expected<auth::ConsumeEnrollResult, StoreError>{
                           auth::ConsumeEnrollResult{
                               .kind = auth::ConsumeEnrollResult::Kind::token_rejected,
@@ -600,6 +680,9 @@ grpc::Status AgentServiceImpl::Register(grpc::ServerContext* context,
                     analytics_store->emit(std::move(ae));
                 }
 
+                if (reenrol_via_token)
+                    return reenrol_token_refusal(consumed->not_single_use ? std::string_view{"multi_use_token"}
+                                                                      : std::string_view{variant});
                 response->set_accepted(false);
                 response->set_reject_reason(
                     std::string(yuzu::server::kEnrollmentTokenRejectionPublicMessage));
@@ -611,6 +694,16 @@ grpc::Status AgentServiceImpl::Register(grpc::ServerContext* context,
             // ONE store transaction (consume_and_enroll), so the success audit row
             // below only ever describes a completed enrollment.
             const auto& claim = consumed->claim;
+            if (reenrol_via_token) {
+                // WP01 / owner decision D5: a MULTI-USE (fleet) token is not proof of an existing
+                // identity - it is shared by every holder - so only a single-use token (max_uses ==
+                // 1) re-enrols an id that already holds a live leaf. That is decided INSIDE the
+                // consume UPDATE (require_single_use), so a multi-use token is never consumed and
+                // never reaches here; this is a defence-in-depth backstop only.
+                if (claim.max_uses != 1)
+                    return reenrol_token_refusal("multi_use_token");
+                reenrolled_with_token = true;
+            }
             spdlog::info("Agent {} auto-enrolled via enrollment token id={} ({}/{})", safe_agent_id,
                          claim.token_id, claim.use_count_after,
                          claim.max_uses == 0 ? -1 : claim.max_uses);
@@ -637,6 +730,20 @@ grpc::Status AgentServiceImpl::Register(grpc::ServerContext* context,
                     ev.source_ip = extract_peer_ip(context->peer());
                 ev.result = "success";
                 enroll_audit_ok = audit_store_->log(ev);
+                if (reenrolled_with_token) {
+                    // WP01: the re-enrolment of an id that holds a live leaf is its own,
+                    // countable event (the token authorised it, not the old credential).
+                    AuditEvent re = ev;
+                    re.action = "agent.reenrolled_with_token";
+                    re.target_type = "Agent";
+                    re.target_id = info.agent_id();
+                    re.detail = "token_id=" + claim.token_id + " via=direct";
+                    enroll_audit_ok = audit_store_->log(re) && enroll_audit_ok;
+                }
+            } else if (audit_store_) {
+                // A wired but closed store cannot record the enrolment (nor the re-enrolment row):
+                // that is the same dropped-evidence degradation as a failed write, never silence.
+                enroll_audit_ok = false;
             }
             // #1065 / #1063: a dropped SUCCESS audit row is the same
             // evidence-chain degradation as a dropped failure row — was
@@ -894,6 +1001,11 @@ enrolled:
     // a per-agent client leaf bound to agent_id and return it; the agent persists
     // it and reconnects with mutual TLS. Signing failure is non-fatal — the agent
     // stays on the bootstrap (request-but-don't-require) posture and can retry.
+    std::string_view no_leaf_reason; // set only when NO new leaf is issued below
+    if (request->csr_pem().empty())
+        no_leaf_reason = yuzu::server::kReenrolNoLeafNoCsr;
+    else if (!agent_cert_signer_)
+        no_leaf_reason = yuzu::server::kReenrolNoLeafNoSigner;
     if (!request->csr_pem().empty() && agent_cert_signer_) {
         // #1273 B-2: contain any exception out of the signer — it runs in this sync
         // handler; a throw would terminate the server. Degrade to no-cert (the
@@ -904,17 +1016,46 @@ enrolled:
             issued = agent_cert_signer_(request->csr_pem(), info.agent_id(),
                                         CertIssuanceSource::Direct);
         } catch (const std::exception& e) {
+            no_leaf_reason = yuzu::server::kReenrolNoLeafSignerThrew;
             spdlog::error("Register: signer threw for agent {}: {}", safe_agent_id, e.what());
         } catch (...) {
+            no_leaf_reason = yuzu::server::kReenrolNoLeafSignerThrew;
             spdlog::error("Register: signer threw a non-std exception for agent {}", safe_agent_id);
         }
         if (issued) {
             response->set_issued_certificate(issued->first);
             response->set_issued_ca_chain(issued->second);
             spdlog::info("Issued per-agent client cert for {}", safe_agent_id);
+            // WP01 / D4: the old leaf must not stay valid beside its replacement - the key was
+            // lost, and a lost key may be a stolen key. Only AFTER the new leaf exists (revoking
+            // first would trip sign_agent_csr's revoked-identity guard) and never without one
+            // (that would strand the agent).
+            if (reenrolled_with_token && agent_identity_hooks_ &&
+                agent_identity_hooks_->supersede_older_leaves) {
+                try {
+                    if (!agent_identity_hooks_->supersede_older_leaves(info.agent_id(),
+                                                                       issued->first))
+                        spdlog::warn("agent {}: older leaves not superseded (see "
+                                     "ca.cert.supersede_failed)",
+                                     safe_agent_id);
+                } catch (...) {
+                    spdlog::error("Register: superseding older leaves threw for agent {}",
+                                  safe_agent_id);
+                    metrics_.counter("yuzu_server_ca_supersede_failed_total").increment();
+                }
+            }
         } else {
             spdlog::warn("Register: client-cert signing failed for agent {}", safe_agent_id);
+            if (no_leaf_reason.empty())
+                no_leaf_reason = yuzu::server::kReenrolNoLeafSignerFailed;
         }
+    }
+    // WP01: a single-use token was consumed to re-enrol a live-leaf id but NO leaf was issued: the
+    // token is spent and the old leaf stays. Count it (alert YuzuAgentReenrolTokenNoLeaf).
+    if (reenrolled_with_token && !no_leaf_reason.empty()) {
+        yuzu::server::count_reenrol_token_no_leaf(&metrics_, no_leaf_reason);
+        spdlog::warn("agent {}: re-enrolment token consumed but no leaf issued ({})", safe_agent_id,
+                     no_leaf_reason);
     }
 
     PendingRegistration pending;
@@ -1516,6 +1657,11 @@ grpc::Status AgentServiceImpl::Subscribe(
     registry_.set_stream(agent_id, stream, context,
                          revocation_checker_ ? extract_peer_cert_pem(*context) : std::string{});
     registry_.map_session(session_id, agent_id);
+    // HA WS-5 #5685 follow-up: the arrival mirror of the departure mirror below. Hygiene only (it
+    // drops a previous session's plugin list); the verdict is confirmed against the directory row.
+    mirror_arrival_to_presence(
+        heartbeat_ingestion_ ? heartbeat_ingestion_->offline_endpoint_store() : nullptr, agent_id,
+        session_id);
 
     auto subscribe_start = std::chrono::steady_clock::now();
     if (auto analytics_store = analytics_store_.lock()) {
@@ -1594,9 +1740,15 @@ grpc::Status AgentServiceImpl::Subscribe(
             const ResponseProvenance prov =
                 resolve_response_provenance(resp.command_id(), resp.output() == "__keepalive__");
             if (resp.output() == "__keepalive__") {
-                notify_exec_tracker(resp.command_id(), agent_id, resp, prov);
+                notify_exec_tracker(resp.command_id(), agent_id, resp, prov,
+                                    /*response_dropped=*/false);
                 continue;
             }
+            // A failed provenance lookup: stored under the unverified label, which the result-set
+            // fill never reads, and reaching no tracker row, so the pair's terminal frame reports
+            // it (unverified_frame_seen). An unrecorded id can never reach a tracker row: not noted.
+            if (prov.outcome == ProvenanceOutcome::kLookupDegraded)
+                note_unverified_frame(resp.command_id(), agent_id);
 
             // Track first response for server-side latency
             {
@@ -1621,7 +1773,12 @@ grpc::Status AgentServiceImpl::Subscribe(
             // Publish each row as its own SSE event
             publish_output_rows(agent_id, plugin, resp.output());
 
-            // Store streaming response
+            // Store streaming response. A frame the store did not keep (a failed write, or a cap
+            // refusal) carries output no stored-response read will return: `response_dropped`
+            // records it beside the agent's status (same tracker upsert), and the tracker keeps
+            // it for the rest of the execution, so a result-set fill cannot read the agent as
+            // having fully answered.
+            bool response_dropped = false;
             if (response_store_) {
                 StoredResponse sr;
                 sr.instruction_id = resp.command_id();
@@ -1634,7 +1791,7 @@ grpc::Status AgentServiceImpl::Subscribe(
                 // command_execution record so the executions detail drawer
                 // can correlate exactly, on any replica.
                 sr.execution_id = prov.execution_id;
-                response_store_->store(sr);
+                response_dropped = !store_outcome_durable(response_store_->store(sr));
             }
 
             // registry.write audit rows (RUNNING frames carry the plugin output).
@@ -1646,7 +1803,7 @@ grpc::Status AgentServiceImpl::Subscribe(
             // UAT 2026-05-06 #8: notify the executions tracker so the
             // drawer's per-agent KPI table populates and the SSE
             // `agent-transition` event fires for live updates.
-            notify_exec_tracker(resp.command_id(), agent_id, resp, prov);
+            notify_exec_tracker(resp.command_id(), agent_id, resp, prov, response_dropped);
 
             if (auto analytics_store = analytics_store_.lock()) {
                 AnalyticsEvent ae;
@@ -1671,7 +1828,10 @@ grpc::Status AgentServiceImpl::Subscribe(
             const ResponseProvenance prov = resolve_response_provenance(resp.command_id());
             const std::string sink_error = failure_text_for_sinks(prov.plugin, resp);
 
-            // Store completion response
+            // Store completion response. `response_dropped` records that this terminal answer was
+            // NOT persisted (a failed store or finalize); the tracker keeps it beside the agent's
+            // status so a result-set fill does not count the agent as having answered.
+            bool response_dropped = false;
             if (response_store_) {
                 const std::string& plugin_name = prov.plugin;
                 std::string err_detail;
@@ -1715,12 +1875,20 @@ grpc::Status AgentServiceImpl::Subscribe(
                     sr.plugin = plugin_name;
                     sr.error_detail = err_detail;
                     sr.execution_id = current_exec;
-                    response_store_->store(sr);
+                    response_dropped = !store_outcome_durable(response_store_->store(sr));
+                } else if (finalize_result == FR::Error) {
+                    // Already logged inside the store; do NOT insert (would re-create the
+                    // sentinel). The terminal answer is not durable, so say so.
+                    response_dropped = true;
                 }
                 // FR::Updated → row already updated in place, no insert.
-                // FR::Error → already logged inside the store; do NOT
-                //             insert — would re-create the sentinel.
             }
+            // An earlier RUNNING frame of this agent whose provenance lookup failed is absent from
+            // the result-set fill's read: the answer is not fully stored. Checked, not consumed:
+            // notify_exec_tracker below forgets the record only once a tracker row carries the
+            // flag, so a terminal frame it cannot record leaves the record for a replay.
+            if (unverified_frame_seen(resp.command_id(), agent_id))
+                response_dropped = true;
 
             // A terminal frame that carries output AND the agent-stamped action owes its audit
             // rows too (defence in depth: this agent's terminal frame carries no output); a frame
@@ -1733,7 +1901,7 @@ grpc::Status AgentServiceImpl::Subscribe(
             // UAT 2026-05-06 #8: notify the executions tracker on terminal
             // status so the drawer's per-agent KPI flips to its terminal
             // state and the SSE `agent-transition` event fires.
-            notify_exec_tracker(resp.command_id(), agent_id, resp, prov);
+            notify_exec_tracker(resp.command_id(), agent_id, resp, prov, response_dropped);
 
             std::string status_str =
                 (resp.status() == pb::CommandResponse::SUCCESS) ? "done" : "error";
@@ -1951,12 +2119,16 @@ void AgentServiceImpl::record_command_dispatch(const std::string& command_id,
     // has failed the rest are SKIPPED: counted as a degrade exactly like a failed write (the
     // command is still dispatched; its responses are labelled unverified), so an outage costs the
     // loop one short wait, not N. A null latch is every other caller: the ordinary budget, no skip.
+    auto* tracker = execution_tracker_.load(std::memory_order_acquire);
     if (latch && latch->tripped()) {
         latch->note_skipped();
         metrics_.counter("yuzu_exec_correlation_write_degrade_total").increment();
+        // #3678: the command is still sent and may consume an agent dedup-ring slot, so the
+        // outbox redelivery horizon must count it even though its record was not written.
+        if (tracker)
+            tracker->note_unrecorded_dispatch();
         return;
     }
-    auto* tracker = execution_tracker_.load(std::memory_order_acquire);
     const bool recorded =
         tracker && (latch ? tracker->record_command_dispatch(command_id, plugin, execution_id,
                                                              latch->lease_timeout())
@@ -1965,6 +2137,10 @@ void AgentServiceImpl::record_command_dispatch(const std::string& command_id,
         if (latch)
             latch->trip();
         metrics_.counter("yuzu_exec_correlation_write_degrade_total").increment();
+        // #3678: see the skipped branch above. A null tracker has no sequence to advance (the
+        // outbox's reader is then unreadable and holds), so there is nothing to count.
+        if (tracker)
+            tracker->note_unrecorded_dispatch();
     }
 }
 
@@ -1990,9 +2166,12 @@ void AgentServiceImpl::process_gateway_response(const std::string& agent_id,
         const ResponseProvenance prov =
             resolve_response_provenance(resp.command_id(), resp.output() == "__keepalive__");
         if (resp.output() == "__keepalive__") {
-            notify_exec_tracker(resp.command_id(), agent_id, resp, prov);
+            notify_exec_tracker(resp.command_id(), agent_id, resp, prov,
+                                /*response_dropped=*/false);
             return;
         }
+        if (prov.outcome == ProvenanceOutcome::kLookupDegraded) // see the Subscribe twin
+            note_unverified_frame(resp.command_id(), agent_id);
 
         // Track first response for server-side latency
         {
@@ -2013,6 +2192,7 @@ void AgentServiceImpl::process_gateway_response(const std::string& agent_id,
         const std::string& plugin = prov.plugin;
         publish_output_rows(agent_id, plugin, resp.output());
 
+        bool response_dropped = false; // a frame the store did not keep; see the Subscribe twin
         if (response_store_) {
             StoredResponse sr;
             sr.instruction_id = resp.command_id();
@@ -2024,7 +2204,7 @@ void AgentServiceImpl::process_gateway_response(const std::string& agent_id,
             // PR 2 / HA WS-1(1b): streaming response — keep the mapping
             // until completion (PG-backed, shared across replicas).
             sr.execution_id = prov.execution_id;
-            response_store_->store(sr);
+            response_dropped = !store_outcome_durable(response_store_->store(sr));
         }
 
         // registry.write audit rows. No gRPC context on the gateway path to carry an
@@ -2033,7 +2213,7 @@ void AgentServiceImpl::process_gateway_response(const std::string& agent_id,
         (void)audit_registry_frame(agent_id, resp, plugin);
 
         // UAT 2026-05-06 #8: gateway-streamed RUNNING — notify tracker.
-        notify_exec_tracker(resp.command_id(), agent_id, resp, prov);
+        notify_exec_tracker(resp.command_id(), agent_id, resp, prov, response_dropped);
 
         if (auto analytics_store = analytics_store_.lock()) {
             AnalyticsEvent ae;
@@ -2053,6 +2233,7 @@ void AgentServiceImpl::process_gateway_response(const std::string& agent_id,
         const ResponseProvenance prov = resolve_response_provenance(resp.command_id());
         const std::string sink_error = failure_text_for_sinks(prov.plugin, resp);
 
+        bool response_dropped = false; // see the Subscribe twin
         if (response_store_) {
             const std::string& gw_plugin = prov.plugin;
             std::string err_detail;
@@ -2086,17 +2267,21 @@ void AgentServiceImpl::process_gateway_response(const std::string& agent_id,
                 sr.plugin = gw_plugin;
                 sr.error_detail = err_detail;
                 sr.execution_id = current_exec;
-                response_store_->store(sr);
+                response_dropped = !store_outcome_durable(response_store_->store(sr));
+            } else if (finalize_result == FR::Error) {
+                response_dropped = true;
             }
             // FR::Updated → in-place; FR::Error → already logged, do NOT insert.
         }
+        if (unverified_frame_seen(resp.command_id(), agent_id)) // see the Subscribe twin
+            response_dropped = true;
 
         // A terminal frame that carries output owes its audit rows too (see the Subscribe twin;
         // the hook has logged any failure (and counted the rows it knows) itself).
         (void)audit_registry_frame(agent_id, resp, prov.plugin);
 
         // UAT 2026-05-06 #8: gateway-streamed terminal — notify tracker.
-        notify_exec_tracker(resp.command_id(), agent_id, resp, prov);
+        notify_exec_tracker(resp.command_id(), agent_id, resp, prov, response_dropped);
 
         std::string status_str = (resp.status() == pb::CommandResponse::SUCCESS) ? "done" : "error";
         metrics_.counter("yuzu_commands_completed_total", {{"status", status_str}}).increment();
@@ -2228,14 +2413,65 @@ std::string AgentServiceImpl::failure_text_for_sinks(const std::string& plugin,
         return {};
     std::string text = resp.error().message();
     if (!forensics_plugins_ || forensics_plugins_->contains(plugin))
-        text = sanitize_forensics_error_detail(text);
+        return sanitize_forensics_error_detail(text);
+    // Every sink of this text (tracker row, outbox, bus, notification, analytics, webhook) binds
+    // or embeds it as text, and a NUL byte cannot be stored in a text column. Replace it with
+    // U+FFFD so the status is always recorded; the rest of the message is kept as sent.
+    if (text.find('\0') != std::string::npos) {
+        std::string cleaned;
+        cleaned.reserve(text.size() + 8);
+        for (const char c : text) {
+            if (c == '\0')
+                cleaned += "\xEF\xBF\xBD";
+            else
+                cleaned += c;
+        }
+        text = std::move(cleaned);
+    }
     return text;
+}
+
+namespace {
+int64_t steady_seconds_now() {
+    return std::chrono::duration_cast<std::chrono::seconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+} // namespace
+
+void AgentServiceImpl::note_unverified_frame(const std::string& command_id,
+                                             const std::string& agent_id) {
+    const auto noted = unverified_frames_.note(command_id, agent_id, steady_seconds_now());
+    if (noted.evicted > 0)
+        metrics_
+            .counter("yuzu_server_response_ingest_dropped_total",
+                     {{"reason", "unverified_registry_overflow"}})
+            .increment(static_cast<double>(noted.evicted));
+    // The counter is the evidence for every eviction; these lines name the agent only when a
+    // marker or the latch is first set (at most one line per 10 min per agent for a marker).
+    if (noted.marked) {
+        static RefusalLogThrottle marker_log(std::chrono::seconds(600));
+        if (marker_log.should_warn(agent_id))
+            spdlog::warn("[ingest] the unverified-frame record is full for agent={}: for the "
+                         "next {} s every answer of that agent is reported as not fully stored",
+                         yuzu::log_id_token(agent_id),
+                         UnverifiedFrameRegistry::kDefaultMaxAgeSeconds);
+    }
+    if (noted.latched)
+        spdlog::warn("[ingest] the unverified-frame record cannot keep an entry: for the next "
+                     "{} s every agent answer is reported as not fully stored (agent={})",
+                     UnverifiedFrameRegistry::kDefaultMaxAgeSeconds, yuzu::log_id_token(agent_id));
+}
+
+bool AgentServiceImpl::unverified_frame_seen(const std::string& command_id,
+                                             const std::string& agent_id) {
+    return unverified_frames_.contains(command_id, agent_id, steady_seconds_now());
 }
 
 void AgentServiceImpl::notify_exec_tracker(const std::string& command_id,
                                            const std::string& agent_id,
                                            const pb::CommandResponse& resp,
-                                           const ResponseProvenance& prov) {
+                                           const ResponseProvenance& prov, bool response_dropped) {
     // Atomic snapshot — detached gateway-forward worker threads spawned
     // by ServerImpl::forward_gateway_pending outlive gRPC's Shutdown
     // drain (those threads are *clients* of the gateway, not server-side
@@ -2376,6 +2612,7 @@ void AgentServiceImpl::notify_exec_tracker(const std::string& command_id,
     // #4990: shown at the Execution:Read tier (drawer, execution status, event stream and outbox),
     // below the Forensics tier of the plugin's own rows; see failure_text_for_sinks.
     s.error_detail = failure_text_for_sinks(prov.plugin, resp);
+    s.response_dropped = response_dropped;
     switch (resp.status()) {
     case pb::CommandResponse::RUNNING:
         s.status = "running";
@@ -2405,7 +2642,18 @@ void AgentServiceImpl::notify_exec_tracker(const std::string& command_id,
     default:
         return;
     }
-    tracker->update_agent_status(execution_id, s);
+    // The row now carries the dropped-answer flag (sticky), so the record of an earlier unverified
+    // frame of this pair has done its job; a failed upsert keeps it for a replayed terminal frame.
+    // A lost answer whose row could not be written is recorded instead, so a later terminal or
+    // replayed frame of the pair still reports it. Noted even when a marker, a remembered command
+    // or the latch already reports the pair: those may expire first (note keeps an existing entry).
+    const bool recorded = tracker->update_agent_status(execution_id, s);
+    if (response_dropped) {
+        if (recorded)
+            unverified_frames_.forget(command_id, agent_id);
+        else
+            note_unverified_frame(command_id, agent_id);
+    }
 }
 
 void AgentServiceImpl::publish_output_rows(const std::string& agent_id, const std::string& plugin,

@@ -1189,8 +1189,7 @@ td .sub { display: block; overflow: hidden; text-overflow: ellipsis; color: var(
 .tl-kax .lab, .tl-kax .res { color: var(--mut); font-size: 12.5px; justify-content: center; font-weight: 400; }
 .tl-ktk { position: absolute; top: 0; bottom: 0; border-left: 1px solid var(--line2); padding-left: 5px; font-family: var(--mono); font-size: 11px; line-height: 34px; color: var(--mut); white-space: nowrap; }
 .tl-ks { position: absolute; top: 14px; height: 18px; border: 1px solid var(--c1); border-radius: 2px; font-family: var(--mono); font-size: 11px; line-height: 16px; padding: 0 5px; color: var(--ink2); overflow: hidden; white-space: nowrap; }
-.tl-ks.l { background: color-mix(in srgb, var(--c1) 55%, transparent); }
-.tl-ks.h1 { background: color-mix(in srgb, var(--c1) 34%, transparent); }
+.tl-ks.h1 { background: color-mix(in srgb, var(--c1) 34%, transparent); border-right: 2px dashed var(--c1); }
 .tl-ks.h2 { background: color-mix(in srgb, var(--c1) 22%, transparent); }
 .tl-ks.h3 { background: color-mix(in srgb, var(--c1) 11%, transparent); }
 .tl-ks.fz { border-style: dashed; }
@@ -1203,8 +1202,7 @@ td .sub { display: block; overflow: hidden; text-overflow: ellipsis; color: var(
 .tl-kleg { display: flex; flex-wrap: wrap; gap: 6px 18px; padding: 12px 16px; font-size: 13px; color: var(--mut); }
 .tl-kleg span { display: inline-flex; align-items: center; gap: 6px; }
 .tl-kleg i { display: inline-block; width: 16px; height: 10px; border: 1px solid var(--c1); border-radius: 2px; }
-.tl-kleg i.l { background: color-mix(in srgb, var(--c1) 55%, transparent); }
-.tl-kleg i.h1 { background: color-mix(in srgb, var(--c1) 34%, transparent); }
+.tl-kleg i.h1 { background: color-mix(in srgb, var(--c1) 34%, transparent); border-right: 2px dashed var(--c1); }
 .tl-kleg i.h2 { background: color-mix(in srgb, var(--c1) 22%, transparent); }
 .tl-kleg i.h3 { background: color-mix(in srgb, var(--c1) 11%, transparent); }
 .tl-knote { padding: 0 16px 14px; color: var(--mut); font-size: 13px; margin: 0; }
@@ -1218,7 +1216,7 @@ td .sub { display: block; overflow: hidden; text-overflow: ellipsis; color: var(
 .tl-rg { position: absolute; top: 5px; height: 20px; box-sizing: border-box; overflow: hidden; border: 1px dashed var(--line2); border-radius: 2px; background: var(--surface2); color: var(--mut); pointer-events: none; }
 .tl-rg b { display: block; padding: 0 6px; font-size: 11.5px; font-weight: 500; line-height: 18px; white-space: nowrap; }
 .tl-rg.rolled, .tl-rg.unstated { background: transparent; }
-.tl-rg.paused, .tl-rg.capped, .tl-rg.unreadable { border-color: var(--warn); background: color-mix(in srgb, var(--warn) 7%, transparent); color: var(--ink2); }
+.tl-rg.paused, .tl-rg.unreadable { border-color: var(--warn); background: color-mix(in srgb, var(--warn) 7%, transparent); color: var(--ink2); }
 .tl-warn { padding: 8px 16px; border-bottom: 1px solid var(--line); color: var(--warn); font-size: 13px; }
 .tl-row.d1 .lab { padding-left: 28px; }
 .tl-row.d2 .lab { padding-left: 40px; }

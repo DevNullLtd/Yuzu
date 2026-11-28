@@ -275,6 +275,9 @@ TEST_CASE("every documented Guardian heartbeat tag is one the emitter actually e
     // #4045: yuzu.guardian_baseline_persist_failures, so a metrics.md mention of it is checked
     // against its emitter instead of tripping this scrape with no way to satisfy it.
     emit_guardian_baseline_persist_heartbeat_tags(emitted, 1);
+    // #5605: the current-backlog tag and the boot-scan tag (non-zero, so the sparse one emits).
+    emit_guardian_baseline_unpersisted_heartbeat_tag(emitted, std::optional<std::uint64_t>{1});
+    emit_guardian_baseline_rebaselined_heartbeat_tag(emitted, 1);
     // Governance fix (Gate 8, doc-scrape false-negative): yuzu.guardian_generation is a
     // real, always-emitted heartbeat tag - a metrics.md doc edit mentioning it by name (the
     // arm-gauge alerting-hazard note) trips this scrape unless an emitter call covers it.

@@ -1,0 +1,997 @@
+/**
+ * test_virtualization_runtime_parsers.cpp -- pure tests for the `runtime_posture` core
+ * (virtualization_runtime_parsers.hpp): the verb table, the endpoint decision, the JSON readers and
+ * their key allow-lists, the per-field character allow-lists, the status tables and the row
+ * formatters. Portable, no I/O.
+ *
+ * Fixture provenance: every JSON specimen is SYNTHETIC, shaped from the documented docker engine
+ * and podman compatibility API replies; no real image, host or account name appears. The real
+ * captures are taken on a Linux host after the gates settle and recorded in the PR.
+ */
+#include <catch2/catch_test_macros.hpp>
+
+#include "virtualization_runtime_parsers.hpp"
+
+#include <cerrno>
+#include <chrono>
+#include <cstdint>
+#include <format>
+#include <regex>
+#include <set>
+#include <string>
+#include <type_traits>
+#include <vector>
+
+using namespace yuzu::virtualization;
+using namespace yuzu::virtualization::runtime;
+using nlohmann::json;
+
+namespace {
+
+constexpr const char* kEndpointOk = "/run/yuzu-agent/runtime.sock";
+
+StatResult socket_stat(std::uint32_t uid, std::uint32_t gid, std::uint32_t perm, std::uint64_t dev,
+                       std::uint64_t ino) {
+    StatResult s;
+    s.mode = 0140000u | perm;
+    s.uid = uid;
+    s.gid = gid;
+    s.dev = dev;
+    s.ino = ino;
+    return s;
+}
+
+StatResult dir_stat(std::uint32_t uid, std::uint32_t perm) {
+    StatResult s;
+    s.mode = 0040000u | perm;
+    s.uid = uid;
+    return s;
+}
+
+std::string id(char c, std::size_t n = 64) { return std::string(n, c); }
+
+} // namespace
+
+// ---------------------------------------------------------------------------------------------
+// verb table
+// ---------------------------------------------------------------------------------------------
+
+TEST_CASE("runtime verbs: every index builds a GET on one of exactly four allowlisted paths",
+          "[virtualization][runtime][verbs]") {
+    const std::set<std::string> allowed{"/version", "/info", "/containers/json?all=1"};
+    const std::regex inspect{"^/containers/[0-9a-f]{12,64}/json$"};
+    std::size_t built = 0;
+    for (std::size_t i = 0; i < static_cast<std::size_t>(Verb::count); ++i) {
+        const auto verb = static_cast<Verb>(i);
+        const auto req = verb == Verb::container_inspect ? build_request(verb, id('a'))
+                                                         : build_request(verb);
+        REQUIRE(req.has_value());
+        CHECK(req->method() == "GET");
+        CHECK((allowed.count(req->path()) == 1 || std::regex_match(req->path(), inspect)));
+        CHECK(req->verb() == verb);
+        ++built;
+    }
+    CHECK(built == 4);
+    CHECK(kVerbs.size() == 4);
+    CHECK_FALSE(build_request(Verb::count).has_value());
+}
+
+TEST_CASE("runtime verbs: a Request can only come out of the verb table",
+          "[virtualization][runtime][verbs]") {
+    // `Request{verb, "GET", "/x"}` and `Request{}` do not compile: the constructor is private, so
+    // build_request is the one way to make one. A copy of a built request is still a table row.
+    static_assert(!std::is_aggregate_v<Request>);
+    static_assert(!std::is_default_constructible_v<Request>);
+    static_assert(!std::is_constructible_v<Request, Verb, const char*, const char*>);
+    static_assert(!std::is_constructible_v<Request, Verb, std::string, std::string>);
+    static_assert(std::is_copy_constructible_v<Request>);
+    const auto built = build_request(Verb::version);
+    REQUIRE(built.has_value());
+    const Request copy = *built;
+    CHECK(copy.path() == "/version");
+}
+
+TEST_CASE("runtime verbs: an inspect id must be 12 to 64 lowercase hex and nothing else builds "
+          "a request",
+          "[virtualization][runtime][verbs]") {
+    CHECK(build_request(Verb::container_inspect, id('a', 12)).has_value());
+    CHECK(build_request(Verb::container_inspect, id('0', 64)).has_value());
+    CHECK_FALSE(build_request(Verb::container_inspect, id('A')).has_value());   // uppercase
+    CHECK_FALSE(build_request(Verb::container_inspect, "ab/../../etc/passwd0").has_value());
+    CHECK_FALSE(build_request(Verb::container_inspect, "../aaaaaaaaaaaaaa").has_value());
+    CHECK_FALSE(build_request(Verb::container_inspect, id('a', 11)).has_value());
+    CHECK_FALSE(build_request(Verb::container_inspect, id('a', 65)).has_value());
+    CHECK_FALSE(build_request(Verb::container_inspect, "").has_value());
+    CHECK_FALSE(build_request(Verb::container_inspect, id('g')).has_value()); // not hex
+    // an id handed to a verb that takes none
+    CHECK_FALSE(build_request(Verb::version, id('a')).has_value());
+    CHECK_FALSE(build_request(Verb::info, id('a')).has_value());
+    CHECK_FALSE(build_request(Verb::containers_list, id('a')).has_value());
+}
+
+// ---------------------------------------------------------------------------------------------
+// endpoint
+// ---------------------------------------------------------------------------------------------
+
+TEST_CASE("runtime endpoint: lexical decision", "[virtualization][runtime][endpoint]") {
+    CHECK(parse_endpoint("").verdict == EndpointVerdict::unset);
+    const auto ok = parse_endpoint(kEndpointOk);
+    CHECK(ok.verdict == EndpointVerdict::ok);
+    CHECK(ok.path == kEndpointOk);
+    CHECK(parse_endpoint("run/x.sock").verdict == EndpointVerdict::relative);
+    CHECK(parse_endpoint("./x.sock").verdict == EndpointVerdict::relative);
+    CHECK(parse_endpoint("/run/../x").verdict == EndpointVerdict::dotdot);
+    CHECK(parse_endpoint("/run/yuzu-agent/..").verdict == EndpointVerdict::dotdot);
+    CHECK(parse_endpoint("/..").verdict == EndpointVerdict::dotdot);
+    CHECK(parse_endpoint("/x/..").verdict == EndpointVerdict::dotdot);
+    // an empty segment hides nothing
+    CHECK(parse_endpoint("/run//../x").verdict == EndpointVerdict::dotdot);
+    // a name that merely contains dots is not a `..` segment
+    CHECK(parse_endpoint("/run/yuzu..agent/a.sock").verdict == EndpointVerdict::ok);
+    CHECK(parse_endpoint("/...").verdict == EndpointVerdict::ok);
+    CHECK(parse_endpoint("/a..b").verdict == EndpointVerdict::ok);
+
+    for (const auto s : kDefaultSockets)
+        CHECK(parse_endpoint(s).verdict == EndpointVerdict::default_socket);
+    // lexical normalisation: the same four paths in other spellings
+    CHECK(parse_endpoint("/run/./docker.sock").verdict == EndpointVerdict::default_socket);
+    CHECK(parse_endpoint("//run//docker.sock").verdict == EndpointVerdict::default_socket);
+    CHECK(parse_endpoint("/var/run/docker.sock/").verdict == EndpointVerdict::default_socket);
+    CHECK(parse_endpoint("/run/podman/./podman.sock").verdict == EndpointVerdict::default_socket);
+    CHECK(parse_endpoint("/run/containerd//containerd.sock").verdict ==
+          EndpointVerdict::default_socket);
+
+    // the 107-byte sun_path bound, measured on the normalised path
+    const std::string at_limit = "/" + std::string(kMaxSocketPath - 1, 'a');
+    CHECK(at_limit.size() == kMaxSocketPath);
+    CHECK(parse_endpoint(at_limit).verdict == EndpointVerdict::ok);
+    CHECK(parse_endpoint(at_limit + "a").verdict == EndpointVerdict::too_long);
+    CHECK(parse_endpoint("//" + at_limit).verdict == EndpointVerdict::ok); // collapses to the limit
+}
+
+TEST_CASE("runtime endpoint: a `..` segment is exactly a whole segment, wherever it sits",
+          "[virtualization][runtime][endpoint]") {
+    for (const char* p : {"..", "/..", "../x", "a/..", "../..", "a//../b", "/./../x"})
+        CHECK(has_dotdot_segment(p));
+    for (const char* p : {"", "/", ".", "...", "/.../", "a..b", "..a", "a..", "/a/.b/c.."})
+        CHECK_FALSE(has_dotdot_segment(p));
+    const std::string with_nul{"/a\0/..", 6};
+    CHECK(has_dotdot_segment(with_nul)); // an embedded NUL is not a separator and hides nothing
+}
+
+TEST_CASE("runtime endpoint: normalise_path never resolves a dotdot", "[virtualization][runtime][endpoint]") {
+    CHECK(normalise_path("/a//b/./c/") == "/a/b/c");
+    CHECK(normalise_path("/") == "/");
+    CHECK(normalise_path("///") == "/");
+    CHECK(normalise_path("/a/../b") == "/a/../b");
+    CHECK(normalise_path("a//b") == "a/b");
+    CHECK(ancestors_of("/run/yuzu-agent/runtime.sock") ==
+          std::vector<std::string>{"/run/yuzu-agent", "/run", "/"});
+    CHECK(ancestors_of("/x.sock") == std::vector<std::string>{"/"});
+}
+
+TEST_CASE("runtime endpoint: object checks run in the note's order", "[virtualization][runtime][endpoint]") {
+    constexpr std::uint32_t kEgid = 998;
+    const std::vector<StatResult> defaults{socket_stat(0, 999, 0660, 7, 100)};
+    const auto verdict = [&](const StatResult& s) { return check_endpoint_leaf(s, kEgid, defaults); };
+
+    CHECK(verdict(socket_stat(0, kEgid, 0660, 7, 200)) == EndpointVerdict::ok);
+
+    StatResult enoent;
+    enoent.err = ENOENT;
+    CHECK(verdict(enoent) == EndpointVerdict::absent); // the only error that is not a refusal
+    for (const int e : {EACCES, ELOOP, ENAMETOOLONG, ENOTDIR, EIO}) {
+        StatResult s;
+        s.err = e;
+        CHECK(verdict(s) == EndpointVerdict::stat_error);
+    }
+
+    StatResult link;
+    link.mode = 0120777u; // O_PATH|O_NOFOLLOW on a symlink hands back the link itself
+    CHECK(verdict(link) == EndpointVerdict::symlink);
+    StatResult dir = dir_stat(0, 0755);
+    CHECK(verdict(dir) == EndpointVerdict::not_socket);
+    StatResult reg;
+    reg.mode = 0100660u;
+    CHECK(verdict(reg) == EndpointVerdict::not_socket);
+
+    // a bind mount or hard link of a default socket: same (dev, ino), named before the owner,
+    // group and mode checks (the real socket is root:docker, which would read as `group`)
+    CHECK(verdict(socket_stat(0, 999, 0660, 7, 100)) == EndpointVerdict::same_inode);
+    CHECK(verdict(socket_stat(0, kEgid, 0660, 8, 100)) == EndpointVerdict::ok); // other device
+    CHECK(verdict(socket_stat(0, kEgid, 0660, 7, 101)) == EndpointVerdict::ok); // other inode
+
+    CHECK(verdict(socket_stat(1000, kEgid, 0660, 7, 200)) == EndpointVerdict::owner);
+    CHECK(verdict(socket_stat(0, 4, 0660, 7, 200)) == EndpointVerdict::group);
+    CHECK(verdict(socket_stat(0, kEgid, 0666, 7, 200)) == EndpointVerdict::mode);
+    CHECK(verdict(socket_stat(0, kEgid, 0600, 7, 200)) == EndpointVerdict::mode);
+    CHECK(verdict(socket_stat(0, kEgid, 0664, 7, 200)) == EndpointVerdict::mode);
+}
+
+TEST_CASE("runtime endpoint: ancestor directories", "[virtualization][runtime][endpoint]") {
+    CHECK(check_endpoint_ancestor(dir_stat(0, 0755)) == EndpointVerdict::ok);
+    CHECK(check_endpoint_ancestor(dir_stat(0, 0700)) == EndpointVerdict::ok);
+    CHECK(check_endpoint_ancestor(dir_stat(1000, 0755)) == EndpointVerdict::insecure_ancestor);
+    CHECK(check_endpoint_ancestor(dir_stat(0, 0775)) == EndpointVerdict::insecure_ancestor);
+    CHECK(check_endpoint_ancestor(dir_stat(0, 0757)) == EndpointVerdict::insecure_ancestor);
+    CHECK(check_endpoint_ancestor(dir_stat(0, 01777)) == EndpointVerdict::insecure_ancestor);
+    StatResult file;
+    file.mode = 0100644u;
+    CHECK(check_endpoint_ancestor(file) == EndpointVerdict::insecure_ancestor);
+    StatResult gone;
+    gone.err = ENOENT;
+    CHECK(check_endpoint_ancestor(gone) == EndpointVerdict::absent);
+    StatResult denied;
+    denied.err = EACCES;
+    CHECK(check_endpoint_ancestor(denied) == EndpointVerdict::stat_error);
+}
+
+TEST_CASE("runtime endpoint: status tables (decide_endpoint)", "[virtualization][runtime][status]") {
+    CHECK(endpoint_status_for(EndpointVerdict::unset) == EndpointStatus::unset);
+    CHECK(endpoint_status_for(EndpointVerdict::ok) == EndpointStatus::ok);
+    CHECK(endpoint_status_for(EndpointVerdict::absent) == EndpointStatus::unreachable);
+    for (const auto v : {EndpointVerdict::relative, EndpointVerdict::dotdot, EndpointVerdict::too_long,
+                         EndpointVerdict::default_socket, EndpointVerdict::same_inode,
+                         EndpointVerdict::not_socket, EndpointVerdict::symlink, EndpointVerdict::owner,
+                         EndpointVerdict::group, EndpointVerdict::mode,
+                         EndpointVerdict::insecure_ancestor, EndpointVerdict::stat_error}) {
+        CHECK(endpoint_status_for(v) == EndpointStatus::endpoint_refused);
+        CHECK(endpoint_reason_token(v) != "-");
+    }
+    // no reason for a verdict that is not a refusal: the endpoint row prints it as-is
+    for (const auto v : {EndpointVerdict::unset, EndpointVerdict::ok, EndpointVerdict::absent})
+        CHECK(endpoint_reason_token(v) == "-");
+
+    // the constraint token: the refusal reason, `unreachable` for ENOENT, nothing for unset and ok
+    CHECK(endpoint_failure_cause(EndpointVerdict::unset).empty());
+    CHECK(endpoint_failure_cause(EndpointVerdict::ok).empty());
+    CHECK(endpoint_failure_cause(EndpointVerdict::absent) == "unreachable");
+    for (const auto v : {EndpointVerdict::relative, EndpointVerdict::dotdot, EndpointVerdict::too_long,
+                         EndpointVerdict::default_socket, EndpointVerdict::same_inode,
+                         EndpointVerdict::not_socket, EndpointVerdict::symlink, EndpointVerdict::owner,
+                         EndpointVerdict::group, EndpointVerdict::mode,
+                         EndpointVerdict::insecure_ancestor, EndpointVerdict::stat_error}) {
+        CHECK(endpoint_failure_cause(v) == endpoint_reason_token(v));
+        CHECK(std::regex_match(rt_token("endpoint:" + endpoint_failure_cause(v)),
+                               std::regex{"^linux:virtualization:runtime_posture(:[a-z0-9_]+)+$"}));
+    }
+
+    CHECK(endpoint_status_for(Outcome::ok) == EndpointStatus::ok);
+    CHECK(endpoint_status_for(Outcome::eacces) == EndpointStatus::permission_denied);
+    for (const auto o : {Outcome::enoent, Outcome::timeout, Outcome::other})
+        CHECK(endpoint_status_for(o) == EndpointStatus::unreachable);
+    CHECK(endpoint_status_for(Outcome::not_http) == EndpointStatus::not_http);
+    CHECK(endpoint_status_for(Outcome::oversized) == EndpointStatus::not_http);
+}
+
+TEST_CASE("runtime status: a read error is a timeout only once its read timer has run out",
+          "[virtualization][runtime][status]") {
+    using std::chrono::milliseconds;
+    const milliseconds read_to{5000};
+    CHECK(classify_read_error(milliseconds{0}, read_to) == Outcome::not_http);
+    CHECK(classify_read_error(milliseconds{4949}, read_to) == Outcome::not_http); // read_to - 51
+    CHECK(classify_read_error(milliseconds{4950}, read_to) == Outcome::timeout);  // read_to - 50
+    CHECK(classify_read_error(milliseconds{5000}, read_to) == Outcome::timeout);
+    CHECK(classify_read_error(milliseconds{9000}, read_to) == Outcome::timeout);
+    // a budget under the slack always reads as a timeout
+    CHECK(classify_read_error(milliseconds{0}, milliseconds{20}) == Outcome::timeout);
+}
+
+TEST_CASE("runtime status: a request back at or past its budget is a timeout whatever it reported",
+          "[virtualization][runtime][status][deadline]") {
+    using std::chrono::milliseconds;
+    const milliseconds budget{20000};
+    // inside the budget the transport's own outcome stands
+    for (const auto o : {Outcome::ok, Outcome::eacces, Outcome::enoent, Outcome::timeout,
+                         Outcome::oversized, Outcome::not_http, Outcome::other}) {
+        CHECK(budget_outcome(o, milliseconds{0}, budget) == o);
+        CHECK(budget_outcome(o, milliseconds{19999}, budget) == o);
+    }
+    // at the budget and past it nothing is ok, and nothing else survives either: a reply that came
+    // back late is not read, and a read error at the cut is the timeout that caused it
+    for (const auto o : {Outcome::ok, Outcome::eacces, Outcome::enoent, Outcome::timeout,
+                         Outcome::oversized, Outcome::not_http, Outcome::other}) {
+        CHECK(budget_outcome(o, budget, budget) == Outcome::timeout);
+        CHECK(budget_outcome(o, milliseconds{20001}, budget) == Outcome::timeout);
+        CHECK(budget_outcome(o, milliseconds{25000}, budget) == Outcome::timeout);
+    }
+    // the smallest budget the seam passes on (1 ms)
+    CHECK(budget_outcome(Outcome::ok, milliseconds{0}, milliseconds{1}) == Outcome::ok);
+    CHECK(budget_outcome(Outcome::ok, milliseconds{1}, milliseconds{1}) == Outcome::timeout);
+}
+
+TEST_CASE("runtime status: detection is about standard paths and an endpoint failure changes none",
+          "[virtualization][runtime][status]") {
+    CHECK(decide_runtime(false, false) == "not_detected");
+    CHECK(decide_runtime(true, false) == "detected");
+    CHECK(decide_runtime(false, true) == "served");
+    CHECK(decide_runtime(true, true) == "served");
+    // the endpoint state is not an input of decide_runtime at all: nothing to change.
+}
+
+TEST_CASE("runtime status: overprivileged default socket needs a held group with write, or other-write",
+          "[virtualization][runtime][status]") {
+    const std::vector<std::uint32_t> groups{998, 27};
+    CHECK(socket_overprivileged(socket_stat(0, 27, 0660, 1, 1), groups));  // supplementary group
+    CHECK(socket_overprivileged(socket_stat(0, 998, 0660, 1, 1), groups)); // effective group
+    CHECK(socket_overprivileged(socket_stat(0, 4, 0666, 1, 1), groups));   // other-write
+    CHECK_FALSE(socket_overprivileged(socket_stat(0, 4, 0660, 1, 1), groups)); // a group not held
+    CHECK_FALSE(socket_overprivileged(socket_stat(0, 27, 0640, 1, 1), groups)); // no group write
+    CHECK_FALSE(socket_overprivileged(dir_stat(0, 0777), groups));              // not a socket
+    StatResult gone;
+    gone.err = ENOENT;
+    CHECK_FALSE(socket_overprivileged(gone, groups));
+}
+
+TEST_CASE("runtime mounts: a path touches a network mount when on, under or containing it",
+          "[virtualization][runtime][status]") {
+    CHECK(path_touches_mount("/var/lib/docker", "/var/lib/docker"));
+    CHECK(path_touches_mount("/var/lib/docker", "/var/lib"));       // under
+    CHECK(path_touches_mount("/var/lib/docker", "/var/lib/docker/overlay2")); // contains
+    CHECK(path_touches_mount("/var/lib/docker", "/"));
+    CHECK_FALSE(path_touches_mount("/var/lib/docker", "/var/lib/dockerx"));
+    CHECK_FALSE(path_touches_mount("/var/lib/docker", "/srv/data"));
+}
+
+TEST_CASE("runtime rows: a default socket field reports mode, uid and gid", "[virtualization][runtime][rows]") {
+    CHECK(socket_present_field(socket_stat(0, 998, 0660, 1, 1)) == "present:0660:0:998");
+    CHECK(socket_present_field(socket_stat(0, 0, 0600, 1, 1)) == "present:0600:0:0");
+}
+
+// ---------------------------------------------------------------------------------------------
+// JSON
+// ---------------------------------------------------------------------------------------------
+
+TEST_CASE("runtime json: nesting over 32 is discarded as it starts and reads malformed",
+          "[virtualization][runtime][json]") {
+    const auto nested = [](int levels) {
+        std::string s;
+        for (int i = 0; i < levels; ++i)
+            s += "[";
+        for (int i = 0; i < levels; ++i)
+            s += "]";
+        return s;
+    };
+    const auto at32 = parse_limited(nested(32));
+    CHECK(at32.ok);
+    CHECK_FALSE(at32.too_deep);
+    const auto at33 = parse_limited(nested(33));
+    CHECK_FALSE(at33.ok);
+    CHECK(at33.too_deep);
+    // a deep body is bounded work, not a crash
+    const auto deep = parse_limited(nested(100000));
+    CHECK_FALSE(deep.ok);
+    CHECK(deep.too_deep);
+    // malformed text: no exception, not ok, not too_deep
+    const auto bad = parse_limited("{\"a\":");
+    CHECK_FALSE(bad.ok);
+    CHECK_FALSE(bad.too_deep);
+    CHECK_FALSE(parse_limited("").ok);
+    // comments are ignored
+    CHECK(parse_limited("{/* c */\"a\":1}").ok);
+}
+
+TEST_CASE("runtime daemon.json: only allowlisted keys, arrays as counts, hosts_tcp",
+          "[virtualization][runtime][config]") {
+    const auto r = parse_daemon_json(R"({
+        // a comment is ignored
+        "live-restore": true, "userns-remap": "default", "no-new-privileges": false,
+        "icc": true, "iptables": false, "tls": true, "tlsverify": true,
+        "data-root": "/var/lib/docker", "log-driver": "json-file", "storage-driver": "overlay2",
+        "selinux-enabled": false, "userland-proxy": true,
+        "hosts": ["fd://", "tcp://0.0.0.0:2375"],
+        "insecure-registries": ["a:5000", "b:5000", "c:5000"],
+        "registry-mirrors": ["https://m.example"],
+        "auth": {"user": "u", "password": "hunter2"},
+        "proxies": {"http-proxy": "http://user:pw@proxy"},
+        "tlscert": "/etc/docker/cert.pem"
+    })");
+    REQUIRE_FALSE(r.malformed);
+    std::vector<std::string> keys;
+    std::string all;
+    for (const auto& c : r.rows) {
+        keys.push_back(c.key);
+        all += c.key + "=" + c.value + ";";
+    }
+    CHECK(keys == std::vector<std::string>{"live-restore", "userns-remap", "no-new-privileges", "icc",
+                                           "iptables", "tls", "tlsverify", "data-root", "log-driver",
+                                           "storage-driver", "selinux-enabled", "userland-proxy",
+                                           "hosts", "hosts_tcp", "insecure-registries",
+                                           "registry-mirrors"});
+    CHECK(all.find("live-restore=yes;") != std::string::npos);
+    CHECK(all.find("no-new-privileges=no;") != std::string::npos);
+    CHECK(all.find("hosts=2;hosts_tcp=yes;") != std::string::npos);
+    CHECK(all.find("insecure-registries=3;registry-mirrors=1;") != std::string::npos);
+    // nothing that looks like a credential, a proxy or a certificate path is emitted
+    for (const char* leak : {"hunter2", "password", "pw@", "tlscert", "cert.pem"})
+        CHECK(all.find(leak) == std::string::npos);
+    // no key is emitted twice
+    CHECK(std::set<std::string>(keys.begin(), keys.end()).size() == keys.size());
+}
+
+TEST_CASE("runtime daemon.json: wrong types read malformed, withhold their row and never render",
+          "[virtualization][runtime][config]") {
+    const auto wrong = parse_daemon_json(R"({"icc":[1],"data-root":7,"live-restore":"yes",
+                                             "hosts":"tcp://x","log-driver":"a b\u001b[31m",
+                                             "userns-remap":["x"]})");
+    CHECK(wrong.malformed);
+    // icc, data-root, live-restore, hosts and userns-remap are withheld; log-driver is `invalid`
+    REQUIRE(wrong.rows.size() == 1);
+    CHECK(wrong.rows[0].key == "log-driver");
+    CHECK(wrong.rows[0].value == "invalid");
+
+    // a value of the wrong kind for ITS key is withheld, not rendered through another kind's path: a
+    // boolean on a string key must not read yes/no, nor a string on a boolean key; the well-typed
+    // `icc` still reports beside the malformed flag
+    const auto kinds = parse_daemon_json(R"({"data-root":true,"log-driver":false,"storage-driver":true,
+                                              "userns-remap":false,"icc":true,"tls":"true"})");
+    CHECK(kinds.malformed);
+    REQUIRE(kinds.rows.size() == 1);
+    CHECK(kinds.rows[0].key == "icc");
+    CHECK(kinds.rows[0].value == "yes");
+
+    const auto tcp_no = parse_daemon_json(R"({"hosts":["unix:///var/run/docker.sock"]})");
+    CHECK_FALSE(tcp_no.malformed);
+    REQUIRE(tcp_no.rows.size() == 2);
+    CHECK(tcp_no.rows[1].value == "no");
+
+    // a `hosts` element that is not a string: `hosts_tcp no` cannot be told, so neither hosts row is
+    // emitted and the file reads malformed (a sibling key still reports)
+    for (const char* text : {R"({"hosts":[5]})", R"({"hosts":["fd://",5]})", R"({"hosts":[null,"tcp://x"]})",
+                             R"({"hosts":[["tcp://x"]]})"}) {
+        const auto bad = parse_daemon_json(text);
+        INFO(text);
+        CHECK(bad.malformed);
+        CHECK(bad.rows.empty());
+    }
+    const auto hosts_sibling = parse_daemon_json(R"({"icc":false,"hosts":[5]})");
+    CHECK(hosts_sibling.malformed);
+    REQUIRE(hosts_sibling.rows.size() == 1);
+    CHECK(hosts_sibling.rows[0].key == "icc");
+    // the registry lists are counted, never read: a non-array is malformed, an array is not (a null
+    // list is a missing key, see "JSON null is a missing key")
+    for (const char* text : {R"({"insecure-registries":"a:5000"})", R"({"registry-mirrors":{"a":1}})"}) {
+        const auto bad = parse_daemon_json(text);
+        INFO(text);
+        CHECK(bad.malformed);
+        CHECK(bad.rows.empty());
+    }
+    CHECK_FALSE(parse_daemon_json(R"({"insecure-registries":[5,null]})").malformed);
+
+    for (const char* text : {"{not json", "[1,2]", "\"s\"", "", "{\"a\":"})
+        CHECK(parse_daemon_json(text).malformed);
+    // nesting over the limit reads malformed, no field of it is read
+    std::string deep = R"({"icc":true,"x":)";
+    for (int i = 0; i < 40; ++i)
+        deep += "[";
+    for (int i = 0; i < 40; ++i)
+        deep += "]";
+    deep += "}";
+    const auto d = parse_daemon_json(deep);
+    CHECK(d.malformed);
+    CHECK(d.rows.empty());
+}
+
+TEST_CASE("runtime /version: the dialect must be identified, a wrong type is malformed",
+          "[virtualization][runtime][version]") {
+    const auto podman = parse_version(json::parse(
+        R"({"Version":"5.2.0","ApiVersion":"1.41","Components":[{"Name":"Podman Engine","Version":"5.2.0"}]})"));
+    CHECK_FALSE(podman.malformed);
+    CHECK(podman.dialect == Dialect::podman);
+    CHECK(podman.version == "5.2.0");
+    CHECK(podman.api_version == "1.41");
+
+    const auto docker = parse_version(json::parse(
+        R"({"Version":"27.3.1","ApiVersion":"1.47","Components":[{"Name":"Engine"}]})"));
+    CHECK(docker.dialect == Dialect::docker);
+
+    // a reply that names no runtime identifies none: well-typed, so not malformed, and no dialect
+    const auto bare = parse_version(json::parse(R"({"Version":"27.3.1"})"));
+    CHECK_FALSE(bare.malformed);
+    CHECK(bare.dialect == Dialect::none);
+    CHECK(bare.version == "27.3.1");
+    CHECK(bare.api_version == "-");
+    for (const char* body : {"{}", R"({"message":"ok"})", R"({"Components":[]})",
+                             R"({"Components":[{"Name":"containerd"},{"x":1}]})"}) {
+        const auto none = parse_version(json::parse(body));
+        INFO(body);
+        CHECK_FALSE(none.malformed);
+        CHECK(none.dialect == Dialect::none);
+    }
+    // what does identify docker: a component named Engine, or a string ApiVersion (older daemons)
+    const auto api_only = parse_version(json::parse(R"({"ApiVersion":"1.47"})"));
+    CHECK_FALSE(api_only.malformed);
+    CHECK(api_only.dialect == Dialect::docker);
+    CHECK(api_only.api_version == "1.47");
+    const auto engine_only = parse_version(json::parse(R"({"Components":[{"Name":"Engine"}]})"));
+    CHECK_FALSE(engine_only.malformed);
+    CHECK(engine_only.dialect == Dialect::docker);
+    // podman wins over an Engine component or an ApiVersion (podman's compat reply carries both)
+    CHECK(parse_version(json::parse(
+                            R"({"ApiVersion":"1.41","Components":[{"Name":"Engine"},{"Name":"Podman Engine"}]})"))
+              .dialect == Dialect::podman);
+
+    // every key read is wrong-typed: malformed, no dialect (Components is not an array), `-` fields
+    const auto odd = parse_version(json::parse(R"({"Version":27,"ApiVersion":true,"Components":"x"})"));
+    CHECK(odd.malformed);
+    CHECK(odd.dialect == Dialect::none);
+    CHECK(odd.version == "-");
+    CHECK(odd.api_version == "-");
+
+    // a wrong-typed Version or ApiVersion alone: malformed, the field stays `-`; a string ApiVersion
+    // still identifies docker, and a wrong-typed one identifies nothing
+    const auto wrong_version = parse_version(json::parse(R"({"Version":27,"ApiVersion":"1.47"})"));
+    CHECK(wrong_version.malformed);
+    CHECK(wrong_version.dialect == Dialect::docker);
+    CHECK(wrong_version.version == "-");
+    CHECK(wrong_version.api_version == "1.47");
+    const auto wrong_api = parse_version(json::parse(R"({"Version":"1","ApiVersion":5})"));
+    CHECK(wrong_api.malformed);
+    CHECK(wrong_api.version == "1");
+    CHECK(wrong_api.api_version == "-");
+    CHECK(wrong_api.dialect == Dialect::none);
+
+    // a Components element that is not an object, or a Name that is not a string: malformed and no
+    // dialect, even beside a "Podman Engine" element
+    const auto wrong_comp = parse_version(json::parse(R"({"Components":[1,{"Name":5},{"Name":"Podman Engine"}]})"));
+    CHECK(wrong_comp.malformed);
+    CHECK(wrong_comp.dialect == Dialect::none);
+    for (const char* body : {R"({"Components":[1]})", R"({"Components":[{"Name":5}]})",
+                             R"({"Components":{"Name":"Podman Engine"}})"}) {
+        const auto bad = parse_version(json::parse(body));
+        INFO(body);
+        CHECK(bad.malformed);
+        CHECK(bad.dialect == Dialect::none);
+    }
+
+    // a MISSING key is never wrong-typed: an element without Name, or without any key, is fine
+    const auto missing = parse_version(json::parse(
+        R"({"Version":"1","Components":[{"Name":"Podman Engine"},{"x":1}]})"));
+    CHECK_FALSE(missing.malformed);
+    CHECK(missing.dialect == Dialect::podman);
+    CHECK_FALSE(parse_version(json::parse(R"({"Components":[]})")).malformed);
+    CHECK(parse_version(json::parse(R"({"Components":[]})")).dialect == Dialect::none);
+
+    // a non-object reply
+    for (const char* body : {"[1]", "\"s\"", "7", "null"}) {
+        const auto bad = parse_version(json::parse(body));
+        INFO(body);
+        CHECK(bad.malformed);
+        CHECK(bad.dialect == Dialect::none);
+        CHECK(bad.version == "-");
+        CHECK(bad.api_version == "-");
+    }
+    CHECK(parse_version(json::parse(R"({"Version":"1.0\u001b"})")).version == "invalid");
+}
+
+TEST_CASE("runtime /info: at most three rows, no other key is read", "[virtualization][runtime][info]") {
+    const auto info = parse_info(json::parse(R"({
+        "CgroupDriver":"systemd",
+        "SecurityOptions":["name=seccomp,profile=builtin","name=rootless"],
+        "RegistryConfig":{"Auth":"x"}, "Name":"host", "DockerRootDir":"/var/lib/docker",
+        "HttpProxy":"http://u:p@h"})"));
+    CHECK_FALSE(info.malformed);
+    const auto& rows = info.rows;
+    REQUIRE(rows.size() == 3);
+    CHECK(rows[0].key == "rootless");
+    CHECK(rows[0].value == "yes");
+    CHECK(rows[1].key == "cgroup_driver");
+    CHECK(rows[1].value == "systemd");
+    CHECK(rows[2].key == "security_options_count");
+    CHECK(rows[2].value == "2");
+
+    const auto rootful =
+        parse_info(json::parse(R"({"CgroupDriver":"cgroupfs","SecurityOptions":["name=seccomp"]})"));
+    CHECK_FALSE(rootful.malformed);
+    REQUIRE(rootful.rows.size() == 3);
+    CHECK(rootful.rows[0].value == "no");
+
+    // a missing key omits its row and is not malformed
+    const auto only_driver = parse_info(json::parse(R"({"CgroupDriver":"systemd"})"));
+    CHECK_FALSE(only_driver.malformed);
+    REQUIRE(only_driver.rows.size() == 1);
+    CHECK(only_driver.rows[0].key == "cgroup_driver");
+    const auto empty = parse_info(json::parse("{}"));
+    CHECK_FALSE(empty.malformed);
+    CHECK(empty.rows.empty());
+
+    // a non-object reply and a wrong-typed key are malformed, never thrown on, never rendered
+    for (const char* body : {"[]", "\"s\"", "7", "null"}) {
+        const auto bad = parse_info(json::parse(body));
+        INFO(body);
+        CHECK(bad.malformed);
+        CHECK(bad.rows.empty());
+    }
+    const auto wrong = parse_info(json::parse(R"({"CgroupDriver":3,"SecurityOptions":"x"})"));
+    CHECK(wrong.malformed);
+    CHECK(wrong.rows.empty());
+    const auto wrong_driver = parse_info(json::parse(R"({"CgroupDriver":3})"));
+    CHECK(wrong_driver.malformed);
+    CHECK(wrong_driver.rows.empty());
+    const auto wrong_options = parse_info(json::parse(R"({"SecurityOptions":5})"));
+    CHECK(wrong_options.malformed);
+    CHECK(wrong_options.rows.empty());
+    // a SecurityOptions element that is not a string: "rootless" cannot be told, so neither it nor the
+    // count is emitted (never `rootless no`), and the reply is malformed
+    for (const char* body : {R"({"SecurityOptions":[5]})", R"({"SecurityOptions":["name=rootless",5]})",
+                             R"({"SecurityOptions":[null]})", R"({"SecurityOptions":[["name=rootless"]]})"}) {
+        const auto bad = parse_info(json::parse(body));
+        INFO(body);
+        CHECK(bad.malformed);
+        CHECK(bad.rows.empty());
+    }
+    const auto options_bad_driver_ok =
+        parse_info(json::parse(R"({"CgroupDriver":"systemd","SecurityOptions":["a",5]})"));
+    CHECK(options_bad_driver_ok.malformed);
+    REQUIRE(options_bad_driver_ok.rows.size() == 1);
+    CHECK(options_bad_driver_ok.rows[0].key == "cgroup_driver");
+    // an empty list is well-typed: rootless no, count 0
+    const auto no_options = parse_info(json::parse(R"({"SecurityOptions":[]})"));
+    CHECK_FALSE(no_options.malformed);
+    REQUIRE(no_options.rows.size() == 2);
+    CHECK(no_options.rows[0].value == "no");
+    CHECK(no_options.rows[1].value == "0");
+    // a well-typed key still reports beside a wrong-typed one
+    const auto mixed =
+        parse_info(json::parse(R"({"CgroupDriver":"systemd","SecurityOptions":{"a":1}})"));
+    CHECK(mixed.malformed);
+    REQUIRE(mixed.rows.size() == 1);
+    CHECK(mixed.rows[0].key == "cgroup_driver");
+
+    // a string that fails its charset is `invalid`, which is a value and not a wrong type
+    const auto bad_driver = parse_info(json::parse(R"({"CgroupDriver":"a\u001b"})"));
+    CHECK_FALSE(bad_driver.malformed);
+    REQUIRE(bad_driver.rows.size() == 1);
+    CHECK(bad_driver.rows[0].value == "invalid");
+}
+
+// ---------------------------------------------------------------------------------------------
+// containers
+// ---------------------------------------------------------------------------------------------
+
+TEST_CASE("runtime list: docker-shaped and podman-shaped entries become rows with unknown inspect "
+          "fields",
+          "[virtualization][runtime][containers]") {
+    const std::string docker_list = R"([
+        {"Id":")" + id('a') + R"(","Names":["/web"],"Image":"registry.example/app:1.2",
+         "State":"running","Command":"secret-cmd","Labels":{"k":"leak"},"Mounts":[{"Source":"/x"}],
+         "Ports":[{"PrivatePort":80}]},
+        {"Id":")" + id('b') + R"(","Names":["/db","/web/db"],"Image":"sha256:0123abcd","State":"exited"}])";
+    const auto l = containers_from_list(json::parse(docker_list));
+    REQUIRE(l.rows.size() == 2);
+    CHECK_FALSE(l.malformed);
+    CHECK(l.skipped == 0);
+    CHECK(l.rows[0].id12 == id('a', 12));
+    CHECK(l.rows[0].name == "web"); // leading slash stripped
+    CHECK(l.rows[0].image == "registry.example/app:1.2");
+    CHECK(l.rows[0].state == "running");
+    CHECK(l.rows[0].privileged == Tri::unknown);
+    CHECK(l.rows[0].network_mode == "unknown");
+    CHECK(l.rows[0].socket_mounted == Tri::unknown);
+    CHECK(l.rows[1].name == "db");
+    // the list reply's Command/Labels/Mounts/Ports are never read: nothing of them is in a row
+    const std::string line = format_container_row("docker", l.rows[0]);
+    for (const char* leak : {"secret-cmd", "leak", "Labels", "PrivatePort"})
+        CHECK(line.find(leak) == std::string::npos);
+
+    // podman's compatibility list reply has the same four keys
+    const auto p = containers_from_list(json::parse(
+        R"([{"Id":")" + id('c') + R"(","Names":["pod-app"],"Image":"localhost/app:latest","State":"running"}])"));
+    REQUIRE(p.rows.size() == 1);
+    CHECK(p.rows[0].name == "pod-app");
+}
+
+TEST_CASE("runtime list: caps, skips and wrong types never throw", "[virtualization][runtime][containers]") {
+    json big = json::array();
+    for (int i = 0; i < 300; ++i) {
+        big.push_back({{"Id", std::format("{:016x}", i) + std::string(48, 'a')}, {"Names", {"/n"}},
+                       {"Image", "i"}, {"State", "running"}});
+    }
+    const auto capped = containers_from_list(big);
+    CHECK(capped.rows.size() == kMaxContainerRows);
+    CHECK(capped.rows_capped);
+
+    const auto exact = [&] {
+        json a = json::array();
+        for (std::size_t i = 0; i < kMaxContainerRows; ++i)
+            a.push_back({{"Id", id('a')}, {"State", "running"}});
+        return containers_from_list(a);
+    }();
+    CHECK(exact.rows.size() == kMaxContainerRows);
+    CHECK_FALSE(exact.rows_capped); // exactly at the cap is not capped
+
+    const auto not_array = containers_from_list(json::parse(R"({"Id":"x"})"));
+    CHECK(not_array.malformed);
+    CHECK(not_array.rows.empty());
+
+    const auto mixed = containers_from_list(json::parse(
+        R"([{"Id":7},{"Id":"short"},"str",null,{"Id":")" + id('d') + R"(","Names":"notarray","Image":5,"State":[]}])"));
+    CHECK(mixed.skipped == 4);
+    CHECK(mixed.malformed); // Names, Image and State are each present with another type
+    REQUIRE(mixed.rows.size() == 1);
+    CHECK(mixed.rows[0].name == "-");
+    CHECK(mixed.rows[0].image == "-");
+    CHECK(mixed.rows[0].state == "invalid");
+}
+
+TEST_CASE("runtime list: a wrong-typed key of a valid entry keeps the row and reads malformed",
+          "[virtualization][runtime][containers]") {
+    const std::string valid_id = id('e');
+    const auto one = [&](const std::string& rest) {
+        return containers_from_list(json::parse(R"([{"Id":")" + valid_id + R"(")" + rest + "}]"));
+    };
+    // Image / State / Names / the first Names element each present with another type
+    const auto image = one(R"(,"Names":["/web"],"Image":5,"State":"running")");
+    CHECK(image.malformed);
+    REQUIRE(image.rows.size() == 1);
+    CHECK(image.rows[0].image == "-");
+    CHECK(image.rows[0].name == "web"); // the well-typed fields still report
+    CHECK(image.rows[0].state == "running");
+    const auto state = one(R"(,"Image":"i","State":7)");
+    CHECK(state.malformed);
+    REQUIRE(state.rows.size() == 1);
+    CHECK(state.rows[0].state == "invalid");
+    CHECK(one(R"(,"Names":"web")").malformed);
+    const auto first = one(R"(,"Names":[5,"/web"])");
+    CHECK(first.malformed);
+    REQUIRE(first.rows.size() == 1);
+    CHECK(first.rows[0].name == "-");
+    // a MISSING key (or an empty Names) is not wrong-typed
+    for (const char* rest : {"", R"(,"Names":[])", R"(,"Image":"i")", R"(,"State":"running")"}) {
+        INFO(rest);
+        const auto ok = one(rest);
+        CHECK_FALSE(ok.malformed);
+        CHECK(ok.rows.size() == 1);
+    }
+}
+
+TEST_CASE("runtime fields: the charset check runs before truncation and a miss reads invalid",
+          "[virtualization][runtime][fields]") {
+    // a 1000-byte name made of allowed characters is truncated to 256 bytes
+    CHECK(checked_name(std::string(1000, 'a')).size() == kFieldCap);
+    CHECK(checked_image(std::string(1000, 'a')).size() == kFieldCap);
+    CHECK(checked_network_mode(std::string(1000, 'a')).size() == kShortFieldCap);
+    CHECK(checked_version(std::string(1000, '1')).size() == kShortFieldCap);
+    // ... but a bad byte anywhere, even past the cap, is invalid, not silently cut off
+    CHECK(checked_name(std::string(1000, 'a') + "\x1b") == "invalid");
+    CHECK(checked_name("a\x1b[31mred") == "invalid");           // ESC passes wire_field; not this
+    CHECK(checked_name("a\xe2\x80\xae" "gnp") == "invalid");    // bidi override
+    CHECK(checked_name("a|b") == "invalid");
+    CHECK(checked_name("a\\b") == "invalid");
+    CHECK(checked_name("a\nb") == "invalid");
+    CHECK(checked_name("-leading") == "invalid"); // first byte must be alphanumeric
+    CHECK(checked_name("") == "invalid");
+    CHECK(checked_name("ok_name-1.2") == "ok_name-1.2");
+    CHECK(checked_image("reg.example:5000/team/app@sha256:ab+c") == "reg.example:5000/team/app@sha256:ab+c");
+    CHECK(checked_image("a b") == "invalid");
+    CHECK(checked_network_mode("container:abc") == "container:abc");
+    CHECK(checked_network_mode("host") == "host");
+    CHECK(checked_network_mode("a/b") == "invalid");
+    // the state is a closed enum
+    for (const char* s : {"created", "running", "paused", "restarting", "removing", "exited", "dead"})
+        CHECK(checked_state(s) == s);
+    CHECK(checked_state("configured") == "invalid"); // a podman-only state is not guessed at
+    CHECK(checked_state("Running") == "invalid");
+    CHECK(checked_state("") == "invalid");
+}
+
+TEST_CASE("runtime inspect: privileged, network mode and the host-socket mount flag",
+          "[virtualization][runtime][containers]") {
+    const auto make = [] {
+        ContainerRow r;
+        r.id = id('a');
+        r.id12 = id('a', 12);
+        return r;
+    };
+
+    ContainerRow priv = make();
+    REQUIRE(apply_inspect(priv, json::parse(R"({"HostConfig":{"Privileged":true,"NetworkMode":"host"},
+                                                "Mounts":[{"Source":"/data"}],
+                                                "Config":{"Env":["SECRET=1"]}})")));
+    CHECK(priv.privileged == Tri::yes);
+    CHECK(priv.network_mode == "host");
+    CHECK(priv.socket_mounted == Tri::no);
+
+    // a mount source that IS a default socket, or a directory that CONTAINS one
+    for (const char* src : {"/run/docker.sock", "/var/run/docker.sock", "/run/podman/podman.sock",
+                            "/run/containerd/containerd.sock", "/run", "/var/run", "/var", "/",
+                            "/run/podman", "/run/containerd", "//run//", "/run/./"}) {
+        ContainerRow r = make();
+        REQUIRE(apply_inspect(r, json{{"HostConfig", {{"Privileged", false}, {"NetworkMode", "bridge"}}},
+                                      {"Mounts", json::array({{{"Source", src}}})}}));
+        INFO(src);
+        CHECK(r.socket_mounted == Tri::yes);
+        CHECK(r.privileged == Tri::no);
+    }
+    // unrelated mounts, and a path that merely shares a prefix
+    for (const char* src : {"/data", "/run/dockerx", "/var/lib/docker", "/runx", "/run/user/1000",
+                            "/home/jsmith", "relative/run"}) {
+        ContainerRow r = make();
+        REQUIRE(apply_inspect(r, json{{"HostConfig", json::object()},
+                                      {"Mounts", json::array({{{"Source", src}}})}}));
+        INFO(src);
+        CHECK(r.socket_mounted == Tri::no);
+    }
+    // an empty Mounts mounts no socket; an absent, null or wrong-typed Mounts is unknown
+    ContainerRow none = make();
+    REQUIRE(apply_inspect(none, json::parse(R"({"HostConfig":{},"Mounts":null})")));
+    CHECK(none.socket_mounted == Tri::unknown); // null is a missing key, never `no`
+    ContainerRow empty = make();
+    REQUIRE(apply_inspect(empty, json::parse(R"({"HostConfig":{},"Mounts":[]})")));
+    CHECK(empty.socket_mounted == Tri::no);
+    ContainerRow absent = make();
+    REQUIRE(apply_inspect(absent, json::parse(R"({"HostConfig":{}})")));
+    CHECK(absent.socket_mounted == Tri::unknown);
+    // a wrong-typed key read is a failed inspection: the row is left untouched, all three fields
+    // unknown (the caller counts `inspect:failed:<n>`), never a field read through another type
+    for (const char* body : {
+             R"({"HostConfig":{"Privileged":"yes","NetworkMode":5},"Mounts":"x"})",
+             R"({"HostConfig":{"Privileged":1,"NetworkMode":"host"},"Mounts":[]})",
+             R"({"HostConfig":{"Privileged":true,"NetworkMode":5},"Mounts":[]})",
+             R"({"HostConfig":{"Privileged":true},"Mounts":"x"})",
+             R"({"HostConfig":{"Privileged":true},"Mounts":{"Source":"/run"}})",
+             R"({"HostConfig":{"Privileged":true},"Mounts":[5]})",
+             R"({"HostConfig":{"Privileged":true},"Mounts":[{"Source":"/data"},null]})",
+             R"({"HostConfig":{"Privileged":true},"Mounts":[{"Source":3}]})",
+             R"({"HostConfig":{"Privileged":true},"Mounts":[{"Source":"/data"},{"Source":["/run"]}]})"}) {
+        ContainerRow r = make();
+        INFO(body);
+        CHECK_FALSE(apply_inspect(r, json::parse(body)));
+        CHECK(r.privileged == Tri::unknown);
+        CHECK(r.network_mode == "unknown");
+        CHECK(r.socket_mounted == Tri::unknown);
+    }
+    // a mount object with no Source (tmpfs) mounts no host path and is well-typed
+    ContainerRow tmpfs = make();
+    REQUIRE(apply_inspect(tmpfs, json::parse(R"({"HostConfig":{},"Mounts":[{"Type":"tmpfs"},{"Source":"/data"}]})")));
+    CHECK(tmpfs.socket_mounted == Tri::no);
+
+    // no HostConfig object: the row is untouched and the caller counts a failed inspection
+    ContainerRow untouched = make();
+    CHECK_FALSE(apply_inspect(untouched, json::parse(R"({"Mounts":[]})")));
+    CHECK_FALSE(apply_inspect(untouched, json::parse("[]")));
+    CHECK(untouched.privileged == Tri::unknown);
+    CHECK(untouched.socket_mounted == Tri::unknown);
+}
+
+TEST_CASE("runtime readers: a key whose value is JSON null is a missing key, never wrong-typed",
+          "[virtualization][runtime][null]") {
+    // Go runtimes emit null for an empty slice or pointer, so the honest common reply must stay
+    // clean: the row is omitted or the field stays unknown, with no token. A null ELEMENT of an
+    // array a reader walks is not a key and stays wrong-typed (covered beside each reader).
+
+    // /version
+    // (a null key names nothing, so no runtime is identified either)
+    const auto version = parse_version(json::parse(R"({"Version":null,"ApiVersion":null,"Components":null})"));
+    CHECK_FALSE(version.malformed);
+    CHECK(version.dialect == Dialect::none);
+    CHECK(version.version == "-");
+    CHECK(version.api_version == "-");
+    const auto name = parse_version(json::parse(R"({"Version":"1","Components":[{"Name":null}]})"));
+    CHECK_FALSE(name.malformed);
+    CHECK(name.dialect == Dialect::none);
+    CHECK(name.version == "1");
+
+    // /info: a null SecurityOptions emits neither `rootless` nor the count (never `rootless no`)
+    const auto info = parse_info(json::parse(R"({"SecurityOptions":null,"CgroupDriver":null})"));
+    CHECK_FALSE(info.malformed);
+    CHECK(info.rows.empty());
+    const auto driver = parse_info(json::parse(R"({"SecurityOptions":null,"CgroupDriver":"systemd"})"));
+    CHECK_FALSE(driver.malformed);
+    REQUIRE(driver.rows.size() == 1);
+    CHECK(driver.rows[0].key == "cgroup_driver");
+
+    // the list reply: Names, Image and State
+    const auto list = containers_from_list(json::parse(
+        R"([{"Id":")" + id('a') + R"(","Names":null,"Image":null,"State":null},)" +
+        R"({"Id":")" + id('b') + R"(","Names":null,"Image":"i","State":"running"}])"));
+    CHECK_FALSE(list.malformed);
+    REQUIRE(list.rows.size() == 2);
+    CHECK(list.rows[0].name == "-");
+    CHECK(list.rows[0].image == "-");
+    CHECK(list.rows[0].state == "invalid");
+    CHECK(list.rows[1].name == "-");
+    CHECK(list.rows[1].image == "i"); // the well-typed keys still report
+    CHECK(list.rows[1].state == "running");
+
+    // inspect: every field stays unknown, and a well-typed key still reports beside a null one
+    const auto make = [] {
+        ContainerRow r;
+        r.id = id('a');
+        r.id12 = id('a', 12);
+        return r;
+    };
+    for (const char* body : {R"({"HostConfig":{"Privileged":null,"NetworkMode":null},"Mounts":null})",
+                             R"({"HostConfig":{"Privileged":null},"Mounts":null})"}) {
+        ContainerRow r = make();
+        INFO(body);
+        REQUIRE(apply_inspect(r, json::parse(body)));
+        CHECK(r.privileged == Tri::unknown);
+        CHECK(r.network_mode == "unknown");
+        CHECK(r.socket_mounted == Tri::unknown);
+    }
+    ContainerRow beside = make();
+    REQUIRE(apply_inspect(beside, json::parse(R"({"HostConfig":{"Privileged":true,"NetworkMode":null},"Mounts":null})")));
+    CHECK(beside.privileged == Tri::yes);
+    CHECK(beside.network_mode == "unknown");
+    CHECK(beside.socket_mounted == Tri::unknown);
+    // a mount whose Source is null mounts no host path, as for one without a Source (tmpfs)
+    ContainerRow no_source = make();
+    REQUIRE(apply_inspect(no_source, json::parse(R"({"HostConfig":{},"Mounts":[{"Source":null},{"Source":"/data"}]})")));
+    CHECK(no_source.socket_mounted == Tri::no);
+    // a null HostConfig is a missing one: the inspection counts as failed and the row is untouched
+    ContainerRow no_hc = make();
+    CHECK_FALSE(apply_inspect(no_hc, json::parse(R"({"HostConfig":null,"Mounts":[]})")));
+    CHECK(no_hc.privileged == Tri::unknown);
+    CHECK(no_hc.socket_mounted == Tri::unknown);
+
+    // daemon.json: every allow-listed key, `hosts` and the two registry lists included
+    for (const char* key : {"live-restore", "userns-remap", "no-new-privileges", "icc", "iptables", "tls",
+                            "tlsverify", "data-root", "log-driver", "storage-driver", "selinux-enabled",
+                            "userland-proxy", "hosts", "insecure-registries", "registry-mirrors"}) {
+        const auto out = parse_daemon_json(std::string{R"({")"} + key + R"(":null})");
+        INFO(key);
+        CHECK_FALSE(out.malformed);
+        CHECK(out.rows.empty());
+    }
+    const auto sibling = parse_daemon_json(R"({"icc":null,"live-restore":true,"hosts":null})");
+    CHECK_FALSE(sibling.malformed);
+    REQUIRE(sibling.rows.size() == 1);
+    CHECK(sibling.rows[0].key == "live-restore");
+}
+
+// ---------------------------------------------------------------------------------------------
+// rows and tokens
+// ---------------------------------------------------------------------------------------------
+
+TEST_CASE("runtime rows: every field goes through wire_field", "[virtualization][runtime][rows]") {
+    ContainerRow c;
+    c.id12 = id('a', 12);
+    c.name = "a|b\\";    // a pipe and a trailing backslash can neither open a field nor eat a delimiter
+    c.image = "x\ny";
+    c.state = "running";
+    const std::string row = format_container_row("docker", c);
+    std::size_t unescaped_pipes = 0;
+    for (std::size_t i = 0; i < row.size(); ++i) {
+        if (row[i] == '\\' && i + 1 < row.size() && row[i + 1] == '|')
+            ++i;
+        else if (row[i] == '|')
+            ++unescaped_pipes;
+    }
+    CHECK(unescaped_pipes == 8); // exactly the nine fields' separators
+    CHECK(row.find('\n') == std::string::npos);
+    CHECK(row.rfind("container|docker|aaaaaaaaaaaa|", 0) == 0);
+    const std::string tail = "|unknown|unknown|unknown"; // privileged, network_mode, socket flag
+    REQUIRE(row.size() > tail.size());
+    CHECK(row.substr(row.size() - tail.size()) == tail);
+
+    CHECK(format_endpoint_row(EndpointStatus::unset, "-", Dialect::none) == "endpoint|unset|-|-");
+    CHECK(format_endpoint_row(EndpointStatus::endpoint_refused, "default_socket", Dialect::none) ==
+          "endpoint|endpoint_refused|default_socket|-");
+    CHECK(format_endpoint_row(EndpointStatus::ok, "", Dialect::podman) == "endpoint|ok|-|podman");
+    CHECK(format_runtime_row("docker", "served", "present:0660:0:998", "present",
+                             "27.3.1", "1.47") ==
+          "runtime|docker|served|present:0660:0:998|present|27.3.1|1.47");
+    CHECK(format_config_row("docker", "live-restore", "yes") == "config|docker|live-restore|yes");
+}
+
+TEST_CASE("runtime tokens: every token matches the plugin grammar", "[virtualization][runtime][tokens]") {
+    const std::regex grammar{"^linux:virtualization:runtime_posture(:[a-z0-9_]+)+$"};
+    for (const char* tail : {"busy", "deadline_exhausted", "rows_capped", "inspect_capped",
+                             "daemon_json:malformed", "docker:overprivileged", "version:http_403",
+                             "inspect:failed:3", "docker:network_fs_skipped", "mountinfo:unreadable",
+                             "endpoint:default_socket", "endpoint:unreachable", "version:timeout",
+                             "version:response_oversized", "info:malformed", "list:entries_skipped"})
+        CHECK(std::regex_match(rt_token(tail), grammar));
+    CHECK(http_cause(403) == "http_403");
+    CHECK(http_cause(100) == "http_100");
+    CHECK(http_cause(599) == "http_599");
+    CHECK(http_cause(99) == "http_other");
+    CHECK(http_cause(600) == "http_other");
+    CHECK(http_cause(-1) == "http_other");
+    CHECK(http_cause(0) == "http_other");
+    CHECK(std::regex_match(rt_token("x:" + http_cause(70000)), grammar));
+    for (const auto o : {Outcome::eacces, Outcome::enoent, Outcome::timeout, Outcome::oversized,
+                         Outcome::not_http, Outcome::other})
+        CHECK(std::regex_match(rt_token("info:" + failure_cause(o)), grammar));
+}

@@ -86,9 +86,13 @@ ROOT = Path(__file__).resolve().parents[2]
 
 # One entry per enrolled family. `core`/`presentation` are OBJECT-FILE STEMS
 # (the source file's name under server/core/src, without the `.cpp`
-# extension) - find_object resolves each stem inside CORE_TARGET_OBJ_DIR (the
-# yuzu_server_core static library's `.p` directory, hard-coded below). A family
-# whose TUs live in another meson target needs its own per-family directory.
+# extension) - find_object resolves each stem inside CORE_TARGET_OBJ_DIRS (the
+# `.p` object directories of the two server-core static libraries,
+# yuzu_server_core and yuzu_server_routes, hard-coded below; which library a
+# TU is in is a 4 GiB archive-size cut, NOT the core/presentation seam this
+# gate enforces - a family's core and presentation stems may share a library
+# or not). A family whose TUs live in another meson target needs its own
+# per-family directory.
 FAMILIES: dict[str, dict[str, list[str]]] = {
     "dex": {
         "core": [
@@ -135,20 +139,25 @@ def find_build_dir(explicit: str | None) -> Path:
     )
 
 
-#: The core library target's own object directory (UP-10) - restricting the
-#: object lookup to here, rather than an `rglob` over the whole build tree,
-#: avoids ever picking up a stale or duplicate object compiled into a
-#: DIFFERENT target's `.p` directory (e.g. a future test binary that also
-#: compiles one of these same source files) - `find_object` below now
-#: errors clearly if the wanted object is missing or duplicated even within
-#: this single, narrower directory, rather than silently matching whichever
+#: The server-core library targets' own object directories (UP-10) -
+#: restricting the object lookup to these, rather than an `rglob` over the
+#: whole build tree, avoids ever picking up a stale or duplicate object
+#: compiled into a DIFFERENT target's `.p` directory (e.g. a future test
+#: binary that also compiles one of these same source files) - `find_object`
+#: below errors clearly if the wanted object is missing or duplicated even
+#: within these narrower directories, rather than silently matching whichever
 #: copy `rglob` happened to find first across the whole tree.
-CORE_TARGET_OBJ_DIR = Path("server") / "core" / "libyuzu_server_core.a.p"
+#: server-core is TWO static libraries (server/core/meson.build, LNK1248 split);
+#: a stem's object lives in exactly one of them, so both are searched.
+CORE_TARGET_OBJ_DIRS = (
+    Path("server") / "core" / "libyuzu_server_core.a.p",
+    Path("server") / "core" / "libyuzu_server_routes.a.p",
+)
 
 
 def find_object(build_dir: Path, stem: str) -> Path:
     """Locate the single compiled object for a source stem under the core
-    library target's own object directory (see CORE_TARGET_OBJ_DIR).
+    library targets' object directories (see CORE_TARGET_OBJ_DIRS).
 
     Meson names an object `src_<stem>.cpp.o` (or `.obj` on the MSVC backend)
     inside its target's `*.p`/`.p` directory - match on the exact basename
@@ -156,25 +165,30 @@ def find_object(build_dir: Path, stem: str) -> Path:
     file's name (there is none today, but a future one should not silently
     match the wrong object).
     """
-    obj_dir = build_dir / CORE_TARGET_OBJ_DIR
-    if not obj_dir.is_dir():
-        raise SystemExit(
-            f"check_core_presentation_link: core target object directory "
-            f"{obj_dir} does not exist - build yuzu_server_core first "
-            f"(`meson compile -C <builddir> yuzu_server_core`)"
-        )
+    obj_dirs = [build_dir / d for d in CORE_TARGET_OBJ_DIRS]
+    for obj_dir in obj_dirs:
+        if not obj_dir.is_dir():
+            raise SystemExit(
+                f"check_core_presentation_link: core target object directory "
+                f"{obj_dir} does not exist - build yuzu_server_core and "
+                f"yuzu_server_routes first (`meson compile -C <builddir> "
+                f"yuzu_server_core yuzu_server_routes`)"
+            )
     wanted = {f"src_{stem}.cpp.o", f"src_{stem}.cpp.obj"}
-    matches = [p for p in obj_dir.iterdir() if p.name in wanted]
+    matches = [p for d in obj_dirs for p in d.iterdir() if p.name in wanted]
     if not matches:
         raise SystemExit(
             f"check_core_presentation_link: no compiled object for '{stem}' under "
-            f"{obj_dir} (matched none of {sorted(wanted)}) - build "
-            f"yuzu_server_core first (`meson compile -C <builddir> yuzu_server_core`)"
+            f"{[str(d) for d in obj_dirs]} (matched none of {sorted(wanted)}) - build "
+            f"yuzu_server_core and yuzu_server_routes first"
         )
     if len(matches) > 1:
         raise SystemExit(
             f"check_core_presentation_link: ambiguous object for '{stem}' under "
-            f"{obj_dir}: {sorted(str(m) for m in matches)}"
+            f"{[str(d) for d in obj_dirs]}: {sorted(str(m) for m in matches)} - "
+            f"a source file belongs to exactly one server-core library, so a "
+            f"stale object survived a move between them: delete the stale "
+            f"object file (or both `*.a.p` directories) and rebuild"
         )
     return matches[0]
 

@@ -16,7 +16,8 @@ namespace yuzu::server {
 /// The full `ResultSet` row as REST/MCP both serve it: id, name,
 /// owner_principal, created_at, ttl_at, last_used_at, pinned, parent_id
 /// (empty string when unset — a ground set has no parent), source_kind,
-/// status (string form), source_execution_id, device_count.
+/// status (string form), source_execution_id, device_count, agents_failed, agents_unanswered and
+/// `partial` (true when either count is above zero).
 nlohmann::json result_set_json(const ResultSet& r);
 
 } // namespace yuzu::server

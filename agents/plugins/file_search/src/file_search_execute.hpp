@@ -1,0 +1,170 @@
+/**
+ * file_search_execute.hpp -- the whole body of the plugin's execute() and the ABI seam's try/catch, and the entry
+ * points the OS-neutral shell (file_search_shell.cpp) exports to the plugin TU. The OS bindings the shell
+ * stands on are declared in file_search_os.hpp.
+ *
+ * It sits between the plugin TU (file_search_plugin.cpp: descriptors, init, shutdown, the heartbeat and log
+ * hooks) and the pure driver (file_search_driver.hpp). The slice itself is injected (SliceFn), so a test
+ * drives the whole execute path without a filesystem, and the allocation-failure case
+ * (tests/unit/test_plugin_abi_oom_containment.cpp) compiles this header as the ABI seam under test.
+ *
+ * WHAT execute() DOES, in order. An unknown action writes one non-row line and returns 1. A request that
+ * does not parse writes the `search|invalid|<token>` trailer alone, reports UNAVAILABLE and returns 1. Every
+ * other answer is the slice's rows, written as the driver made them (the pool thread writes all rows), a
+ * typed status and 0:
+ *   ok      OK, and FULL when this slice ended the search with a complete verdict, else PARTIAL
+ *   busy    UNAVAILABLE, provenance file_search:busy
+ *   invalid UNAVAILABLE, provenance file_search:<reason>  (returns 1)
+ *   failed  UNAVAILABLE, provenance file_search:<reason>
+ * The status is a coarse summary for the host; the trailer and the coverage row are the answer.
+ *
+ * NO EXCEPTION CROSSES THE ABI. A throw in the body (parse, slice, row writes) becomes one
+ * `search|failed|internal_error` trailer and UNAVAILABLE; if even that cannot be built (the allocator is
+ * failing) the call returns 1 rather than unwind through the SDK's extern "C" export. The after hook is
+ * contained separately, where it is called: it runs once the answer is written, so what it throws is dropped
+ * and nothing is written for it. A slice's answer ends in exactly ONE `search` row, and telemetry never
+ * rewrites it.
+ */
+#pragma once
+
+#include <yuzu/plugin.hpp>
+#include <yuzu/string_utils.hpp>
+#include <wire_utf8.hpp>
+
+#include "file_search_driver.hpp"
+#include "file_search_os.hpp"
+#include "file_search_request.hpp"
+
+#if !defined(_WIN32)
+#include "component_legs.hpp" // ci::AroundLookup
+#endif
+
+#include <algorithm>
+#include <chrono>
+#include <functional>
+#include <string>
+#include <string_view>
+#include <vector>
+
+namespace yuzu::file_search {
+
+inline constexpr std::string_view kSearchAction = "search";
+
+/// The name rule of the OS the plugin runs on. A function, not a value: building it allocates, so it is
+/// called inside the seam's try block.
+using SemanticsFn = std::function<fsr::NameSemantics()>;
+
+/// One slice of a parsed request. Production: run_live_slice. A test injects its own.
+using SliceFn = std::function<SliceResult(const Request&)>;
+
+/// Called once with a finished slice's result, after its rows and typed status were written: the plugin TU's
+/// heartbeat and log. Optional. It may throw: the call site below contains it and writes nothing for it.
+using AfterSliceFn = std::function<void(const SliceResult&)>;
+
+namespace execute_detail {
+
+inline void report_status(yuzu::CommandContext& ctx, const SliceResult& r) {
+    if (r.status == Status::ok) {
+        const bool complete = r.cursor.empty() && std::ranges::any_of(r.rows, [](const std::string& row) {
+            return row.starts_with("coverage|complete|");
+        });
+        ctx.set_result_status(YUZU_RESULT_STATUS_OK,
+                              complete ? YUZU_RESULT_COMPLETENESS_FULL : YUZU_RESULT_COMPLETENESS_PARTIAL);
+        return;
+    }
+    ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_UNKNOWN,
+                          "file_search:" + r.reason);
+}
+
+} // namespace execute_detail
+
+/// Dispatch, validation and the single ABI containment. `semantics` yields the name rule of this OS (the
+/// pattern is compiled with it); `provenance_on_throw` is the typed status provenance when the body throws;
+/// `normalise` is the OS's root normaliser (the POSIX rule by default).
+inline int execute_search(yuzu::CommandContext& ctx, std::string_view action, std::string_view root,
+                          std::string_view pattern, std::string_view kinds, std::string_view cursor,
+                          const SemanticsFn& semantics, const SliceFn& run, const AfterSliceFn& after,
+                          std::string_view provenance_on_throw, RootNormaliser normalise = &normalise_root) {
+    try {
+        if (action != kSearchAction) {
+            std::string a{action};
+            yuzu::shared::scrub_wire_bytes(a);
+            ctx.write_output("unknown action: " + yuzu::util::safe_output_field(a));
+            return 1;
+        }
+        const auto req = parse_request(root, pattern, kinds, cursor, semantics(), normalise);
+        if (!req) {
+            const std::string reason = to_token(req.error());
+            ctx.write_output(format_search_row({.status = Status::invalid, .reason = reason}));
+            ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_UNKNOWN,
+                                  "file_search:" + reason);
+            return 1;
+        }
+        const SliceResult r = run(*req);
+        for (const auto& row : r.rows)
+            ctx.write_output(row);
+        execute_detail::report_status(ctx, r);
+        if (after) {
+            try {
+                after(r); // telemetry: a throw here must not add a second trailer to an answer already written
+            } catch (...) {
+            }
+        }
+        return r.status == Status::invalid ? 1 : 0;
+    } catch (...) {
+        try {
+            ctx.write_output(
+                format_search_row({.status = Status::failed, .reason = to_token(Fault::internal_error)}));
+            ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_UNKNOWN,
+                                  std::string{provenance_on_throw});
+        } catch (...) {
+            return 1;
+        }
+        return 0;
+    }
+}
+
+// ---- the OS-neutral shell (file_search_shell.cpp) ----
+
+/// One slice over the live filesystem: the mount table, a leg per unit and the profile roots (each made on
+/// the slice's worker), a worker thread per slice, all bound through file_search_os.hpp. Never throws except
+/// for an allocation failure, which the execute seam contains.
+[[nodiscard]] SliceResult run_live_slice(const Request& req);
+
+/// Runs `work` on a fresh worker thread for at most `timeout`, inside the OS's worker environment
+/// (os_in_worker_environment). The driver's BoundedRunner in production. Exported so the shell tests run the
+/// environment the plugin runs.
+[[nodiscard]] RunOutcome<WorkResult> run_on_worker(std::chrono::milliseconds timeout,
+                                                   std::function<WorkResult()> work);
+
+/// Draws the process's cursor key (os_draw_cursor_key) if it has not been drawn; false if it cannot be, and
+/// then no search runs. The first draw is final either way: a failure is remembered and never retried, and a
+/// success is never drawn again, so a re-init keeps the cursors it issued valid for as long as the process
+/// lives.
+[[nodiscard]] bool init_cursor_key() noexcept;
+
+/// Asks a slice that is running to end at the next entry (the stop flag the worker polls). Idempotent.
+void request_stop() noexcept;
+
+/// Clears the stop flag: a plugin that is initialised again after a shutdown (the module stays mapped, so
+/// its statics outlive the unload) must not start cancelled.
+void clear_stop() noexcept;
+
+#if !defined(_WIN32)
+
+// ---- the POSIX shell (file_search_posix.cpp) ----
+
+/// The hook the search leg wraps around every lookup that may need a capability. Linux: raises
+/// CAP_DAC_READ_SEARCH on the calling thread for the lookup and drops it after; macOS: empty. Exported so
+/// the shell test runs the hook the plugin runs.
+[[nodiscard]] ci::AroundLookup around_lookup_hook();
+
+#if defined(__APPLE__)
+/// The canonical form macOS names are compared in: ASCII folded inline; any other well-formed UTF-8
+/// normalised to NFC and case folded; invalid UTF-8 left as the bytes it is.
+[[nodiscard]] std::string macos_canonical_name(std::string_view name);
+#endif
+
+#endif // !_WIN32
+
+} // namespace yuzu::file_search

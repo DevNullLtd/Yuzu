@@ -45,6 +45,9 @@ inline constexpr TwinRow kExpectedTwins[] = {
     {"list_discovered_devices", "Infrastructure", "Read", true},
     // The MCP twin of POST /api/v1/hardware/sync (same Execution:Execute gate).
     {"sync_hardware_software", "Execution", "Execute", false},
+    // #2146: the MCP twin of POST /api/v1/instructions/{id}/execute (and the legacy
+    // POST /api/instructions/{id}/execute): the same plain Execution:Execute gate.
+    {"execute_instruction_definition", "Execution", "Execute", false},
     // #4030: executions/workflows/schedules read-twin programme.
     {"list_workflows", "Workflow", "Read", true},
     {"get_workflow", "Workflow", "Read", true},
@@ -60,6 +63,17 @@ inline constexpr TwinRow kExpectedTwins[] = {
     {"list_definitions", "InstructionDefinition", "Read", true},
     {"get_definition", "InstructionDefinition", "Read", true},
     {"export_definition", "InstructionDefinition", "Read", true},
+    // #2146 batch C: the instruction-definition / instruction-set authoring twins, pinned against
+    // instruction_authoring_routes.cpp (the v1 routes) and mcp_instruction_authoring.cpp.
+    {"create_definition", "InstructionDefinition", "Write", false},
+    {"update_definition", "InstructionDefinition", "Write", false},
+    {"delete_definition", "InstructionDefinition", "Delete", false},
+    {"import_definition", "InstructionDefinition", "Write", false},
+    {"save_definition_yaml", "InstructionDefinition", "Write", false},
+    {"validate_definition_yaml", "InstructionDefinition", "Read", true},
+    {"list_instruction_sets", "InstructionSet", "Read", true},
+    {"create_instruction_set", "InstructionSet", "Write", false},
+    {"delete_instruction_set", "InstructionSet", "Delete", false},
     // #4029: product-pack read twins, pinned against product_pack_model.hpp /
     // the new GET /api/v1/product-packs* routes.
     {"list_product_packs", "ProductPack", "Read", true},
@@ -103,6 +117,8 @@ inline constexpr TwinRow kExpectedTwins[] = {
     // header comment above was originally pinned against).
     {"get_dex_device_score", "GuaranteedState", "Read", true},
     {"get_dex_device_app_perf", "GuaranteedState", "Read", true},
+    // #2146 PR B: the per-device live read twin (POST /api/v1/dex/devices/{id}/live).
+    {"get_device_live", "GuaranteedState", "Read", true},
     // #4035: the 8 genuinely-new REST+MCP twins from the same issue.
     {"get_dex_app", "GuaranteedState", "Read", true},
     {"list_dex_apps", "GuaranteedState", "Read", true},
@@ -199,6 +215,37 @@ inline constexpr TwinRow kExpectedTwins[] = {
     // Inventory:Read gate the REST routes take through require_fleet_read.
     {"query_software_catalogue", "Inventory", "Read", true},
     {"get_software_versions", "Inventory", "Read", true},
+    // SAM-35 software read model + collection settings twins, pinned against the SAM-33 routes
+    // (software_read_routes.cpp: fleet_read_fn Inventory:Read), the SAM-34 routes
+    // (software_collection_settings_routes.cpp: ManagementGroup:Read/Write for the list, the group
+    // and the PUT; the device-scoped Inventory:Read for the effective read).
+    {"list_software_hosts", "Inventory", "Read", true},
+    {"get_software_host", "Inventory", "Read", true},
+    {"list_software_changes", "Inventory", "Read", true},
+    {"get_software_summary", "Inventory", "Read", true},
+    {"get_software_plugin_health", "Inventory", "Read", true},
+    {"list_software_collection_settings", "ManagementGroup", "Read", true},
+    {"get_software_collection_settings", "ManagementGroup", "Read", true},
+    {"set_software_collection_settings", "ManagementGroup", "Write", false},
+    {"get_software_host_collection_settings", "Inventory", "Read", true},
+    // SAM-29 lifecycle-rule and normalisation-curation twins, pinned against
+    // software_lifecycle_routes.cpp and software_curation_routes.cpp: the GLOBAL Inventory:Read /
+    // Inventory:Write pair each route takes through perm_fn.
+    {"list_software_lifecycle_rules", "Inventory", "Read", true},
+    {"import_software_lifecycle_rules", "Inventory", "Write", false},
+    {"delete_software_lifecycle_rules", "Inventory", "Write", false},
+    {"get_software_normalization_status", "Inventory", "Read", true},
+    {"list_software_curation_queue", "Inventory", "Read", true},
+    {"curate_software_alias", "Inventory", "Write", false},
+    {"reject_software_curation", "Inventory", "Write", false},
+    {"replace_software_normalization_pack", "Inventory", "Write", false},
+    // SAM-21: the components lookup twin, pinned against GET /api/v1/inventory/software/components
+    // (rest_api_v1.cpp: fleet_read_fn Inventory:Read), and the sync status twin, pinned against
+    // GET /api/v1/hardware/sync/{execution_id} (hardware_routes.cpp). The status row is a READ
+    // (Execution:Read: the tier, the approval rule and the readOnlyHint see a read) while the
+    // handler runs perm_fn(Execution, Execute), the REST route's own RBAC gate.
+    {"query_software_components", "Inventory", "Read", true},
+    {"get_software_sync_status", "Execution", "Read", true},
     // /crypto slice 1 twins, pinned against GET /api/v1/crypto/libraries{,/devices}
     // (crypto_routes.cpp): the same Inventory:Read gate through fleet_read_fn.
     {"get_crypto_libraries", "Inventory", "Read", true},
@@ -208,6 +255,9 @@ inline constexpr TwinRow kExpectedTwins[] = {
     // same Inventory:Read gate through fleet_read_fn.
     {"list_hardware_ci", "Inventory", "Read", true},
     {"get_hardware_ci", "Inventory", "Read", true},
+    // The bulk CI page, pinned against GET /api/v1/hardware-ci (hardware_routes.cpp): the same
+    // Inventory:Read gate through fleet_read_fn.
+    {"list_hardware_ci_records", "Inventory", "Read", true},
     // Seam PR2: list_quarantined_devices, pinned against GET /api/v1/quarantine
     // (rest_api_v1.cpp): the same Security:Read gate through require_fleet_read.
     {"list_quarantined_devices", "Security", "Read", true},
@@ -226,12 +276,30 @@ inline constexpr TwinRow kExpectedTwins[] = {
     // /api/config routes do. The per-key administrator-only refusal is config::write_refusal's.
     {"get_runtime_config", "Infrastructure", "Read", true},
     {"set_runtime_config", "Infrastructure", "Write", false},
+    // DEX score policy (#6087): twins of GET/PUT/DELETE /api/v1/dex/score-policy. reset is the
+    // distinct operation Infrastructure:Delete so the supervised tier's approval rule applies.
+    {"get_dex_score_policy", "GuaranteedState", "Read", true},
+    {"set_dex_score_policy", "Infrastructure", "Write", false},
+    {"reset_dex_score_policy", "Infrastructure", "Delete", false},
+    // Fleet application usage: twin of GET /api/v1/dex/apps/usage. The declared pair is the REST
+    // route's first gate; the handler also requires Forensics:Read through the fleet gate.
+    {"get_dex_apps_usage", "GuaranteedState", "Read", true},
     // get_me, the twin of GET /api/v1/me (ledger row get.api-me). The REST route has no
     // permission gate (auth_fn only), so this row pins the MCP side alone:
     // Infrastructure:Read drives MCP tier classification only, with no RBAC check behind it
     // (the check_permission pattern), and a service-scoped token is refused at the generic
     // MCP gate. No arguments, so it is a kNoArgTools entry in test_operator_surface_twins.cpp.
     {"get_me", "Infrastructure", "Read", true},
+    // get_rbac_enforcement, the twin of GET /api/v1/rbac/enforcement (ledger row
+    // get.fragments-access-enforcement, #6033). Like get_me, the REST route and the HTML
+    // fragment have no permission gate (session only), so this row pins the MCP side alone:
+    // Infrastructure:Read drives MCP tier classification only, with no RBAC check behind it,
+    // and a service-scoped token is refused at the generic MCP gate. No arguments. It is also
+    // listed in kNoArgTools in test_operator_surface_twins.cpp, but that entry is inert today:
+    // the check it exempts rejects only the exact schema literal {"type":"object","properties":{}},
+    // and this tool's input schema also carries additionalProperties:false, so it passes with or
+    // without the entry. The input schema itself is pinned in test_rbac_enforcement_read_mcp.cpp.
+    {"get_rbac_enforcement", "Infrastructure", "Read", true},
 };
 
 } // namespace yuzu::server::twin_table

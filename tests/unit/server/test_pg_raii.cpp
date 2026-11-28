@@ -6,17 +6,21 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include "pg/pg_exec.hpp"
 #include "pg/pg_raii.hpp"
 
 #include "../test_helpers.hpp"
+#include "../test_log_capture.hpp" // stray_control_bytes
 
 #include <libpq-fe.h>
 
 #include <cstdlib>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
 #include <utility>
+#include <vector>
 
 using yuzu::server::pg::PgConn;
 using yuzu::server::pg::PgResult;
@@ -159,7 +163,7 @@ TEST_CASE("PgTxn rollback-unless-commit", "[pg][raii][pg-smoke]") {
         CHECK(count_rows(conn.get()) == 0);
     }
 
-    SECTION("commit failure leaves the guard armed") {
+    SECTION("an aborted transaction is rolled back by commit(), which returns false") {
         begin(conn.get());
         PgTxn txn{conn.get()};
         // Poison the transaction: a failed statement puts it in
@@ -167,10 +171,11 @@ TEST_CASE("PgTxn rollback-unless-commit", "[pg][raii][pg-smoke]") {
         PgResult bad{PQexec(conn.get(), "SELECT no_such_column FROM t")};
         CHECK(bad.status() == PGRES_FATAL_ERROR);
         // Postgres turns COMMIT on an aborted txn into ROLLBACK but still
-        // answers PGRES_COMMAND_OK, so commit() "succeeds" — the invariant
-        // that matters is the connection comes back idle and nothing
-        // persisted.
-        (void)txn.commit();
+        // answers PGRES_COMMAND_OK, so commit() checks the transaction state
+        // first, rolls back and returns false (see the aborted-transaction case
+        // below). The invariant here: the connection comes back idle and
+        // nothing persisted.
+        CHECK_FALSE(txn.commit());
         CHECK(PQtransactionStatus(conn.get()) == PQTRANS_IDLE);
         CHECK(count_rows(conn.get()) == 0);
     }
@@ -188,4 +193,180 @@ TEST_CASE("PgTxn rollback-unless-commit", "[pg][raii][pg-smoke]") {
         CHECK(PQtransactionStatus(conn.get()) == PQTRANS_IDLE);
         CHECK(count_rows(conn.get()) == 0); // b rolled back exactly once
     }
+}
+
+// Dave's review of #7376, item 3: PgTxn::commit() must not report success for a transaction a
+// refused or failed statement aborted. COMMIT in PQTRANS_INERROR completes as ROLLBACK yet
+// answers PGRES_COMMAND_OK, so commit() checks the transaction state first.
+TEST_CASE("PgTxn commit() and an aborted transaction", "[pg][raii]") {
+    YUZU_REQUIRE_PG_DB(db);
+    PgConn conn = connect_with_table(db.dsn());
+
+    SECTION("a NUL refusal the callback ignored: commit() is false and nothing persists") {
+        begin(conn.get());
+        {
+            PgTxn txn{conn.get()};
+            insert_row(conn.get(), 1);
+            const std::vector<std::optional<std::string>> params{std::string("a\0b", 3)};
+            PgResult refused = yuzu::server::pg::exec_params(
+                conn.get(), "INSERT INTO t (id) VALUES (length($1))", params);
+            CHECK(refused.status() == PGRES_FATAL_ERROR); // the callback "ignores" this result
+            CHECK_FALSE(txn.commit());
+            CHECK(PQtransactionStatus(conn.get()) == PQTRANS_IDLE); // rolled back by commit()
+            CHECK_FALSE(txn.commit()); // stays false; no second COMMIT on a reused connection
+        }
+        CHECK(count_rows(conn.get()) == 0); // the earlier insert did not persist either
+    }
+
+    SECTION("a failed statement recovered with ROLLBACK TO SAVEPOINT still commits") {
+        begin(conn.get());
+        {
+            PgTxn txn{conn.get()};
+            insert_row(conn.get(), 1);
+            PgResult sp{PQexec(conn.get(), "SAVEPOINT s1")};
+            REQUIRE(sp.status() == PGRES_COMMAND_OK);
+            PgResult bad{PQexec(conn.get(), "INSERT INTO t (id) VALUES (1)")}; // duplicate key
+            CHECK(bad.status() == PGRES_FATAL_ERROR);
+            PgResult back{PQexec(conn.get(), "ROLLBACK TO SAVEPOINT s1")};
+            REQUIRE(back.status() == PGRES_COMMAND_OK);
+            insert_row(conn.get(), 2);
+            CHECK(txn.commit());
+        }
+        CHECK(count_rows(conn.get()) == 2);
+    }
+
+    SECTION("after a refused commit the guard is disarmed: a transaction started later survives") {
+        begin(conn.get());
+        {
+            PgTxn txn{conn.get()};
+            insert_row(conn.get(), 1);
+            PgResult bad{PQexec(conn.get(), "SELECT no_such_column FROM t")};
+            CHECK(bad.status() == PGRES_FATAL_ERROR);
+            CHECK_FALSE(txn.commit()); // rolled back here; the guard must not roll back again
+            // The caller starts and commits its own transaction on the same connection while the
+            // guard is still in scope. A destructor that still rolled back would not touch it
+            // (it runs after COMMIT), so open a second one that is still open at destruction.
+            begin(conn.get());
+            insert_row(conn.get(), 2);
+        } // ~PgTxn runs with the caller's second transaction open: it must NOT roll it back
+        CHECK(PQtransactionStatus(conn.get()) == PQTRANS_INTRANS);
+        PgResult commit2{PQexec(conn.get(), "COMMIT")};
+        CHECK(commit2.status() == PGRES_COMMAND_OK);
+        CHECK(count_rows(conn.get()) == 1); // the second transaction's row, not the first's
+    }
+
+    SECTION("a guard moved after its refused commit stays disarmed") {
+        begin(conn.get());
+        {
+            PgTxn first{conn.get()};
+            insert_row(conn.get(), 1);
+            PgResult bad{PQexec(conn.get(), "SELECT no_such_column FROM t")};
+            CHECK(bad.status() == PGRES_FATAL_ERROR);
+            CHECK_FALSE(first.commit());
+            PgTxn second{std::move(first)};
+            CHECK_FALSE(second.commit()); // the flag travelled with the move
+            begin(conn.get());
+            insert_row(conn.get(), 2);
+        } // both guards leave scope with the caller's transaction open
+        CHECK(PQtransactionStatus(conn.get()) == PQTRANS_INTRANS);
+        PgResult commit2{PQexec(conn.get(), "COMMIT")};
+        CHECK(commit2.status() == PGRES_COMMAND_OK);
+        CHECK(count_rows(conn.get()) == 1);
+    }
+
+    SECTION("plain success is unchanged") {
+        begin(conn.get());
+        {
+            PgTxn txn{conn.get()};
+            insert_row(conn.get(), 1);
+            CHECK(txn.commit());
+            CHECK(txn.commit());
+        }
+        CHECK(PQtransactionStatus(conn.get()) == PQTRANS_IDLE);
+        CHECK(count_rows(conn.get()) == 1);
+    }
+}
+
+// ── connect_failure_cause (F56): fixed causes, nothing copied from libpq text ──
+
+TEST_CASE("connect_failure_cause never echoes libpq text", "[raii][log_injection][F56]") {
+    using yuzu::server::pg::connect_failure_cause;
+    // A URI DSN whose password contained '/' leaves a fragment of it in the port/dbname libpq
+    // quotes; the cause must be a constant that contains none of it.
+    const std::string leaky =
+        "connection to server at \"db\" (10.0.0.1), port s3cr3tfrag failed: Connection refused\n"
+        "\tIs the server running on that host and accepting TCP/IP connections?\n";
+    const std::string cause = connect_failure_cause(leaky);
+    CHECK(cause.find("s3cr3tfrag") == std::string::npos);
+    CHECK(cause.find('\n') == std::string::npos);
+
+    const std::string generic = connect_failure_cause("weird\nforged line s3cr3tfrag");
+    CHECK(generic.find("s3cr3tfrag") == std::string::npos);
+    CHECK(generic == yuzu::server::pg::kConnectFailureGeneric);
+}
+
+TEST_CASE("query_failure_detail keeps the step and a folded, capped first line (WP04-X)",
+          "[raii][F56]") {
+    using yuzu::server::pg::query_failure_detail;
+    // An ordinary failover is NOT a certificate problem.
+    const auto d = query_failure_detail("connection lost during probe",
+                                        "server closed the connection unexpectedly\n\tThis probably means...");
+    CHECK(d == "connection lost during probe: server closed the connection unexpectedly");
+    const auto e = query_failure_detail("connection lost during probe", "SSL SYSCALL error: EOF detected\n");
+    CHECK(e.find("TLS negotiation") == std::string::npos);
+    CHECK(e.find("EOF detected") != std::string::npos);
+    // Folded and capped; empty text keeps just the step.
+    const auto f = query_failure_detail("s", std::string("a\x1b[2J\xC2\x9B") + std::string(500, 'x'));
+    CHECK(yuzu::test::stray_control_bytes(f) == 0);
+    CHECK(f.size() <= 1 + 3 + 120 + 8);
+    CHECK(query_failure_detail("step", "") == "step");
+    // The 120-byte cut backs up over a UTF-8 continuation byte: no dangling lead byte.
+    const auto g = query_failure_detail("s", std::string(119, 'x') + "\xC3\xA9" + "tail");
+    CHECK(g == "s: " + std::string(119, 'x')); // the 2-byte character is dropped whole
+    for (const unsigned char c : g)
+        CHECK(c < 0x80);
+    // Malformed input: stray continuation bytes after ASCII do not cost the ASCII byte before them.
+    const auto h = query_failure_detail("s", std::string(120, 'y') + "\x80\x80more");
+    CHECK(h.substr(0, 3 + 120) == "s: " + std::string(120, 'y'));
+}
+
+TEST_CASE("connect_failure_cause: each branch, and the mis-bucketing cases", "[raii][F56]") {
+    using yuzu::server::pg::connect_failure_cause;
+    using yuzu::server::pg::kConnectFailureGeneric;
+    const auto is = [](const char* in, std::string_view needle) {
+        return std::string_view{connect_failure_cause(in)}.find(needle) != std::string_view::npos;
+    };
+    CHECK(is("FATAL:  password authentication failed for user \"app\"", "authentication failed"));
+    CHECK(is("FATAL:  no pg_hba.conf entry for host \"1.2.3.4\"", "pg_hba.conf"));
+    CHECK(is("SSL error: certificate verify failed", "TLS"));
+    CHECK(is("FATAL:  database \"x\" does not exist", "does not exist"));
+    CHECK(is("could not translate host name \"h\" to address", "could not be resolved"));
+    CHECK(is("connection to server failed: timeout expired", "timed out"));
+    CHECK(is("connection failed: Connection refused", "not reachable"));
+    CHECK(is("FATAL:  the database system is starting up", "not accepting"));
+    // #4943 discriminator: the reserve-slots refusal and plain max_connections are NOT generic.
+    using yuzu::server::pg::kConnectNoFreeSlots;
+    using yuzu::server::pg::kConnectNoWritableHost;
+    CHECK(std::string_view{connect_failure_cause(
+              "connection to server at \"h\" (1.2.3.4), port 5432 failed: FATAL:  remaining connection "
+              "slots are reserved for roles with privileges of the \"pg_use_reserved_connections\" role")} ==
+          kConnectNoFreeSlots);
+    CHECK(std::string_view{connect_failure_cause("FATAL:  sorry, too many clients already")} ==
+          kConnectNoFreeSlots);
+    // target_session_attrs=read-write refused every host.
+    CHECK(std::string_view{connect_failure_cause(
+              "connection to server failed: session is read-only")} == kConnectNoWritableHost);
+    CHECK(std::string_view{connect_failure_cause(
+              "connection to server failed: server is in hot standby mode")} == kConnectNoWritableHost);
+    // Ordering: a role merely NAMED like a cause stays a missing role; auth beats slots.
+    CHECK(is("FATAL:  role \"hot standby\" does not exist", "does not exist"));
+    CHECK(is("FATAL:  database \"remaining connection slots\" does not exist", "does not exist"));
+    CHECK(is("FATAL:  password authentication failed ... remaining connection slots", "authentication failed"));
+    CHECK(is("out of memory", "out of memory"));
+    CHECK(std::string_view{connect_failure_cause("something else")} == kConnectFailureGeneric);
+    // A missing sslrootcert says "does not exist" but is a TLS failure, not a missing database.
+    CHECK(is("root certificate file \"/x/root.crt\" does not exist", "TLS"));
+    // A database or role that merely CONTAINS "SSL" is a missing database, not a TLS failure.
+    CHECK(is("FATAL:  database \"SSL_prod\" does not exist", "does not exist"));
+    CHECK(is("FATAL:  role \"No such file or directory\" does not exist", "does not exist"));
 }

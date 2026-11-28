@@ -1654,8 +1654,7 @@ const std::string& windows_system_directory() {
     // process is running, and this is called on every Windows spawn whose
     // working_dir defaults ("/" sentinel, mapped below) plus every
     // Windows-plugin caller (e.g. script_exec's PowerShell path) that needs
-    // a trusted absolute System32 path. Same pattern as
-    // quarantine_plugin.cpp's netsh_path(): an honest empty return on
+    // a trusted absolute System32 path. An honest empty return on
     // failure, never a guessed fallback -- callers fail closed on it.
     static const std::string dir = [] {
         wchar_t buf[MAX_PATH]{};

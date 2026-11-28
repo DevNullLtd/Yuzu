@@ -13,6 +13,7 @@
 
 #include "network_routes.hpp"
 
+#include "dex_pane.hpp"
 #include "web_utils.hpp"
 
 #include <cctype>
@@ -56,8 +57,8 @@ std::string placeholder(const std::string& title, const std::string& sub) {
 
 // A drill anchor: hx-get the fragment into the shared page mount (#guardian-detail).
 std::string drill(const std::string& path_qs, const std::string& disp) {
-    return "<a hx-get=\"" + path_qs + "\" hx-target=\"#guardian-detail\" "
-           "hx-swap=\"innerHTML\" style=\"cursor:pointer;\">" + disp + "</a>";
+    return "<a hx-get=\"" + path_qs + "\"" + std::string(kDexPaneSwapAttrs) +
+           " style=\"cursor:pointer;\">" + disp + "</a>";
 }
 
 std::string fmt_ms(double v) { return std::format("{:.0f} ms", v); }
@@ -283,8 +284,8 @@ std::string render_network_devices_fragment(const std::vector<NetPerfDeviceRow>&
     }
 
     std::string h = dex_fragment_style();
-    h += "<a class=\"gp-back\" hx-get=\"/fragments/network/overview\" hx-target=\"#guardian-detail\" "
-         "hx-swap=\"innerHTML\" style=\"cursor:pointer;\">&larr; Network quality</a>";
+    h += "<a class=\"gp-back\" hx-get=\"/fragments/network/overview\"" + std::string(kDexPaneSwapAttrs) +
+         " style=\"cursor:pointer;\">&larr; Network quality</a>";
     h += "<div class=\"gp-head\"><div><div class=\"gp-titleline\"><h1>" + title +
          "</h1></div><div class=\"gp-sub\">Values are each device&rsquo;s current heartbeat sample "
          "&mdash; the same data the fleet cards aggregate. The device/app flags are <b>measured "
@@ -300,8 +301,7 @@ std::string render_network_devices_fragment(const std::vector<NetPerfDeviceRow>&
         h += "<div class=\"gp-note\">cohort by tag key: <select name=\"key\" "
              "hx-get=\"/fragments/network/devices?metric=" +
              std::string(metric_token) +
-             "\" hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\" hx-trigger=\"change\" "
-             "class=\"dx-ctl\">";
+             "\"" + std::string(kDexPaneSwapAttrs) + " hx-trigger=\"change\" class=\"dx-ctl\">";
         h += "<option value=\"\"" + std::string(cohort_key.empty() ? " selected" : "") +
              ">(none)</option>";
         bool key_listed = false;

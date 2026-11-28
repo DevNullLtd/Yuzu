@@ -23,6 +23,8 @@
 #   CH-22: coverage-gate refuses a non-Linux host (#6187)
 #   CH-23: option parsing, baseline types, gcovr search path, host-override marker, interrupts
 #   CH-24: a failed stale-counter purge is inconclusive
+#   CH-25: requested perf/scale execution and metrics must both be complete
+#   CH-26: manual coverage captures use distinct identities across revisions
 #
 # Usage:
 #   bash tests/shell/test_pr2_gates.sh             # run all scenarios
@@ -82,8 +84,24 @@ cat > "$MOCKBIN/rebar3" <<'EOF'
 #!/usr/bin/env bash
 # Mock rebar3 — prints scripted output from YUZU_MOCK_CT_OUTPUT
 # and exits with YUZU_MOCK_CT_RC.
+if [[ " $* " == *" --suite yuzu_gw_scale_SUITE "* ]]; then
+    printf '%s\n' "${YUZU_MOCK_SCALE_OUTPUT:-}"
+    exit "${YUZU_MOCK_SCALE_RC:-0}"
+fi
 printf '%s\n' "${YUZU_MOCK_CT_OUTPUT:-}"
 exit "${YUZU_MOCK_CT_RC:-0}"
+EOF
+
+# Darwin host facts are fixture inputs, not a prerequisite for a mocked CT run
+# (sysctl can be unavailable in a sandbox). No real host settings are changed.
+cat > "$MOCKBIN/sysctl" <<'EOF'
+#!/usr/bin/env bash
+case "$*" in
+    '-n vm.loadavg') echo '{ 1.0 1.0 1.0 }' ;;
+    '-n machdep.cpu.brand_string') echo 'fixture CPU' ;;
+    '-n hw.memsize') echo 8589934592 ;;
+    *) exit 1 ;;
+esac
 EOF
 
 chmod +x "$MOCKBIN"/*
@@ -317,7 +335,7 @@ Registratiun: 5000 ops in 613 ms (8157 op/s)
 Heartbit queue: 20000 ops in 83 ms (240964 op/s)
 All 9 tests passed." \
     bash "$YUZU_ROOT/scripts/test/perf-gate.sh" \
-        --run-id "$run_id" >/dev/null 2>&1 || true
+        --run-id "$run_id" --allow-busy >/dev/null 2>&1 || true
 
     local status notes
     status=$(db_gate_status "$run_id" "Perf")
@@ -881,7 +899,14 @@ if [[ -n "\${YUZU_MOCK_LN_RACE:-}" ]]; then
 fi
 exec /bin/ln "\$@"
 EOF
-    chmod +x "$FK_BIN/meson" "$FK_BIN/gcovr" "$FK_BIN/ps" "$FK_BIN/find" "$FK_BIN/ln"
+    # Fixed available space makes the low-disk/decimal tests independent of
+    # the host filesystem (large disks exceeded CH-21's former threshold).
+    cat > "$FK_BIN/df" <<'EOF'
+#!/usr/bin/env bash
+printf 'Filesystem 1024-blocks Used Available Capacity Mounted on\n'
+printf 'fixture 2097152 1048576 1048576 50%% /fixture\n'
+EOF
+    chmod +x "$FK_BIN/meson" "$FK_BIN/gcovr" "$FK_BIN/ps" "$FK_BIN/find" "$FK_BIN/ln" "$FK_BIN/df"
     FK_SAVED_PATH="$PATH"; export PATH="$FK_BIN:$PATH"
     printf '{"branch_percent":60.0,"line_percent":70.0,"slack_pp":0.5}' > "$CHAOS_ROOT/$tag-baseline.json"
     FK_BASE="$CHAOS_ROOT/$tag-baseline.json"
@@ -1832,7 +1857,7 @@ scenario_CH_21() {
     start_run ch21f
     FK_OUT=$(YUZU_MOCK_DB_FAIL=metric bash "$FK_ROOT/scripts/test/coverage-gate.sh" --run-id ch21f \
         --build-dir "$build" --baseline "$FK_BASE" --capture-baselines 2>&1) && FK_RC=0 || FK_RC=$?
-    if [[ "$FK_RC" != "1" || "$(cksum < "$FK_BASE")" != "$before21" || "$FK_OUT" != *"refused --capture-baselines: a DB write failed"* ]]; then
+    if [[ "$FK_RC" != "1" || "$(cksum < "$FK_BASE")" != "$before21" || "$FK_OUT" != *"refused --capture-baselines: evidence recording failed"* ]]; then
         bad "CH-21" "capture after a failed DB write: rc=$FK_RC baseline-changed=$([[ $(cksum < "$FK_BASE") != "$before21" ]] && echo yes || echo no)"
     else ok "CH-21: --capture-baselines after a failed DB write refuses and leaves the baseline untouched"; fi
 
@@ -2204,8 +2229,154 @@ scenario_CH_24() {
     export PATH="$FK_SAVED_PATH"
 }
 
+scenario_CH_25() {
+    echo ""
+    echo "=== CH-25: requested perf/scale work cannot disappear into PASS ==="
+    init_db || { bad "CH-25" "db init failed"; return; }
+    local perf="Registration: 5000 ops in 613 ms (8157 ops/sec)"
+    local scale="SCALE_METRIC scale_steady_stop_ms_n10=12
+SCALE_METRIC scale_steady_latency_ms_p95_n10=8
+SCALE_METRIC scale_steady_gateway_memory_per_connection_bytes_n10=1024"
+    local kind run_id ct_rc scale_rc perf_output scale_output expected rc status notes
+    for kind in success scale_assert scale_tooling scale_empty perf_empty; do
+        run_id="ch25-$kind"
+        start_run "$run_id"
+        ct_rc=0; scale_rc=0; perf_output="$perf"; scale_output="$scale"; expected=WARN
+        case "$kind" in
+            success) expected=PASS ;;
+            scale_assert) scale_rc=1 ;;
+            scale_tooling) scale_rc=2 ;;
+            scale_empty) scale_output="All tests passed." ;;
+            perf_empty) perf_output="All tests passed." ;;
+        esac
+        rc=0
+        YUZU_MOCK_CT_RC="$ct_rc" YUZU_MOCK_CT_OUTPUT="$perf_output" \
+        YUZU_MOCK_SCALE_RC="$scale_rc" YUZU_MOCK_SCALE_OUTPUT="$scale_output" \
+            bash "$YUZU_ROOT/scripts/test/perf-gate.sh" --run-id "$run_id" \
+            --scale-agents 10 --allow-busy >"$CHAOS_ROOT/$run_id.log" 2>&1 || rc=$?
+        status=$(db_gate_status "$run_id" Perf)
+        notes=$(db_gate_notes "$run_id" Perf)
+        if [[ "$status" == "$expected" ]] && \
+           { [[ "$expected" == PASS && "$rc" == 0 ]] || [[ "$expected" == WARN && "$rc" == 2 ]]; }; then
+            ok "CH-25: $kind -> $status (exit $rc)"
+        else
+            bad "CH-25" "$kind: expected $expected, got $status (exit $rc): $notes"
+            tail -8 "$CHAOS_ROOT/$run_id.log"
+        fi
+        if [[ "$kind" == success || "$kind" == scale_assert ]]; then
+            if python3 - "$YUZU_TEST_DB" "$run_id" <<'PY'
+import sqlite3, sys
+with sqlite3.connect(sys.argv[1]) as db:
+    observed = db.execute(
+        "SELECT metric_name,metric_value,metric_unit FROM test_metrics "
+        "WHERE run_id=? AND metric_name LIKE 'perf_scale_%' ORDER BY metric_name",
+        (sys.argv[2],),
+    ).fetchall()
+    expected = [
+        ("perf_scale_steady_gateway_memory_per_connection_bytes_n10", 1024, "bytes"),
+        ("perf_scale_steady_latency_ms_p95_n10", 8, "ms"),
+        ("perf_scale_steady_stop_ms_n10", 12, "ms"),
+    ]
+    assert observed == expected, observed
+PY
+            then ok "CH-25: $kind retains scale values and units"
+            else bad "CH-25" "$kind lost scale values or units"; fi
+        fi
+    done
+
+    # Exercise persistence errors in the actual recorder, not just mocked exits.
+    for kind in metric gate; do
+        run_id="ch25-db-$kind"
+        start_run "$run_id"
+        python3 - "$YUZU_TEST_DB" "$run_id" "$kind" <<'PY'
+import sqlite3, sys
+table = {"metric": "test_metrics", "gate": "test_gates"}[sys.argv[3]]
+with sqlite3.connect(sys.argv[1]) as db:
+    # The identifiers and run IDs come only from this fixed test matrix.
+    db.execute(f"CREATE TRIGGER refuse_{sys.argv[3]} BEFORE INSERT ON {table} "
+               f"WHEN NEW.run_id='{sys.argv[2]}' BEGIN SELECT RAISE(ABORT, 'fixture failure'); END")
+PY
+        rc=0
+        YUZU_MOCK_CT_RC=0 YUZU_MOCK_CT_OUTPUT="$perf" \
+            bash "$YUZU_ROOT/scripts/test/perf-gate.sh" --run-id "$run_id" \
+            --allow-busy >"$CHAOS_ROOT/$run_id.log" 2>&1 || rc=$?
+        status=$(db_gate_status "$run_id" Perf)
+        if [[ "$rc" == 2 && "$status" != PASS ]] && \
+           grep -q "ERROR could not record" "$CHAOS_ROOT/$run_id.log"; then
+            ok "CH-25: failed $kind persistence -> exit 2, no PASS"
+        else
+            bad "CH-25" "failed $kind persistence: exit=$rc status=$status"
+        fi
+    done
+}
+
+scenario_CH_26() {
+    echo ""
+    echo "=== CH-26: coverage captures preserve evidence across commits ==="
+    init_db || { bad "CH-26" "db init failed"; return; }
+    ch_fixture ch26
+    local build="$FK_ROOT/build-ch26" revision capture rc
+    git -C "$FK_ROOT" init -q || { bad "CH-26" "fixture git init failed"; return; }
+    # Real revisions and real recorder writes; only coverage execution is mocked.
+    for capture in 1 2 3; do
+        if [[ "$capture" != 3 ]]; then
+            git -C "$FK_ROOT" -c user.name=Fixture -c user.email=fixture@example.invalid \
+                -c commit.gpgsign=false commit --allow-empty -qm "fixture $capture" || {
+                bad "CH-26" "fixture commit failed"; export PATH="$FK_SAVED_PATH"; return;
+            }
+        fi
+        revision=$(git -C "$FK_ROOT" rev-parse HEAD)
+        rc=0
+        bash "$FK_ROOT/scripts/test/coverage-gate.sh" --capture-baselines \
+            --build-dir "$build" --baseline "$FK_BASE" \
+            >"$CHAOS_ROOT/ch26-$capture.log" 2>&1 || rc=$?
+        if [[ "$rc" != 0 ]]; then
+            bad "CH-26" "capture $capture failed (exit $rc): $(tail -4 "$CHAOS_ROOT/ch26-$capture.log")"
+            export PATH="$FK_SAVED_PATH"; return
+        fi
+        if ! python3 - "$YUZU_TEST_DB" "$FK_BASE" "$capture" "$revision" "$CHAOS_ROOT/ch26-first.json" <<'PY'
+import json, sqlite3, sys
+db, baseline, count, revision, first = sys.argv[1:]
+with sqlite3.connect(db) as conn:
+    rows = conn.execute("SELECT run_id,commit_sha,started_at FROM test_runs ORDER BY rowid").fetchall()
+    assert len(rows) == int(count), rows
+    assert len({row[0] for row in rows}) == int(count), rows
+    assert rows[-1][0].startswith("manual-") and rows[-1][1] == revision, rows
+    assert conn.execute("SELECT COUNT(*) FROM test_gates WHERE gate_name='Coverage' AND status='PASS'").fetchone()[0] == int(count)
+    assert conn.execute("SELECT COUNT(*) FROM test_metrics").fetchone()[0] == 2 * int(count)
+    with open(baseline, encoding="utf-8") as source:
+        assert json.load(source)["captured_commit"] == revision
+    if count == "1":
+        with open(first, "w", encoding="utf-8") as target:
+            json.dump(rows[0], target)
+    else:
+        with open(first, encoding="utf-8") as source:
+            assert list(rows[0]) == json.load(source), rows
+PY
+        then bad "CH-26" "capture $capture lost or relabelled evidence"
+        else ok "CH-26: capture $capture has its own identity and retains previous evidence"; fi
+    done
+    local first_id
+    first_id=$(python3 - "$CHAOS_ROOT/ch26-first.json" <<'PY'
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as source:
+    print(json.load(source)[0])
+PY
+)
+    cp "$FK_BASE" "$CHAOS_ROOT/ch26-before-refusal.json"
+    rc=0
+    bash "$FK_ROOT/scripts/test/coverage-gate.sh" --capture-baselines --run-id "$first_id" \
+        --build-dir "$build" --baseline "$FK_BASE" >"$CHAOS_ROOT/ch26-refused.log" 2>&1 || rc=$?
+    if [[ "$rc" == 1 ]] && cmp -s "$FK_BASE" "$CHAOS_ROOT/ch26-before-refusal.json" \
+        && grep -q 'belongs to commit' "$CHAOS_ROOT/ch26-refused.log" \
+        && grep -q 'run-ID/revision conflicts' "$CHAOS_ROOT/ch26-refused.log"; then
+        ok "CH-26: explicit cross-revision reuse refuses capture with an actionable error and unchanged baseline"
+    else bad "CH-26" "cross-revision capture refusal lost its diagnostic or rewrote the baseline (exit $rc)"; fi
+    export PATH="$FK_SAVED_PATH"
+}
+
 # ── Scenario dispatch ───────────────────────────────────────────────────
-SCENARIOS=(CH-2 CH-3 CH-4 CH-6 CH-8 CH-15 CH-16 CH-17 CH-18 CH-19 CH-20 CH-21 CH-22 CH-23 CH-24)
+SCENARIOS=(CH-2 CH-3 CH-4 CH-6 CH-8 CH-15 CH-16 CH-17 CH-18 CH-19 CH-20 CH-21 CH-22 CH-23 CH-24 CH-25 CH-26)
 
 # CH-1 (clean-log + workflow-failure → FAIL) requires a live gh CLI mock
 # which is more involved — defer to a dedicated PR2.1 harness pass once
@@ -2233,6 +2404,8 @@ for s in "${SCENARIOS[@]}"; do
         CH-22) scenario_CH_22 ;;
         CH-23) scenario_CH_23 ;;
         CH-24) scenario_CH_24 ;;
+        CH-25) scenario_CH_25 ;;
+        CH-26) scenario_CH_26 ;;
         *)     echo "unknown scenario: $s" >&2; exit 2 ;;
     esac
 done

@@ -13,10 +13,13 @@
 
 #include "echo_cursor.hpp"
 #include "echo_db.hpp"
+#include "echo_test_db.hpp"
+#include "echo_fold_schema.hpp"
 #include "echo_registry_parsers.hpp"
 #include "echo_registry_source.hpp"
 #include "echo_schema_registry.hpp"
 #include "test_helpers.hpp"
+#include "test_log_capture.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_string.hpp>
@@ -26,15 +29,19 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdio>
+#include <deque>
 #include <filesystem>
 #include <format>
 #include <functional>
 #include <limits>
 #include <map>
+#include <memory>
 #include <optional>
 #include <set>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <vector>
 
 #ifdef _WIN32
@@ -45,9 +52,12 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <regex>
 #include <evntrace.h> // ControlTraceW QUERY: no session may outlive stop()
 #include <sddl.h>
+#include <win_profiles.hpp> // enumerate_hku_subkeys_checked, PrivilegeScope: the offline-hive cases
 #include <win_str.hpp>
+#include "echo_hive_mount_gate.hpp"  // g_mount_workers_in_flight
 #include "echo_win_process_name.hpp" // process_basename_for_pid
 #endif
 
@@ -240,7 +250,7 @@ TEST_CASE("baseline_entry_from_bytes hashes every byte read (R8)", "[echo][regis
     CHECK(ea.h != eb.h);
     CHECK(ea.s == eb.s);
     CHECK(ea == baseline_entry_from_bytes(P::kRegBinary, a.size(), a, false)); // identical bytes
-    CHECK(ea.d.size() <= kBaselineRenderCap);
+    CHECK(ea.d.empty()); // the old value is not kept in the baseline: it is never stored in a row
     const auto big = baseline_entry_from_bytes(P::kRegBinary, 9'000'000, a, true);
     CHECK(big.dt); // hash covers a prefix only
     CHECK(big.s == 9'000'000);
@@ -295,13 +305,15 @@ TEST_CASE("diff_registry_snapshot: added/changed/removed values and the four rea
         const auto& changed = by.at("changed:A:ImagePath");
         CHECK(changed.data == "c:\\a2.exe");
         CHECK(changed.has_prev);
-        CHECK(changed.prev_data == "c:\\a.exe");
+        CHECK(changed.prev_size == utf16("c:\\a.exe").size());
+        CHECK(changed.prev_data.empty()); // the old value is no longer rendered into the baseline
         CHECK(changed.root == root);
         CHECK(changed.window_lo == 10);
         CHECK(changed.window_hi == 20);
         CHECK(by.at("added:A:Start").data == "2");
         CHECK_FALSE(by.at("added:A:Start").has_prev);
-        CHECK(by.at("removed:B:ImagePath").prev_data == "c:\\b.exe");
+        CHECK(by.at("removed:B:ImagePath").has_prev);
+        CHECK(by.at("removed:B:ImagePath").prev_data.empty());
         CHECK(d.changed);
     }
 
@@ -381,10 +393,196 @@ TEST_CASE("diff_registry_snapshot: added/changed/removed values and the four rea
         const auto d = diff_registry_snapshot(first.baseline, read3, root, "notify", win, 20);
         for (const auto& c : d.candidates)
             if (c.value == "Blob") {
+                CHECK(kRegistryDataCap == 512);
                 CHECK(c.data.size() <= kRegistryDataCap);
+                CHECK_FALSE(c.data.empty());
                 CHECK(c.data_truncated);
                 CHECK(c.size == 10'000);
             }
+    }
+}
+
+namespace {
+
+// The test-side inverse of registry_name_utf8 (production has no decoder: nothing needs one).
+// Reading left to right a U+FFFD is followed by a second U+FFFD (a literal one) or by four hex
+// digits that start with `D` (a lone surrogate).
+std::u16string decode_registry_name(const std::string& s) {
+    std::u16string out;
+    const auto cp_at = [&](std::size_t& i) {
+        const auto b0 = static_cast<unsigned char>(s[i]);
+        const std::size_t n = b0 < 0x80 ? 1 : b0 < 0xE0 ? 2 : b0 < 0xF0 ? 3 : 4;
+        char32_t cp = n == 1 ? b0 : (b0 & (0xFF >> (n + 1)));
+        for (std::size_t k = 1; k < n; ++k)
+            cp = (cp << 6) | (static_cast<unsigned char>(s[i + k]) & 0x3F);
+        i += n;
+        return cp;
+    };
+    for (std::size_t i = 0; i < s.size();) {
+        const char32_t cp = cp_at(i);
+        if (cp == 0xFFFD) {
+            if (i < s.size() && static_cast<unsigned char>(s[i]) == 0xEF) { // a second U+FFFD
+                cp_at(i);
+                out += static_cast<char16_t>(0xFFFD);
+            } else { // four hex digits: a lone surrogate
+                out += static_cast<char16_t>(std::stoi(s.substr(i, 4), nullptr, 16));
+                i += 4;
+            }
+        } else if (cp >= 0x10000) {
+            out += static_cast<char16_t>(0xD800 + ((cp - 0x10000) >> 10));
+            out += static_cast<char16_t>(0xDC00 + ((cp - 0x10000) & 0x3FF));
+        } else {
+            out += static_cast<char16_t>(cp);
+        }
+    }
+    return out;
+}
+
+const std::vector<std::u16string>& registry_name_table() {
+    static const std::vector<std::u16string> t{
+       u"Run",                        // valid BMP text
+       u"caf\u00E9 \u4E2D",           // non-ASCII BMP
+       u"x\U0001F600y",               // a surrogate pair
+       std::u16string{u'a', char16_t(0xD800)},                          // a lone high
+       std::u16string{u'a', char16_t(0xDC00)},                          // a lone low
+       std::u16string{char16_t(0xD800), u'D', u'8', u'0', u'0'},        // a lone high then the text D800
+       std::u16string{char16_t(0xD800)},                                // a lone high alone
+       u"\uFFFD",                     // a literal replacement character
+       u"\uFFFD" u"D800",             // a literal one followed by the text D800
+       u"\uFFFD\uFFFD",               // two literal ones
+       u"\\uD800",                    // the valid name spelt backslash-u-D800
+       std::u16string{u'n', char16_t(0), u'm'}, // a name with U+0000
+       std::u16string{char16_t(0xDC00), char16_t(0xD800)}, // low then high: both lone
+    };
+    return t;
+}
+
+} // namespace
+
+TEST_CASE("registry names: valid UTF-16 without a replacement character converts to the same UTF-8 as before",
+          "[echo][registry][pure]") {
+    CHECK(registry_name_utf8(u"Run") == "Run");
+    CHECK(registry_name_utf8(u"caf\u00E9 \u4E2D") == "caf\xC3\xA9 \xE4\xB8\xAD");
+    CHECK(registry_name_utf8(u"x\U0001F600y") == "x\xF0\x9F\x98\x80y");
+    CHECK(registry_name_utf8(u"\\uD800") == "\\uD800"); // a backslash is just a backslash
+    CHECK(registry_name_utf8(std::u16string{u'n', char16_t(0), u'm'}) == std::string("n\0m", 3));
+}
+
+TEST_CASE("registry names: a lone surrogate and a literal replacement character and the spelled-out escape text all encode differently",
+          "[echo][registry][pure]") {
+    const auto& t = registry_name_table();
+    std::set<std::string> seen;
+    for (const auto& n : t)
+        CHECK(seen.insert(registry_name_utf8(n)).second); // pairwise distinct
+    CHECK(seen.size() == t.size());
+    CHECK(registry_name_utf8(std::u16string{char16_t(0xD800)}) == "\xEF\xBF\xBD" "D800");
+    CHECK(registry_name_utf8(u"\uFFFD") == "\xEF\xBF\xBD\xEF\xBF\xBD");
+}
+
+TEST_CASE("registry names: every encoded name decodes back to the name it came from", "[echo][registry][pure]") {
+    for (const auto& n : registry_name_table())
+        CHECK(decode_registry_name(registry_name_utf8(n)) == n);
+}
+
+TEST_CASE("registry diff: a value replaced by one whose name differs only in a lone surrogate is reported removed and added",
+          "[echo][registry][pure]") {
+    namespace P = yuzu::profiles;
+    const std::string root = "HKLM\\SOFTWARE\\r";
+    const RegistryWindow win{10, 20};
+    const std::string spelt = registry_name_utf8(u"\\uD800");
+    const std::string lone = registry_name_utf8(std::u16string{char16_t(0xD800)});
+    REQUIRE(spelt != lone);
+    const auto base_read = complete({{root + "\\A", {{spelt, vread(P::kRegDword, dword(1))}}}});
+    const auto base = diff_registry_snapshot({}, base_read, root, "reconcile", win, 20, /*suppress=*/true).baseline;
+    const auto now = complete({{root + "\\A", {{lone, vread(P::kRegDword, dword(1))}}}});
+    const auto d = diff_registry_snapshot(base, now, root, "reconcile", win, 20);
+    std::set<std::string> got;
+    for (const auto& c : d.candidates)
+        got.insert(c.action + ":" + c.value);
+    CHECK(got == std::set<std::string>{"removed:" + spelt, "added:" + lone});
+}
+
+TEST_CASE("registry diff: unnamed skipped children make a read non-authoritative whatever its status",
+          "[echo][registry][pure]") {
+    namespace P = yuzu::profiles;
+    const std::string root = "HKLM\\SOFTWARE\\r";
+    const RegistryWindow win{10, 20};
+    const std::string a = root + "\\A", b = root + "\\B";
+    const auto base_read = complete({{a, {{"v", vread(P::kRegDword, dword(1))}}},
+                                     {b, {{"v", vread(P::kRegDword, dword(2))}}}});
+    const auto base = diff_registry_snapshot({}, base_read, root, "reconcile", win, 20, /*suppress=*/true).baseline;
+    const auto actions = [&](const DiffResult& d) {
+        std::set<std::string> got;
+        for (const auto& c : d.candidates)
+            got.insert(c.action + ":" + c.key.substr(root.size() + 1) + ":" + c.value);
+        return got;
+    };
+
+    // B is missing from the read, and it may be one of the unnamed children. The status says
+    // Complete on purpose: the guard is where removals are derived, not only in the shell.
+    auto now = complete({{a, {{"v", vread(P::kRegDword, dword(1))}}}});
+    now.skipped_overflow = 3;
+    const auto held = diff_registry_snapshot(base, now, root, "reconcile", win, 20);
+    CHECK(held.candidates.empty()); // no removed row and no key_removed row
+    CHECK(held.baseline.keys.contains(b));
+
+    now.skipped_overflow = 0; // the same read without unnamed children proves B is gone
+    CHECK(actions(diff_registry_snapshot(base, now, root, "reconcile", win, 20)) ==
+          std::set<std::string>{"removed:B:v", "key_removed:B:"});
+}
+
+TEST_CASE("registry diff: a legacy single-U+FFFD name is replaced on a Complete read and only added beside on a Capped one",
+          "[echo][registry][pure]") {
+    namespace P = yuzu::profiles;
+    const std::string root = "HKLM\\SOFTWARE\\r";
+    const RegistryWindow win{10, 20};
+    const std::string key = root + "\\A";
+    // What the lossy conversion stored for a lone surrogate, against what the encoder writes now.
+    const std::string legacy = "\xEF\xBF\xBD";
+    const std::string lone = registry_name_utf8(std::u16string{char16_t(0xD800)});
+    REQUIRE(lone == "\xEF\xBF\xBD" "D800");
+    const auto base_read = complete({{key, {{legacy, vread(P::kRegDword, dword(1))}}}});
+    const auto base = diff_registry_snapshot({}, base_read, root, "reconcile", win, 20, /*suppress=*/true).baseline;
+    auto now = complete({{key, {{lone, vread(P::kRegDword, dword(1))}}}});
+
+    std::set<std::string> got;
+    for (const auto& c : diff_registry_snapshot(base, now, root, "reconcile", win, 20).candidates)
+        got.insert(c.action + ":" + c.value);
+    CHECK(got == std::set<std::string>{"removed:" + legacy, "added:" + lone});
+
+    now.status = RegistryReadStatus::Capped; // a root that stays partial: only adds appear
+    const auto partial = diff_registry_snapshot(base, now, root, "reconcile", win, 20);
+    got.clear();
+    for (const auto& c : partial.candidates)
+        got.insert(c.action + ":" + c.value);
+    CHECK(got == std::set<std::string>{"added:" + lone});
+    CHECK(partial.baseline.keys.at(key).contains(legacy)); // the old stored form lingers
+}
+
+TEST_CASE("registry read: a name already present in the key marks the read partial and keeps the first",
+          "[echo][registry][pure]") {
+    std::map<std::string, RegistryValueRead> values;
+    CHECK(record_registry_name(values, "Same", vread(4, dword(1))));
+    CHECK_FALSE(record_registry_name(values, "Same", vread(4, dword(2)))); // the caller marks the read Capped
+    CHECK(values.size() == 1);
+    CHECK(values.at("Same").bytes == dword(1)); // the first entry is kept, never overwritten
+}
+
+TEST_CASE("registry read budget: a skipped child is charged like a visited key and a passed deadline refuses it",
+          "[echo][registry][pure]") {
+    {
+        RegistryReadBudget b;
+        bool all_admitted = true;
+        for (std::size_t i = 0; i < kBaselineKeyCap; ++i)
+            all_admitted = b.admit_key_by(100, 200) && all_admitted;
+        CHECK(all_admitted);
+        CHECK_FALSE(b.admit_key_by(100, 200)); // the key budget ends a run of skipped children
+    }
+    {
+        RegistryReadBudget b;
+        CHECK(b.admit_key_by(199, 200));
+        CHECK_FALSE(b.admit_key_by(200, 200)); // at the deadline
+        CHECK_FALSE(b.admit_key_by(201, 200)); // past it
     }
 }
 
@@ -517,6 +715,47 @@ TEST_CASE("attribute_candidate: correlation on value name, type, size and window
         CHECK(attribute_candidate(kr, {ev(150, 9, RegistryEtwOp::DeleteKey, "", 0, 0, "x.exe"),
                                        ev(150, 9, RegistryEtwOp::DeleteValue, "", 0, 0, "x.exe")})
                  .kind == AttributionKind::None);
+    }
+}
+
+TEST_CASE("attribute_candidate: names built with the one identity correlate (pure; the ETW read is a live case)",
+          "[echo][registry][pure]") {
+    // The Windows shell builds both sides through registry_name_utf8: the reader stores a name
+    // through name_identity and the ETW callback hands the event's ValueName through the same
+    // function before value_name_key, so a candidate and the event that wrote it compare equal.
+    const std::string fffd = registry_name_utf8(u"\uFFFD");
+    const std::string lone = registry_name_utf8(std::u16string{char16_t(0xD800)});
+    const std::string fffd_d800 = registry_name_utf8(u"\uFFFD" u"D800");
+    REQUIRE(lone != fffd_d800);
+
+    SECTION("a name holding a literal U+FFFD is correlated to its writer") {
+        const auto a = attribute_candidate(cand("changed", fffd, 4, 4, 100, 200),
+                                           {ev(150, 31, RegistryEtwOp::Set, fffd, 4, 4, "w.exe")});
+        CHECK(a.kind == AttributionKind::Corr);
+        CHECK(a.pid == 31);
+        CHECK(a.image == "w.exe");
+    }
+    SECTION("a lone surrogate and a literal U+FFFD followed by D800 each name their own writer") {
+        // Same type, size and window; written by two processes. Neither is Ambiguous or swapped.
+        const std::vector<RegistryEtwEvent> events{
+           ev(150, 11, RegistryEtwOp::Set, lone, 4, 4, "a.exe"),
+           ev(160, 22, RegistryEtwOp::Set, fffd_d800, 4, 4, "b.exe")};
+        const auto a = attribute_candidate(cand("changed", lone, 4, 4, 100, 200), events);
+        CHECK(a.kind == AttributionKind::Corr);
+        CHECK(a.pid == 11);
+        CHECK(a.image == "a.exe");
+        const auto b = attribute_candidate(cand("changed", fffd_d800, 4, 4, 100, 200), events);
+        CHECK(b.kind == AttributionKind::Corr);
+        CHECK(b.pid == 22);
+        CHECK(b.image == "b.exe");
+    }
+    SECTION("an ASCII name is unchanged") {
+        const std::string start = registry_name_utf8(u"Start");
+        CHECK(start == "Start");
+        CHECK(value_name_key(start) == value_name_key("Start"));
+        CHECK(attribute_candidate(cand("changed", start, 4, 4, 100, 200),
+                                  {ev(150, 1, RegistryEtwOp::Set, registry_name_utf8(u"START"))})
+                 .kind == AttributionKind::Corr); // the ASCII fold still applies
     }
 }
 
@@ -918,6 +1157,378 @@ TEST_CASE("cursor and baseline codecs", "[echo][registry][pure]") {
     CHECK_NOTHROW(encode_registry_baseline(b));
 }
 
+
+// ── Offline (unloaded) hives: the pure core ─────────────────────────────────
+
+namespace {
+
+const std::string kSidA = "S-1-5-21-1";
+const std::string kSidB = "S-1-5-21-2";
+const std::string kSuffix = "Software\\yuzu_test_u";
+const std::string kSuffix2 = "Software\\yuzu_test_u2";
+
+std::string uroot(const std::string& sid, const std::string& suffix = kSuffix) {
+    return "HKU\\" + sid + "\\" + suffix;
+}
+OfflineProfile prof(const std::string& sid) { return {sid, "C:\\Users\\" + sid}; }
+
+} // namespace
+
+TEST_CASE("roots_for: loaded sids, then offline sids, same suffixes, each sid once",
+          "[echo][registry][pure]") {
+    const RegistryScope sc{{"SOFTWARE\\yuzu_test_r"}, {kSuffix, kSuffix2}};
+    const auto roots = sc.roots_for({kSidA}, {prof(kSidB)});
+    REQUIRE(roots.size() == 5);
+    CHECK(roots[0] == "HKLM\\SOFTWARE\\yuzu_test_r");
+    CHECK(roots[1] == uroot(kSidA));
+    CHECK(roots[2] == uroot(kSidA, kSuffix2));
+    CHECK(roots[3] == uroot(kSidB)); // the offline root is named exactly like a loaded one
+    CHECK(roots[4] == uroot(kSidB, kSuffix2));
+
+    // a sid in BOTH lists (and an offline duplicate) is emitted once, from the loaded list
+    CHECK(sc.roots_for({kSidA}, {prof(kSidA), prof(kSidB), prof(kSidB)}).size() == 5);
+    // the one-argument overload is the loaded list alone
+    CHECK(sc.roots_for({kSidA}).size() == 3);
+
+    // `.bak`, `_Classes`, `.DEFAULT` and the temporary mounts sibling plugins make are not profiles
+    const auto none = sc.roots_for({}, {prof(kSidA + ".bak"), prof(kSidA + "_Classes"),
+                                        prof(".DEFAULT"), prof("YUZU_HIVE_" + kSidA + "_1_2")});
+    CHECK(none.size() == 1); // HKLM only
+
+    const std::set<std::string> only_b{kSidB};
+    CHECK(is_offline_root(uroot(kSidB), only_b));
+    CHECK_FALSE(is_offline_root(uroot(kSidA), only_b));
+    CHECK_FALSE(is_offline_root("HKLM\\SOFTWARE\\yuzu_test_r", only_b));
+    CHECK_FALSE(is_offline_root(uroot(kSidB + "9"), only_b)); // sid component, not a prefix
+}
+
+TEST_CASE("reconcile_offline: a complete walk replaces, an incomplete one keeps, a loaded sid never stays",
+          "[echo][registry][pure]") {
+    const std::vector<OfflineProfile> known{prof(kSidA), prof(kSidB)};
+
+    OfflineDiscovery complete;
+    complete.profiles = {prof(kSidA)};
+    CHECK(reconcile_offline(known, {}, {}, complete) == std::vector<OfflineProfile>{prof(kSidA)});
+
+    OfflineDiscovery incomplete;
+    incomplete.complete = false;
+    CHECK(reconcile_offline(known, {}, {}, incomplete) == known);
+
+    // a sid whose record exists but whose path was unreadable keeps its cursor entry (ahead of
+    // the walk's own listing: a known real path outranks a listed one for a partial sid)
+    OfflineDiscovery partial;
+    partial.partial = {kSidB};
+    partial.profiles = {prof(kSidA)};
+    CHECK(reconcile_offline(known, {}, {}, partial) ==
+          std::vector<OfflineProfile>{prof(kSidB), prof(kSidA)});
+    // ... but not when it is NOT named: a complete walk that omits it says the profile is gone
+    CHECK(reconcile_offline(known, {}, {}, complete).size() == 1);
+
+    // a loaded sid is removed in every case
+    CHECK(reconcile_offline(known, {}, {kSidA}, incomplete) ==
+          std::vector<OfflineProfile>{prof(kSidB)});
+    CHECK(reconcile_offline(known, {}, {kSidA}, partial) ==
+          std::vector<OfflineProfile>{prof(kSidB)});
+    complete.profiles = {prof(kSidA), prof(kSidB)};
+    CHECK(reconcile_offline(known, {}, {kSidA, kSidB}, complete).empty());
+}
+
+TEST_CASE("reconcile_offline: a sid loaded last tick and gone now is a known profile with no path yet, unless a complete walk names it nowhere",
+          "[echo][registry][pure]") {
+    const OfflineProfile unpathed{kSidA, ""};
+    const std::vector<std::string> was_loaded{kSidA};
+
+    // incomplete walk: carried with an empty path
+    OfflineDiscovery incomplete;
+    incomplete.complete = false;
+    CHECK(reconcile_offline({}, was_loaded, {}, incomplete) ==
+          std::vector<OfflineProfile>{unpathed});
+
+    // complete walk whose record for it failed to read: carried
+    OfflineDiscovery partial;
+    partial.partial = {kSidA};
+    CHECK(reconcile_offline({}, was_loaded, {}, partial) == std::vector<OfflineProfile>{unpathed});
+
+    // complete walk that lists it: the walk's path replaces the empty one
+    OfflineDiscovery listed;
+    listed.profiles = {prof(kSidA)};
+    CHECK(reconcile_offline({}, was_loaded, {}, listed) ==
+          std::vector<OfflineProfile>{prof(kSidA)});
+
+    // complete walk that names it nowhere: authoritative, the profile left ProfileList
+    CHECK(reconcile_offline({}, was_loaded, {}, OfflineDiscovery{}).empty());
+
+    // still loaded: never offline
+    CHECK(reconcile_offline({}, was_loaded, was_loaded, incomplete).empty());
+
+    // a real known entry wins over the empty one, on an incomplete walk and on a complete one
+    // that names the sid in `partial` (its record failed to read this time)
+    CHECK(reconcile_offline({prof(kSidA)}, was_loaded, {}, incomplete) ==
+          std::vector<OfflineProfile>{prof(kSidA)});
+    CHECK(reconcile_offline({prof(kSidA)}, was_loaded, {}, partial) ==
+          std::vector<OfflineProfile>{prof(kSidA)});
+
+    // HKU names that are not profiles (`<sid>_Classes`, `.DEFAULT`) leave HKU at logoff too
+    CHECK(reconcile_offline({}, {kSidA + "_Classes", ".DEFAULT"}, {}, incomplete).empty());
+}
+
+TEST_CASE("reconcile_offline: a virtual service SID or a well-known system SID that unloads is never carried as a logged-off user",
+          "[echo][registry][pure]") {
+    OfflineDiscovery incomplete;
+    incomplete.complete = false;
+    for (const char* sid : {"S-1-5-80-1-2-3", "S-1-5-82-1-2", "S-1-5-83-0-1", "S-1-5-90-0-1",
+                            "S-1-5-96-0-1", "S-1-5-18", "S-1-5-19", "S-1-5-20"}) {
+        INFO(sid);
+        // not a pathless entry that the next walks would carry forever, whatever the walk says
+        CHECK(reconcile_offline({}, {sid}, {}, incomplete).empty());
+        CHECK(reconcile_offline({}, {sid}, {}, OfflineDiscovery{false, {sid}, {}}).empty());
+    }
+    // an Entra user and an ordinary account that unload still are carried
+    const std::string entra = "S-1-12-1-1-2-3-4";
+    CHECK(reconcile_offline({}, {entra, kSidA}, {}, incomplete) ==
+          std::vector<OfflineProfile>{{entra, ""}, {kSidA, ""}});
+}
+
+TEST_CASE("reconcile_offline: an incomplete walk ADDS the profiles it listed and never removes one",
+          "[echo][registry][pure]") {
+    // A host with more ProfileList entries than the walk's cap is incomplete on every walk, yet the
+    // profiles it does reach must be discovered; only a complete walk may remove scope.
+    OfflineDiscovery cut;
+    cut.complete = false;
+    cut.profiles = {prof(kSidA), prof(kSidB)};
+    CHECK(reconcile_offline({}, {}, {}, cut) == std::vector<OfflineProfile>{prof(kSidA), prof(kSidB)});
+
+    // a known profile the cut walk did not reach stays; one it listed is not duplicated
+    const std::string sid_c = "S-1-5-21-3";
+    CHECK(reconcile_offline({prof(sid_c), prof(kSidA)}, {}, {}, cut) ==
+          std::vector<OfflineProfile>{prof(sid_c), prof(kSidA), prof(kSidB)});
+
+    // a known entry keeps its own path (an incomplete walk does not re-point it) ...
+    const OfflineProfile moved{kSidA, "D:\\moved"};
+    CHECK(reconcile_offline({prof(kSidA)}, {}, {}, OfflineDiscovery{false, {}, {moved}}) ==
+          std::vector<OfflineProfile>{prof(kSidA)});
+    // ... unless it has none yet (it logged off while the walk was cut short): the walk supplies it
+    CHECK(reconcile_offline({{kSidA, ""}}, {}, {}, OfflineDiscovery{false, {}, {moved}}) ==
+          std::vector<OfflineProfile>{moved});
+
+    // a loaded sid is never added
+    CHECK(reconcile_offline({}, {}, {kSidA}, cut) == std::vector<OfflineProfile>{prof(kSidB)});
+}
+
+TEST_CASE("is_virtual_service_sid: service, app-pool, VM, Window Manager and Font Driver Host SIDs, not users",
+          "[echo][registry][pure]") {
+    for (const char* sid : {"S-1-5-80-1-2-3", "S-1-5-82-1-2", "S-1-5-83-0-1", "S-1-5-90-0-1", "S-1-5-96-0-1"})
+        CHECK(is_virtual_service_sid(sid));
+    for (const char* sid : {"S-1-5-21-1-2-3-1001", "S-1-12-1-1-2-3-4", "S-1-5-18", "S-1-5-8", "S-1-5-800-1",
+                            "S-1-5-82", ""})
+        CHECK_FALSE(is_virtual_service_sid(sid));
+}
+
+TEST_CASE("classify_offline_discovery: a <sid>.bak record is its base sid's partial, never a profile; a virtual service SID is never offline",
+          "[echo][registry][pure]") {
+    using yuzu::profiles::HiveState;
+    using yuzu::profiles::ProfileInfo;
+    const std::string entra = "S-1-12-1-1-2-3-4";
+    const auto info = [](const std::string& sid, std::string path) {
+        return ProfileInfo{sid, "", std::move(path), HiveState::not_loaded, false};
+    };
+    const std::vector<ProfileInfo> profiles{
+       info(kSidA + ".bak", "C:\\Users\\" "user.bak"), // the temporary-profile leftover of A
+       info(kSidB, "C:\\Users\\foo"),
+       info(entra, "C:\\Users\\example"),          // an Entra user: S-1-12-1-*, listed
+       info("S-1-5-82-1-2", "C:\\Users\\svc"),
+       info("S-1-5-80-9", "C:\\Windows\\ServiceProfiles\\x"),
+    };
+    const std::vector<std::string> failed{"S-1-5-82-7", kSidB + ".bak"};
+    const auto d = classify_offline_discovery(true, false, false, profiles, failed);
+    CHECK(d.complete);
+    // B is listed with a path but has a `.bak` sibling (its failed record), so its own record is the
+    // temporary profile's: partial, never a profile of this walk (see the temporary-profile test below)
+    CHECK(d.profiles == std::vector<OfflineProfile>{{entra, "C:\\Users\\example"}});
+    // A is proved to exist by its .bak record (partial: its known entry stands), but is not a
+    // profile of this walk; the virtual service SIDs are in neither list. B's failed .bak record
+    // proves B the same way: the partial entry is the base sid, never the `.bak` name.
+    CHECK(d.partial == std::vector<std::string>{kSidA, kSidB});
+    // so a complete walk that saw only A's .bak (mid-rename) keeps A's known baseline scope
+    CHECK(reconcile_offline({prof(kSidA)}, {}, {}, d) ==
+          std::vector<OfflineProfile>{prof(kSidA), {entra, "C:\\Users\\example"}});
+
+    // A complete walk whose ONLY evidence for a known profile is its failed .bak record (any
+    // case) keeps that profile: the record's base sid is what names it, not the `.bak` text.
+    const std::vector<std::string> bak_only{kSidB + ".BAK"};
+    const auto only = classify_offline_discovery(true, false, false, {}, bak_only);
+    CHECK(only.complete);
+    CHECK(only.partial == std::vector<std::string>{kSidB});
+    CHECK(reconcile_offline({prof(kSidB)}, {}, {}, only) == std::vector<OfflineProfile>{prof(kSidB)});
+    // while a failed .bak record that names no user hive, or a virtual service SID's, names no one
+    const std::vector<std::string> not_users{"garbage.bak", "S-1-5-82-7.bak", ".DEFAULT.bak"};
+    CHECK(classify_offline_discovery(true, false, false, {}, not_users).partial.empty());
+}
+
+TEST_CASE("a listed <sid> beside <sid>.bak (a temporary profile) never replaces the known real path, and a first-seen one is not mounted",
+          "[echo][registry][pure]") {
+    using yuzu::profiles::HiveState;
+    using yuzu::profiles::ProfileInfo;
+    const auto info = [](const std::string& sid, std::string path) {
+        return ProfileInfo{sid, "", std::move(path), HiveState::not_loaded, false};
+    };
+    const OfflineProfile real{kSidA, "C:\\Users\\user"};
+    const std::string temp = "C:\\Users\\tmp";
+    const std::vector<std::string> none;
+
+    // the temporary-profile signature: the base sid's record now names a TEMP folder, beside the .bak
+    const std::vector<ProfileInfo> pair{info(kSidA, temp), info(kSidA + ".bak", "C:\\Users\\user")};
+    const auto d = classify_offline_discovery(true, false, false, pair, none);
+    CHECK(d.complete);
+    CHECK(d.profiles.empty()); // neither record is a hive to mount
+    CHECK(d.partial == std::vector<std::string>{kSidA});
+    CHECK(reconcile_offline({real}, {}, {}, d) == std::vector<OfflineProfile>{real}); // the real path stands
+    CHECK(reconcile_offline({}, {}, {}, d).empty()); // first seen: nothing enters scope
+
+    // the same when the .bak record failed to read instead of listing
+    const std::vector<ProfileInfo> alone{info(kSidA, temp)};
+    const std::vector<std::string> bak_failed{kSidA + ".bak"};
+    const auto f = classify_offline_discovery(true, false, false, alone, bak_failed);
+    CHECK(f.profiles.empty());
+    CHECK(f.partial == std::vector<std::string>{kSidA});
+    CHECK(reconcile_offline({real}, {}, {}, f) == std::vector<OfflineProfile>{real});
+
+    // without a .bak the listed path is the profile's
+    CHECK(classify_offline_discovery(true, false, false, alone, none).profiles ==
+          std::vector<OfflineProfile>{{kSidA, temp}});
+
+    // reconcile_offline on its own: a sid the walk flagged partial keeps its known real path even
+    // when the same walk also lists it; a listed path still fills an entry that has none
+    OfflineDiscovery both;
+    both.partial = {kSidA};
+    both.profiles = {{kSidA, temp}};
+    CHECK(reconcile_offline({real}, {}, {}, both) == std::vector<OfflineProfile>{real});
+    CHECK(reconcile_offline({{kSidA, ""}}, {}, {}, both) ==
+          std::vector<OfflineProfile>{{kSidA, temp}});
+}
+
+TEST_CASE("classify_offline_discovery: a loaded profile is skipped, an unreadable path is partial, a cut walk or a failed root is incomplete",
+          "[echo][registry][pure]") {
+    using yuzu::profiles::HiveState;
+    using yuzu::profiles::ProfileInfo;
+    const std::string sid_c = "S-1-5-21-3", sid_d = "S-1-5-21-4", sid_e = "S-1-5-21-5",
+                      sid_f = "S-1-5-21-6";
+    const auto info = [](const std::string& sid, HiveState st, std::string path,
+                         bool unreadable = false) {
+        return ProfileInfo{sid, "", std::move(path), st, unreadable};
+    };
+    const std::vector<ProfileInfo> profiles{
+       info(kSidA, HiveState::loaded, "C:\\Users\\user"),               // logged in: not offline
+       info(kSidB, HiveState::not_loaded, "C:\\Users\\foo"),           // offline
+       info(sid_c, HiveState::loaded_classes_only, "C:\\Users\\bar"),  // its NTUSER.DAT is not loaded
+       info(sid_d, HiveState::not_loaded, "C:\\Users\\baz", true),     // path unreadable: partial
+       info(sid_e, HiveState::not_loaded, ""),                         // no path: partial
+    };
+    const std::vector<std::string> none;
+
+    // a complete walk: loaded skipped, a path-less profile partial (its cursor entry stands)
+    const auto d = classify_offline_discovery(true, false, false, profiles, none);
+    CHECK(d.complete);
+    CHECK(d.profiles ==
+          std::vector<OfflineProfile>{{kSidB, "C:\\Users\\foo"}, {sid_c, "C:\\Users\\bar"}});
+    CHECK(d.partial == std::vector<std::string>{sid_d, sid_e});
+    const std::vector<OfflineProfile> known{prof(sid_d), prof(sid_f)};
+    CHECK(reconcile_offline(known, {}, {}, d) ==
+          std::vector<OfflineProfile>{
+             prof(sid_d), {kSidB, "C:\\Users\\foo"}, {sid_c, "C:\\Users\\bar"}});
+
+    // a record that failed to read is partial too, once (named by the walk and by the list)
+    const std::vector<std::string> failed{sid_d, sid_f};
+    CHECK(classify_offline_discovery(true, false, false, profiles, failed).partial ==
+          std::vector<std::string>{sid_d, sid_e, sid_f});
+
+    // a walk cut short, or stopped at the profile cap, is incomplete but still lists what it saw
+    for (const auto& [walk_complete, truncated] :
+         {std::pair{false, false}, std::pair{true, true}}) {
+        INFO("walk_complete=" << walk_complete << " truncated=" << truncated);
+        const auto cut =
+           classify_offline_discovery(walk_complete, false, truncated, profiles, none);
+        CHECK_FALSE(cut.complete);
+        CHECK(cut.profiles.size() == 2);
+        CHECK(cut.partial == std::vector<std::string>{sid_d, sid_e});
+    }
+
+    // ProfileList could not be opened: nothing was walked, so nothing is reported
+    const auto root = classify_offline_discovery(false, true, false, profiles, failed);
+    CHECK_FALSE(root.complete);
+    CHECK(root.profiles.empty());
+    CHECK(root.partial.empty());
+
+    // an empty, complete walk is a real answer: no logged-off profile exists
+    const auto empty = classify_offline_discovery(true, false, false, {}, none);
+    CHECK(empty.complete);
+    CHECK(empty.profiles.empty());
+    CHECK(empty.partial.empty());
+}
+
+TEST_CASE("cursor codec carries `offline` and `deferred`, both optional on decode",
+          "[echo][registry][pure]") {
+    RegistryCursor cur;
+    cur.present = true;
+    cur.tick = 3;
+    cur.hku = {kSidA};
+    cur.offline = {prof(kSidB), {kSidA + "9", "D:\\profiles\\x"}};
+    RegistryRootState st;
+    st.baselined = true;
+    st.status = "unreadable";
+    st.deferred = true;
+    cur.roots[uroot(kSidB)] = st;
+    const auto back = decode_registry_cursor(encode_registry_cursor(cur));
+    REQUIRE_FALSE(back.malformed);
+    CHECK(back.offline == cur.offline);
+    CHECK(back.roots.at(uroot(kSidB)).deferred);
+    CHECK(back.roots.at(uroot(kSidB)) == st);
+
+    // not written when empty / false: a cursor without either decodes as before
+    RegistryCursor plain;
+    plain.present = true;
+    plain.roots["HKLM\\R"] = RegistryRootState{};
+    const auto json = nlohmann::json::parse(encode_registry_cursor(plain));
+    CHECK_FALSE(json.contains("offline"));
+    CHECK_FALSE(json.at("roots").at("HKLM\\R").contains("deferred"));
+    const auto old = decode_registry_cursor(encode_registry_cursor(plain));
+    REQUIRE_FALSE(old.malformed);
+    CHECK(old.offline.empty());
+    CHECK_FALSE(old.roots.at("HKLM\\R").deferred);
+
+    // a malformed element is a lost cursor, never a half-read scope
+    for (const char* bad : {R"({"v":1,"tick":0,"roots":{},"hku":[],"offline":[["S-1-5-21-1"]]})",
+                            R"({"v":1,"tick":0,"roots":{},"hku":[],"offline":[["a","b","c"]]})",
+                            R"({"v":1,"tick":0,"roots":{},"hku":[],"offline":["S-1-5-21-1"]})",
+                            R"({"v":1,"tick":0,"roots":{},"hku":[],"offline":[[1,2]]})"}) {
+        INFO(bad);
+        CHECK(decode_registry_cursor(std::string{bad}).malformed);
+    }
+}
+
+TEST_CASE("stitch_registry_tick: an offline candidate is written at once as attr:offline, never correlated",
+          "[echo][registry][pure]") {
+    auto c = cand("changed", "Start", 4, 4, 100 * SEC, 110 * SEC);
+    c.source = "offline";
+    // a matching write event inside the window, a loss epoch over it, the session down and a
+    // restart floor after it: none of them changes the marker
+    const auto evs = std::vector<RegistryEtwEvent>{ev(105 * SEC, 7, RegistryEtwOp::Set, "Start")};
+    const std::vector<LossEpoch> epochs{{100 * SEC, 110 * SEC}};
+    for (const bool etw : {true, false}) {
+        INFO("etw=" << etw);
+        const auto r = stitch_registry_tick({c}, evs, epochs, StitchFlags{etw, 200 * SEC},
+                                            111 * SEC /* inside the settle hold */, 1);
+        REQUIRE(r.rows.size() == 1);
+        CHECK(r.held_next.empty());
+        CHECK(r.rows[0].detail == "attr:offline");
+        CHECK(r.rows[0].actor_pid == 0);
+        CHECK(r.rows[0].source == "offline");
+        CHECK(r.rows[0].record_key.starts_with("offline:"));
+        CHECK(r.counters.none == 1);
+        CHECK(r.counters.attributed == 0);
+    }
+}
+
 TEST_CASE("registry schema constants agree with the registry", "[echo][registry][pure]") {
     const CaptureSourceDef* def = nullptr;
     for (const auto& s : capture_sources())
@@ -925,13 +1536,125 @@ TEST_CASE("registry schema constants agree with the registry", "[echo][registry]
             def = &s;
     REQUIRE(def != nullptr);
     CHECK(def->default_enabled);
-    CHECK(def->unique_key_column == "record_key");
-    REQUIRE(def->granularities.size() == 1);
-    CHECK(def->granularities[0].suffix == "live");
-    CHECK(def->granularities[0].retention_type == RetentionType::kRowCount);
+    // roll-up only: an hourly and a daily tier, no raw table (the replay ring replaces record_key's
+    // UNIQUE index)
+    REQUIRE(def->granularities.size() == 2);
+    CHECK(def->granularities[0].suffix == "hourly");
+    CHECK(def->granularities[1].suffix == "daily");
+    CHECK(def->granularities[0].retention_type == RetentionType::kTimeBased);
     CHECK(kEtwKeywordMask == 0x4300); // SetValueKey | DeleteValueKey | DeleteKey, never OpenKey/CreateKey
     CHECK(supported_capture_method("registry", "windows") == "regnotify+etw");
-    CHECK(generate_warehouse_ddl().find("registry_live_record_key_uq") != std::string::npos);
+    CHECK(generate_warehouse_ddl().find("registry_live") == std::string::npos);
+}
+
+// The start-up sweep of leftover YUZU_HIVE_* mounts: the pure decision, with the unload injected.
+
+TEST_CASE("select_stale_hive_mounts: only YUZU_HIVE_ mounts; never a profile hive / .DEFAULT / a _Classes hive / an empty name",
+          "[echo][registry][pure]") {
+    const std::vector<std::string> hku{".DEFAULT",
+                                       "S-1-5-18",
+                                       "S-1-5-21-1-2-3-1001",
+                                       "S-1-5-21-1-2-3-1001_Classes",
+                                       "YUZU_HIVE_S-1-5-21-1-2-3-1002_0123456789abcdef_0",
+                                       "",
+                                       "yuzu_hive_lower",
+                                       "XYUZU_HIVE_S-1-5-21-1-2-3-1004_0123456789abcdef_2",
+                                       "YUZU_HIVE_S-1-5-21-1-2-3-1003_fedcba9876543210_7"};
+    // In HKEY_USERS order, nothing else.
+    CHECK(select_stale_hive_mounts(hku) == std::vector<std::string>{hku[4], hku[8]});
+    CHECK(select_stale_hive_mounts({}).empty());
+    CHECK(select_stale_hive_mounts({"S-1-5-21-1-2-3-1001", ".DEFAULT"}).empty());
+}
+
+TEST_CASE("select_stale_hive_mounts: a prefix only narrows the set; one that is not a mount prefix selects nothing",
+          "[echo][registry][pure]") {
+    const std::vector<std::string> hku{"S-1-5-21-1-2-3-1001",
+                                       "YUZU_HIVE_S-1-5-21-1-2-3-1002_0123456789abcdef_0",
+                                       "YUZU_HIVE_S-1-5-21-1-2-3-1003_fedcba9876543210_7"};
+    CHECK(select_stale_hive_mounts(hku, "YUZU_HIVE_S-1-5-21-1-2-3-1002_") ==
+          std::vector<std::string>{hku[1]});
+    CHECK(select_stale_hive_mounts(hku, "YUZU_HIVE_S-1-5-21-1-2-3-9999_").empty());
+    // No argument can reach a profile hive: a prefix outside the mount namespace selects nothing,
+    // an empty one included (it would otherwise match every name).
+    CHECK(select_stale_hive_mounts(hku, "S-1-").empty());
+    CHECK(select_stale_hive_mounts(hku, "").empty());
+    CHECK(select_stale_hive_mounts(hku, "YUZU_").empty());
+}
+
+TEST_CASE("registry sweep: an incomplete HKU listing stays pending for one retry and then completes with one warning",
+          "[echo][registry][pure]") {
+    bool retried = false;
+    HiveSweepResult listed; // the listing was complete (whatever it found)
+    HiveSweepResult unlisted;
+    unlisted.listing_error = "index 3 (RegEnumKeyExW rc=5)";
+
+    // A complete listing settles at once and never spends the retry.
+    auto settle = settle_sweep(listed, retried);
+    CHECK_FALSE(settle.pending);
+    CHECK_FALSE(settle.warn);
+    CHECK_FALSE(retried);
+
+    // The first incomplete listing keeps the sweep pending, silently, for exactly one retry.
+    settle = settle_sweep(unlisted, retried);
+    CHECK(settle.pending);
+    CHECK_FALSE(settle.warn);
+    CHECK(retried);
+
+    // The second one completes it with the one warning: a deterministic failure is not retried
+    // every tick.
+    settle = settle_sweep(unlisted, retried);
+    CHECK_FALSE(settle.pending);
+    CHECK(settle.warn);
+
+    // A retry that does list completes without a warning.
+    retried = true;
+    settle = settle_sweep(listed, retried);
+    CHECK_FALSE(settle.pending);
+    CHECK_FALSE(settle.warn);
+}
+
+TEST_CASE("sweep_hive_mounts: each name is offered once in order; a refusal is retained and the rest are still attempted",
+          "[echo][registry][pure]") {
+    const std::vector<std::string> names{"YUZU_HIVE_a_0000000000000000_0",
+                                         "YUZU_HIVE_b_0000000000000000_1",
+                                         "YUZU_HIVE_c_0000000000000000_2"};
+    std::vector<std::string> offered;
+    const auto r = sweep_hive_mounts(names, [&](const std::string& n) {
+        offered.push_back(n);
+        return n != names[1]; // the middle one is held open by something
+    });
+    CHECK(offered == names); // a refusal does not stop the sweep
+    CHECK(r.released == std::vector<std::string>{names[0], names[2]});
+    CHECK(r.retained == std::vector<std::string>{names[1]});
+
+    int calls = 0;
+    const auto none = sweep_hive_mounts({}, [&](const std::string&) {
+        ++calls;
+        return true;
+    });
+    CHECK(calls == 0);
+    CHECK(none.released.empty());
+    CHECK(none.retained.empty());
+
+    const auto all_held = sweep_hive_mounts(names, [](const std::string&) { return false; });
+    CHECK(all_held.released.empty());
+    CHECK(all_held.retained == names);
+}
+
+TEST_CASE("select then sweep: only a stale mount ever reaches the unload callback",
+          "[echo][registry][pure]") {
+    // The composition the Windows shell runs over an HKEY_USERS listing: a loaded profile, its
+    // classes hive and .DEFAULT are never offered to the unload, whatever it would answer.
+    const std::vector<std::string> hku{".DEFAULT", "S-1-5-21-1-2-3-1001", "S-1-5-21-1-2-3-1001_Classes",
+                                       "YUZU_HIVE_S-1-5-21-1-2-3-1002_0123456789abcdef_0"};
+    std::vector<std::string> offered;
+    const auto r = sweep_hive_mounts(select_stale_hive_mounts(hku), [&](const std::string& n) {
+        offered.push_back(n);
+        return true;
+    });
+    CHECK(offered == std::vector<std::string>{hku[3]});
+    CHECK(r.released == offered);
+    CHECK(r.retained.empty());
 }
 
 #ifndef _WIN32
@@ -959,11 +1682,77 @@ struct TestDb {
     }
 };
 
+// Every row a tick committed since make_db(). The roll-up tier keeps no writer pid, attribution
+// detail, source or record key, so what a tick DECIDED is read from the reader's `committed`
+// observer; what the database KEEPS is read from the registry tiers.
+std::vector<RegistryEvent>& committed_rows() {
+    static std::vector<RegistryEvent> rows;
+    return rows;
+}
+
+void record_committed(const std::vector<RegistryEvent>& rows) {
+    auto& all = committed_rows();
+    all.insert(all.end(), rows.begin(), rows.end());
+}
+
 TestDb make_db() {
+    committed_rows().clear();
     auto tmp = yuzu::test::unique_temp_path("yuzu_test_echo_registry_");
-    auto r = EchoDatabase::open(tmp);
+    auto r = yuzu::test::open_echo_db(tmp);
     REQUIRE(r.has_value());
     return TestDb{std::move(*r), tmp};
+}
+
+// Run `sql` over the committed rows laid out as the retired raw `registry_live` table (its columns
+// in their old order, `id` first, `record_key` unique with first-write-wins, as the raw store did),
+// so each assertion about a row's pid, detail, source or key keeps its original query.
+QueryResult ql(const std::string& sql) {
+    yuzu::test::SqliteHandleOwner<sqlite3> h;
+    REQUIRE(sqlite3_open(":memory:", &h.db) == SQLITE_OK);
+    std::string cols;
+    std::string marks;
+    for (const auto& c : legacy_live_columns("registry")) {
+        cols += (cols.empty() ? "" : ",") + std::string{c.name};
+        marks += marks.empty() ? "?" : ",?";
+    }
+    std::string ddl = "CREATE TABLE registry_live (id INTEGER PRIMARY KEY";
+    for (const auto& c : legacy_live_columns("registry"))
+        ddl += ", " + std::string{c.name} + " " + std::string{c.sql_type};
+    ddl += ", UNIQUE(record_key))";
+    REQUIRE(sqlite3_exec(h.db, ddl.c_str(), nullptr, nullptr, nullptr) == SQLITE_OK);
+    const std::string ins = "INSERT OR IGNORE INTO registry_live (" + cols + ") VALUES (" + marks + ")";
+    for (const auto& e : committed_rows()) {
+        sqlite3_stmt* st = nullptr;
+        REQUIRE(sqlite3_prepare_v2(h.db, ins.c_str(), -1, &st, nullptr) == SQLITE_OK);
+        int i = 1;
+        const auto text = [&](const std::string& v) {
+            sqlite3_bind_text(st, i++, v.c_str(), static_cast<int>(v.size()), SQLITE_TRANSIENT);
+        };
+        const auto num = [&](std::int64_t v) { sqlite3_bind_int64(st, i++, v); };
+        num(e.ts); num(e.snapshot_id); text(e.hive); text(e.key_path); text(e.value_name);
+        text(e.action); text(e.data_type); text(e.data); num(e.data_size); num(e.data_truncated);
+        text(e.prev_data_type); text(e.prev_data); num(e.prev_data_size); num(e.prev_data_truncated);
+        num(e.actor_pid); text(e.actor_image); text(e.source); num(e.observed_at); text(e.detail);
+        text(e.record_key);
+        REQUIRE(sqlite3_step(st) == SQLITE_DONE);
+        sqlite3_finalize(st);
+    }
+    sqlite3_stmt* st = nullptr;
+    REQUIRE(sqlite3_prepare_v2(h.db, sql.c_str(), -1, &st, nullptr) == SQLITE_OK);
+    QueryResult out;
+    const int n = sqlite3_column_count(st);
+    for (int c = 0; c < n; ++c)
+        out.columns.emplace_back(sqlite3_column_name(st, c));
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        QueryRow row;
+        for (int c = 0; c < n; ++c) {
+            const auto* t = sqlite3_column_text(st, c);
+            row.emplace_back(t ? reinterpret_cast<const char*>(t) : "");
+        }
+        out.rows.push_back(std::move(row));
+    }
+    sqlite3_finalize(st);
+    return out;
 }
 
 const std::string kRoot = "HKLM\\SOFTWARE\\yuzu_test_r";
@@ -979,6 +1768,20 @@ struct Fake {
     std::function<void()> on_loss_query; // runs inside session_loss(): the callback thread never stops
     bool etw{true}; // the write-event session is delivering
     std::vector<std::string> sids;
+    int loaded_sids_calls{0}; // the HKU enumerations collect() made
+    bool fail_loaded_sids{false}; // the HKU enumeration fails part-way (throws, like the real one)
+    OfflineDiscovery offline_discovery; // complete, no logged-off profile
+    std::deque<OfflineDiscovery> offline_discovery_queue; // answers consumed one per walk, before the line above
+    std::int64_t offline_mount_cost{0}; // clock a read_offline_hive call advances
+    int offline_profile_calls{0};
+    std::vector<std::vector<std::string>> offline_loaded_args; // `loaded` of each discovery call
+    std::map<std::string, OfflineHiveRead> offline_reads; // by sid; unscripted = every root Absent
+    struct OfflineCall {
+        std::string sid, path;
+        std::vector<std::string> roots;
+        std::int64_t deadline{0};
+    };
+    std::vector<OfflineCall> offline_calls;
     int ccs{1};
     std::set<std::string> unarmed;
     std::vector<std::vector<std::string>> watch_calls;
@@ -1000,7 +1803,37 @@ struct Fake {
             }
             return it->second;
         };
-        r.loaded_sids = [this] { return sids; };
+        r.loaded_sids = [this] {
+            ++loaded_sids_calls;
+            if (fail_loaded_sids)
+                throw IncompleteCaptureError("Echo registry: HKEY_USERS enumeration failed");
+            return sids;
+        };
+        r.offline_profiles = [this](const std::vector<std::string>& loaded) {
+            ++offline_profile_calls;
+            offline_loaded_args.push_back(loaded);
+            if (!offline_discovery_queue.empty()) {
+                auto d = std::move(offline_discovery_queue.front());
+                offline_discovery_queue.pop_front();
+                return d;
+            }
+            return offline_discovery;
+        };
+        r.read_offline_hive = [this](const std::string& sid, const std::string& path,
+                                     const std::vector<std::string>& roots, std::int64_t deadline) {
+            offline_calls.push_back({sid, path, roots, deadline});
+            clock += offline_mount_cost;
+            const auto it = offline_reads.find(sid);
+            if (it != offline_reads.end())
+                return it->second;
+            OfflineHiveRead absent;
+            for (const auto& root : roots) {
+                SubtreeRead a;
+                a.status = RegistryReadStatus::Absent;
+                absent.roots[root] = a;
+            }
+            return absent;
+        };
         r.now_ts = [this] { return clock += 1000; }; // strictly increasing
         r.etw_running = [this] { return etw; };
         r.session_loss = [this] {
@@ -1014,6 +1847,7 @@ struct Fake {
         r.rearm = [this](const std::string& root) { return !unarmed.contains(root); };
         r.start = [] {};
         r.stop = [] {};
+        r.committed = record_committed;
         return r;
     }
 };
@@ -1039,8 +1873,9 @@ QueryResult q(EchoDatabase& db, const std::string& sql) {
     return *r;
 }
 
+// Events the database kept: the roll-up counts one per event in `change_count`.
 std::int64_t count_rows(EchoDatabase& db) {
-    return std::stoll(q(db, "SELECT COUNT(*) FROM registry_live").rows.at(0).at(0));
+    return std::stoll(q(db, "SELECT COALESCE(SUM(change_count), 0) FROM registry_hourly").rows.at(0).at(0));
 }
 
 RegistryCursor read_cursor(EchoDatabase& db) {
@@ -1049,14 +1884,15 @@ RegistryCursor read_cursor(EchoDatabase& db) {
     return decode_registry_cursor(*c);
 }
 
-// Fails every INSERT into registry_live from a second connection until released.
+// Fails every INSERT into the registry hourly tier from a second connection until released.
+// `table` names another table to fail instead (an upsert is an INSERT too).
 struct InsertTrap {
     sqlite3* h{nullptr};
-    explicit InsertTrap(const fs::path& p) {
+    explicit InsertTrap(const fs::path& p, const std::string& table = "registry_hourly_r") {
         REQUIRE(sqlite3_open(p.string().c_str(), &h) == SQLITE_OK);
         REQUIRE(sqlite3_exec(h,
-                             "CREATE TRIGGER yuzu_test_trap BEFORE INSERT ON registry_live "
-                             "BEGIN SELECT RAISE(ABORT, 'trap'); END",
+                             ("CREATE TRIGGER yuzu_test_trap BEFORE INSERT ON " + table +
+                              " BEGIN SELECT RAISE(ABORT, 'trap'); END").c_str(),
                              nullptr, nullptr, nullptr) == SQLITE_OK);
     }
     void release() {
@@ -1153,8 +1989,9 @@ TEST_CASE("registry source: baseline tick writes baselines and no rows; a change
     f.clock = T0 + 300 * SEC;
     const auto third = tick(t.db, *src);
     CHECK(third.events_emitted == 1);
-    const auto rows = q(t.db, "SELECT action, hive, key_path, value_name, data, prev_data, "
-                              "actor_pid, actor_image, detail, observed_at, source FROM registry_live");
+    const auto rows = ql("SELECT action, hive, key_path, value_name, data, prev_data, "
+                              "actor_pid, actor_image, detail, observed_at, source, "
+                              "prev_data_truncated, prev_data_size, ts FROM registry_live");
     REQUIRE(rows.rows.size() == 1);
     const auto& r = rows.rows[0];
     CHECK(r[0] == "changed");
@@ -1162,7 +1999,9 @@ TEST_CASE("registry source: baseline tick writes baselines and no rows; a change
     CHECK(r[2] == "SOFTWARE\\yuzu_test_r\\Svc");
     CHECK(r[3] == "Start");
     CHECK(r[4] == "2");
-    CHECK(r[5] == "1");
+    CHECK(r[5].empty());  // the old value is not stored ...
+    CHECK(r[11] == "1");  // ... and the row says there was one (prev_data_truncated)
+    CHECK(r[12] != "0");  // with its size
     CHECK(r[6] == "0");  // no writer named ...
     CHECK(r[7].empty()); // ... no image ...
     CHECK(r[8] == "attr:none"); // ... and the row says why
@@ -1170,11 +2009,29 @@ TEST_CASE("registry source: baseline tick writes baselines and no rows; a change
     CHECK(r[9] != std::to_string(filetime_to_unix_ms(T0 + 98 * SEC)));  // not the notify time
     CHECK(r[9] != std::to_string(filetime_to_unix_ms(T0 + 300 * SEC))); // nor the finalising tick
     CHECK(r[10] == "notify");
+    // The reader reported no key write time here, so the row's time is the end of the read.
+    CHECK(r[13] == std::to_string(filetime_to_unix_ms(read_end) / 1000));
     CHECK(read_cursor(t.db).held.empty());
 
     f.clock = T0 + 400 * SEC;
     CHECK(tick(t.db, *src).events_emitted == 0); // nothing dirty, nothing held: nothing more
     CHECK(count_rows(t.db) == 1);
+
+    // What the database keeps of that row is the roll-up tier: the key, the count, the last
+    // value, its type and the writer's image. The pid, the attribution detail and the source above
+    // are not stored.
+    const auto kept = q(t.db, "SELECT hive, key_path, value_name, action, change_count, last_data, "
+                              "last_data_type, last_actor_image FROM registry_hourly");
+    REQUIRE(kept.rows.size() == 1);
+    CHECK(kept.rows[0][0] == "HKLM");
+    CHECK(kept.rows[0][1] == "SOFTWARE\\yuzu_test_r\\Svc");
+    CHECK(kept.rows[0][2] == "Start");
+    CHECK(kept.rows[0][3] == "changed");
+    CHECK(kept.rows[0][4] == "1");
+    CHECK(kept.rows[0][5] == "2");
+    CHECK(kept.rows[0][6] == ql("SELECT data_type FROM registry_live").rows.at(0).at(0));
+    CHECK(kept.rows[0][7].empty());
+    CHECK(q(t.db, "SELECT COUNT(*) FROM registry_daily").rows.at(0).at(0) == "1"); // both tiers written
 }
 
 TEST_CASE("registry source: a burst well before the tick is written in that same tick",
@@ -1193,7 +2050,7 @@ TEST_CASE("registry source: a burst well before the tick is written in that same
     src->push_event_for_test(ev(T0 + 49 * SEC + SEC / 2, 812, RegistryEtwOp::Set, "Start", 4, 4, "services.exe"));
     CHECK(tick(t.db, *src).events_emitted == 1);
     CHECK(read_cursor(t.db).held.empty());
-    const auto rows = q(t.db, "SELECT actor_pid, detail FROM registry_live");
+    const auto rows = ql("SELECT actor_pid, detail FROM registry_live");
     REQUIRE(rows.rows.size() == 1);
     CHECK(rows.rows[0][0] == "812");
     CHECK(rows.rows[0][1] == "attr:corr");
@@ -1216,7 +2073,7 @@ TEST_CASE("registry source: a pushed event attributes by correlation; two pids a
         src->push_event_for_test(ev(held.window_hi + SEC, 78, RegistryEtwOp::Set, "Start", 4, 4, "y.exe"));
         f.clock = T0 + 300 * SEC;
         tick(t.db, *src);
-        const auto rows = q(t.db, "SELECT actor_pid, actor_image, detail FROM registry_live");
+        const auto rows = ql("SELECT actor_pid, actor_image, detail FROM registry_live");
         REQUIRE(rows.rows.size() == 1);
         if (two_pids) {
             CHECK(rows.rows[0][0] == "0"); // never a writer named when it is ambiguous
@@ -1248,7 +2105,7 @@ TEST_CASE("registry source: with the session down a change lands as attr:off at 
     // written by the tick that saw the change and nothing is held in the cursor.
     CHECK(tick(t.db, *src).events_emitted == 1);
     CHECK(read_cursor(t.db).held.empty());
-    const auto rows = q(t.db, "SELECT actor_pid, detail FROM registry_live");
+    const auto rows = ql("SELECT actor_pid, detail FROM registry_live");
     REQUIRE(rows.rows.size() == 1);
     CHECK(rows.rows[0][0] == "0");
     CHECK(rows.rows[0][1] == "attr:off");
@@ -1308,7 +2165,7 @@ TEST_CASE("registry source: a failed commit rolls back in memory and replays cle
 
     f.clock += SEC;
     tick(t.db, *src); // the trap is gone: re-reads, re-derives everything, commits
-    const auto rows = q(t.db, "SELECT actor_pid, detail, record_key FROM registry_live "
+    const auto rows = ql("SELECT actor_pid, detail, record_key FROM registry_live "
                               "WHERE action <> 'capture_gap'");
     REQUIRE(rows.rows.size() == 1);
     CHECK(rows.rows[0][0] == "5");
@@ -1319,7 +2176,7 @@ TEST_CASE("registry source: a failed commit rolls back in memory and replays cle
     CHECK(rows.rows[0][2] ==
           registry_diff_record_key(held.source, held.observed_at, held.action, held.key, held.value));
     // the loss counter was not absorbed by the failed tick: the replay reports it, once
-    const auto gaps = q(t.db, "SELECT detail FROM registry_live WHERE record_key LIKE 'gap:loss:%'");
+    const auto gaps = ql("SELECT detail FROM registry_live WHERE record_key LIKE 'gap:loss:%'");
     REQUIRE(gaps.rows.size() == 1);
     CHECK(gaps.rows[0][0] == "gap:loss:3");
 }
@@ -1334,7 +2191,7 @@ TEST_CASE("registry source: lost cursor; restart; baseline loss; storage errors"
     SECTION("malformed stored cursor -> CursorLost, one gap row, every root re-baselined") {
         const auto r = src->collect(t.db, std::optional<std::string>{"{not json"});
         CHECK(r.outcome == CursorOutcome::CursorLost);
-        const auto rows = q(t.db, "SELECT action, detail FROM registry_live");
+        const auto rows = ql("SELECT action, detail FROM registry_live");
         REQUIRE(rows.rows.size() == 1);
         CHECK(rows.rows[0][0] == "capture_gap");
         CHECK_THAT(rows.rows[0][1], ContainsSubstring("gap:cursorlost"));
@@ -1358,7 +2215,7 @@ TEST_CASE("registry source: lost cursor; restart; baseline loss; storage errors"
         CHECK(read_cursor(t.db).held.empty());
         f2.clock = T0 + 600 * SEC;
         CHECK(tick(t.db, *src2).events_emitted == 0);
-        const auto rows = q(t.db, "SELECT action, detail, source FROM registry_live ORDER BY id");
+        const auto rows = ql("SELECT action, detail, source FROM registry_live ORDER BY id");
         REQUIRE(rows.rows.size() == 2);
         CHECK(rows.rows[0][0] == "capture_gap");
         CHECK(rows.rows[0][1].find("gap:restart") == 0);
@@ -1388,7 +2245,7 @@ TEST_CASE("registry source: lost cursor; restart; baseline loss; storage errors"
         tick(t.db, *src2);
         f2.clock = T0 + 600 * SEC;
         tick(t.db, *src2);
-        const auto rows = q(t.db, "SELECT data, actor_pid, detail FROM registry_live "
+        const auto rows = ql("SELECT data, actor_pid, detail FROM registry_live "
                                   "WHERE action = 'changed' ORDER BY id");
         REQUIRE(rows.rows.size() == 2);
         CHECK(rows.rows[0][0] == "2");
@@ -1412,7 +2269,7 @@ TEST_CASE("registry source: lost cursor; restart; baseline loss; storage errors"
         src2->push_event_for_test(ev(held.window_lo + SEC / 2, 5, RegistryEtwOp::Set, "Start"));
         f2.clock = T0 + 500 * SEC;
         CHECK(tick(t.db, *src2).outcome == CursorOutcome::Advanced);
-        const auto rows = q(t.db, "SELECT action, actor_pid, detail FROM registry_live ORDER BY id");
+        const auto rows = ql("SELECT action, actor_pid, detail FROM registry_live ORDER BY id");
         REQUIRE(rows.rows.size() == 2);
         CHECK(rows.rows[0][2].find("gap:restart") == 0);
         CHECK(rows.rows[1][0] == "changed");
@@ -1445,7 +2302,7 @@ TEST_CASE("registry source: lost cursor; restart; baseline loss; storage errors"
         f.dirty->mark(kRoot, f.clock);
         f.reads[kRoot] = svc(2);
         tick(t.db, *src);
-        const auto rows = q(t.db, "SELECT detail FROM registry_live");
+        const auto rows = ql("SELECT detail FROM registry_live");
         REQUIRE(rows.rows.size() == 1); // the gap only: no change was invented from the lost baseline
         CHECK_THAT(rows.rows[0][0], ContainsSubstring("gap:baselinelost"));
         // a malformed baseline is treated the same way
@@ -1490,7 +2347,7 @@ TEST_CASE("registry source: disable discards the paused window; re-enable re-bas
     f.clock = T0 + 100 * SEC;
     const auto r = tick(t.db, *src);
     CHECK(r.outcome == CursorOutcome::CursorLost);
-    const auto rows = q(t.db, "SELECT detail FROM registry_live");
+    const auto rows = ql("SELECT detail FROM registry_live");
     REQUIRE(rows.rows.size() == 1); // the gap; the paused-window change is NOT reported
     CHECK_THAT(rows.rows[0][0], ContainsSubstring("gap:disabled"));
     CHECK(read_cursor(t.db).held.empty());
@@ -1507,7 +2364,7 @@ TEST_CASE("registry source: a candidate held across a disable finalises as lost-
     src->on_enabled_changed(true);
     f.clock = T0 + 300 * SEC;
     tick(t.db, *src);
-    const auto rows = q(t.db, "SELECT actor_pid, detail FROM registry_live WHERE action = 'changed'");
+    const auto rows = ql("SELECT actor_pid, detail FROM registry_live WHERE action = 'changed'");
     REQUIRE(rows.rows.size() == 1);
     CHECK(rows.rows[0][0] == "0");
     CHECK(rows.rows[0][1] == "attr:lost-restart");
@@ -1543,7 +2400,7 @@ TEST_CASE("registry source: buffer overflow becomes a loss epoch that degrades o
     CHECK(cur.loss[0].lo == T0 + 95 * SEC + SEC / 2); // the evicted event's own timestamp
     CHECK(cur.loss[0].hi == T0 + 95 * SEC + SEC / 2);
     CHECK(cur.held.size() == 2); // the settle hold keeps both
-    const auto gap = q(t.db, "SELECT detail FROM registry_live");
+    const auto gap = ql("SELECT detail FROM registry_live");
     REQUIRE(gap.rows.size() == 1);
     CHECK(gap.rows[0][0] == "gap:loss:1");
     CHECK(t.db.get_config("registry_etw_dropped", "") == "1");
@@ -1552,7 +2409,7 @@ TEST_CASE("registry source: buffer overflow becomes a loss epoch that degrades o
     // candidate it overlaps, and the disjoint one attributes.
     f.clock = T0 + 200 * SEC;
     tick(t.db, *src);
-    const auto rows = q(t.db, "SELECT key_path, actor_pid, detail FROM registry_live "
+    const auto rows = ql("SELECT key_path, actor_pid, detail FROM registry_live "
                               "WHERE action != 'capture_gap' ORDER BY value_name");
     REQUIRE(rows.rows.size() == 2);
     CHECK(rows.rows[0][2] == "attr:corr"); // Count, root B: its window is disjoint from the epoch
@@ -1561,7 +2418,7 @@ TEST_CASE("registry source: buffer overflow becomes a loss epoch that degrades o
     CHECK(rows.rows[1][1] == "0");
     // The eviction was reported by the first tick and absorbed with its commit: the second tick
     // (no new eviction) writes no second gap row.
-    CHECK(std::stoll(q(t.db, "SELECT COUNT(*) FROM registry_live WHERE record_key LIKE 'gap:loss:%'")
+    CHECK(std::stoll(ql("SELECT COUNT(*) FROM registry_live WHERE record_key LIKE 'gap:loss:%'")
                         .rows.at(0).at(0)) == 1);
 }
 
@@ -1576,7 +2433,7 @@ TEST_CASE("registry source: kernel loss and a failed loss query are loss, report
     f.clock = T0 + 100 * SEC;
     f.loss.events_lost = 3;
     tick(t.db, *src);
-    auto gap = q(t.db, "SELECT detail FROM registry_live");
+    auto gap = ql("SELECT detail FROM registry_live");
     REQUIRE(gap.rows.size() == 1);
     CHECK(gap.rows[0][0] == "gap:loss:3");
     CHECK(t.db.get_config("registry_etw_lost", "") == "3");
@@ -1587,7 +2444,7 @@ TEST_CASE("registry source: kernel loss and a failed loss query are loss, report
     f.loss.query_ok = false; // the query failing is itself loss ...
     f.clock = T0 + 300 * SEC;
     tick(t.db, *src);
-    gap = q(t.db, "SELECT detail FROM registry_live ORDER BY id");
+    gap = ql("SELECT detail FROM registry_live ORDER BY id");
     REQUIRE(gap.rows.size() == 2);
     CHECK(gap.rows[1][0] == "gap:loss:1");
     f.loss.query_ok = true; // ... and recovering is not
@@ -1599,7 +2456,7 @@ TEST_CASE("registry source: kernel loss and a failed loss query are loss, report
     f.loss.decode_failed = 2; // callback decode failures are loss too
     f.clock = T0 + 500 * SEC;
     tick(t.db, *src);
-    gap = q(t.db, "SELECT detail FROM registry_live ORDER BY id");
+    gap = ql("SELECT detail FROM registry_live ORDER BY id");
     REQUIRE(gap.rows.size() == 3);
     CHECK(gap.rows[2][0] == "gap:loss:2");
 }
@@ -1634,7 +2491,7 @@ TEST_CASE("registry source: loss over a held window degrades it (kernel counters
         if (mode == Loss::FailedQuery)
             f.loss.query_ok = false;
         tick(t.db, *src);
-        const auto rows = q(t.db, "SELECT actor_pid, detail FROM registry_live WHERE action = 'changed'");
+        const auto rows = ql("SELECT actor_pid, detail FROM registry_live WHERE action = 'changed'");
         REQUIRE(rows.rows.size() == 1);
         if (mode == Loss::None) { // the control: the same setup attributes when nothing was lost
             CHECK(rows.rows[0][0] == "812");
@@ -1675,7 +2532,7 @@ TEST_CASE("registry source: an eviction during loss sampling cannot select the s
     REQUIRE(fired);
     REQUIRE(f.buffer->drop_info().count == 1); // the positive control: the eviction happened mid-tick
 
-    const auto rows = q(t.db, "SELECT actor_pid, actor_image, detail FROM registry_live WHERE action = 'changed'");
+    const auto rows = ql("SELECT actor_pid, actor_image, detail FROM registry_live WHERE action = 'changed'");
     REQUIRE(rows.rows.size() == 1);
     CHECK(rows.rows[0][0] == "0"); // never the survivor
     CHECK(rows.rows[0][1].empty());
@@ -1738,7 +2595,7 @@ TEST_CASE("registry source: a kernel loss counted after the reads lies inside it
 
         f.clock = T0 + 300 * SEC; // the window has settled; no new loss is reported
         tick(t.db, *src);
-        const auto rows = q(t.db, "SELECT actor_pid, detail FROM registry_live WHERE action = 'changed'");
+        const auto rows = ql("SELECT actor_pid, detail FROM registry_live WHERE action = 'changed'");
         REQUIRE(rows.rows.size() == 1);
         if (lose) {
             CHECK(rows.rows[0][0] == "0"); // never the bystander across a reported loss
@@ -1840,11 +2697,11 @@ TEST_CASE("registry source: a budget-deferred never-complete root keeps its pend
 
     d.f.clock = T0 + 401 * SEC;
     tick(d.t.db, *d.src);
-    const auto rows = q(d.t.db, "SELECT actor_pid, detail FROM registry_live WHERE action = 'changed'");
+    const auto rows = ql("SELECT actor_pid, detail FROM registry_live WHERE action = 'changed'");
     REQUIRE(rows.rows.size() == 1);
     CHECK(rows.rows[0][0] == "0"); // two writers: never the survivor
     CHECK(rows.rows[0][1] == "attr:ambiguous:2");
-    CHECK(q(d.t.db, "SELECT COUNT(*) FROM registry_live WHERE record_key LIKE 'gap:loss:%'")
+    CHECK(ql("SELECT COUNT(*) FROM registry_live WHERE record_key LIKE 'gap:loss:%'")
              .rows.at(0).at(0) == "0");
 }
 
@@ -1857,11 +2714,11 @@ TEST_CASE("registry source: a budget-deferred never-complete root keeps the loss
 
     d.f.clock = T0 + 401 * SEC;
     tick(d.t.db, *d.src);
-    const auto rows = q(d.t.db, "SELECT actor_pid, detail FROM registry_live WHERE action = 'changed'");
+    const auto rows = ql("SELECT actor_pid, detail FROM registry_live WHERE action = 'changed'");
     REQUIRE(rows.rows.size() == 1);
     CHECK(rows.rows[0][0] == "0");
     CHECK(rows.rows[0][1] == "attr:degraded");
-    CHECK(q(d.t.db, "SELECT COUNT(*) FROM registry_live WHERE record_key LIKE 'gap:loss:%'")
+    CHECK(ql("SELECT COUNT(*) FROM registry_live WHERE record_key LIKE 'gap:loss:%'")
              .rows.at(0).at(0) == "1");
 }
 
@@ -1905,7 +2762,7 @@ TEST_CASE("registry source: read statuses; status keys; fair root scheduling",
         CHECK(t.db.get_config("registry_watch_roots", "") == "2");
         CHECK(read_cursor(t.db).roots.at(kRoot).window_base == 0); // a Capped read does not advance it
         // ... and the held change lands, the only non-gap row
-        CHECK(std::stoll(q(t.db, "SELECT COUNT(*) FROM registry_live WHERE action <> 'capture_gap'")
+        CHECK(std::stoll(ql("SELECT COUNT(*) FROM registry_live WHERE action <> 'capture_gap'")
                             .rows.at(0).at(0)) == 1);
     }
 
@@ -1973,11 +2830,11 @@ TEST_CASE("registry source: an unreadable root and a denied child set that gains
     auto src = make_registry_cursor_source(scope1(), f.reader());
     const std::string locked = kRoot + "\\Locked";
     auto gap_count = [&] {
-        return std::stoll(q(t.db, "SELECT COUNT(*) FROM registry_live WHERE record_key LIKE 'gap:unreadable:%'")
+        return std::stoll(ql("SELECT COUNT(*) FROM registry_live WHERE record_key LIKE 'gap:unreadable:%'")
                              .rows.at(0).at(0));
     };
     auto last_gap = [&] {
-        return q(t.db, "SELECT detail FROM registry_live WHERE record_key LIKE 'gap:unreadable:%' "
+        return ql("SELECT detail FROM registry_live WHERE record_key LIKE 'gap:unreadable:%' "
                        "ORDER BY id DESC LIMIT 1").rows.at(0).at(0);
     };
     // A read of the root with Svc\Start = `start`, optionally with Locked readable and holding a value.
@@ -2010,7 +2867,7 @@ TEST_CASE("registry source: an unreadable root and a denied child set that gains
     // values are kept (no `removed` rows), the root is NOT unreadable, and ONE gap names it.
     CHECK(next_tick(read(2, false, {locked})).events_emitted == 2);
     CHECK(count_rows(t.db) == 2);
-    CHECK(std::stoll(q(t.db, "SELECT COUNT(*) FROM registry_live WHERE action IN ('removed','key_removed')")
+    CHECK(std::stoll(ql("SELECT COUNT(*) FROM registry_live WHERE action IN ('removed','key_removed')")
                         .rows.at(0).at(0)) == 0);
     CHECK(gap_count() == 1);
     CHECK_THAT(last_gap(), ContainsSubstring("gap:unreadable:" + kRoot));
@@ -2064,11 +2921,11 @@ TEST_CASE("registry source: the denied child set writes a gap only when it gains
     auto src = make_registry_cursor_source(scope1(), f.reader());
     const std::string a = kRoot + "\\A", b = kRoot + "\\B", c = kRoot + "\\C", d = kRoot + "\\D";
     auto gap_count = [&] {
-        return std::stoll(q(t.db, "SELECT COUNT(*) FROM registry_live WHERE record_key LIKE 'gap:unreadable:%'")
+        return std::stoll(ql("SELECT COUNT(*) FROM registry_live WHERE record_key LIKE 'gap:unreadable:%'")
                              .rows.at(0).at(0));
     };
     auto last_gap = [&] {
-        return q(t.db, "SELECT detail FROM registry_live WHERE record_key LIKE 'gap:unreadable:%' "
+        return ql("SELECT detail FROM registry_live WHERE record_key LIKE 'gap:unreadable:%' "
                        "ORDER BY id DESC LIMIT 1").rows.at(0).at(0);
     };
     auto stored = [&] { return read_cursor(t.db).roots.at(kRoot).skipped; };
@@ -2157,6 +3014,166 @@ TEST_CASE("registry source: the denied child set writes a gap only when it gains
     }
 }
 
+TEST_CASE("registry read: more than 32 denied children are counted and the gap row says how many are not named",
+          "[echo][registry][lifecycle]") {
+    auto t = make_db();
+    Fake f;
+    auto src = make_registry_cursor_source(scope1(), f.reader());
+    auto last_gap = [&] {
+        return ql("SELECT detail FROM registry_live WHERE record_key LIKE 'gap:unreadable:%' "
+                  "ORDER BY id DESC LIMIT 1").rows.at(0).at(0);
+    };
+    auto r = svc(1);
+    r.status = RegistryReadStatus::Capped;
+    for (std::size_t i = 0; i < kSkippedCap; ++i)
+        r.skipped.push_back(std::format("{}\\D{:03}", kRoot, i));
+    r.skipped_overflow = 5;
+    f.reads[kRoot] = std::move(r);
+    f.clock += 100 * SEC;
+    f.dirty->mark(kRoot, f.clock);
+    tick(t.db, *src);
+    const std::string detail = last_gap();
+    CHECK_THAT(detail, ContainsSubstring("(37 child key(s) denied read access"));
+    CHECK_THAT(detail, ContainsSubstring("; and 5 more not named"));
+    CHECK(read_cursor(t.db).roots.at(kRoot).skipped.size() == kSkippedCap); // the stored set stays bounded
+}
+
+TEST_CASE("registry source: a larger count of unnamed denied children writes one gap row; a steady, lower or cleared count writes none",
+          "[echo][registry][lifecycle]") {
+    auto t = make_db();
+    Fake f;
+    auto src = make_registry_cursor_source(scope1(), f.reader());
+    std::vector<std::string> named;
+    for (std::size_t i = 0; i < kSkippedCap; ++i)
+        named.push_back(std::format("{}\\D{:03}", kRoot, i));
+    auto gap_count = [&] {
+        return std::stoll(ql("SELECT COUNT(*) FROM registry_live WHERE record_key LIKE 'gap:unreadable:%'")
+                             .rows.at(0).at(0));
+    };
+    auto last_gap = [&] {
+        return ql("SELECT detail FROM registry_live WHERE record_key LIKE 'gap:unreadable:%' "
+                  "ORDER BY id DESC LIMIT 1").rows.at(0).at(0);
+    };
+    auto stored = [&] { return read_cursor(t.db).roots.at(kRoot).skipped_overflow; };
+    // One tick over an unchanged root: the same 32 named children, `overflow` more beyond them.
+    auto next_tick = [&](RegistryReadStatus status, std::size_t overflow) {
+        auto r = svc(1);
+        r.status = status;
+        r.skipped = named;
+        r.skipped_overflow = overflow;
+        f.reads[kRoot] = std::move(r);
+        f.clock += 100 * SEC;
+        f.dirty->mark(kRoot, f.clock);
+        return tick(t.db, *src);
+    };
+    using S = RegistryReadStatus;
+
+    // 32 denied children and no more: all named, a Complete read, one gap row.
+    CHECK(next_tick(S::Complete, 0).events_emitted == 1);
+    CHECK(gap_count() == 1);
+    CHECK(stored() == 0);
+
+    // The 33rd: every named child is one the stored set already holds, only the count is new.
+    CHECK(next_tick(S::Capped, 1).events_emitted == 1);
+    CHECK(gap_count() == 2);
+    CHECK_THAT(last_gap(), ContainsSubstring("(33 child key(s) denied read access"));
+    CHECK(last_gap().ends_with("; and 1 more not named"));
+    CHECK(stored() == 1);
+
+    CHECK(next_tick(S::Capped, 1).events_emitted == 0); // steady: nothing new
+    CHECK(gap_count() == 2);
+
+    CHECK(next_tick(S::Capped, 2).events_emitted == 1); // the 34th
+    CHECK(gap_count() == 3);
+    CHECK(last_gap().ends_with("; and 2 more not named"));
+    CHECK(stored() == 2);
+
+    // A Capped read may add but never shrinks, like the named set: a lower count writes nothing
+    // and is not remembered, so the same 2 again is not a gain.
+    CHECK(next_tick(S::Capped, 1).events_emitted == 0);
+    CHECK(stored() == 2);
+    CHECK(next_tick(S::Capped, 2).events_emitted == 0);
+    CHECK(gap_count() == 3);
+
+    // A Complete read clears the count (nothing to report), and a count that comes back is new.
+    CHECK(next_tick(S::Complete, 0).events_emitted == 0);
+    CHECK(stored() == 0);
+    CHECK(gap_count() == 3);
+    CHECK(next_tick(S::Capped, 1).events_emitted == 1);
+    CHECK(gap_count() == 4);
+}
+
+TEST_CASE("registry cursor: the unnamed skipped count is written only when set and decodes to 0 when absent",
+          "[echo][registry][pure]") {
+    RegistryCursor cur;
+    cur.present = true;
+    cur.tick = 3;
+    cur.roots["HKLM\\R"] = RegistryRootState{true, 100, 110, 120, "capped", false, {"HKLM\\R\\D"}};
+    const auto plain = encode_registry_cursor(cur);
+    // Unset: the row has no such field, so it is byte-identical to one an earlier build wrote.
+    CHECK_FALSE(nlohmann::json::parse(plain).at("roots").at("HKLM\\R").contains("skipped_overflow"));
+    const auto absent = decode_registry_cursor(plain);
+    CHECK_FALSE(absent.malformed);
+    CHECK(absent.roots.at("HKLM\\R").skipped_overflow == 0);
+    CHECK(absent.roots.at("HKLM\\R") == cur.roots.at("HKLM\\R"));
+
+    cur.roots["HKLM\\R"].skipped_overflow = 7;
+    const auto set = encode_registry_cursor(cur);
+    CHECK(nlohmann::json::parse(set).at("roots").at("HKLM\\R").at("skipped_overflow").get<std::size_t>() == 7);
+    const auto back = decode_registry_cursor(set);
+    CHECK_FALSE(back.malformed);
+    CHECK(back.roots.at("HKLM\\R").skipped_overflow == 7);
+    CHECK(back.roots.at("HKLM\\R") == cur.roots.at("HKLM\\R"));
+    CHECK(encode_registry_cursor(back) == set);
+}
+
+TEST_CASE("registry read: a read with uncounted denied children derives adds for later siblings and no removals",
+          "[echo][registry][lifecycle]") {
+    auto t = make_db();
+    Fake f;
+    auto src = make_registry_cursor_source(scope1(), f.reader());
+    const std::string a = kRoot + "\\A", b = kRoot + "\\B", c = kRoot + "\\C";
+    auto step = [&](SubtreeRead r) {
+        f.reads[kRoot] = std::move(r);
+        f.clock += 100 * SEC;
+        f.dirty->mark(kRoot, f.clock);
+        return tick_settled(t.db, f, *src);
+    };
+    step(complete({{a, {{"v", vread(4, dword(1))}}}, {b, {{"v", vread(4, dword(2))}}}}));
+    // B is gone from this read (it may be one of the unnamed denied children); C is a later sibling.
+    auto r = complete({{a, {{"v", vread(4, dword(1))}}}, {c, {{"v", vread(4, dword(3))}}}});
+    r.status = RegistryReadStatus::Capped;
+    r.skipped_overflow = 3;
+    step(std::move(r));
+    const auto rows = ql("SELECT action, key_path FROM registry_live WHERE action IN ('added','removed','key_removed')");
+    REQUIRE_FALSE(rows.rows.empty());
+    int added_c = 0;
+    for (const auto& row : rows.rows) {
+        CHECK(row.at(0) == "added"); // no removed and no key_removed row
+        added_c += row.at(1).ends_with("\\C");
+    }
+    CHECK(added_c == 1);
+}
+
+TEST_CASE("registry names: a NUL is escaped in the gap detail only", "[echo][registry][lifecycle]") {
+    auto t = make_db();
+    Fake f;
+    auto src = make_registry_cursor_source(scope1(), f.reader());
+    auto r = svc(1);
+    r.status = RegistryReadStatus::Capped;
+    r.skipped = {kRoot + std::string{'\\', 'a', '\0', 'b'}}; // the identity path keeps the NUL
+    f.reads[kRoot] = std::move(r);
+    f.clock += 100 * SEC;
+    f.dirty->mark(kRoot, f.clock);
+    tick(t.db, *src);
+    const std::string detail = ql("SELECT detail FROM registry_live WHERE record_key LIKE 'gap:unreadable:%' "
+                                  "ORDER BY id DESC LIMIT 1").rows.at(0).at(0);
+    CHECK_THAT(detail, ContainsSubstring("\\a<NUL>b"));
+    CHECK(detail.find('\0') == std::string::npos);
+    CHECK(read_cursor(t.db).roots.at(kRoot).skipped ==
+          std::vector<std::string>{kRoot + std::string{'\\', 'a', '\0', 'b'}}); // identity unchanged
+}
+
 TEST_CASE("registry source: with a budget admitting one root per tick every root is read within n ticks (R15)",
           "[echo][registry][lifecycle]") {
     auto t = make_db();
@@ -2216,7 +3233,7 @@ TEST_CASE("registry source: a root that stays Unreadable under budget pressure k
         CHECK(f.read_calls[0] == (i % 2 == 0 ? kRoot : kRoot2));
         CHECK(read_cursor(t.db).roots.at(kRoot).status == "unreadable");
     }
-    const auto gaps = q(t.db, "SELECT detail FROM registry_live WHERE record_key LIKE 'gap:unreadable:%'");
+    const auto gaps = ql("SELECT detail FROM registry_live WHERE record_key LIKE 'gap:unreadable:%'");
     REQUIRE(gaps.rows.size() == 1);
     CHECK_THAT(gaps.rows[0][0], ContainsSubstring("gap:unreadable:" + kRoot + " (the root could not be read"));
     CHECK(count_rows(t.db) == 1); // B's unchanged reads wrote nothing
@@ -2245,10 +3262,51 @@ TEST_CASE("registry source: a control-set switch re-baselines CurrentControlSet 
     f.clock = T0 + 200 * SEC;
     f.dirty->mark(svc_root, f.clock);
     tick(t.db, *src);
-    const auto rows = q(t.db, "SELECT detail FROM registry_live");
+    const auto rows = ql("SELECT detail FROM registry_live");
     REQUIRE(rows.rows.size() == 1); // one gap; no removed/added storm
     CHECK_THAT(rows.rows[0][0], ContainsSubstring("control set changed"));
     CHECK(read_cursor(t.db).ccs == "ControlSet002");
+}
+
+namespace {
+
+// Does this stored baseline row hold no key at all (what an Absent read, the shrink on leaving
+// scope and a never-populated root share)? Decoded rather than compared as text: the encoder
+// writes its keys sorted (`{"keys":{},"v":1}`), so a literal of the other order never equals a
+// real blanked baseline and every `!= literal` against it would pass whatever the row held.
+bool empty_baseline(const std::string& json) {
+    const auto d = decode_registry_baseline(json);
+    return !d.malformed && d.baseline.keys.empty();
+}
+
+// Is a USABLE baseline stored: a row that decodes and holds at least one key? `!empty_baseline`
+// is also true for a missing row and for malformed text, so "the baseline was kept" is asserted
+// with this, never with the negation.
+bool nonempty_baseline(const std::string& json) {
+    const auto d = decode_registry_baseline(json);
+    return !d.malformed && !d.baseline.keys.empty();
+}
+
+} // namespace
+
+TEST_CASE("registry test helpers: empty_baseline and nonempty_baseline decode the row, whatever its key order",
+          "[echo][registry]") {
+    const std::string populated = encode_registry_baseline(
+       RegistryBaseline{{{"HKU\\S\\k", {{"v", BaselineEntry{4, 4, "h", "1", false}}}}}});
+    struct Case {
+        const char* name;
+        std::string json;
+        bool empty, nonempty;
+    };
+    for (const auto& c : {Case{"empty, the literal's own key order", R"({"v":1,"keys":{}})", true, false},
+                          Case{"empty, the encoder's key order", R"({"keys":{},"v":1})", true, false},
+                          Case{"populated", populated, false, true},
+                          Case{"missing row", "", false, false},
+                          Case{"malformed text", "not-json", false, false}}) {
+        INFO(c.name);
+        CHECK(empty_baseline(c.json) == c.empty);
+        CHECK(nonempty_baseline(c.json) == c.nonempty);
+    }
 }
 
 TEST_CASE("registry source: a logged-off user's roots leave scope without a removal storm",
@@ -2261,8 +3319,7 @@ TEST_CASE("registry source: a logged-off user's roots leave scope without a remo
     f.reads[user_root] = complete({{user_root, {{"v", vread(4, dword(1))}}}});
     tick(t.db, *src);
     CHECK(f.watch_calls.back() == std::vector<std::string>{user_root});
-    const std::string empty_baseline = R"({"v":1,"keys":{}})";
-    CHECK(*t.db.try_get_state("registry:" + user_root).value() != empty_baseline);
+    CHECK(nonempty_baseline(t.db.try_get_state("registry:" + user_root).value().value_or("")));
     f.sids.clear();
     f.clock = T0 + 100 * SEC;
     f.dirty->mark_hku();
@@ -2270,8 +3327,2616 @@ TEST_CASE("registry source: a logged-off user's roots leave scope without a remo
     tick(t.db, *src);
     CHECK(f.watch_calls.back().empty());
     CHECK(count_rows(t.db) == 0); // not read, so no mass removal
-    CHECK(*t.db.try_get_state("registry:" + user_root).value() == empty_baseline); // and no values kept
+    CHECK(empty_baseline(t.db.try_get_state("registry:" + user_root).value().value_or(""))); // and no values kept
     CHECK(read_cursor(t.db).roots.empty());
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Storage budget: row volume (512 B data, no old value, no bam subtree, key write time)
+// ═══════════════════════════════════════════════════════════════════════════
+
+TEST_CASE("registry_path_excluded: the bam State subtree only, on a separator boundary",
+          "[echo][registry][pure]") {
+    const std::string bam = "HKLM\\SYSTEM\\CurrentControlSet\\Services\\bam\\State";
+    CHECK(registry_path_excluded(bam));
+    CHECK(registry_path_excluded(bam + "\\UserSettings"));
+    CHECK(registry_path_excluded(bam + "\\UserSettings\\S-1-5-21-1"));
+    CHECK(registry_path_excluded("hklm\\system\\currentcontrolset\\services\\BAM\\state")); // ASCII case folded
+    CHECK(registry_path_excluded("HKLM\\SYSTEM\\CurrentControlSet\\Services\\bam\\STATE\\x"));
+    CHECK_FALSE(registry_path_excluded(bam + "X"));              // not on a boundary
+    CHECK_FALSE(registry_path_excluded(bam + "X\\UserSettings"));
+    CHECK_FALSE(registry_path_excluded("HKLM\\SYSTEM\\CurrentControlSet\\Services\\bam")); // the parent
+    CHECK_FALSE(registry_path_excluded("HKLM\\SYSTEM\\CurrentControlSet\\Services\\bam\\Other"));
+    CHECK_FALSE(registry_path_excluded("HKLM\\SYSTEM\\CurrentControlSet\\Services\\bamX\\State"));
+    CHECK_FALSE(registry_path_excluded("HKLM\\SYSTEM\\CurrentControlSet\\Services\\Dhcp"));
+    CHECK_FALSE(registry_path_excluded(""));
+    CHECK_FALSE(registry_path_excluded("HKU\\S-1-5-21-1\\Software\\Run"));
+}
+
+TEST_CASE("diff_registry_snapshot ignores the bam State subtree in both directions",
+          "[echo][registry][pure]") {
+    namespace P = yuzu::profiles;
+    const std::string root = "HKLM\\SYSTEM\\CurrentControlSet\\Services";
+    const std::string bam_state = root + "\\bam\\State";
+    const RegistryWindow win{10, 20};
+
+    // A read that visits bam\State yields no candidate for it and keeps it out of the baseline.
+    auto read = complete({{root + "\\Dhcp", {{"Start", vread(P::kRegDword, dword(2))}}},
+                          {bam_state, {{"Version", vread(P::kRegDword, dword(1))}}},
+                          {bam_state + "\\UserSettings", {{"x", vread(P::kRegDword, dword(1))}}}});
+    const auto first = diff_registry_snapshot({}, read, root, "notify", win, 20);
+    REQUIRE(first.candidates.size() == 1);
+    CHECK(first.candidates[0].key == root + "\\Dhcp");
+    CHECK(first.baseline.keys.size() == 1);
+    CHECK_FALSE(first.baseline.keys.contains(bam_state));
+
+    // A baseline written by an earlier build still holds the subtree: the next read drops it
+    // without a removed row, and reports the baseline as changed so it is rewritten once.
+    RegistryBaseline legacy = first.baseline;
+    legacy.keys[bam_state]["Version"] = baseline_entry_from_bytes(P::kRegDword, 4, dword(1), false);
+    legacy.keys[bam_state + "\\UserSettings"]["x"] = baseline_entry_from_bytes(P::kRegDword, 4, dword(1), false);
+    auto read2 = complete({{root + "\\Dhcp", {{"Start", vread(P::kRegDword, dword(2))}}}});
+    const auto second = diff_registry_snapshot(legacy, read2, root, "reconcile", win, 30);
+    CHECK(second.candidates.empty());
+    CHECK(second.changed);
+    CHECK_FALSE(second.baseline.keys.contains(bam_state));
+    CHECK_FALSE(second.baseline.keys.contains(bam_state + "\\UserSettings"));
+
+    // The same holds for a partial read, which starts from a copy of the baseline.
+    SubtreeRead capped = read2;
+    capped.status = RegistryReadStatus::Capped;
+    const auto third = diff_registry_snapshot(legacy, capped, root, "reconcile", win, 40);
+    CHECK(third.candidates.empty());
+    CHECK_FALSE(third.baseline.keys.contains(bam_state));
+
+    // The key IN the read with a changed value yields no row either.
+    auto read3 = complete({{root + "\\Dhcp", {{"Start", vread(P::kRegDword, dword(2))}}},
+                           {bam_state, {{"Version", vread(P::kRegDword, dword(9))}}}});
+    const auto fourth = diff_registry_snapshot(second.baseline, read3, root, "notify", win, 50);
+    CHECK(fourth.candidates.empty());
+}
+
+TEST_CASE("registry rows: the old value is not stored, only its type and size", "[echo][registry][pure]") {
+    auto c = cand("changed", "Start", 4, 4, 10, 20);
+    c.has_prev = true;
+    c.prev_type = 4;
+    c.prev_size = 4;
+    c.prev_data = "legacy text from an old baseline";
+    const auto row = registry_row_from_candidate(c, 0, "", "attr:none", 1);
+    CHECK(row.prev_data.empty());
+    CHECK(row.prev_data_size == 4);
+    CHECK(row.prev_data_truncated == 1); // "there was a value; it is not stored"
+    CHECK_FALSE(row.prev_data_type.empty());
+    CHECK(row.data == "x"); // the NEW value is unchanged
+
+    c.prev_size = 0; // an empty old value: nothing was left out
+    CHECK(registry_row_from_candidate(c, 0, "", "attr:none", 1).prev_data_truncated == 0);
+    c.has_prev = false;
+    CHECK(registry_row_from_candidate(c, 0, "", "attr:none", 1).prev_data_size == 0);
+}
+
+TEST_CASE("registry rows: the time is the key's LastWriteTime, clamped to the read",
+          "[echo][registry][pure]") {
+    namespace P = yuzu::profiles;
+    const std::string root = "HKLM\\SOFTWARE\\r";
+    const std::int64_t read_end = T0 + 100 * SEC;
+    const std::int64_t wrote = T0 + 40 * SEC;
+    const RegistryWindow win{T0, read_end};
+    SubtreeRead base_read = complete({{root + "\\A", {{"v", vread(P::kRegDword, dword(1))}}}});
+    const auto base = diff_registry_snapshot({}, base_read, root, "reconcile", win, read_end, true);
+
+    const auto one_change = [&](std::int64_t key_written) {
+        SubtreeRead r = complete({{root + "\\A", {{"v", vread(P::kRegDword, dword(2))}}}});
+        r.written[root + "\\A"] = key_written;
+        const auto d = diff_registry_snapshot(base.baseline, r, root, "notify", win, read_end);
+        REQUIRE(d.candidates.size() == 1);
+        return d.candidates[0];
+    };
+
+    SECTION("a plausible write time becomes the row time; the record key stays on the read") {
+        const auto c = one_change(wrote);
+        CHECK(c.key_written == wrote);
+        const auto row = registry_row_from_candidate(c, 0, "", "attr:none", 1);
+        CHECK(row.ts == filetime_to_unix_ms(wrote) / 1000);
+        CHECK(row.observed_at == filetime_to_unix_ms(read_end)); // unchanged: the read
+        CHECK(row.record_key == registry_row_from_candidate(one_change(0), 0, "", "attr:none", 1).record_key);
+    }
+    SECTION("a write time after the read is clamped to the read end") {
+        const auto row = registry_row_from_candidate(one_change(read_end + 5 * SEC), 0, "", "attr:none", 1);
+        CHECK(row.ts == filetime_to_unix_ms(read_end) / 1000);
+    }
+    SECTION("an unknown (0) write time falls back to the read end") {
+        const auto row = registry_row_from_candidate(one_change(0), 0, "", "attr:none", 1);
+        CHECK(row.ts == filetime_to_unix_ms(read_end) / 1000);
+    }
+    SECTION("a Capped read that visited a key but published no stamp for it uses the read end") {
+        // The reader stamps a key only after its final validation; a walk that ended early or
+        // saw the key written leaves `written` without the key, and the row must not be timed
+        // from any earlier query.
+        SubtreeRead part = complete({{root + "\\A", {{"v", vread(P::kRegDword, dword(2))}}}});
+        part.status = RegistryReadStatus::Capped;
+        REQUIRE_FALSE(part.written.contains(root + "\\A"));
+        const auto d = diff_registry_snapshot(base.baseline, part, root, "notify", win, read_end);
+        REQUIRE(d.candidates.size() == 1);
+        CHECK(d.candidates[0].key_written == 0);
+        const auto row = registry_row_from_candidate(d.candidates[0], 0, "", "attr:none", 1);
+        CHECK(row.ts == filetime_to_unix_ms(read_end) / 1000);
+    }
+    SECTION("a key_removed row has no write time and uses the read end") {
+        SubtreeRead gone;
+        gone.status = RegistryReadStatus::Absent;
+        gone.written[root + "\\A"] = wrote; // even a stale stamp must not be used for a vanished key
+        const auto d = diff_registry_snapshot(base.baseline, gone, root, "reconcile", win, read_end);
+        bool saw_key_removed = false;
+        for (const auto& c : d.candidates) {
+            const auto row = registry_row_from_candidate(c, 0, "", "attr:none", 1);
+            CHECK(row.ts == filetime_to_unix_ms(read_end) / 1000);
+            saw_key_removed = saw_key_removed || c.action == "key_removed";
+        }
+        CHECK(saw_key_removed);
+    }
+}
+
+TEST_CASE("registry cursor: the key write time round-trips and a legacy candidate decodes to 0",
+          "[echo][registry][pure]") {
+    RegistryCursor cur;
+    cur.present = true;
+    cur.tick = 1;
+    cur.hku = {};
+    auto held = cand("changed", "Start", 4, 4, 10, 20);
+    held.key_written = T0 + 7 * SEC;
+    cur.held = {held};
+    const auto json = encode_registry_cursor(cur);
+    auto back = decode_registry_cursor(json);
+    REQUIRE_FALSE(back.malformed);
+    REQUIRE(back.held.size() == 1);
+    CHECK(back.held[0].key_written == T0 + 7 * SEC);
+
+    // A cursor written before the field existed: the candidate carries no "kw".
+    auto legacy = nlohmann::json::parse(json);
+    for (auto& h : legacy["held"])
+        h.erase("kw");
+    const auto old = decode_registry_cursor(legacy.dump());
+    REQUIRE_FALSE(old.malformed);
+    REQUIRE(old.held.size() == 1);
+    CHECK(old.held[0].key_written == 0);
+    CHECK(old.held[0].observed_at == held.observed_at);
+}
+
+TEST_CASE("registry baseline: the old value is not rendered, and the field is still written",
+          "[echo][registry][pure]") {
+    namespace P = yuzu::profiles;
+    const auto e = baseline_entry_from_bytes(P::kRegSz, 18, utf16("c:\\a.exe"), false);
+    CHECK(e.d.empty());
+    CHECK_FALSE(e.h.empty()); // the change-detection hash is unaffected
+    RegistryBaseline b;
+    b.keys["K"]["v"] = e;
+    const auto json = nlohmann::json::parse(encode_registry_baseline(b));
+    CHECK(json.at("keys").at("K").at("v").at("d") == ""); // kept for a rolled-back build
+    // A baseline from an earlier build, with text in "d", still decodes.
+    auto legacy = json;
+    legacy["keys"]["K"]["v"]["d"] = "c:\\a.exe";
+    const auto back = decode_registry_baseline(legacy.dump());
+    CHECK_FALSE(back.malformed);
+    CHECK(back.baseline.keys.at("K").at("v").d == "c:\\a.exe");
+    // The next diff sees identical bytes as unchanged (the hash decides), and reports the
+    // baseline changed once because its "d" now differs, with no row.
+    SubtreeRead r = complete({{"K", {{"v", vread(P::kRegSz, utf16("c:\\a.exe"))}}}});
+    const auto d = diff_registry_snapshot(back.baseline, r, "K", "reconcile", RegistryWindow{1, 2}, 2);
+    CHECK(d.candidates.empty());
+    CHECK(d.changed);
+    CHECK(d.baseline.keys.at("K").at("v").d.empty());
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Offline (unloaded) hives over an injected reader
+// ═══════════════════════════════════════════════════════════════════════════
+
+namespace {
+
+SubtreeRead uread(const std::string& root, std::uint32_t v) {
+    return complete({{root, {{"v", vread(4, dword(v))}}}});
+}
+
+// uread with the key's LastWriteTime (FILETIME) the offline reader saw: the same `written` map the
+// live reader fills, so an offline row takes the same key-write-time as its `ts`.
+SubtreeRead uread_written(const std::string& root, std::uint32_t v, std::int64_t key_written) {
+    auto r = uread(root, v);
+    r.written[root] = key_written;
+    return r;
+}
+
+// What a changed row holds for a DWORD that was 1 before: the old value's type, size and "there
+// was a value" flag, and NO text (type '/' size '/' prev_data_truncated '/' prev_data).
+const std::string kOldDwordNotStored = "REG_DWORD/4/1/";
+
+OfflineHiveRead hive_read(std::map<std::string, SubtreeRead> roots) {
+    OfflineHiveRead h;
+    h.roots = std::move(roots);
+    return h;
+}
+
+// What read_offline_hive answers when the guard refuses the hive: every root Unreadable, the
+// refusal token on the hive and on each root.
+OfflineHiveRead refused_hive(const std::vector<std::string>& roots, const std::string& reason) {
+    OfflineHiveRead h;
+    h.reason = reason;
+    for (const auto& root : roots) {
+        SubtreeRead u;
+        u.status = RegistryReadStatus::Unreadable;
+        u.reason = reason;
+        h.roots[root] = u;
+    }
+    return h;
+}
+
+// One scripted reader, one database, the source over them.
+struct OfflineRig {
+    TestDb t = make_db();
+    Fake f;
+    std::unique_ptr<RegistryCursorSource> src;
+
+    explicit OfflineRig(RegistryScope scope = RegistryScope{{}, {kSuffix}}) {
+        src = make_registry_cursor_source(std::move(scope), f.reader());
+    }
+    // Ordinary ticks until the persisted cursor says `cursor_tick` ticks have run (the next
+    // tick is then the one with cur.tick == cursor_tick: 12 is the hourly reconcile).
+    void tick_to(std::int64_t cursor_tick) {
+        while (read_cursor(t.db).tick < cursor_tick) {
+            f.clock += SEC;
+            tick(t.db, *src);
+        }
+    }
+    CursorCollectResult next() {
+        f.clock += SEC;
+        return tick(t.db, *src);
+    }
+    std::string state(const std::string& root) {
+        const auto r = t.db.try_get_state("registry:" + root);
+        REQUIRE(r.has_value());
+        return r->value_or("");
+    }
+    std::string config(const std::string& key) { return t.db.get_config(key, ""); }
+    std::int64_t gap_unreadable_rows() {
+        return std::stoll(
+           ql("SELECT COUNT(*) FROM registry_live WHERE record_key LIKE 'gap:unreadable:%'")
+              .rows.at(0).at(0));
+    }
+};
+
+} // namespace
+
+TEST_CASE("registry source: a failed HKEY_USERS enumeration keeps the cursor and the HKU mark "
+          "and the next tick re-enumerates",
+          "[echo][registry][lifecycle]") {
+    OfflineRig r;
+    const auto root = uroot(kSidA);
+    r.f.sids = {kSidA};
+    r.f.reads[root] = uread(root, 1);
+    CHECK(r.next().outcome == CursorOutcome::Baseline);
+    r.f.dirty->mark_hku();
+    r.f.clock += SEC;
+    const std::string cursor_before = *r.t.db.get_cursor("registry").value();
+    const std::string baseline_before = r.state(root);
+    const auto watch_calls_before = r.f.watch_calls.size();
+    const std::string watch_roots_before = r.config("registry_watch_roots");
+
+    // The enumeration answers an error part-way: the tick throws before it touches the watch
+    // set, the dirty marks, the baselines, the status keys or the cursor, and writes no gap row.
+    r.f.fail_loaded_sids = true;
+    CHECK_THROWS_AS(tick(r.t.db, *r.src), IncompleteCaptureError);
+    CHECK(*r.t.db.get_cursor("registry").value() == cursor_before);
+    CHECK(r.state(root) == baseline_before);
+    CHECK(count_rows(r.t.db) == 0);
+    CHECK(r.f.watch_calls.size() == watch_calls_before);
+    CHECK(r.config("registry_watch_roots") == watch_roots_before);
+    CHECK(r.f.dirty->take_hku()); // the name-watch mark was put back (R7)
+    r.f.dirty->mark_hku();
+
+    // The enumeration works again: the tick lists the loaded users once more and commits.
+    r.f.fail_loaded_sids = false;
+    const int enumerations = r.f.loaded_sids_calls;
+    r.f.clock += SEC;
+    tick(r.t.db, *r.src);
+    CHECK(r.f.loaded_sids_calls == enumerations + 1);
+    CHECK(*r.t.db.get_cursor("registry").value() != cursor_before);
+}
+
+TEST_CASE("registry source: a commit that fails for three ticks then succeeds records one commit "
+          "stalled gap with the window in its key",
+          "[echo][registry][lifecycle]") {
+    auto t = make_db();
+    Fake f;
+    auto src = make_registry_cursor_source(scope1(), f.reader());
+    f.reads[kRoot] = svc(1);
+    REQUIRE(tick(t.db, *src).outcome == CursorOutcome::Baseline);
+
+    const std::string lost_before = t.db.get_config("registry_etw_lost", "");
+    const auto kept = count_rows(t.db); // what the warehouse held before the failures
+
+    // Three ticks whose commit is refused. Each has a loss row, so it has a row to fail on.
+    std::int64_t first_failure = 0;
+    {
+        InsertTrap trap(t.path);
+        for (int i = 0; i < 3; ++i) {
+            f.clock += 10 * SEC;
+            f.loss.events_lost += 1;
+            if (i == 0)
+                first_failure = f.clock + 1000; // the fake clock steps 1000 per read; `now` is the first
+            CHECK_THROWS_AS(tick(t.db, *src), IncompleteCaptureError);
+        }
+    }
+    CHECK(ql("SELECT COUNT(*) FROM registry_live WHERE record_key LIKE 'gap:commit_stalled:%'")
+              .rows.at(0).at(0) == "0"); // nothing was committed while it failed
+    CHECK(count_rows(t.db) == kept);
+
+    // The trap is gone: the next tick commits the loss it re-derived and the stall window.
+    f.clock += 10 * SEC;
+    const std::int64_t recovered = f.clock + 1000;
+    CHECK(t.db.get_config("registry_etw_lost", "") == lost_before); // still nothing committed
+    const auto before = read_cursor(t.db).tick;
+    tick(t.db, *src);
+    CHECK(read_cursor(t.db).tick == before + 1); // the status keys and cursor moved again
+    CHECK(t.db.get_config("registry_etw_lost", "") == "3"); // the three losses, committed now
+    const auto stalled =
+        ql("SELECT record_key FROM registry_live WHERE record_key LIKE 'gap:commit_stalled:%'");
+    REQUIRE(stalled.rows.size() == 1);
+    CHECK(stalled.rows[0][0] ==
+          std::format("gap:commit_stalled:commit:{}:{}", first_failure, recovered));
+    CHECK(ql("SELECT COUNT(*) FROM registry_live WHERE action = 'capture_gap'")
+              .rows.at(0).at(0) == "2"); // the loss row and the stall row
+    CHECK(count_rows(t.db) == kept + 2); // and the warehouse kept both, in the one commit
+
+    // The window is consumed: a later commit adds no second stall row.
+    f.clock += 10 * SEC;
+    tick(t.db, *src);
+    CHECK(ql("SELECT COUNT(*) FROM registry_live WHERE record_key LIKE 'gap:commit_stalled:%'")
+              .rows.at(0).at(0) == "1");
+    CHECK(count_rows(t.db) == kept + 2);
+}
+
+TEST_CASE("registry source: a commit that never failed records no commit stalled gap",
+          "[echo][registry][lifecycle]") {
+    auto t = make_db();
+    Fake f;
+    auto src = make_registry_cursor_source(scope1(), f.reader());
+    f.reads[kRoot] = svc(1);
+    REQUIRE(tick(t.db, *src).outcome == CursorOutcome::Baseline);
+    for (int i = 0; i < 3; ++i) {
+        f.clock += 10 * SEC;
+        f.loss.events_lost += 1;
+        tick(t.db, *src);
+    }
+    CHECK(ql("SELECT COUNT(*) FROM registry_live WHERE action = 'capture_gap'")
+              .rows.at(0).at(0) == "3"); // the three loss rows
+    CHECK(ql("SELECT COUNT(*) FROM registry_live WHERE record_key LIKE 'gap:commit_stalled:%'")
+              .rows.at(0).at(0) == "0");
+}
+
+TEST_CASE("walk_enumeration: only the end of the list completes a walk and an error is a failed "
+          "read and never a short list",
+          "[echo][registry]") {
+    using Script = std::vector<std::pair<ListStep, std::string>>;
+    const auto walk = [](const Script& script) {
+        return walk_enumeration([&](unsigned i, std::string& name, std::string& err) {
+            REQUIRE(i < script.size()); // the walk never asks past a terminal answer
+            const auto& [step, text] = script[i];
+            (step == ListStep::Item ? name : err) = text;
+            return step;
+        });
+    };
+
+    SECTION("a list that ends at its end returns every name") {
+        const auto w = walk({{ListStep::Item, "S-1-5-18"},
+                             {ListStep::Item, "S-1-5-21-1"},
+                             {ListStep::End, ""}});
+        CHECK(w.error.empty());
+        CHECK(w.names == std::vector<std::string>{"S-1-5-18", "S-1-5-21-1"});
+    }
+    SECTION("an empty list is complete") {
+        const auto w = walk({{ListStep::End, ""}});
+        CHECK(w.error.empty());
+        CHECK(w.names.empty());
+    }
+    SECTION("an error part-way fails the walk, names the index and returns no names") {
+        const auto w = walk({{ListStep::Item, "S-1-5-18"},
+                             {ListStep::Item, "S-1-5-21-1"},
+                             {ListStep::Error, "error 5"},
+                             {ListStep::Item, "never reached"}});
+        CHECK(w.error == "index 2 (error 5)");
+        CHECK(w.names.empty()); // the two names found so far are not handed out
+    }
+    SECTION("an error on the first index fails the walk too") {
+        const auto w = walk({{ListStep::Error, "error 6"}});
+        CHECK(w.error == "index 0 (error 6)");
+        CHECK(w.names.empty());
+    }
+}
+
+TEST_CASE("registry source: a failed HKEY_USERS enumeration at start-up arms no watch and the "
+          "first tick lists again",
+          "[echo][registry][lifecycle]") {
+    OfflineRig r;
+    const auto root = uroot(kSidA);
+    r.f.sids = {kSidA};
+    r.f.reads[root] = uread(root, 1);
+
+    // start() takes the same list: a failed enumeration must not escape it and must not arm a
+    // partial watch.
+    r.f.fail_loaded_sids = true;
+    REQUIRE_NOTHROW(r.src->start(r.t.db));
+    CHECK(r.f.watch_calls.empty());
+
+    // The first tick enumerates again: while that still fails it throws and keeps the (empty)
+    // cursor; once it works the loaded user is listed, baselined and watched.
+    r.f.clock += SEC;
+    CHECK_THROWS_AS(tick(r.t.db, *r.src), IncompleteCaptureError);
+    CHECK_FALSE(r.t.db.get_cursor("registry").value().has_value());
+    r.f.fail_loaded_sids = false;
+    CHECK(r.next().outcome == CursorOutcome::Baseline);
+    CHECK_FALSE(r.f.watch_calls.empty());
+    CHECK(nonempty_baseline(r.state(root)));
+}
+
+TEST_CASE("registry offline: first sight baselines silently; one mount per hive per hour, and discovery only when the loaded list is re-enumerated",
+          "[echo][registry][lifecycle]") {
+    OfflineRig r;
+    const auto root = uroot(kSidA);
+    r.f.offline_discovery.profiles = {prof(kSidA)};
+    r.f.offline_reads[kSidA] = hive_read({{root, uread(root, 1)}});
+
+    CHECK(r.next().outcome == CursorOutcome::Baseline);
+    CHECK(r.f.offline_profile_calls == 1);
+    REQUIRE(r.f.offline_calls.size() == 1);
+    CHECK(r.f.offline_calls[0].sid == kSidA);
+    CHECK(r.f.offline_calls[0].path == prof(kSidA).path);
+    CHECK(r.f.offline_calls[0].roots == std::vector<std::string>{root});
+    CHECK(r.f.offline_calls[0].deadline > T0);
+    CHECK(count_rows(r.t.db) == 0);
+    CHECK(nonempty_baseline(r.state(root)));
+    CHECK(r.f.read_calls.empty()); // the loaded-hive reader is not used for an offline root
+
+    r.tick_to(12); // eleven ordinary ticks: no hive mount and no profile walk
+    CHECK(r.f.offline_profile_calls == 1);
+    CHECK(r.f.offline_calls.size() == 1);
+
+    // the hourly reconcile re-walks and re-reads; a changed value lands in THAT tick
+    r.f.offline_reads[kSidA] = hive_read({{root, uread(root, 2)}});
+    CHECK(r.next().events_emitted == 1);
+    CHECK(r.f.offline_profile_calls == 2);
+    CHECK(r.f.offline_calls.size() == 2);
+    const auto rows = ql("SELECT action, hive, key_path, data, prev_data_type || '/' || prev_data_size || '/' || prev_data_truncated || '/' || prev_data, actor_pid, "
+                                "detail, source, record_key FROM registry_live");
+    REQUIRE(rows.rows.size() == 1);
+    const auto& row = rows.rows[0];
+    CHECK(row[0] == "changed");
+    CHECK(row[1] == "HKU");
+    CHECK(row[2] == kSidA + "\\" + kSuffix); // the logical name, never a salted mount name
+    CHECK(row[3] == "2");
+    CHECK(row[4] == kOldDwordNotStored); // old value: type, size, "there was one", no text
+    CHECK(row[5] == "0");
+    CHECK(row[6] == "attr:offline");
+    CHECK(row[7] == "offline");
+    CHECK_THAT(row[8], ContainsSubstring("offline:"));
+    CHECK(read_cursor(r.t.db).held.empty());
+    CHECK(nonempty_baseline(r.state(root)));
+
+    // an HKU name-watch mark re-walks too; the cursor's list otherwise stands
+    r.f.dirty->mark_hku();
+    r.next();
+    CHECK(r.f.offline_profile_calls == 3);
+    CHECK(r.f.offline_calls.size() == 2);
+}
+
+TEST_CASE("registry offline: offline roots are never watched, never counted as watch roots; a capped read stays visible",
+          "[echo][registry][lifecycle]") {
+    OfflineRig r(RegistryScope{{"SOFTWARE\\yuzu_test_r"}, {kSuffix}});
+    const auto live = uroot(kSidB);
+    const auto off = uroot(kSidA);
+    r.f.sids = {kSidB};
+    r.f.offline_discovery.profiles = {prof(kSidA)};
+    r.f.reads[kRoot] = svc(1);
+    r.f.reads[live] = uread(live, 1);
+    SubtreeRead capped = uread(off, 1);
+    capped.status = RegistryReadStatus::Capped;
+    r.f.offline_reads[kSidA] = hive_read({{off, capped}});
+    r.next();
+
+    REQUIRE_FALSE(r.f.watch_calls.empty());
+    for (const auto& call : r.f.watch_calls)
+        CHECK(std::find(call.begin(), call.end(), off) == call.end());
+    CHECK(r.f.watch_calls.back() == std::vector<std::string>{kRoot, live});
+    CHECK(r.config("registry_watch_roots") == "2");
+    CHECK(r.config("registry_watch_roots_unarmed") == "0");
+    CHECK(r.config("registry_offline_roots") == "1");
+    CHECK(r.config("registry_offline_roots_unreadable") == "0");
+    CHECK(r.config("registry_offline_discovery_incomplete") == "0");
+    CHECK(r.config("registry_roots_capped") == "1"); // aggregate: the capped offline read counts
+    CHECK(read_cursor(r.t.db).roots.at(off).armed);
+}
+
+TEST_CASE("registry offline: a sid in both snapshots is live - watched, dirty-driven, never in cursor.offline",
+          "[echo][registry][lifecycle]") {
+    OfflineRig r;
+    const auto root = uroot(kSidA);
+    r.f.sids = {kSidA};
+    r.f.offline_discovery.profiles = {prof(kSidA)}; // the profile list lags the HKU snapshot
+    r.f.reads[root] = uread(root, 1);
+    r.next();
+    CHECK(r.f.offline_calls.empty());
+    CHECK(r.f.read_calls == std::vector<std::string>{root});
+    CHECK(r.f.watch_calls.back() == std::vector<std::string>{root});
+    CHECK(read_cursor(r.t.db).offline.empty());
+    CHECK(r.config("registry_watch_roots") == "1");
+    CHECK(r.config("registry_offline_roots") == "0");
+
+    // dirty-driven like any loaded root
+    r.f.read_calls.clear();
+    r.f.dirty->mark(root, r.f.clock);
+    r.f.reads[root] = uread(root, 2);
+    r.next();
+    CHECK(r.f.read_calls == std::vector<std::string>{root});
+    CHECK(r.f.offline_calls.empty());
+}
+
+TEST_CASE("registry offline: a hive with several roots is mounted once, and a re-enable re-baselines every one of its roots silently",
+          "[echo][registry][lifecycle]") {
+    OfflineRig r(RegistryScope{{"SOFTWARE\\yuzu_test_r"}, {kSuffix, kSuffix2}});
+    r.f.offline_discovery.profiles = {prof(kSidA), prof(kSidB)};
+    r.f.reads[kRoot] = svc(1);
+    const auto a1 = uroot(kSidA), a2 = uroot(kSidA, kSuffix2);
+    const auto b1 = uroot(kSidB), b2 = uroot(kSidB, kSuffix2);
+    const auto script = [&](std::uint32_t a_second_root) {
+        r.f.offline_reads[kSidA] = hive_read({{a1, uread(a1, 1)}, {a2, uread(a2, a_second_root)}});
+        r.f.offline_reads[kSidB] = hive_read({{b1, uread(b1, 1)}, {b2, uread(b2, 1)}});
+    };
+    script(1);
+    r.next();
+    REQUIRE(r.f.offline_calls.size() == 2); // exactly one mount per sid, each carrying both roots
+    CHECK(r.f.offline_calls[0].sid != r.f.offline_calls[1].sid);
+    CHECK(r.f.offline_calls[0].roots.size() == 2);
+    CHECK(r.f.offline_calls[1].roots.size() == 2);
+    const auto before = r.state(a2);
+    REQUIRE(nonempty_baseline(before));
+
+    // the SECOND root of A changes while the source is disabled: the re-enable must re-baseline it
+    // together with the first (a member left baselined would report the change as a row)
+    script(2);
+    r.src->on_enabled_changed(false);
+    r.src->on_enabled_changed(true);
+    r.next();
+    CHECK(r.f.offline_calls.size() == 4); // one more mount per sid, in THAT tick
+    CHECK(ql("SELECT COUNT(*) FROM registry_live WHERE action = 'changed'")
+             .rows.at(0).at(0) == "0");
+    CHECK(count_rows(r.t.db) == 1); // only the disabled-window gap
+    CHECK(r.state(a2) != before);   // the new state is the baseline
+    const auto cur = read_cursor(r.t.db);
+    for (const auto& root : {a1, a2, b1, b2}) {
+        CHECK(cur.roots.at(root).baselined);
+        CHECK(nonempty_baseline(r.state(root)));
+    }
+
+    // a refusal is one gap row PER ROOT: both of A's roots report it
+    r.f.offline_reads[kSidA] = refused_hive({a1, a2}, "offline:hive_path_unc");
+    r.tick_to(12);
+    r.next();
+    CHECK(r.gap_unreadable_rows() == 2);
+}
+
+TEST_CASE("registry offline: a refused hive keeps its baseline, writes one gap row per root naming the reason (one here: a single-root scope), and costs one attempt an hour",
+          "[echo][registry][lifecycle]") {
+    OfflineRig r;
+    const auto root = uroot(kSidA);
+    const std::string why = "offline:hive_path_unc";
+    r.f.offline_discovery.profiles = {prof(kSidA)};
+    r.f.offline_reads[kSidA] = hive_read({{root, uread(root, 1)}});
+    r.next();
+    const auto baseline = r.state(root);
+
+    r.f.offline_reads[kSidA] = refused_hive({root}, why);
+    r.tick_to(12);
+    CHECK(r.f.offline_calls.size() == 1); // between reconciles: no attempt
+    r.next();                             // the reconcile
+    CHECK(r.f.offline_calls.size() == 2);
+    CHECK(r.gap_unreadable_rows() == 1);
+    const auto gap = ql("SELECT action, detail FROM registry_live "
+                               "WHERE record_key LIKE 'gap:unreadable:%'");
+    CHECK(gap.rows.at(0).at(0) == "capture_gap");
+    CHECK_THAT(gap.rows.at(0).at(1), ContainsSubstring(why));
+    CHECK_THAT(gap.rows.at(0).at(1), ContainsSubstring(root));
+    CHECK(r.state(root) == baseline); // kept
+    CHECK(r.config("registry_offline_roots_unreadable") == "1");
+    CHECK(r.config("registry_roots_unreadable") == "1");
+
+    r.tick_to(24);
+    CHECK(r.f.offline_calls.size() == 2);
+    r.next(); // the next hour: tried again, still refused, no second row
+    CHECK(r.f.offline_calls.size() == 3);
+    CHECK(r.gap_unreadable_rows() == 1);
+    CHECK(count_rows(r.t.db) == 1);
+}
+
+TEST_CASE("registry offline: a refused hive the budget defers keeps status unreadable and is retried NEXT tick, with no second gap row per root",
+          "[echo][registry][lifecycle]") {
+    OfflineRig r(RegistryScope{{"SOFTWARE\\yuzu_test_r"}, {kSuffix}});
+    const auto root = uroot(kSidA);
+    bool burn = false;
+    auto reader = r.f.reader();
+    auto read = reader.read_subtree;
+    reader.read_subtree = [&r, &burn, read](const std::string& rt, std::int64_t deadline) {
+        auto res = read(rt, deadline);
+        if (burn && rt == kRoot)
+            r.f.clock += kSnapshotBudget100ns + SEC; // the budget is spent by the first read
+        return res;
+    };
+    r.src = make_registry_cursor_source(RegistryScope{{"SOFTWARE\\yuzu_test_r"}, {kSuffix}},
+                                        std::move(reader));
+    r.f.reads[kRoot] = svc(1);
+    r.f.offline_discovery.profiles = {prof(kSidA)};
+    r.f.offline_reads[kSidA] = hive_read({{root, uread(root, 1)}});
+    r.next();
+    r.f.offline_reads[kSidA] = refused_hive({root}, "offline:hive_path_unc");
+    r.tick_to(12);
+    r.next(); // reconcile: refused, one row
+    REQUIRE(r.f.offline_calls.size() == 2);
+    REQUIRE(r.gap_unreadable_rows() == 1);
+
+    r.tick_to(24);
+    burn = true;
+    r.next(); // reconcile: the HKLM root spends the budget, the refused hive is deferred
+    burn = false;
+    CHECK(r.f.offline_calls.size() == 2);
+    const auto deferred = read_cursor(r.t.db).roots.at(root);
+    CHECK(deferred.deferred);
+    CHECK(deferred.status == "unreadable"); // untouched: one gap row per transition
+    r.next();                               // NEXT tick, not the next reconcile
+    CHECK(r.f.offline_calls.size() == 3);
+    CHECK_FALSE(read_cursor(r.t.db).roots.at(root).deferred);
+    CHECK(r.gap_unreadable_rows() == 1);
+    r.next();
+    CHECK(r.f.offline_calls.size() == 3); // back to hourly
+}
+
+TEST_CASE("registry offline: a mount that was not attempted writes no baseline and no row, and is retried next tick",
+          "[echo][registry][lifecycle]") {
+    OfflineRig r;
+    const auto root = uroot(kSidA);
+    r.f.offline_discovery.profiles = {prof(kSidA)};
+    OfflineHiveRead skipped;
+    skipped.attempted = false;
+    skipped.reason = "offline:skipped_after_timeout";
+    r.f.offline_reads[kSidA] = skipped;
+    r.next();
+    CHECK(r.f.offline_calls.size() == 1);
+    const auto st = r.t.db.try_get_state("registry:" + root);
+    REQUIRE(st.has_value());
+    CHECK_FALSE(st->has_value()); // no baseline written
+    CHECK(count_rows(r.t.db) == 0);
+    const auto cur = read_cursor(r.t.db);
+    CHECK(cur.roots.at(root).deferred);
+    CHECK_FALSE(cur.roots.at(root).baselined);
+
+    r.f.offline_reads[kSidA] = hive_read({{root, uread(root, 1)}});
+    r.next(); // not the next reconcile: the next tick
+    CHECK(r.f.offline_calls.size() == 2);
+    const auto after = read_cursor(r.t.db).roots.at(root);
+    CHECK_FALSE(after.deferred);
+    CHECK(after.baselined);
+    CHECK(nonempty_baseline(r.state(root)));
+    CHECK(count_rows(r.t.db) == 0);
+}
+
+TEST_CASE("registry offline: a re-enable re-baselines an offline root in THAT tick, silently",
+          "[echo][registry][lifecycle]") {
+    OfflineRig r;
+    const auto root = uroot(kSidA);
+    r.f.offline_discovery.profiles = {prof(kSidA)};
+    r.f.offline_reads[kSidA] = hive_read({{root, uread(root, 1)}});
+    r.next();
+    r.tick_to(3);
+    REQUIRE(r.f.offline_calls.size() == 1);
+    const auto before = r.state(root);
+
+    r.f.offline_reads[kSidA] = hive_read({{root, uread(root, 2)}}); // changed while disabled
+    r.src->on_enabled_changed(false);
+    r.src->on_enabled_changed(true);
+    r.next();
+    CHECK(r.f.offline_calls.size() == 2); // not the next hourly reconcile
+    CHECK(r.state(root) != before);       // the new state is the baseline ...
+    CHECK(count_rows(r.t.db) == 1);       // ... and only the disabled-window gap was written
+    CHECK(ql("SELECT COUNT(*) FROM registry_live WHERE action = 'changed'")
+             .rows.at(0).at(0) == "0");
+}
+
+TEST_CASE("registry offline: logoff keeps scope, resets the retention term and consumes the stale notify; a failed commit restores it",
+          "[echo][registry][lifecycle]") {
+    OfflineRig r(RegistryScope{{"SOFTWARE\\yuzu_test_r"}, {kSuffix}});
+    const auto root = uroot(kSidA);
+    r.f.sids = {kSidA};
+    r.f.reads[kRoot] = svc(1);
+    r.f.reads[root] = uread(root, 1);
+    r.next();
+    const auto live = read_cursor(r.t.db);
+    REQUIRE(live.roots.at(root).window_base != 0);
+    REQUIRE(live.roots.at(kRoot).window_base != 0);
+    const auto baseline = r.state(root);
+
+    // an unread notify on the user's root, then the user logs off
+    const std::int64_t notify = r.f.clock + 5 * SEC;
+    r.f.dirty->mark(root, notify);
+    r.f.sids.clear();
+    r.f.offline_discovery.profiles = {prof(kSidA)};
+    r.f.dirty->mark_hku();
+    r.f.loss.events_lost = 1; // a gap:loss row, so the commit has a row to fail on
+    r.f.clock += 10 * SEC;
+    {
+        InsertTrap trap(r.t.path);
+        CHECK_THROWS_AS(r.next(), IncompleteCaptureError);
+    }
+    CHECK(r.f.dirty->first(root) == notify); // the take was restored
+    CHECK(r.f.dirty->peek_dirty(root));
+
+    r.next(); // the retry commits
+    CHECK(r.f.dirty->first(root) == 0);        // consumed
+    CHECK_FALSE(r.f.dirty->peek_dirty(root));
+    CHECK(r.f.offline_calls.empty());          // no hive read: it is not due
+    const auto cur = read_cursor(r.t.db);
+    REQUIRE(cur.roots.contains(root));         // still in scope ...
+    CHECK(cur.roots.at(root).window_base == 0); // ... with nothing from its loaded life
+    CHECK(cur.roots.at(root).baselined);
+    CHECK(cur.offline == std::vector<OfflineProfile>{prof(kSidA)});
+    CHECK(r.state(root) == baseline);          // no leave-scope drop
+    CHECK(ql("SELECT COUNT(*) FROM registry_live WHERE action != 'capture_gap'")
+             .rows.at(0).at(0) == "0");
+    // the retention floor is the other root's base alone
+    CHECK(retention_watermark(cur.roots, {}) == cur.roots.at(kRoot).window_base);
+
+    // A notify that lands on the root AFTER the logoff take is never read (nothing watches an
+    // unloaded hive) and must not hold the floor: an event older than the loaded root's base is
+    // still released, though the offline root's unread notify is older still.
+    const std::int64_t base = cur.roots.at(kRoot).window_base;
+    r.src->push_event_for_test(ev(base - 1, 9, RegistryEtwOp::Set, "late"));
+    r.f.dirty->mark(root, base - 500 * SEC);
+    r.next();
+    CHECK(r.src->buffer_for_test().size() == 0);
+    CHECK(read_cursor(r.t.db).roots.at(kRoot).window_base == base); // that tick read nothing
+
+    // the hourly offline read diffs against the baseline the loaded hive left behind
+    r.f.offline_reads[kSidA] = hive_read({{root, uread(root, 2)}});
+    r.tick_to(12);
+    r.next();
+    REQUIRE(r.f.offline_calls.size() == 1);
+    const auto rows = ql("SELECT prev_data_type || '/' || prev_data_size || '/' || prev_data_truncated || '/' || prev_data, data, detail FROM registry_live "
+                                "WHERE action = 'changed'");
+    REQUIRE(rows.rows.size() == 1);
+    CHECK(rows.rows[0][0] == kOldDwordNotStored);
+    CHECK(rows.rows[0][1] == "2");
+    CHECK(rows.rows[0][2] == "attr:offline");
+}
+
+TEST_CASE("registry offline: logon reads the loaded hive at once against the offline baseline (a RunOnce consumed at logon is removed, lost-restart)",
+          "[echo][registry][lifecycle]") {
+    OfflineRig r;
+    r.src->start(r.t.db); // the buffer holds nothing from before this instant
+    const auto root = uroot(kSidA);
+    r.f.offline_discovery.profiles = {prof(kSidA)};
+    r.f.offline_reads[kSidA] =
+       hive_read({{root, complete({{root, {{"once", vread(4, dword(1))}}}})}});
+    r.next();
+    REQUIRE(r.f.offline_calls.size() == 1);
+    REQUIRE(read_cursor(r.t.db).roots.at(root).window_base == 0);
+
+    // the user logs on: the value is gone, no notify was ever marked
+    r.f.sids = {kSidA};
+    r.f.offline_discovery.profiles.clear();
+    r.f.dirty->mark_hku();
+    r.f.reads[root] = complete({{root, {}}});
+    r.next();
+    CHECK(r.f.read_calls == std::vector<std::string>{root}); // read in THIS tick
+    CHECK(r.f.offline_calls.size() == 1);
+    CHECK(r.f.watch_calls.back() == std::vector<std::string>{root});
+    const auto rows = ql("SELECT action, value_name, detail, source FROM registry_live");
+    REQUIRE(rows.rows.size() == 1);
+    CHECK(rows.rows[0][0] == "removed");
+    CHECK(rows.rows[0][1] == "once");
+    CHECK(rows.rows[0][2] == "attr:lost-restart"); // window_base 0, so the floor says it
+    CHECK(rows.rows[0][3] == "reconcile");
+    const auto cur = read_cursor(r.t.db);
+    CHECK(cur.roots.at(root).window_base != 0); // advances from here
+    CHECK(cur.offline.empty());
+}
+
+TEST_CASE("registry offline: an offline read never advances window_base and leaves the retention floor to the loaded roots",
+          "[echo][registry][lifecycle]") {
+    OfflineRig r(RegistryScope{{"SOFTWARE\\yuzu_test_r"}, {kSuffix}});
+    const auto root = uroot(kSidA);
+    r.f.reads[kRoot] = svc(1);
+    r.f.offline_discovery.profiles = {prof(kSidA)};
+    r.f.offline_reads[kSidA] = hive_read({{root, uread(root, 1)}});
+    r.next();
+    const auto first_base = read_cursor(r.t.db).roots.at(kRoot).window_base;
+    REQUIRE(first_base != 0);
+    r.tick_to(12);
+
+    // one event the live root's base has already passed, one far ahead of it
+    r.src->push_event_for_test(ev(first_base + 1, 1, RegistryEtwOp::Set, "old"));
+    r.src->push_event_for_test(ev(first_base + 100000 * SEC, 2, RegistryEtwOp::Set, "new"));
+    r.next(); // reconcile: both roots are read; the offline one at an hour's age
+    const auto cur = read_cursor(r.t.db);
+    CHECK(r.f.offline_calls.size() == 2);
+    CHECK(cur.roots.at(root).window_base == 0); // an offline read never advances it
+    CHECK(retention_watermark(cur.roots, {}) == cur.roots.at(kRoot).window_base);
+    CHECK(cur.roots.at(kRoot).window_base > first_base + 1);
+    CHECK(r.src->buffer_for_test().size() == 1); // the old event was released, the new one kept
+}
+
+TEST_CASE("registry offline: a row takes the key's write time as its ts, as a loaded hive's does",
+          "[echo][registry][lifecycle]") {
+    const auto run = [](std::optional<std::int64_t> key_written_at) {
+        OfflineRig r;
+        const auto root = uroot(kSidA);
+        r.f.offline_discovery.profiles = {prof(kSidA)};
+        r.f.offline_reads[kSidA] = hive_read({{root, uread(root, 1)}});
+        r.next();
+        r.tick_to(12);
+        // the value changed while the user was logged off; the hive is read at the hourly tick
+        const auto written = key_written_at ? *key_written_at : 0;
+        r.f.offline_reads[kSidA] =
+            hive_read({{root, written ? uread_written(root, 2, written) : uread(root, 2)}});
+        REQUIRE(r.next().events_emitted == 1);
+        const auto rows = ql("SELECT action, data, ts, observed_at, "
+                                    "prev_data_type || '/' || prev_data_size || '/' || prev_data FROM registry_live");
+        REQUIRE(rows.rows.size() == 1);
+        return rows.rows[0];
+    };
+
+    SECTION("a plausible key time is the row's ts; observed_at stays the read") {
+        const std::int64_t wrote = T0 + 3 * SEC;
+        const auto row = run(wrote);
+        CHECK(row[0] == "changed");
+        CHECK(row[1] == "2"); // the changed value is still detected: its new data ...
+        CHECK(row[4] == "REG_DWORD/4/"); // ... and the old value's type and size, not its text
+        CHECK(std::stoll(row[2]) == filetime_to_unix_ms(wrote) / 1000);
+        CHECK(std::stoll(row[3]) / 1000 > std::stoll(row[2])); // the read is later than the write
+    }
+    SECTION("no key time, or one after the read, falls back to the read") {
+        for (const auto& row : {run(std::nullopt), run(T0 + 100000 * SEC)}) {
+            CHECK(row[0] == "changed");
+            CHECK(row[1] == "2");
+            CHECK(std::stoll(row[2]) == std::stoll(row[3]) / 1000);
+        }
+    }
+}
+
+TEST_CASE("registry offline: an incomplete profile walk keeps the known scope and is flagged; a complete one clears the flag",
+          "[echo][registry][lifecycle]") {
+    OfflineRig r;
+    const auto root = uroot(kSidA);
+    r.f.offline_discovery.profiles = {prof(kSidA)};
+    r.f.offline_reads[kSidA] = hive_read({{root, uread(root, 1)}});
+    r.next();
+    const auto baseline = r.state(root);
+    r.tick_to(12);
+
+    // the reconcile's walk fails (ProfileList unopenable, cut short, ...) and the hive changed
+    r.f.offline_discovery = OfflineDiscovery{false, {}, {}};
+    r.f.offline_reads[kSidA] = hive_read({{root, uread(root, 2)}});
+    r.next();
+    CHECK(r.config("registry_offline_discovery_incomplete") == "1");
+    CHECK(read_cursor(r.t.db).offline ==
+          std::vector<OfflineProfile>{prof(kSidA)}); // no scope removal
+    CHECK(read_cursor(r.t.db).roots.contains(root));
+    CHECK(nonempty_baseline(r.state(root))); // the baseline was not erased
+    CHECK(r.state(root) != baseline);       // the known path was still read: the change is not lost
+    const auto rows = ql("SELECT prev_data_type || '/' || prev_data_size || '/' || prev_data_truncated || '/' || prev_data, data, detail FROM registry_live");
+    REQUIRE(rows.rows.size() == 1);
+    CHECK(rows.rows[0][0] == kOldDwordNotStored);
+    CHECK(rows.rows[0][1] == "2");
+    CHECK(rows.rows[0][2] == "attr:offline");
+
+    // the next complete walk lists it again: the flag clears, nothing is re-baselined or repeated
+    r.f.offline_discovery = OfflineDiscovery{};
+    r.f.offline_discovery.profiles = {prof(kSidA)};
+    r.f.dirty->mark_hku();
+    r.next();
+    CHECK(r.config("registry_offline_discovery_incomplete") == "0");
+    CHECK(read_cursor(r.t.db).offline == std::vector<OfflineProfile>{prof(kSidA)});
+    CHECK(count_rows(r.t.db) == 1);
+}
+
+TEST_CASE("registry offline: a user who logs off on a tick whose walk is incomplete keeps the baseline, is not read without a path, and is read the tick a complete walk supplies it",
+          "[echo][registry][lifecycle]") {
+    // The walk fails outright, or is complete but the user's own record failed to read.
+    for (const OfflineDiscovery& walk :
+         {OfflineDiscovery{false, {}, {}}, OfflineDiscovery{true, {kSidA}, {}}}) {
+        INFO("complete=" << walk.complete << " partial=" << walk.partial.size());
+        OfflineRig r;
+        const auto root = uroot(kSidA);
+        r.f.sids = {kSidA};
+        r.f.reads[root] = uread(root, 1);
+        r.next(); // A is loaded and baselined
+        const auto baseline = r.state(root);
+        REQUIRE(nonempty_baseline(baseline));
+        REQUIRE(read_cursor(r.t.db).roots.at(root).window_base != 0);
+
+        // A logs off on the tick the walk is bad: nothing says A's profile is gone
+        r.f.sids.clear();
+        r.f.offline_discovery = walk;
+        r.f.dirty->mark_hku();
+        r.next();
+        auto cur = read_cursor(r.t.db);
+        REQUIRE(cur.roots.contains(root));
+        CHECK(cur.roots.at(root).baselined);
+        CHECK(cur.roots.at(root).window_base == 0);
+        CHECK(cur.roots.at(root).deferred); // due the moment a path is known
+        CHECK(cur.offline == std::vector<OfflineProfile>{{kSidA, ""}});
+        CHECK(r.state(root) == baseline);   // not emptied
+        CHECK(r.f.offline_calls.empty());   // no path, so no mount
+        CHECK(count_rows(r.t.db) == 0);
+        CHECK(r.config("registry_offline_discovery_incomplete") == (walk.complete ? "0" : "1"));
+
+        // The next ORDINARY tick walks again (the path is unknown), the complete walk lists A,
+        // a second walk lists the SAME path (a path first learned is taken only on agreement),
+        // and A is read at once -- not at the next hourly reconcile -- against the loaded baseline.
+        const int walks = r.f.offline_profile_calls;
+        r.f.offline_discovery = OfflineDiscovery{};
+        r.f.offline_discovery.profiles = {prof(kSidA)};
+        r.f.offline_reads[kSidA] = hive_read({{root, uread(root, 2)}});
+        r.next();
+        CHECK(r.f.offline_profile_calls == walks + 2);
+        REQUIRE(r.f.offline_calls.size() == 1);
+        CHECK(r.f.offline_calls[0].path == prof(kSidA).path);
+        const auto rows = ql("SELECT action, prev_data_type || '/' || prev_data_size || '/' || prev_data_truncated || '/' || prev_data, data, detail FROM registry_live");
+        REQUIRE(rows.rows.size() == 1);
+        CHECK(rows.rows[0][0] == "changed");
+        CHECK(rows.rows[0][1] == kOldDwordNotStored);
+        CHECK(rows.rows[0][2] == "2");
+        CHECK(rows.rows[0][3] == "attr:offline");
+        cur = read_cursor(r.t.db);
+        CHECK_FALSE(cur.roots.at(root).deferred);
+        CHECK(cur.offline == std::vector<OfflineProfile>{prof(kSidA)});
+        CHECK(r.config("registry_offline_discovery_incomplete") == "0");
+
+        r.next(); // settled: no more walks, no more mounts until the hour
+        CHECK(r.f.offline_profile_calls == walks + 2);
+        CHECK(r.f.offline_calls.size() == 1);
+    }
+}
+
+TEST_CASE("registry offline: an incomplete walk is retried on the next ordinary tick, not at the next hour",
+          "[echo][registry][lifecycle]") {
+    OfflineRig r;
+    const auto root = uroot(kSidA);
+    r.f.offline_discovery.profiles = {prof(kSidA)};
+    r.f.offline_reads[kSidA] = hive_read({{root, uread(root, 1)}});
+    r.next();
+    r.tick_to(12);
+    r.f.offline_discovery.complete = false;
+    r.next(); // the reconcile: the walk is incomplete, the known list (with its path) stands
+    REQUIRE(r.config("registry_offline_discovery_incomplete") == "1");
+    const int walks = r.f.offline_profile_calls;
+
+    r.next(); // an ordinary tick, no HKU mark: walks again, still incomplete
+    CHECK(r.f.offline_profile_calls == walks + 1);
+    r.f.offline_discovery.complete = true;
+    r.next(); // and again: now complete, the flag clears
+    CHECK(r.f.offline_profile_calls == walks + 2);
+    CHECK(r.config("registry_offline_discovery_incomplete") == "0");
+    r.next(); // settled
+    CHECK(r.f.offline_profile_calls == walks + 2);
+    CHECK(read_cursor(r.t.db).offline == std::vector<OfflineProfile>{prof(kSidA)});
+}
+
+TEST_CASE("registry offline: a user who logs off while the walk stays incomplete stays in scope and is walked again every tick, then dropped by the first complete walk that omits it",
+          "[echo][registry][lifecycle]") {
+    OfflineRig r;
+    const auto root = uroot(kSidA);
+    r.f.sids = {kSidA};
+    r.f.reads[root] = uread(root, 1);
+    r.next();
+    r.f.sids.clear();
+    r.f.offline_discovery = OfflineDiscovery{false, {}, {}};
+    r.f.dirty->mark_hku();
+    r.next();
+    const int walks = r.f.offline_profile_calls;
+    for (int i = 1; i <= 3; ++i) { // ordinary ticks, no HKU mark: the walk repeats anyway
+        r.next();
+        CHECK(r.f.offline_profile_calls == walks + i);
+        CHECK(read_cursor(r.t.db).offline == std::vector<OfflineProfile>{{kSidA, ""}});
+        CHECK(nonempty_baseline(r.state(root)));
+    }
+    CHECK(r.f.offline_calls.empty());
+    CHECK(count_rows(r.t.db) == 0);
+
+    // a complete walk that names it nowhere is authoritative: the profile left ProfileList
+    r.f.offline_discovery = OfflineDiscovery{};
+    r.next();
+    CHECK(read_cursor(r.t.db).roots.empty());
+    CHECK(read_cursor(r.t.db).offline.empty());
+    CHECK(empty_baseline(r.state(root)));
+    CHECK(count_rows(r.t.db) == 0);
+    CHECK(r.f.offline_calls.empty());
+}
+
+TEST_CASE("registry offline: collect enumerates HKU once per tick and hands that one list to the profile walk",
+          "[echo][registry][lifecycle]") {
+    OfflineRig r;
+    const std::string sid_c = "S-1-5-21-3";
+    r.f.offline_discovery.profiles = {prof(kSidA)};
+    std::vector<std::vector<std::string>> expected;
+    const auto tick_with = [&](std::vector<std::string> loaded) {
+        r.f.sids = loaded;
+        r.f.dirty->mark_hku();
+        expected.push_back(std::move(loaded));
+        r.next();
+    };
+    const auto enumerations_so_far = [&] { return r.f.loaded_sids_calls; };
+    tick_with({kSidB}); // the first tick walks
+    CHECK(enumerations_so_far() == 1);
+    tick_with({kSidB, sid_c});
+    CHECK(enumerations_so_far() == 2);
+    tick_with({});
+    CHECK(enumerations_so_far() == 3);
+    // B and C have just logged off and the complete walk omits both: that omission is confirmed
+    // by ONE more walk, which is handed the same snapshot (not a fresh enumeration)
+    expected.push_back({});
+    tick_with({kSidB});
+    CHECK(enumerations_so_far() == 4);
+    // exactly one HKU enumeration per tick (the profile walk is handed its result, never a second
+    // snapshot), and one walk per tick -- two on the tick that confirmed a removal -- each handed
+    // the exact list collect() took for that tick
+    CHECK(r.f.offline_loaded_args == expected);
+    CHECK(r.f.offline_profile_calls == 5);
+}
+
+TEST_CASE("classify_offline_discovery: a profile missing from collect's HKU snapshot is offline, even if it has logged on since",
+          "[echo][registry][pure]") {
+    using yuzu::profiles::RawProfileRecord;
+    // The ProfileList record exists. collect()'s snapshot was taken before A's hive loaded, so A
+    // is not in it: classified against that snapshot A is offline and is carried, not dropped.
+    // (A logon after the snapshot is handled by the next tick: the HKU name watch moves A to
+    // the loaded list, and the live arm of the mount reads the loaded hive meanwhile.)
+    const std::vector<RawProfileRecord> records{{kSidA, "C:\\Users\\user", false}};
+    const std::vector<std::string> snapshot{kSidB};
+    const std::vector<std::string> none;
+    const auto profiles = yuzu::profiles::build_profile_list(records, snapshot);
+    const auto d = classify_offline_discovery(true, false, false, profiles, none);
+    CHECK(d.complete);
+    CHECK(d.profiles == std::vector<OfflineProfile>{{kSidA, "C:\\Users\\user"}});
+    CHECK(reconcile_offline({}, {}, snapshot, d) == d.profiles);
+    // the same record against a snapshot that holds A classifies it loaded, not offline
+    const auto loaded =
+       yuzu::profiles::build_profile_list(records, std::vector<std::string>{kSidA});
+    CHECK(classify_offline_discovery(true, false, false, loaded, none).profiles.empty());
+}
+
+TEST_CASE("registry offline: a re-enable does not retry a refused offline hive until the next hour, keeps its baseline state, and writes no second unreadable row",
+          "[echo][registry][lifecycle]") {
+    // Both a hive that was baselined before the guard refused it and one refused on first sight.
+    // A refused root is not due on the re-enable tick (its status is `unreadable`, so the
+    // `!baselined` clause does not fire); it waits for the reconcile like any refused hive.
+    for (const bool baselined_first : {true, false}) {
+        INFO("baselined before the refusal: " << baselined_first);
+        OfflineRig r;
+        const auto root = uroot(kSidA);
+        const std::string why = "offline:hive_path_unc";
+        r.f.offline_discovery.profiles = {prof(kSidA)};
+        if (baselined_first) {
+            r.f.offline_reads[kSidA] = hive_read({{root, uread(root, 1)}});
+            r.next();
+            r.tick_to(12);
+        }
+        r.f.offline_reads[kSidA] = refused_hive({root}, why);
+        r.next(); // the reconcile (baselined) or the first sight (never baselined): refused
+        const auto attempts = r.f.offline_calls.size();
+        const auto kept = r.state(root);
+        REQUIRE(r.gap_unreadable_rows() == 1);
+        REQUIRE(kept.empty() == !baselined_first);
+
+        r.src->on_enabled_changed(false);
+        r.src->on_enabled_changed(true);
+        r.next(); // the re-enable tick
+        CHECK(r.f.offline_calls.size() == attempts);          // not re-attempted
+        CHECK(r.state(root) == kept);                         // baseline (or its absence) kept
+        CHECK(r.gap_unreadable_rows() == 1);                  // the refusal row, once
+        CHECK(ql("SELECT COUNT(*) FROM registry_live WHERE record_key LIKE 'gap:disabled:%'")
+                 .rows.at(0).at(0) == "1");                   // the pause row
+        CHECK(count_rows(r.t.db) == 2);
+        const auto after = read_cursor(r.t.db).roots.at(root);
+        CHECK_FALSE(after.baselined); // cleared by the re-enable; the next successful read sets it
+        CHECK(after.status == "unreadable");
+
+        // the next reconcile reads it once; readable now, it is re-baselined silently
+        // (the paused window's change is never stored)
+        r.f.offline_reads[kSidA] = hive_read({{root, uread(root, 2)}});
+        r.tick_to((read_cursor(r.t.db).tick / 12 + 1) * 12);
+        CHECK(r.f.offline_calls.size() == attempts);
+        r.next();
+        CHECK(r.f.offline_calls.size() == attempts + 1);
+        CHECK(read_cursor(r.t.db).roots.at(root).baselined);
+        CHECK(nonempty_baseline(r.state(root)));
+        CHECK(r.state(root) != kept);
+        CHECK(count_rows(r.t.db) == 2);
+    }
+}
+
+TEST_CASE("registry offline: a record with an unreadable path keeps its entry; a complete walk that omits the profile drops it without a removal storm",
+          "[echo][registry][lifecycle]") {
+    OfflineRig r;
+    const auto root = uroot(kSidA);
+    r.f.offline_discovery.profiles = {prof(kSidA)};
+    r.f.offline_reads[kSidA] = hive_read({{root, uread(root, 1)}});
+    r.next();
+    r.tick_to(12);
+
+    // complete walk, the record is there, its ProfileImagePath was not readable this time
+    r.f.offline_discovery = OfflineDiscovery{true, {kSidA}, {}};
+    r.next();
+    REQUIRE(r.f.offline_calls.size() == 2);
+    CHECK(r.f.offline_calls.back().path == prof(kSidA).path); // the cursor's path was used
+    CHECK(read_cursor(r.t.db).offline == std::vector<OfflineProfile>{prof(kSidA)});
+
+    // complete walk that does not list it at all: the profile left ProfileList
+    r.tick_to(24);
+    r.f.offline_discovery = OfflineDiscovery{};
+    r.next();
+    CHECK(r.f.offline_calls.size() == 2); // not read
+    CHECK(read_cursor(r.t.db).roots.empty());
+    CHECK(read_cursor(r.t.db).offline.empty());
+    CHECK(empty_baseline(r.state(root))); // shrunk, not a removal storm
+    CHECK(count_rows(r.t.db) == 0);
+}
+
+TEST_CASE("registry offline: a hive refused on first sight is retried only at reconcile",
+          "[echo][registry][lifecycle]") {
+    OfflineRig r;
+    const auto root = uroot(kSidA);
+    const std::string why = "offline:hive_path_unc";
+    r.f.offline_discovery.profiles = {prof(kSidA)};
+    r.f.offline_reads[kSidA] = refused_hive({root}, why);
+    r.next(); // first sight: refused, so never baselined
+    CHECK(r.f.offline_calls.size() == 1);
+    CHECK(r.gap_unreadable_rows() == 1);
+    CHECK(r.state(root).empty());
+    CHECK_FALSE(read_cursor(r.t.db).roots.at(root).baselined);
+
+    r.tick_to(11); // eleven ordinary ticks: a refusal costs one attempt an hour, not one a tick
+    CHECK(r.f.offline_calls.size() == 1);
+    CHECK(r.gap_unreadable_rows() == 1);
+    r.tick_to(12);
+    r.next(); // the reconcile retries once, still refused, no second row
+    CHECK(r.f.offline_calls.size() == 2);
+    CHECK(r.gap_unreadable_rows() == 1);
+
+    // once the guard lets it through, the next reconcile baselines it silently
+    r.f.offline_reads[kSidA] = hive_read({{root, uread(root, 1)}});
+    r.tick_to(24);
+    CHECK(r.f.offline_calls.size() == 2);
+    r.next();
+    CHECK(r.f.offline_calls.size() == 3);
+    CHECK(read_cursor(r.t.db).roots.at(root).baselined);
+    CHECK(nonempty_baseline(r.state(root)));
+    CHECK(count_rows(r.t.db) == 1); // only the first-sight gap row
+}
+
+TEST_CASE("registry offline: the incomplete-walk warning fires once per transition into incomplete",
+          "[echo][registry][lifecycle]") {
+    yuzu::test::LogCapture logs;
+    OfflineRig r;
+    const auto root = uroot(kSidA);
+    r.f.offline_discovery.profiles = {prof(kSidA)};
+    r.f.offline_reads[kSidA] = hive_read({{root, uread(root, 1)}});
+    r.next();
+
+    // incomplete, incomplete, complete, incomplete: two transitions into incomplete. An HKU
+    // name-watch mark forces a walk on each tick.
+    for (const bool complete : {false, false, true, false}) {
+        r.f.offline_discovery.complete = complete;
+        r.f.dirty->mark_hku();
+        r.next();
+        CHECK(r.config("registry_offline_discovery_incomplete") == (complete ? "0" : "1"));
+    }
+    logs.stop();
+    const std::string text = logs.text();
+    const std::string needle = "profile list could not be read completely";
+    std::size_t warnings = 0;
+    for (auto at = text.find(needle); at != std::string::npos; at = text.find(needle, at + 1))
+        ++warnings;
+    CHECK(warnings == 2);
+    CHECK(r.f.offline_profile_calls == 5);          // the walk ran on every one of the five ticks
+    CHECK(count_rows(r.t.db) == 0);                 // a failed walk is a status key and a log line
+    CHECK(read_cursor(r.t.db).offline == std::vector<OfflineProfile>{prof(kSidA)}); // scope kept
+}
+
+TEST_CASE("registry offline: the deferred retry marker survives a source restart",
+          "[echo][registry][lifecycle]") {
+    OfflineRig r;
+    const auto root = uroot(kSidA);
+    r.f.offline_discovery.profiles = {prof(kSidA)};
+    r.f.offline_reads[kSidA] = hive_read({{root, uread(root, 1)}});
+    r.next(); // baselined at first sight
+    r.tick_to(12);
+
+    // the reconcile's mount is not attempted (an earlier mount this tick timed out)
+    OfflineHiveRead skipped;
+    skipped.attempted = false;
+    skipped.reason = "offline:skipped_after_timeout";
+    r.f.offline_reads[kSidA] = skipped;
+    r.next();
+    REQUIRE(r.f.offline_calls.size() == 2);
+    const auto parked = read_cursor(r.t.db).roots.at(root);
+    REQUIRE(parked.baselined);
+    REQUIRE(parked.status == "complete");
+    REQUIRE(parked.deferred); // the only thing that makes the root due before the next hour
+
+    // A new source over the same database and reader. start() is not called: it would force a
+    // reconcile and read the hive whatever the flag says.
+    r.src = make_registry_cursor_source(RegistryScope{{}, {kSuffix}}, r.f.reader());
+    r.f.offline_reads[kSidA] = hive_read({{root, uread(root, 2)}});
+    r.next(); // not a reconcile tick: the persisted flag alone makes the hive due
+    CHECK(r.f.offline_calls.size() == 3);
+    const auto after = read_cursor(r.t.db).roots.at(root);
+    CHECK_FALSE(after.deferred);
+    CHECK(after.baselined);
+    CHECK(count_rows(r.t.db) == 1); // the change since the persisted baseline
+    CHECK(ql("SELECT detail FROM registry_live").rows.at(0).at(0) == "attr:offline");
+
+    r.next();
+    CHECK(r.f.offline_calls.size() == 3); // back to hourly
+}
+
+TEST_CASE("registry offline: an empty complete discovery (an older build lists no logged-off profile) drops the roots without a removal storm, and the next walk that finds the profile re-baselines it silently",
+          "[echo][registry][lifecycle]") {
+    OfflineRig r;
+    const auto root = uroot(kSidA);
+    r.f.offline_discovery.profiles = {prof(kSidA)};
+    r.f.offline_reads[kSidA] = hive_read({{root, uread(root, 1)}});
+    r.next();
+    REQUIRE(nonempty_baseline(r.state(root)));
+    REQUIRE(read_cursor(r.t.db).offline == std::vector<OfflineProfile>{prof(kSidA)});
+
+    // An older build never lists a logged-off profile. An empty, complete discovery answer stands
+    // in for it here (this drives collect(), not that build's code), so the roots leave scope
+    // through the existing path and the cursor written has no `offline` field.
+    r.tick_to(12);
+    r.f.offline_discovery = OfflineDiscovery{};
+    r.next();
+    CHECK(read_cursor(r.t.db).roots.empty());
+    CHECK(read_cursor(r.t.db).offline.empty());
+    CHECK(empty_baseline(r.state(root))); // shrunk, so a later logon cannot diff against it
+    CHECK(count_rows(r.t.db) == 0);
+    CHECK(ql("SELECT COUNT(*) FROM registry_live WHERE action = 'removed'")
+             .rows.at(0).at(0) == "0");
+    const auto cursor = r.t.db.get_cursor("registry");
+    REQUIRE(cursor.has_value());
+    REQUIRE(cursor->has_value());
+    CHECK_FALSE(nlohmann::json::parse(**cursor).contains("offline"));
+
+    // Walking again: the cursor holds no offline list, so the next ordinary tick walks, finds
+    // the profile and baselines it from scratch, silently.
+    r.f.offline_discovery.profiles = {prof(kSidA)};
+    const auto calls = r.f.offline_calls.size();
+    r.next();
+    CHECK(r.f.offline_calls.size() == calls + 1);
+    CHECK(read_cursor(r.t.db).offline == std::vector<OfflineProfile>{prof(kSidA)});
+    CHECK(nonempty_baseline(r.state(root)));
+    CHECK(count_rows(r.t.db) == 0);
+}
+
+TEST_CASE("registry offline: a queue of logged-off hives cannot starve a loaded root, and the hive read longest ago is mounted first",
+          "[echo][registry][lifecycle]") {
+    OfflineRig r(RegistryScope{{"SOFTWARE\\yuzu_test_r"}, {kSuffix}});
+    const std::vector<std::string> sids{"S-1-5-21-101", "S-1-5-21-102", "S-1-5-21-103",
+                                        "S-1-5-21-104", "S-1-5-21-105", "S-1-5-21-106"};
+    for (const auto& sid : sids) {
+        r.f.offline_discovery.profiles.push_back(prof(sid));
+        r.f.offline_reads[sid] = hive_read({{uroot(sid), uread(uroot(sid), 1)}});
+    }
+    r.f.reads[kRoot] = svc(1);
+    r.f.offline_mount_cost = 6 * SEC; // two mounts fit the 10 s tick budget, a third does not
+
+    const auto mounted_since = [&](std::size_t from) {
+        std::vector<std::string> out;
+        for (std::size_t i = from; i < r.f.offline_calls.size(); ++i)
+            out.push_back(r.f.offline_calls[i].sid);
+        return out;
+    };
+    const auto step = [&] {
+        const auto from = r.f.offline_calls.size();
+        r.next();
+        return mounted_since(from);
+    };
+    using V = std::vector<std::string>;
+
+    // First sight: two hives a tick; a deferred hive goes first next tick, the sid breaking ties.
+    CHECK(step() == V{sids[0], sids[1]});
+    CHECK(r.config("registry_offline_roots_deferred") == "4");
+    CHECK(step() == V{sids[2], sids[3]});
+    CHECK(r.config("registry_offline_roots_deferred") == "2");
+    CHECK(step() == V{sids[4], sids[5]});
+    CHECK(r.config("registry_offline_roots_deferred") == "0");
+    r.tick_to(12);
+    REQUIRE(r.f.offline_calls.size() == 6);
+
+    // The hourly tick: a notified loaded root AND six hives due at once. With a rotation over one
+    // list (start = tick % n) the walk began inside the hives, spent the budget on two mounts and
+    // left the loaded root unread; now the loaded root is read first, in this tick.
+    r.f.read_calls.clear();
+    r.f.dirty->mark(kRoot, r.f.clock);
+    CHECK(step() == V{sids[0], sids[1]}); // the two read longest ago, not the last two in the list
+    CHECK(r.f.read_calls == V{kRoot});
+    CHECK_FALSE(r.f.dirty->peek_dirty(kRoot)); // consumed, not left pinning the ETW floor
+    CHECK(read_cursor(r.t.db).roots.at(kRoot).status == "complete");
+    CHECK(r.config("registry_offline_roots_deferred") == "4"); // visible, not silent
+    for (const auto& sid : {sids[2], sids[3], sids[4], sids[5]})
+        CHECK(read_cursor(r.t.db).roots.at(uroot(sid)).deferred);
+
+    // A profile that appears now, whose sid sorts AFTER the deferred ones, has never been read: it
+    // queues behind the four deferred hives, and among the deferred the one never read goes first.
+    const std::string fresh = "S-1-5-21-107";
+    r.f.offline_discovery.profiles.push_back(prof(fresh));
+    r.f.offline_reads[fresh] = hive_read({{uroot(fresh), uread(uroot(fresh), 1)}});
+    r.f.dirty->mark_hku(); // a walk this tick finds it
+    CHECK(step() == V{sids[2], sids[3]});          // deferred first, oldest read first
+    CHECK(r.config("registry_offline_roots_deferred") == "3");
+    CHECK(step() == V{fresh, sids[4]});            // never read beats read at the third tick; not sid order
+    CHECK(r.config("registry_offline_roots_deferred") == "1");
+    CHECK(step() == V{sids[5]});
+    CHECK(r.config("registry_offline_roots_deferred") == "0");
+    CHECK(step().empty());
+    CHECK(count_rows(r.t.db) == 0);
+}
+
+TEST_CASE("registry offline: a Capped first read is not trusted - the hive is read again next tick and the complete read is a silent baseline",
+          "[echo][registry][lifecycle]") {
+    OfflineRig r;
+    const auto root = uroot(kSidA);
+    r.f.offline_discovery.profiles = {prof(kSidA)};
+    // The read ran out of time after the top key: it saw nothing of what the hive holds.
+    SubtreeRead capped = complete({{root, {}}});
+    capped.status = RegistryReadStatus::Capped;
+    r.f.offline_reads[kSidA] = hive_read({{root, capped}});
+    r.next();
+    CHECK(r.f.offline_calls.size() == 1);
+    CHECK_FALSE(read_cursor(r.t.db).roots.at(root).baselined);
+    CHECK(read_cursor(r.t.db).roots.at(root).status == "capped");
+    CHECK(r.config("registry_roots_capped") == "1");
+
+    // Three values that were there all along, read completely on the NEXT ordinary tick.
+    r.f.offline_reads[kSidA] = hive_read(
+       {{root, complete({{root, {{"a", vread(4, dword(1))}, {"b", vread(4, dword(2))}, {"c", vread(4, dword(3))}}}})}});
+    r.next();
+    CHECK(r.f.offline_calls.size() == 2); // not the next hour
+    CHECK(count_rows(r.t.db) == 0);       // pre-existing values are not `added`
+    CHECK(read_cursor(r.t.db).roots.at(root).baselined);
+    CHECK(read_cursor(r.t.db).roots.at(root).status == "complete");
+    CHECK(r.config("registry_roots_capped") == "0");
+    r.next();
+    CHECK(r.f.offline_calls.size() == 2); // settled: hourly again
+}
+
+TEST_CASE("registry offline: a read that is Capped on an already-baselined hive is retried next tick and a persistently Capped one costs one mount a tick",
+          "[echo][registry][lifecycle]") {
+    OfflineRig r;
+    const auto root = uroot(kSidA);
+    r.f.offline_discovery.profiles = {prof(kSidA)};
+    r.f.offline_reads[kSidA] = hive_read({{root, uread(root, 1)}});
+    r.next();
+    const auto baseline = r.state(root);
+    r.tick_to(12);
+
+    SubtreeRead capped = uread(root, 1);
+    capped.status = RegistryReadStatus::Capped;
+    r.f.offline_reads[kSidA] = hive_read({{root, capped}});
+    r.next(); // the hourly read hits the cap
+    REQUIRE(r.f.offline_calls.size() == 2);
+    CHECK(read_cursor(r.t.db).roots.at(root).baselined); // the earlier baseline stands
+    CHECK(r.state(root) == baseline);
+    for (int i = 3; i <= 5; ++i) { // still Capped: one mount per tick, never more
+        r.next();
+        CHECK(r.f.offline_calls.size() == static_cast<std::size_t>(i));
+    }
+    r.f.offline_reads[kSidA] = hive_read({{root, uread(root, 1)}});
+    r.next();
+    CHECK(r.f.offline_calls.size() == 6);
+    r.next();
+    CHECK(r.f.offline_calls.size() == 6); // complete again: back to hourly
+    CHECK(count_rows(r.t.db) == 0);
+    CHECK(r.config("registry_roots_capped") == "0");
+}
+
+TEST_CASE("registry offline: a removal needs two agreeing complete walks, so a concurrent ProfileList change cannot drop a healthy profile",
+          "[echo][registry][lifecycle]") {
+    const auto listing = [](const std::string& sid) {
+        OfflineDiscovery d;
+        d.profiles = {prof(sid)};
+        return d;
+    };
+    struct Case {
+        const char* name;
+        OfflineDiscovery second;
+        bool kept;
+        const char* incomplete;
+    };
+    OfflineDiscovery cut;
+    cut.complete = false;
+    for (const auto& c : {Case{"the second walk lists it", listing(kSidA), true, "0"},
+                          Case{"the second walk omits it too", OfflineDiscovery{}, false, "0"},
+                          Case{"the second walk is incomplete", cut, true, "1"}}) {
+        INFO(c.name);
+        OfflineRig r;
+        const auto root = uroot(kSidA);
+        r.f.offline_discovery.profiles = {prof(kSidA)};
+        r.f.offline_reads[kSidA] = hive_read({{root, uread(root, 1)}});
+        r.next();
+        r.tick_to(12);
+        const auto baseline = r.state(root);
+        const int walks = r.f.offline_profile_calls;
+        const int enumerations = r.f.loaded_sids_calls;
+
+        // the hourly walk misses A (a rename in flight): complete, but wrong
+        r.f.offline_discovery_queue = {OfflineDiscovery{}, c.second};
+        r.next();
+        CHECK(r.f.offline_profile_calls == walks + 2); // confirmed with ONE more walk
+        CHECK(r.f.loaded_sids_calls == enumerations + 1); // the HKU snapshot is not retaken
+        REQUIRE(r.f.offline_loaded_args.size() == static_cast<std::size_t>(walks) + 2);
+        CHECK(r.f.offline_loaded_args[static_cast<std::size_t>(walks)] ==
+              r.f.offline_loaded_args[static_cast<std::size_t>(walks) + 1]);
+        CHECK(r.config("registry_offline_discovery_incomplete") == c.incomplete);
+        CHECK(count_rows(r.t.db) == 0); // no removal storm either way
+        if (c.kept) {
+            CHECK(read_cursor(r.t.db).offline == std::vector<OfflineProfile>{prof(kSidA)});
+            CHECK(r.state(root) == baseline);
+            CHECK(r.f.offline_calls.size() == 2); // and the hourly read still happened
+        } else {
+            CHECK(read_cursor(r.t.db).roots.empty());
+            CHECK(empty_baseline(r.state(root)));
+            CHECK(r.f.offline_calls.size() == 1);
+        }
+
+        // a walk that drops nothing is never repeated
+        const int after = r.f.offline_profile_calls;
+        r.f.dirty->mark_hku();
+        r.next();
+        CHECK(r.f.offline_profile_calls == after + 1);
+    }
+}
+
+TEST_CASE("registry offline: the removal confirmation is per profile - one the first walk listed or the second walk listed is kept, and only one both complete walks omit goes",
+          "[echo][registry][lifecycle]") {
+    const auto listing = [](std::vector<std::string> sids) {
+        OfflineDiscovery d;
+        for (const auto& s : sids)
+            d.profiles.push_back(prof(s));
+        return d;
+    };
+    OfflineDiscovery cut;
+    cut.complete = false;
+    struct Case {
+        const char* name;
+        OfflineDiscovery first, second;
+        std::vector<std::string> kept; // sorted
+    };
+    // A and B are both known, settled and baselined; the hourly tick's first walk trips the
+    // confirmation by omitting A (and sometimes B).
+    for (const auto& c :
+         {Case{"first {B}, second {}: B was listed, A was omitted twice", listing({kSidB}), OfflineDiscovery{},
+               {kSidB}},
+          Case{"first {B}, second {A}: each was listed by one walk", listing({kSidB}), listing({kSidA}),
+               {kSidA, kSidB}},
+          Case{"first {}, second {A}: only B was omitted twice", OfflineDiscovery{}, listing({kSidA}), {kSidA}},
+          Case{"first {B}, second incomplete: an incomplete walk removes nothing", listing({kSidB}), cut,
+               {kSidA, kSidB}}}) {
+        INFO(c.name);
+        OfflineRig r;
+        r.f.offline_discovery.profiles = {prof(kSidA), prof(kSidB)};
+        std::map<std::string, std::string> baseline;
+        for (const auto& sid : {kSidA, kSidB}) {
+            r.f.offline_reads[sid] = hive_read({{uroot(sid), uread(uroot(sid), 1)}});
+        }
+        r.next();
+        r.tick_to(12);
+        for (const auto& sid : {kSidA, kSidB})
+            baseline[sid] = r.state(uroot(sid));
+        const int walks = r.f.offline_profile_calls;
+        const int enumerations = r.f.loaded_sids_calls;
+        const std::size_t mounts = r.f.offline_calls.size();
+
+        r.f.offline_discovery_queue = {c.first, c.second};
+        r.next();
+        CHECK(r.f.offline_profile_calls == walks + 2);    // confirmed with ONE more walk
+        CHECK(r.f.loaded_sids_calls == enumerations + 1); // the HKU snapshot is not retaken
+        std::vector<std::string> kept;
+        for (const auto& o : read_cursor(r.t.db).offline)
+            kept.push_back(o.sid);
+        std::sort(kept.begin(), kept.end());
+        CHECK(kept == c.kept);
+        for (const auto& sid : {kSidA, kSidB}) {
+            const bool stays = std::find(c.kept.begin(), c.kept.end(), sid) != c.kept.end();
+            CHECK(read_cursor(r.t.db).roots.contains(uroot(sid)) == stays);
+            if (stays)
+                CHECK(r.state(uroot(sid)) == baseline[sid]); // never half-erased
+            else
+                CHECK(empty_baseline(r.state(uroot(sid))));
+        }
+        CHECK(r.f.offline_calls.size() == mounts + c.kept.size()); // every kept hive still read this hour
+        CHECK(count_rows(r.t.db) == 0);                            // no removal storm
+    }
+}
+
+TEST_CASE("registry offline: a user who has just logged off is protected by the same two-walk rule when a complete walk omits them",
+          "[echo][registry][lifecycle]") {
+    OfflineDiscovery lists;
+    lists.profiles = {prof(kSidA)};
+    OfflineDiscovery cut;
+    cut.complete = false;
+    struct Case {
+        const char* name;
+        OfflineDiscovery second;
+        bool kept;
+        std::string path;
+        const char* incomplete;
+    };
+    // A is loaded and baselined; it logs off on a tick whose FIRST walk is complete but misses it
+    // (the profile is mid-rename), which is the very race the confirmation exists for. A second
+    // walk that lists it keeps the profile in scope but does NOT supply its path (a path walk 1
+    // never listed is unconfirmed): it stays pathless and deferred, and the next tick resolves it.
+    for (const auto& c : {Case{"the second walk lists them", lists, true, "", "0"},
+                          Case{"the second walk omits them too", OfflineDiscovery{}, false, "", "0"},
+                          Case{"the second walk is incomplete", cut, true, "", "1"}}) {
+        INFO(c.name);
+        OfflineRig r;
+        const auto root = uroot(kSidA);
+        r.f.sids = {kSidA};
+        r.f.reads[root] = uread(root, 1);
+        r.next();
+        const auto baseline = r.state(root);
+        REQUIRE(nonempty_baseline(baseline));
+        const int walks = r.f.offline_profile_calls;
+        const int enumerations = r.f.loaded_sids_calls;
+
+        r.f.sids.clear();
+        r.f.offline_discovery.profiles = {prof(kSidA)}; // what every later walk says
+        r.f.offline_reads[kSidA] = hive_read({{root, uread(root, 1)}});
+        r.f.offline_discovery_queue = {OfflineDiscovery{}, c.second};
+        r.f.dirty->mark_hku();
+        r.next();
+        CHECK(r.f.offline_profile_calls == walks + 2); // the omission was confirmed, not believed
+        CHECK(r.f.loaded_sids_calls == enumerations + 1);
+        CHECK(r.config("registry_offline_discovery_incomplete") == c.incomplete);
+        CHECK(count_rows(r.t.db) == 0);
+        const auto cur = read_cursor(r.t.db);
+        CHECK(cur.roots.contains(root) == c.kept);
+        if (!c.kept) {
+            CHECK(cur.offline.empty());
+            CHECK(empty_baseline(r.state(root)));
+            continue;
+        }
+        CHECK(cur.offline == std::vector<OfflineProfile>{{kSidA, c.path}});
+        CHECK(cur.roots.at(root).deferred); // due the moment a path is confirmed
+        CHECK(r.f.offline_calls.empty());   // no confirmed path, no mount
+        CHECK(r.state(root) == baseline);
+
+        // The change made while it was logged out is reported against the ORIGINAL baseline.
+        r.f.offline_reads[kSidA] = hive_read({{root, uread(root, 2)}});
+        r.tick_to(12);
+        r.next();
+        const auto rows = ql("SELECT action, prev_data_type || '/' || prev_data_size || '/' || prev_data_truncated || '/' || prev_data, data, detail FROM registry_live");
+        REQUIRE(rows.rows.size() == 1);
+        CHECK(rows.rows[0][0] == "changed");
+        CHECK(rows.rows[0][1] == kOldDwordNotStored);
+        CHECK(rows.rows[0][2] == "2");
+        CHECK(rows.rows[0][3] == "attr:offline");
+    }
+}
+
+TEST_CASE("registry offline: a pathless profile carried from an EARLIER tick is protected by the same two-walk rule; a path only the confirming walk lists is not adopted, and the next tick resolves it",
+          "[echo][registry][lifecycle]") {
+    OfflineDiscovery lists;
+    lists.profiles = {prof(kSidA)};
+    OfflineDiscovery cut;
+    cut.complete = false;
+    struct Case {
+        const char* name;
+        OfflineDiscovery second;
+        bool resolves_next_tick;
+        const char* incomplete;
+    };
+    for (const auto& c : {Case{"the confirming walk lists it", lists, true, "0"},
+                          Case{"the confirming walk is incomplete", cut, false, "1"}}) {
+        INFO(c.name);
+        OfflineRig r;
+        const auto root = uroot(kSidA);
+        r.f.sids = {kSidA};
+        r.f.reads[root] = uread(root, 1);
+        r.next(); // A is loaded and baselined
+        const auto baseline = r.state(root);
+        REQUIRE(nonempty_baseline(baseline));
+
+        // A logs off on a tick whose walk fails outright: it is carried as {A, ""} (no path yet)
+        r.f.sids.clear();
+        r.f.offline_discovery = OfflineDiscovery{false, {}, {}};
+        r.f.dirty->mark_hku();
+        r.next();
+        REQUIRE(read_cursor(r.t.db).offline == std::vector<OfflineProfile>{{kSidA, ""}});
+        REQUIRE(read_cursor(r.t.db).hku.empty()); // so this entry is NOT a just-logged-off sid next tick
+
+        // The next ORDINARY tick: its first walk is complete and omits A, the confirming walk decides.
+        r.f.offline_reads[kSidA] = hive_read({{root, uread(root, 2)}});
+        r.f.offline_discovery_queue = {OfflineDiscovery{}, c.second};
+        const int walks = r.f.offline_profile_calls;
+        const int enumerations = r.f.loaded_sids_calls;
+        const std::size_t mounts = r.f.offline_calls.size();
+        r.next();
+        CHECK(r.f.offline_profile_calls == walks + 2);    // the omission was confirmed, not believed
+        CHECK(r.f.loaded_sids_calls == enumerations + 1); // one HKU snapshot for the whole tick
+        CHECK(r.config("registry_offline_discovery_incomplete") == c.incomplete);
+        const auto cur = read_cursor(r.t.db);
+        REQUIRE(cur.roots.contains(root));
+        CHECK(cur.roots.at(root).baselined);
+        // walk 1 omitted A, so a path only walk 2 listed is unconfirmed either way
+        CHECK(cur.offline == std::vector<OfflineProfile>{{kSidA, ""}}); // kept, still pathless
+        CHECK(cur.roots.at(root).deferred);                            // due once a path is known
+        CHECK(r.f.offline_calls.size() == mounts);                     // no path, no mount
+        CHECK(r.state(root) == baseline);
+        CHECK(count_rows(r.t.db) == 0);
+        if (!c.resolves_next_tick)
+            continue;
+
+        // The next ordinary tick: A is pathless, so the walk repeats; both walks now list the
+        // path, it is taken and A is read in that very tick, against the ORIGINAL baseline.
+        r.f.offline_discovery = OfflineDiscovery{};
+        r.f.offline_discovery.profiles = {prof(kSidA)};
+        r.next();
+        const auto resolved = read_cursor(r.t.db);
+        CHECK(resolved.offline == std::vector<OfflineProfile>{prof(kSidA)}); // the path is resolved
+        CHECK_FALSE(resolved.roots.at(root).deferred);
+        REQUIRE(r.f.offline_calls.size() == mounts + 1);
+        CHECK(r.f.offline_calls.back().path == prof(kSidA).path);
+        const auto rows = ql("SELECT action, prev_data_type || '/' || prev_data_size || '/' || prev_data_truncated || '/' || prev_data, data, detail FROM registry_live");
+        REQUIRE(rows.rows.size() == 1);
+        CHECK(rows.rows[0][0] == "changed");
+        CHECK(rows.rows[0][1] == kOldDwordNotStored);
+        CHECK(rows.rows[0][2] == "2");
+        CHECK(rows.rows[0][3] == "attr:offline");
+    }
+}
+
+TEST_CASE("registry offline: a confirming walk adopts a profile only it listed and removes one both complete walks omit, but supplies no path to a pathless known profile",
+          "[echo][registry][lifecycle]") {
+    const std::string sid_c = "S-1-5-21-3";
+    OfflineRig r;
+    const auto root_a = uroot(kSidA);
+    const auto root_b = uroot(kSidB);
+    const auto root_c = uroot(sid_c);
+    // A is loaded; B is a logged-off profile read at first sight
+    r.f.sids = {kSidA};
+    r.f.reads[root_a] = uread(root_a, 1);
+    r.f.offline_discovery.profiles = {prof(kSidB)};
+    r.f.offline_reads[kSidB] = hive_read({{root_b, uread(root_b, 1)}});
+    r.next();
+    const auto base_a = r.state(root_a);
+    REQUIRE(nonempty_baseline(base_a));
+    REQUIRE(nonempty_baseline(r.state(root_b)));
+
+    // A logs off on a tick whose walk fails outright: {A, ""} joins B in the cursor
+    r.f.sids.clear();
+    r.f.offline_discovery = OfflineDiscovery{false, {}, {}};
+    r.f.dirty->mark_hku();
+    r.next();
+    REQUIRE(read_cursor(r.t.db).offline == (std::vector<OfflineProfile>{prof(kSidB), {kSidA, ""}}));
+
+    // The next ordinary tick. Walk 1 is complete: A's record failed to read (`partial`), B is
+    // omitted. Walk 2 lists A with its path and a profile C no walk has seen, and omits B.
+    OfflineDiscovery walk1;
+    walk1.partial = {kSidA};
+    OfflineDiscovery walk2;
+    walk2.profiles = {prof(kSidA), prof(sid_c)};
+    r.f.offline_discovery_queue = {walk1, walk2};
+    r.f.offline_reads[kSidA] = hive_read({{root_a, uread(root_a, 1)}}); // unchanged
+    r.f.offline_reads[sid_c] = hive_read({{root_c, uread(root_c, 7)}});
+    const int walks = r.f.offline_profile_calls;
+    const std::size_t mounts = r.f.offline_calls.size();
+    r.next();
+    CHECK(r.f.offline_profile_calls == walks + 2);
+
+    // A: the path only walk 2 supplied is unconfirmed, so A stays pathless and deferred;
+    // C: adopted from walk 2 alone (no earlier entry to protect); B: gone.
+    auto cur = read_cursor(r.t.db);
+    CHECK(cur.offline == (std::vector<OfflineProfile>{{kSidA, ""}, prof(sid_c)}));
+    CHECK(cur.roots.contains(root_a));
+    CHECK(cur.roots.at(root_a).deferred);
+    CHECK(cur.roots.contains(root_c));
+    CHECK_FALSE(cur.roots.contains(root_b));
+    REQUIRE(r.f.offline_calls.size() == mounts + 1);
+    CHECK(r.f.offline_calls[mounts].sid == sid_c); // A has no confirmed path, so it is not mounted
+    CHECK(r.state(root_a) == base_a);
+    CHECK(nonempty_baseline(r.state(root_c))); // silently baselined
+    CHECK(empty_baseline(r.state(root_b)));    // its scope removed: the baseline shrunk
+    CHECK(count_rows(r.t.db) == 0);            // no fabricated row for any of them
+
+    // The next ordinary tick: A is still pathless, both walks now list its path, and the
+    // deferred hive is read at the resolved path.
+    r.f.offline_discovery = OfflineDiscovery{};
+    r.f.offline_discovery.profiles = {prof(kSidA), prof(sid_c)};
+    r.next();
+    cur = read_cursor(r.t.db);
+    CHECK(cur.offline == (std::vector<OfflineProfile>{prof(kSidA), prof(sid_c)}));
+    CHECK_FALSE(cur.roots.at(root_a).deferred);
+    REQUIRE(r.f.offline_calls.size() == mounts + 2);
+    CHECK(r.f.offline_calls[mounts + 1].sid == kSidA);
+    CHECK(r.f.offline_calls[mounts + 1].path == prof(kSidA).path);
+    CHECK(r.state(root_a) == base_a);
+    CHECK(count_rows(r.t.db) == 0);
+}
+
+TEST_CASE("registry offline: a path first learned for a pathless profile is taken only when both walks of the tick list the same one",
+          "[echo][registry][lifecycle]") {
+    using yuzu::profiles::HiveState;
+    using yuzu::profiles::ProfileInfo;
+    // The failed-logon signature: `S` names the TEMP folder and `S.bak` the real one. A walk that
+    // sees only `S` (the `.bak` was skipped as the index shifted) lists the TEMP folder as a
+    // normal profile; a walk that sees both flags `S` partial and lists nothing for it.
+    const std::string temp = "C:\\Users\\tmp";
+    const std::vector<ProfileInfo> alone_records{ProfileInfo{kSidA, "", temp, HiveState::not_loaded, false}};
+    const std::vector<ProfileInfo> pair_records{
+       ProfileInfo{kSidA, "", temp, HiveState::not_loaded, false},
+       ProfileInfo{kSidA + ".bak", "", prof(kSidA).path, HiveState::not_loaded, false}};
+    const std::vector<std::string> none;
+    const OfflineDiscovery misses_bak = classify_offline_discovery(true, false, false, alone_records, none);
+    const OfflineDiscovery sees_bak = classify_offline_discovery(true, false, false, pair_records, none);
+    REQUIRE(misses_bak.profiles == std::vector<OfflineProfile>{{kSidA, temp}});
+    REQUIRE(sees_bak.profiles.empty());
+    REQUIRE(sees_bak.partial == std::vector<std::string>{kSidA});
+
+    const auto listing = [](const std::string& sid, const std::string& path) {
+        OfflineDiscovery d;
+        d.profiles = {{sid, path}};
+        return d;
+    };
+    OfflineDiscovery cut;
+    cut.complete = false;
+    // An INCOMPLETE walk still fills a pathless known profile from what it did list, so its
+    // path needs the confirming walk too (the second walk is not limited to complete first walks).
+    const auto cut_listing = [&](const std::string& path) {
+        OfflineDiscovery d = listing(kSidA, path);
+        d.complete = false;
+        return d;
+    };
+    struct Case {
+        const char* name;
+        OfflineDiscovery first, second;
+        bool taken;
+    };
+    for (const auto& c : {Case{"both walks list the same path", listing(kSidA, prof(kSidA).path),
+                               listing(kSidA, prof(kSidA).path), true},
+                          Case{"walk 1 misses the .bak and lists the TEMP folder, walk 2 sees the pair",
+                               misses_bak, sees_bak, false},
+                          Case{"walk 1 lists the TEMP folder, walk 2 lists a different path", misses_bak,
+                               listing(kSidA, prof(kSidA).path), false},
+                          Case{"walk 1 lists a path, walk 2 is incomplete and lists none", misses_bak, cut,
+                               false},
+                          Case{"walk 1 is incomplete and lists the TEMP folder, walk 2 sees the pair",
+                               cut_listing(temp), sees_bak, false},
+                          Case{"walk 1 is incomplete and lists a path, walk 2 lists the same one",
+                               cut_listing(prof(kSidA).path), listing(kSidA, prof(kSidA).path),
+                               true}}) {
+        INFO(c.name);
+        OfflineRig r;
+        const auto root = uroot(kSidA);
+        r.f.sids = {kSidA};
+        r.f.reads[root] = uread(root, 1);
+        r.next(); // A is loaded and baselined
+        const auto baseline = r.state(root);
+        REQUIRE(nonempty_baseline(baseline));
+
+        // A logs off on a tick whose walk fails outright: it is carried as {A, ""} (no path yet)
+        r.f.sids.clear();
+        r.f.offline_discovery = OfflineDiscovery{false, {}, {}};
+        r.f.dirty->mark_hku();
+        r.next();
+        REQUIRE(read_cursor(r.t.db).offline == std::vector<OfflineProfile>{{kSidA, ""}});
+
+        // The next ordinary tick walks twice; what the hive holds now differs from the baseline
+        r.f.offline_reads[kSidA] = hive_read({{root, uread(root, 2)}});
+        r.f.offline_discovery_queue = {c.first, c.second};
+        const int walks = r.f.offline_profile_calls;
+        const int enumerations = r.f.loaded_sids_calls;
+        const std::size_t mounts = r.f.offline_calls.size();
+        r.next();
+        CHECK(r.f.offline_profile_calls == walks + 2);
+        CHECK(r.f.loaded_sids_calls == enumerations + 1); // one HKU snapshot for the whole tick
+        const auto cur = read_cursor(r.t.db);
+        REQUIRE(cur.roots.contains(root));
+        if (c.taken) {
+            CHECK(cur.offline == std::vector<OfflineProfile>{prof(kSidA)});
+            CHECK_FALSE(cur.roots.at(root).deferred);
+            REQUIRE(r.f.offline_calls.size() == mounts + 1);
+            CHECK(r.f.offline_calls.back().path == prof(kSidA).path);
+            const auto rows = ql("SELECT action, prev_data, data, detail FROM registry_live");
+            REQUIRE(rows.rows.size() == 1);
+            CHECK(rows.rows[0][0] == "changed");
+            continue;
+        }
+        // not taken: still pathless and deferred, nothing mounted, the baseline kept, no row
+        CHECK(cur.offline == std::vector<OfflineProfile>{{kSidA, ""}});
+        CHECK(cur.roots.at(root).deferred);
+        CHECK(cur.roots.at(root).baselined);
+        CHECK(r.f.offline_calls.size() == mounts);
+        CHECK(r.state(root) == baseline);
+        CHECK(count_rows(r.t.db) == 0); // no removed row either
+    }
+}
+
+TEST_CASE("registry offline: a known profile's changed path is taken only when both walks list it; otherwise its previous path stands",
+          "[echo][registry][lifecycle]") {
+    const OfflineProfile moved{kSidA, "D:\\Users\\" + kSidA};
+    const OfflineProfile other{kSidA, "E:\\Users\\" + kSidA};
+    const auto listing = [](const OfflineProfile& p) {
+        OfflineDiscovery d;
+        d.profiles = {p};
+        return d;
+    };
+    OfflineDiscovery cut;
+    cut.complete = false;
+    struct Case {
+        const char* name;
+        OfflineDiscovery first, second;
+        OfflineProfile expected;
+    };
+    for (const auto& c : {Case{"both walks list the new path", listing(moved), listing(moved), moved},
+                          Case{"walk 2 lists a different path", listing(moved), listing(other), prof(kSidA)},
+                          Case{"walk 2 omits it (a complete walk)", listing(moved), OfflineDiscovery{},
+                               prof(kSidA)},
+                          Case{"walk 2 is incomplete", listing(moved), cut, prof(kSidA)}}) {
+        INFO(c.name);
+        OfflineRig r;
+        const auto root = uroot(kSidA);
+        r.f.offline_discovery.profiles = {prof(kSidA)};
+        r.f.offline_reads[kSidA] = hive_read({{root, uread(root, 1)}});
+        r.next();
+        r.tick_to(12);
+        const auto baseline = r.state(root);
+        const int walks = r.f.offline_profile_calls;
+        const int enumerations = r.f.loaded_sids_calls;
+        const std::size_t mounts = r.f.offline_calls.size();
+
+        r.f.offline_discovery_queue = {c.first, c.second}; // the hourly tick
+        r.next();
+        CHECK(r.f.offline_profile_calls == walks + 2);
+        CHECK(r.f.loaded_sids_calls == enumerations + 1);
+        CHECK(read_cursor(r.t.db).offline == std::vector<OfflineProfile>{c.expected});
+        REQUIRE(r.f.offline_calls.size() == mounts + 1); // still read this hour, never removed
+        CHECK(r.f.offline_calls.back().path == c.expected.path);
+        CHECK(r.state(root) == baseline);
+        CHECK(count_rows(r.t.db) == 0);
+    }
+}
+
+TEST_CASE("registry offline: a temporary profile (a listed <sid> beside <sid>.bak) is never mounted at its TEMP path or diffed against the real baseline",
+          "[echo][registry][lifecycle]") {
+    using yuzu::profiles::HiveState;
+    using yuzu::profiles::ProfileInfo;
+    const std::string temp = "C:\\Users\\tmp";
+    const std::vector<ProfileInfo> records{
+       ProfileInfo{kSidA, "", temp, HiveState::not_loaded, false},
+       ProfileInfo{kSidA + ".bak", "", prof(kSidA).path, HiveState::not_loaded, false}};
+    const std::vector<std::string> none;
+    const OfflineDiscovery classified = classify_offline_discovery(true, false, false, records, none);
+    OfflineDiscovery listed_and_partial; // a walk that names the sid both ways
+    listed_and_partial.partial = {kSidA};
+    listed_and_partial.profiles = {{kSidA, temp}};
+    struct Case {
+        const char* name;
+        OfflineDiscovery walk;
+    };
+    for (const auto& c : {Case{"classified from the ProfileList records", classified},
+                          Case{"the walk lists the sid and flags it partial", listed_and_partial}}) {
+        INFO(c.name);
+        OfflineRig r;
+        const auto root = uroot(kSidA);
+        r.f.offline_discovery.profiles = {prof(kSidA)};
+        r.f.offline_reads[kSidA] = hive_read({{root, uread(root, 1)}});
+        r.next();
+        r.tick_to(12);
+        const auto baseline = r.state(root);
+        REQUIRE(r.f.offline_calls.size() == 1);
+
+        r.f.offline_discovery = c.walk; // the hourly walk finds the temporary-profile pair
+        r.next();
+        CHECK(count_rows(r.t.db) == 0); // no removed/added storm
+        CHECK(read_cursor(r.t.db).offline == std::vector<OfflineProfile>{prof(kSidA)});
+        for (const auto& call : r.f.offline_calls)
+            CHECK(call.path == prof(kSidA).path); // the TEMP folder is never mounted
+        CHECK(r.state(root) == baseline);
+    }
+
+    // first seen beside its .bak: no hive of the pair is mounted and nothing enters scope
+    OfflineRig first;
+    first.f.offline_discovery = classified;
+    first.next();
+    CHECK(first.f.offline_calls.empty());
+    CHECK(read_cursor(first.t.db).offline.empty());
+}
+
+TEST_CASE("registry offline: a virtual service or system SID whose hive unloads costs no confirming walk and leaves no scope",
+          "[echo][registry][lifecycle]") {
+    for (const char* sid : {"S-1-5-82-1-2", "S-1-5-20"}) {
+        INFO(sid);
+        OfflineRig r;
+        const auto root = uroot(sid);
+        r.f.sids = {sid};
+        r.f.reads[root] = uread(root, 1);
+        r.next(); // loaded and baselined
+        REQUIRE(nonempty_baseline(r.state(root)));
+        const int walks = r.f.offline_profile_calls;
+
+        r.f.sids.clear(); // the hive unloads; the (complete) walk rightly lists nothing for it
+        r.f.dirty->mark_hku();
+        r.next();
+        CHECK(r.f.offline_profile_calls == walks + 1); // and no second walk to confirm a removal
+        CHECK(read_cursor(r.t.db).offline.empty());
+        CHECK(read_cursor(r.t.db).roots.empty());
+        CHECK(r.f.offline_calls.empty());
+        CHECK(count_rows(r.t.db) == 0);
+    }
+}
+
+TEST_CASE("registry offline: an HKU name that is not a profile leaving HKU costs no confirming walk",
+          "[echo][registry][lifecycle]") {
+    OfflineRig r;
+    const auto root = uroot(kSidA);
+    r.f.sids = {kSidA, kSidA + "_Classes", ".DEFAULT"};
+    r.f.reads[root] = uread(root, 1);
+    r.next();
+    const int walks = r.f.offline_profile_calls;
+
+    r.f.sids = {kSidA}; // `<sid>_Classes` and `.DEFAULT` unload; neither was ever a profile
+    r.f.dirty->mark_hku();
+    r.next();
+    CHECK(r.f.offline_profile_calls == walks + 1);
+    CHECK(read_cursor(r.t.db).offline.empty());
+}
+
+TEST_CASE("registry offline: first-sight hives are mounted in sid order whatever order the walk listed them",
+          "[echo][registry][lifecycle]") {
+    const std::string sid_c = "S-1-5-21-3";
+    OfflineRig r;
+    r.f.offline_discovery.profiles = {prof(sid_c), prof(kSidA), prof(kSidB)}; // not in sid order
+    r.next();
+    REQUIRE(r.f.offline_calls.size() == 3);
+    CHECK(r.f.offline_calls[0].sid == kSidA); // nothing has been read (read_end 0 for all): sid breaks the tie
+    CHECK(r.f.offline_calls[1].sid == kSidB);
+    CHECK(r.f.offline_calls[2].sid == sid_c);
+}
+
+TEST_CASE("registry offline: registry_offline_roots_deferred counts offline roots only",
+          "[echo][registry][lifecycle]") {
+    OfflineRig r;
+    const auto root = uroot(kSidA);
+    r.f.sids = {kSidA};
+    r.f.reads[root] = uread(root, 1);
+    r.next(); // A is loaded and baselined
+    auto cur = read_cursor(r.t.db);
+    cur.roots.at(root).deferred = true; // a LIVE root carrying the offline retry marker
+    REQUIRE(r.t.db.insert_registry_events_and_cursor({}, encode_registry_cursor(cur), {}));
+    r.next(); // not dirty and not due: it is not read, and the flag is untouched
+    REQUIRE(read_cursor(r.t.db).roots.at(root).deferred);
+    CHECK(r.config("registry_offline_roots_deferred") == "0");
+    CHECK(r.config("registry_offline_roots") == "0");
+}
+
+TEST_CASE("registry offline: an incomplete walk that lists a profile discovers it, and every tick walks at most once",
+          "[echo][registry][lifecycle]") {
+    // The walk is cut short on every tick (a host with more ProfileList entries than the cap), yet
+    // the profile it does reach is read and baselined: incomplete means "do not remove", not "see nothing".
+    OfflineRig r;
+    const auto root = uroot(kSidA);
+    r.f.offline_discovery = OfflineDiscovery{false, {}, {prof(kSidA)}};
+    r.f.offline_reads[kSidA] = hive_read({{root, uread(root, 1)}});
+    r.next();
+    CHECK(r.config("registry_offline_discovery_incomplete") == "1");
+    CHECK(read_cursor(r.t.db).offline == std::vector<OfflineProfile>{prof(kSidA)});
+    CHECK(r.f.offline_calls.size() == 1);
+    CHECK(nonempty_baseline(r.state(root)));
+    CHECK(count_rows(r.t.db) == 0);
+
+    for (int i = 1; i <= 3; ++i) {
+        r.next();
+        CHECK(r.f.offline_profile_calls == 1 + i); // one walk a tick while it stays incomplete
+        CHECK(r.f.offline_calls.size() == 1);      // but the hive is mounted hourly
+    }
+    r.f.offline_reads[kSidA] = hive_read({{root, uread(root, 2)}});
+    r.tick_to(12);
+    r.next();
+    CHECK(r.f.offline_calls.size() == 2);
+    CHECK(count_rows(r.t.db) == 1); // the change is reported, as for any offline hive
+}
+
+TEST_CASE("registry offline: the empty-path deferral keeps the root's saved status and the unreadable counters",
+          "[echo][registry][lifecycle]") {
+    OfflineRig r;
+    const auto root = uroot(kSidA);
+    r.f.sids = {kSidA};
+    r.f.reads[root] = uread(root, 1);
+    r.next(); // loaded and baselined
+    // the loaded root then becomes unreadable (status unreadable, baseline kept)
+    SubtreeRead denied;
+    denied.status = RegistryReadStatus::Unreadable;
+    r.f.reads[root] = denied;
+    r.f.dirty->mark(root, r.f.clock);
+    r.next();
+    REQUIRE(read_cursor(r.t.db).roots.at(root).status == "unreadable");
+    REQUIRE(r.config("registry_roots_unreadable") == "1");
+    const auto gaps = r.gap_unreadable_rows();
+
+    // A logs off on a tick whose walk fails: no path, so no mount; the saved status must survive
+    // this tick and the next unresolved ones, and the counters must keep saying so.
+    r.f.sids.clear();
+    r.f.offline_discovery = OfflineDiscovery{false, {}, {}};
+    r.f.dirty->mark_hku();
+    for (int i = 0; i < 3; ++i) {
+        r.next();
+        const auto cur = read_cursor(r.t.db);
+        INFO("unresolved tick " << i);
+        CHECK(cur.roots.at(root).status == "unreadable");
+        CHECK(cur.roots.at(root).deferred);
+        CHECK(r.config("registry_roots_unreadable") == "1");
+        CHECK(r.config("registry_offline_roots_unreadable") == "1");
+        CHECK(r.config("registry_offline_roots_deferred") == "1");
+        CHECK(r.f.offline_calls.empty());
+        CHECK(r.gap_unreadable_rows() == gaps);
+    }
+}
+
+TEST_CASE("registry offline: a budget-deferred loaded root that then logs off is read at once, not at the next hour",
+          "[echo][registry][lifecycle]") {
+    const RegistryScope scope{{"SOFTWARE\\yuzu_test_r"}, {kSuffix}};
+    OfflineRig r(scope);
+    const auto root = uroot(kSidA);
+    bool burn = false;
+    auto reader = r.f.reader();
+    auto read = reader.read_subtree;
+    reader.read_subtree = [&r, &burn, read](const std::string& rt, std::int64_t deadline) {
+        auto res = read(rt, deadline);
+        if (burn)
+            r.f.clock += kSnapshotBudget100ns + SEC; // the first read spends the whole budget
+        return res;
+    };
+    r.src = make_registry_cursor_source(scope, std::move(reader));
+    r.f.sids = {kSidA};
+    r.f.reads[kRoot] = svc(1);
+    r.f.reads[root] = uread(root, 1);
+    r.next();
+    r.next(); // two ticks done: the next walks the loaded roots from the first (tick 2 % 2 == 0)
+
+    // both roots are notified; HKLM is read first and spends the budget, so A's root is deferred
+    burn = true;
+    r.f.dirty->mark(kRoot, r.f.clock);
+    r.f.dirty->mark(root, r.f.clock);
+    r.next();
+    burn = false;
+    REQUIRE(read_cursor(r.t.db).roots.at(root).status == "due");
+
+    // A logs off: its root goes offline carrying `due`, which makes the hive due this very tick
+    r.f.sids.clear();
+    r.f.offline_discovery.profiles = {prof(kSidA)};
+    r.f.offline_reads[kSidA] = hive_read({{root, uread(root, 2)}});
+    r.f.dirty->mark_hku();
+    r.next();
+    CHECK(r.f.offline_calls.size() == 1);
+    CHECK(read_cursor(r.t.db).roots.at(root).status == "complete");
+}
+
+TEST_CASE("registry offline: a sid in the loaded list that the cursor still lists as offline is treated as loaded (nobody was logged on, the name-watch mark was missed)",
+          "[echo][registry][lifecycle]") {
+    OfflineRig r;
+    const auto root = uroot(kSidA);
+    r.f.offline_discovery.profiles = {prof(kSidA)};
+    r.f.offline_reads[kSidA] = hive_read({{root, uread(root, 1)}});
+    r.next(); // nobody is logged on; A is a settled offline profile
+    r.next();
+    REQUIRE(r.f.offline_profile_calls == 1); // no walk on an ordinary tick: the cursor's list stands
+
+    // A logs on, but the HKU name watch never fired. cur.hku is empty, so collect() re-enumerates
+    // the loaded list anyway; A is then in both the loaded list and the cursor's offline list.
+    r.f.sids = {kSidA};
+    r.f.reads[root] = uread(root, 1);
+    r.f.read_calls.clear();
+    r.next();
+    CHECK(r.f.offline_profile_calls == 1);                 // still no walk
+    CHECK(r.f.offline_calls.size() == 1);                  // not mounted as an offline hive
+    CHECK(r.f.read_calls == std::vector<std::string>{root}); // read as a loaded root, this tick
+    CHECK(r.f.watch_calls.back() == std::vector<std::string>{root});
+    CHECK(read_cursor(r.t.db).offline.empty());
+    CHECK(r.config("registry_offline_roots") == "0");
+}
+
+TEST_CASE("registry offline: a hive deferred while offline and then read as a loaded root is not mounted out of turn when it logs off again",
+          "[echo][registry][lifecycle]") {
+    OfflineRig r;
+    const auto root = uroot(kSidA);
+    r.f.offline_discovery.profiles = {prof(kSidA)};
+    OfflineHiveRead not_tried;
+    not_tried.attempted = false;
+    not_tried.reason = "offline:skipped_after_timeout";
+    r.f.offline_reads[kSidA] = not_tried;
+    r.next(); // tick 0 (hourly): the mount is not attempted; A is owed a read
+    REQUIRE(r.f.offline_calls.size() == 1);
+    REQUIRE(read_cursor(r.t.db).roots.at(root).deferred);
+
+    r.f.sids = {kSidA}; // A logs on: its first loaded read baselines it, and the owed offline read is moot
+    r.f.reads[root] = uread(root, 1);
+    r.f.dirty->mark_hku();
+    r.next();
+    CHECK_FALSE(read_cursor(r.t.db).roots.at(root).deferred);
+    CHECK(read_cursor(r.t.db).roots.at(root).baselined);
+
+    r.f.sids.clear(); // A logs off again, mid-hour
+    r.f.offline_reads[kSidA] = hive_read({{root, uread(root, 2)}});
+    r.f.dirty->mark_hku();
+    r.next();
+    CHECK(r.f.offline_calls.size() == 1); // not due before the hour: the stale owed read is gone
+    CHECK(count_rows(r.t.db) == 0);
+    CHECK(r.config("registry_offline_roots_deferred") == "0");
+
+    r.tick_to(12);
+    r.next(); // the hourly read, against the loaded baseline
+    CHECK(r.f.offline_calls.size() == 2);
+    CHECK(ql("SELECT COUNT(*) FROM registry_live WHERE action = 'changed'").rows.at(0).at(0) == "1");
+}
+
+TEST_CASE("registry offline: a restart does not mount a settled offline hive again - the restart reconcile is for loaded roots",
+          "[echo][registry][lifecycle]") {
+    OfflineRig r;
+    const auto root = uroot(kSidA);
+    r.f.offline_discovery.profiles = {prof(kSidA)};
+    r.f.offline_reads[kSidA] = hive_read({{root, uread(root, 1)}});
+    r.next();
+    r.tick_to(3);
+    REQUIRE(r.f.offline_calls.size() == 1);
+
+    r.src = make_registry_cursor_source(RegistryScope{{}, {kSuffix}}, r.f.reader());
+    r.src->start(r.t.db); // a persisted cursor: force_all_ makes the first tick a reconcile
+    r.next();
+    CHECK(r.f.offline_calls.size() == 1);   // no mount: it is not the hourly tick
+    CHECK(r.f.offline_profile_calls == 2);  // the profile list IS re-walked (cheap, no mount)
+    CHECK(nonempty_baseline(r.state(root)));
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Sensitive value names (#6634): a stored credential is never kept in any form
+// ═══════════════════════════════════════════════════════════════════════════
+
+namespace {
+
+// Synthetic autologon password; every persisted path below is searched for it.
+constexpr const char* kLogonSecret = "Hunter2-synthetic-logon-secret";
+
+std::string hex_of(std::string_view bytes) {
+    static constexpr char d[] = "0123456789abcdef";
+    std::string out;
+    for (unsigned char c : bytes) {
+        out += d[c >> 4];
+        out += d[c & 0xF];
+    }
+    return out;
+}
+
+// True when `hay` carries the secret as UTF-8 text, as the hex of its UTF-16 bytes, or as the
+// SHA-256 prefix baseline_entry_from_bytes would have stored for those bytes.
+bool carries_secret(std::string_view hay, std::string_view secret) {
+    const std::string bytes = utf16(secret);
+    const std::string hash = baseline_entry_from_bytes(1, bytes.size(), bytes, false).h;
+    return hay.find(secret) != std::string_view::npos ||
+           hay.find(hex_of(bytes)) != std::string_view::npos ||
+           hay.find(hex_of(secret)) != std::string_view::npos ||
+           hay.find(hash) != std::string_view::npos;
+}
+
+const std::string kWinlogon = "HKLM\\SOFTWARE\\yuzu_test_r\\Winlogon";
+
+SubtreeRead logon_read(std::string_view secret, std::uint32_t type = 1) {
+    return complete({{kWinlogon,
+                      {{"DefaultUserName", vread(1, utf16("svc-account"))},
+                       {"DefaultPassword", vread(type, utf16(secret))}}}});
+}
+
+} // namespace
+
+TEST_CASE("is_sensitive_reg_value: a closed, case-insensitive, name-only list",
+          "[echo][registry][pure]") {
+    CHECK(is_sensitive_reg_value("DefaultPassword"));
+    CHECK(is_sensitive_reg_value("defaultpassword"));
+    CHECK(is_sensitive_reg_value("ALTDEFAULTPASSWORD"));
+    CHECK(is_sensitive_reg_value("AltDefaultPassword"));
+    CHECK_FALSE(is_sensitive_reg_value("DefaultUserName"));
+    CHECK_FALSE(is_sensitive_reg_value("AutoAdminLogon"));
+    CHECK_FALSE(is_sensitive_reg_value("DefaultPassword2"));
+    CHECK_FALSE(is_sensitive_reg_value(""));
+}
+
+TEST_CASE("diff: a sensitive value added is masked, sized 0 and baselined by type only",
+          "[echo][registry][pure]") {
+    const std::string root = "HKLM\\SOFTWARE\\yuzu_test_r";
+    const auto d = diff_registry_snapshot({}, logon_read(kLogonSecret), root, "notify", {10, 20}, 20);
+    std::map<std::string, RegistryCandidate> by;
+    for (const auto& c : d.candidates)
+        by[c.value] = c;
+    REQUIRE(by.size() == 2);
+    const auto& pw = by.at("DefaultPassword");
+    CHECK(pw.action == "added");
+    CHECK(pw.data == kRegistryMaskedData);
+    CHECK(pw.size == 0);
+    CHECK_FALSE(pw.data_truncated);
+    CHECK(pw.type == 1);
+    CHECK(d.baseline.keys.at(kWinlogon).at("DefaultPassword") == BaselineEntry{1, 0, "", "", false});
+    // The neighbouring value is rendered, sized and hashed exactly as before.
+    const auto& user = by.at("DefaultUserName");
+    CHECK(user.data == "svc-account");
+    CHECK(user.size == utf16("svc-account").size());
+    const auto& ub = d.baseline.keys.at(kWinlogon).at("DefaultUserName");
+    CHECK(ub.s == utf16("svc-account").size());
+    CHECK_FALSE(ub.h.empty());
+}
+
+TEST_CASE("diff: a content-only change of a sensitive value is no change; type change and removal are",
+          "[echo][registry][pure]") {
+    const std::string root = "HKLM\\SOFTWARE\\yuzu_test_r";
+    const auto first = diff_registry_snapshot({}, logon_read(kLogonSecret), root, "reconcile", {10, 20},
+                                              20, /*suppress=*/true);
+
+    SECTION("content-only: no candidate, baseline unchanged") {
+        const auto d = diff_registry_snapshot(first.baseline, logon_read("a-different-secret"), root,
+                                              "notify", {10, 20}, 20);
+        CHECK(d.candidates.empty());
+        CHECK_FALSE(d.changed);
+    }
+    SECTION("type change: one masked `changed` candidate") {
+        const auto d = diff_registry_snapshot(first.baseline, logon_read(kLogonSecret, 2), root,
+                                              "notify", {10, 20}, 20);
+        REQUIRE(d.candidates.size() == 1);
+        const auto& c = d.candidates[0];
+        CHECK(c.action == "changed");
+        CHECK(c.data == kRegistryMaskedData);
+        CHECK(c.size == 0);
+        CHECK(c.has_prev);
+        CHECK(c.prev_type == 1);
+        CHECK(c.prev_size == 0);
+        CHECK(c.prev_data.empty());
+    }
+    SECTION("removal: one `removed` candidate with no previous size or data") {
+        auto gone = logon_read(kLogonSecret);
+        gone.keys.at(kWinlogon).erase("DefaultPassword");
+        const auto d = diff_registry_snapshot(first.baseline, gone, root, "notify", {10, 20}, 20);
+        REQUIRE(d.candidates.size() == 1);
+        CHECK(d.candidates[0].action == "removed");
+        CHECK(d.candidates[0].prev_size == 0);
+        CHECK(d.candidates[0].prev_data.empty());
+        CHECK(d.candidates[0].data.empty());
+    }
+}
+
+TEST_CASE("diff: a legacy baseline entry for a sensitive name fabricates no row and is rewritten masked",
+          "[echo][registry][pure]") {
+    const std::string root = "HKLM\\SOFTWARE\\yuzu_test_r";
+    const std::string bytes = utf16(kLogonSecret);
+    RegistryBaseline legacy;
+    legacy.keys[kWinlogon]["DefaultPassword"] =
+        baseline_entry_from_bytes(1, bytes.size(), bytes, false);
+    legacy.keys[kWinlogon]["DefaultPassword"].d = kLogonSecret; // an older build's rendered prefix
+    legacy.keys[kWinlogon]["DefaultUserName"] =
+        baseline_entry_from_bytes(1, utf16("svc-account").size(), utf16("svc-account"), false);
+
+    const auto d = diff_registry_snapshot(legacy, logon_read(kLogonSecret), root, "notify", {10, 20}, 20);
+    CHECK(d.candidates.empty()); // same value read: nothing changed
+    CHECK(d.changed);            // but the stored entry is rewritten
+    const auto encoded = encode_registry_baseline(d.baseline);
+    CHECK_FALSE(carries_secret(encoded, kLogonSecret));
+}
+
+TEST_CASE("diff: a Capped read that does not visit a sensitive key masks the retained entry",
+          "[echo][registry][pure]") {
+    const std::string root = "HKLM\\SOFTWARE\\yuzu_test_r";
+    const std::string bytes = utf16(kLogonSecret);
+    RegistryBaseline legacy;
+    legacy.keys[kWinlogon]["DefaultPassword"] =
+        baseline_entry_from_bytes(1, bytes.size(), bytes, false);
+    SubtreeRead capped;
+    capped.status = RegistryReadStatus::Capped; // visited nothing
+    const auto d = diff_registry_snapshot(legacy, capped, root, "notify", {10, 20}, 20);
+    CHECK(d.candidates.empty());
+    CHECK(d.baseline.keys.at(kWinlogon).at("DefaultPassword") == BaselineEntry{1, 0, "", "", false});
+    CHECK(d.changed);
+}
+
+TEST_CASE("baseline_from_read masks a sensitive value", "[echo][registry][pure]") {
+    const auto b = baseline_from_read(logon_read(kLogonSecret));
+    CHECK(b.keys.at(kWinlogon).at("DefaultPassword") == BaselineEntry{1, 0, "", "", false});
+    CHECK_FALSE(b.keys.at(kWinlogon).at("DefaultUserName").h.empty());
+}
+
+TEST_CASE("encode_registry_baseline writes the masked form for a sensitive name whatever the entry holds",
+          "[echo][registry][pure]") {
+    const std::string bytes = utf16(kLogonSecret);
+    RegistryBaseline b;
+    b.keys[kWinlogon]["DefaultPassword"] = baseline_entry_from_bytes(1, bytes.size(), bytes, false);
+    b.keys[kWinlogon]["DefaultPassword"].d = kLogonSecret;
+    b.keys[kWinlogon]["altdefaultpassword"] = baseline_entry_from_bytes(1, bytes.size(), bytes, false);
+    const auto json = encode_registry_baseline(b);
+    CHECK_FALSE(carries_secret(json, kLogonSecret));
+    const auto back = decode_registry_baseline(json);
+    REQUIRE_FALSE(back.malformed);
+    CHECK(back.baseline.keys.at(kWinlogon).at("DefaultPassword") == BaselineEntry{1, 0, "", "", false});
+}
+
+TEST_CASE("cursor row: a held candidate under a sensitive name is written masked, including a legacy one",
+          "[echo][registry][pure]") {
+    RegistryCursor cur;
+    cur.present = true;
+    auto held = cand("added", "DefaultPassword", 1, utf16(kLogonSecret).size(), 10, 20);
+    held.key = kWinlogon;
+    held.data = kLogonSecret;
+    held.has_prev = true;
+    held.prev_size = 99;
+    held.prev_data = kLogonSecret;
+    cur.held = {held};
+
+    const auto json = encode_registry_cursor(cur);
+    CHECK_FALSE(carries_secret(json, kLogonSecret));
+    const auto back = decode_registry_cursor(json);
+    REQUIRE(back.held.size() == 1);
+    CHECK(back.held[0].data == kRegistryMaskedData);
+    CHECK(back.held[0].size == 0);
+
+    // A cursor written by an earlier build holds the cleartext: decoded and stitched, the row is masked.
+    auto legacy = nlohmann::json::parse(json);
+    legacy["held"][0]["d"] = kLogonSecret;
+    legacy["held"][0]["s"] = utf16(kLogonSecret).size();
+    const auto old = decode_registry_cursor(legacy.dump());
+    REQUIRE_FALSE(old.malformed);
+    REQUIRE(old.held.size() == 1);
+    const auto r = stitch_registry_tick(old.held, {}, {}, StitchFlags{true, 0}, 1000 * SEC, 1);
+    REQUIRE(r.rows.size() == 1);
+    CHECK(r.rows[0].data == kRegistryMaskedData);
+    CHECK(r.rows[0].data_size == 0);
+    CHECK_FALSE(carries_secret(r.rows[0].data + r.rows[0].prev_data, kLogonSecret));
+}
+
+TEST_CASE("registry_row_from_candidate masks an unmasked candidate under a sensitive name",
+          "[echo][registry][pure]") {
+    auto c = cand("changed", "DefaultPassword", 1, 62, 10, 20);
+    c.key = kWinlogon;
+    c.data = kLogonSecret;
+    c.has_prev = true;
+    c.prev_size = 40;
+    c.prev_data = kLogonSecret;
+    const auto row = registry_row_from_candidate(c, 0, {}, "attr:none", 1);
+    CHECK(row.data == kRegistryMaskedData);
+    CHECK(row.data_size == 0);
+    CHECK(row.prev_data_size == 0);
+    CHECK(row.prev_data.empty());
+
+    // An ordinary value keeps everything.
+    auto ok = cand("changed", "DefaultUserName", 1, 62, 10, 20);
+    ok.data = "svc-account";
+    CHECK(registry_row_from_candidate(ok, 0, {}, "attr:none", 1).data == "svc-account");
+    CHECK(registry_row_from_candidate(ok, 0, {}, "attr:none", 1).data_size == 62);
+}
+
+TEST_CASE("attribute_candidate: a sensitive value is correlated without its size",
+          "[echo][registry][pure]") {
+    // The masked candidate has size 0; the writer's event has the real length.
+    const auto masked = cand("changed", "DefaultPassword", 1, 0, 100, 200);
+    const auto a = attribute_candidate(
+       masked, {ev(150, 812, RegistryEtwOp::Set, "DefaultPassword", 1, 62, "winlogon.exe")});
+    CHECK(a.kind == AttributionKind::Corr);
+    CHECK(a.pid == 812);
+    // Type still has to match.
+    CHECK(attribute_candidate(masked, {ev(150, 812, RegistryEtwOp::Set, "DefaultPassword", 4, 62)}).kind ==
+          AttributionKind::None);
+    // An ordinary candidate still requires the size to match.
+    CHECK(attribute_candidate(cand("changed", "Start", 4, 4, 100, 200),
+                              {ev(150, 1, RegistryEtwOp::Set, "Start", 4, 8)})
+              .kind == AttributionKind::None);
+}
+
+TEST_CASE("registry source: a Winlogon DefaultPassword leaves no trace in any row, state or cursor",
+          "[echo][registry][lifecycle]") {
+    auto t = make_db();
+    Fake f;
+    auto src = make_registry_cursor_source(scope1(), f.reader());
+
+    // Everything the database persisted that could carry a value: state rows, the cursor row, the
+    // roll-up tiers and the dictionary behind them, and the rows the tick committed.
+    const auto everything = [&] {
+        std::string all;
+        for (const char* sql : {"SELECT state_json FROM echo_state", "SELECT cursor_json FROM echo_cursor",
+                                "SELECT last_data FROM registry_hourly",
+                                "SELECT last_data FROM registry_daily", "SELECT text FROM echo_dict"})
+            for (const auto& row : q(t.db, sql).rows)
+                for (const auto& cell : row)
+                    all += cell + "\n";
+        for (const auto& e : committed_rows())
+            all += e.data + "\n" + e.prev_data + "\n" + e.detail + "\n" + e.value_name + "\n";
+        return all;
+    };
+    // One tick, then a second after the settle interval so a held change lands.
+    const auto step = [&](std::int64_t at, SubtreeRead read) {
+        f.clock = T0 + at * SEC;
+        f.reads[kRoot] = std::move(read);
+        burst(f, kRoot, T0 + (at - 3) * SEC, T0 + (at - 2) * SEC);
+        tick(t.db, *src);
+        f.clock += kEtwSettle100ns + SEC;
+        tick(t.db, *src);
+    };
+
+    f.reads[kRoot] = complete({{kWinlogon, {{"DefaultUserName", vread(1, utf16("svc-account"))}}}});
+    REQUIRE(tick(t.db, *src).outcome == CursorOutcome::Baseline);
+
+    step(100, logon_read(kLogonSecret)); // add
+    CHECK_FALSE(carries_secret(everything(), kLogonSecret));
+    const auto after_add = q(t.db, "SELECT last_data FROM registry_hourly WHERE value_name = 'DefaultPassword'");
+    REQUIRE(after_add.rows.size() == 1);
+    CHECK(after_add.rows[0][0] == kRegistryMaskedData);
+
+    const auto rows_before = count_rows(t.db);
+    step(800, logon_read("changed-synthetic-secret")); // content only: no row
+    CHECK(count_rows(t.db) == rows_before);
+    CHECK_FALSE(carries_secret(everything(), kLogonSecret));
+    CHECK_FALSE(carries_secret(everything(), "changed-synthetic-secret"));
+
+    step(1500, logon_read("changed-synthetic-secret", 2)); // type change
+    CHECK(count_rows(t.db) == rows_before + 1);
+    CHECK_FALSE(carries_secret(everything(), "changed-synthetic-secret"));
+
+    step(2200, complete({{kWinlogon, {{"DefaultUserName", vread(1, utf16("svc-account"))}}}})); // removed
+    CHECK(count_rows(t.db) == rows_before + 2);
+    CHECK_FALSE(carries_secret(everything(), kLogonSecret));
+    CHECK_FALSE(carries_secret(everything(), "changed-synthetic-secret"));
+}
+
+namespace {
+
+// The cursor text an earlier build wrote for a held DefaultPassword change, with state in every
+// field a rewrite has to carry over: the encoder of this build masks the candidate, so the legacy
+// fields are written back over the encoded form.
+std::string legacy_cursor_with_secret() {
+    RegistryCursor cur;
+    cur.present = true;
+    cur.tick = 7;
+    cur.ccs = "ControlSet002";
+    cur.roots[kRoot] =
+        RegistryRootState{true, 100, 110, 120, "capped", false, {kRoot + "\\Denied"}, true};
+    cur.loss = {{30, 40}};
+    cur.hku = {"S-1-5-21-1"};
+    cur.offline = {{"S-1-5-21-2", "C:\\Users\\jsmith"}};
+    auto held = cand("added", "DefaultPassword", 1, utf16(kLogonSecret).size(), 10, 20);
+    held.key = kWinlogon;
+    cur.held = {held};
+    auto j = nlohmann::json::parse(encode_registry_cursor(cur));
+    j["held"][0]["d"] = kLogonSecret;
+    j["held"][0]["s"] = utf16(kLogonSecret).size();
+    j["held"][0]["pd"] = kLogonSecret;
+    return j.dump();
+}
+
+// `rewritten` is `legacy` with only the held value's bytes masked: every other field of every
+// member (tick, ccs, roots, held, loss, hku, offline) is equal.
+void check_same_position(const std::string& legacy, const std::string& rewritten) {
+    auto want = nlohmann::json::parse(legacy);
+    // The fixture has state in every member, so a rewrite that drops one cannot pass.
+    for (const char* member : {"roots", "held", "loss", "hku", "offline"})
+        REQUIRE_FALSE(want.at(member).empty());
+    want["held"][0] =
+        registry_detail::candidate_to_json(registry_detail::candidate_from_json(want["held"][0]));
+    CHECK(want["held"][0]["d"] == std::string{kRegistryMaskedData});
+    CHECK(nlohmann::json::parse(rewritten) == want);
+}
+
+} // namespace
+
+TEST_CASE("masked_registry_cursor: rewrites a legacy cursor at the same position and nothing else",
+          "[echo][registry][pure]") {
+    const std::string legacy = legacy_cursor_with_secret();
+    REQUIRE(carries_secret(legacy, kLogonSecret));
+
+    const auto clean = masked_registry_cursor(legacy);
+    REQUIRE(clean.has_value());
+    CHECK_FALSE(carries_secret(*clean, kLogonSecret));
+    check_same_position(legacy, *clean);
+
+    CHECK_FALSE(masked_registry_cursor(*clean).has_value()); // its own output: nothing to rewrite
+
+    // A held change under an ordinary name, or no held change at all: left byte for byte alone.
+    RegistryCursor other;
+    other.present = true;
+    other.held = {cand("changed", "DefaultUserName", 1, 22, 10, 20)};
+    CHECK_FALSE(masked_registry_cursor(encode_registry_cursor(other)).has_value());
+    CHECK_FALSE(masked_registry_cursor(encode_registry_cursor(RegistryCursor{})).has_value());
+    // A cursor that does not decode is collect()'s to report, never replaced here.
+    CHECK_FALSE(masked_registry_cursor("{not json").has_value());
+}
+
+TEST_CASE("registry source: start() masks a legacy cursor with no tick, which a disabled source never has",
+          "[echo][registry][lifecycle]") {
+    const std::string legacy = legacy_cursor_with_secret();
+    auto t = make_db();
+    REQUIRE(t.db.insert_registry_events_and_cursor({}, legacy, {}).has_value());
+    REQUIRE(carries_secret(*t.db.get_cursor("registry").value(), kLogonSecret)); // seeded
+
+    Fake f;
+    auto src = make_registry_cursor_source(scope1(), f.reader());
+    src->start(t.db); // no collect: a disabled source never ticks, so start() is the only chance
+    const std::string stored = *t.db.get_cursor("registry").value();
+    CHECK_FALSE(carries_secret(stored, kLogonSecret));
+    check_same_position(legacy, stored);
+    // Nothing is replayed or re-baselined: no event, no tier row, no baseline for the root.
+    CHECK(committed_rows().empty());
+    CHECK(count_rows(t.db) == 0);
+    CHECK_FALSE(t.db.try_get_state("registry:" + kRoot).value().has_value());
+
+    // A second start finds nothing to rewrite: the row is byte-identical.
+    Fake f2;
+    auto src2 = make_registry_cursor_source(scope1(), f2.reader());
+    src2->start(t.db);
+    CHECK(*t.db.get_cursor("registry").value() == stored);
+
+    // A cursor that does not decode stays exactly as stored: collect() reports and re-baselines it.
+    auto bad = make_db();
+    REQUIRE(bad.db.insert_registry_events_and_cursor({}, "{not json", {}).has_value());
+    Fake f3;
+    auto src3 = make_registry_cursor_source(scope1(), f3.reader());
+    src3->start(bad.db);
+    CHECK(*bad.db.get_cursor("registry").value() == "{not json");
+}
+
+TEST_CASE("registry source: a failed cursor rewrite at start() changes nothing and is retried",
+          "[echo][registry][lifecycle]") {
+    const std::string legacy = legacy_cursor_with_secret();
+    auto t = make_db();
+    REQUIRE(t.db.insert_registry_events_and_cursor({}, legacy, {}).has_value());
+    Fake f;
+    {
+        InsertTrap trap(t.path, "echo_cursor"); // the cursor upsert fails; reads still work
+        auto src = make_registry_cursor_source(scope1(), f.reader());
+        REQUIRE_NOTHROW(src->start(t.db)); // logged, and the start goes on
+        CHECK(*t.db.get_cursor("registry").value() == legacy); // the disclosed residual: unchanged
+    }
+    auto src = make_registry_cursor_source(scope1(), f.reader()); // the next start
+    src->start(t.db);
+    const std::string stored = *t.db.get_cursor("registry").value();
+    CHECK_FALSE(carries_secret(stored, kLogonSecret));
+    check_same_position(legacy, stored);
+}
+
+
+// The named environment causes that stop the Kernel-Registry ETW session opening, as a SKIP
+// reason; nullopt for anything else, which the caller FAILs with the code (#7173). Win32 1450
+// (ERROR_NO_SYSTEM_RESOURCES) is the system trace-session limit; Win32 5 (ERROR_ACCESS_DENIED)
+// is a missing elevation, a cause only on a token that is not elevated.
+namespace {
+std::optional<std::string> etw_skip_reason(unsigned long start_rc, bool elevated) {
+    if (start_rc == 1450)
+        return "ETW session unavailable: the system trace-session limit is reached (Win32 1450)";
+    if (start_rc == 5 && !elevated)
+        return "ETW session unavailable: not elevated (Win32 5)";
+    return std::nullopt;
+}
+} // namespace
+
+TEST_CASE("registry live: the ETW skip reason names the session limit and the missing elevation and nothing else",
+          "[echo][registry]") {
+    CHECK(etw_skip_reason(1450, true).value_or("").find("trace-session limit") != std::string::npos);
+    CHECK(etw_skip_reason(1450, false).value_or("").find("trace-session limit") != std::string::npos);
+    CHECK(etw_skip_reason(5, false).value_or("").find("not elevated") != std::string::npos);
+    CHECK_FALSE(etw_skip_reason(5, true).has_value());
+    CHECK_FALSE(etw_skip_reason(87, true).has_value());
+    CHECK_FALSE(etw_skip_reason(87, false).has_value());
+    CHECK_FALSE(etw_skip_reason(0, true).has_value());
+    CHECK_FALSE(etw_skip_reason(0, false).has_value());
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -2289,17 +5954,39 @@ namespace {
 // window_base or read stamp ever carries the offset; it is reset straight after.
 std::atomic<std::int64_t> g_clock_offset{0};
 
-// Is this process's token elevated? The ETW cases SKIP when it is not, and FAIL when it is and
-// the session still did not open, so a broken session can never pass as "not elevated".
-bool is_elevated() {
+// Is this process's token elevated? nullopt, with the Win32 code in `error`, when the token query
+// itself fails: an unestablished elevation is never "not elevated". It feeds etw_skip_reason
+// through require_etw_or_skip: a start failure is a SKIP only for a named environment cause, so a
+// broken session can never pass as "not elevated".
+std::optional<bool> is_elevated(unsigned long& error) {
     HANDLE token = nullptr;
-    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token))
-        return false;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) {
+        error = GetLastError();
+        return std::nullopt;
+    }
     TOKEN_ELEVATION e{};
     DWORD len = 0;
     const bool ok = GetTokenInformation(token, TokenElevation, &e, sizeof(e), &len) != 0;
+    if (!ok)
+        error = GetLastError();
     CloseHandle(token);
-    return ok && e.TokenIsElevated != 0;
+    if (!ok)
+        return std::nullopt;
+    return e.TokenIsElevated != 0;
+}
+
+// The session did not open: SKIP when the reader's start error is a named environment cause,
+// FAIL with the code otherwise, so a broken session can never pass as "not elevated". A Win32 5
+// start failure with no established elevation FAILs naming the token-query code.
+void require_etw_or_skip(unsigned long start_rc, const std::string& detail) {
+    unsigned long token_error = 0;
+    const auto elevated = is_elevated(token_error);
+    if (start_rc == 5 && !elevated)
+        FAIL("the ETW session did not open (Win32 5) and elevation could not be established "
+             "(token query Win32 " << token_error << "): " << detail);
+    if (const auto reason = etw_skip_reason(start_rc, elevated.value_or(true)))
+        SKIP(*reason);
+    FAIL("the ETW session did not open (Win32 " << start_rc << "): " << detail);
 }
 
 std::string salt() { return std::to_string(::GetCurrentProcessId()) + "_" + std::to_string(::GetTickCount64()); }
@@ -2359,11 +6046,62 @@ struct LinkKey {
     }
 };
 
+// #7173: name the machine's ETW sessions in a failure message. Total active sessions, plus each
+// session named Yuzu*Etw-<pid> with whether that pid is still alive (a dead owner is a stale
+// session holding one of the machine's session slots; alive=? when the answer could not be had).
+// Read-only; it allocates (a buffer and strings), so it is not noexcept.
+std::string etw_session_table() {
+    constexpr ULONG kMax = 64;
+    constexpr ULONG kName = 1024; // wchar_t slots reserved for each logger name
+    const size_t stride = sizeof(EVENT_TRACE_PROPERTIES) + 2 * kName * sizeof(wchar_t);
+    std::vector<BYTE> buf(stride * kMax, 0);
+    // Alignment: vector<BYTE>::data() is max_align_t-aligned and the stride is a multiple of 8.
+    EVENT_TRACE_PROPERTIES* ptrs[kMax];
+    for (ULONG i = 0; i < kMax; ++i) {
+        auto* p = reinterpret_cast<EVENT_TRACE_PROPERTIES*>(buf.data() + i * stride);
+        p->Wnode.BufferSize = static_cast<ULONG>(stride);
+        p->LoggerNameOffset = sizeof(EVENT_TRACE_PROPERTIES);
+        p->LogFileNameOffset = sizeof(EVENT_TRACE_PROPERTIES) + kName * sizeof(wchar_t);
+        ptrs[i] = p;
+    }
+    ULONG count = 0;
+    const ULONG rc = QueryAllTracesW(ptrs, kMax, &count);
+    if (rc != ERROR_SUCCESS && rc != ERROR_MORE_DATA)
+        return std::format("etw_sessions=query_failed({})", rc);
+    std::string out = std::format("etw_sessions_total={}{}", count, rc == ERROR_MORE_DATA ? "+" : "");
+    for (ULONG i = 0; i < (std::min)(count, kMax); ++i) {
+        const auto* name = reinterpret_cast<const wchar_t*>(reinterpret_cast<const BYTE*>(ptrs[i]) +
+                                                            ptrs[i]->LoggerNameOffset);
+        const std::wstring n(name, wcsnlen(name, kName));
+        // The reaper's name rule: ^Yuzu[A-Za-z]*Etw-[0-9]+\z
+        static const std::wregex re(LR"(Yuzu[A-Za-z]*Etw-([0-9]+))");
+        std::wsmatch m;
+        if (!std::regex_match(n, m, re))
+            continue;
+        const DWORD pid = static_cast<DWORD>(std::wcstoul(m[1].str().c_str(), nullptr, 10));
+        const char* alive = "?"; // refused, or an unparsed pid: not evidence of a dead owner
+        if (pid != 0) {
+            const HANDLE raw = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+            const DWORD err = raw != nullptr ? ERROR_SUCCESS : GetLastError();
+            if (const std::unique_ptr<void, decltype(&::CloseHandle)> h{raw, &::CloseHandle}; h) {
+                DWORD code = 0;
+                if (GetExitCodeProcess(h.get(), &code))
+                    alive = code == STILL_ACTIVE ? "1" : "0";
+            } else if (err == ERROR_INVALID_PARAMETER) {
+                alive = "0"; // no such pid
+            }
+        }
+        out += std::format(" {}:alive={}", yuzu::win::from_wide(n.c_str(), static_cast<int>(n.size())), alive);
+    }
+    return out;
+}
+
 // The production reader over the real mechanism, with a clock a test can step.
 RegistryReader live_reader() {
     auto r = make_windows_registry_reader();
     auto inner = r.now_ts;
     r.now_ts = [inner] { return inner() + g_clock_offset.load(); };
+    r.committed = record_committed;
     return r;
 }
 
@@ -2371,6 +6109,9 @@ struct LiveRun {
     TestDb t = make_db();
     std::shared_ptr<RegistryDirtyTable> dirty;
     std::function<bool()> etw_running; // the reader's own answer: is the session delivering?
+    std::function<unsigned long()> etw_start_error; // why it did not open (0 = no error recorded)
+    // The session's own loss counters; the failure message of a missed ETW event reads them (#7135).
+    std::function<SessionLoss()> session_loss;
     std::string root;                  // the watched root, as the dirty table names it
     std::unique_ptr<RegistryCursorSource> src;
     explicit LiveRun(const std::string& hklm_root, bool etw = true) : root("HKLM\\" + hklm_root) {
@@ -2382,6 +6123,8 @@ struct LiveRun {
         }
         dirty = reader.dirty;
         etw_running = reader.etw_running;
+        etw_start_error = reader.etw_start_error;
+        session_loss = reader.session_loss;
         src = make_registry_cursor_source(RegistryScope{{hklm_root}, {}}, std::move(reader));
         src->start(t.db);
     }
@@ -2393,11 +6136,73 @@ struct LiveRun {
     // collect (the row lands).
     template <class Write>
     void transition(Write&& write, std::function<bool(const RegistryEtwEvent&)> await_event = {}) {
+        const std::uint64_t pushed_before = src->buffer_for_test().pushed();
         write();
         REQUIRE(dirty->wait_dirty_for_test(root, std::chrono::steady_clock::now() + std::chrono::seconds(15)));
-        if (await_event && etw_running())
-            REQUIRE(src->buffer_for_test().wait_for_event(
-               await_event, std::chrono::steady_clock::now() + std::chrono::seconds(15)));
+        if (await_event && etw_running()) {
+            const bool seen = src->buffer_for_test().wait_for_event(
+                await_event, std::chrono::steady_clock::now() + std::chrono::seconds(15));
+            if (!seen) {
+                // #7135: on the shared CI box this wait timed out with nothing in the job log to
+                // say why. The session is system-wide, so name what it delivered since this write
+                // (all writers), whether our own buffer evicted any (evicted), whether an event
+                // carrying this process's pid arrived since this write (from_this_pid: the await
+                // predicate also needs the op and value name, so 1 here with the wait still timed
+                // out means an event arrived but did not match), and what the session says it
+                // lost. Events arriving while events_lost or rt_buffers_lost grow points at the
+                // session overflowing under load, which would have dropped this write's event; no
+                // events at all with etw_running=1 and zero loss points at a session that is not
+                // delivering; etw_running=0 means the session died during the wait. The counters
+                // are cumulative for the session, and zero loss does not prove nothing was dropped
+                // (provider-side drops are not counted). If loss_query_ok is 0 the counters are
+                // not evidence, and the loss counters print n/a. "Passed the reader's filter" counts only
+                // events the reader accepted (provider, the set/delete ids, status 0, decodable), so 0
+                // cannot tell an idle session from one whose events are all being rejected.
+                // from_this_pid is read after the 15 s wait and the loss query, so an event that landed
+                // in that gap reads as "arrived but did not match".
+                const SessionLoss loss = session_loss();
+                const auto evicted = src->buffer_for_test().drop_info().count;
+                // A deadline already in the past evaluates the predicate once, without waiting.
+                // seq is assigned together with pushed_ under the buffer lock, so
+                // seq > pushed_before means pushed since this write.
+                const bool from_this_pid = src->buffer_for_test().wait_for_event(
+                    [pushed_before](const RegistryEtwEvent& e) {
+                        return e.seq > pushed_before && e.pid == ::GetCurrentProcessId();
+                    },
+                    std::chrono::steady_clock::now());
+                const auto counter = [&loss](std::uint64_t v) {
+                    return loss.query_ok ? std::to_string(v) : std::string("n/a");
+                };
+                const std::string detail = std::format(
+                    "no ETW event from this write within 15 s. session passed {} events from "
+                    "all writers through the reader's filter since this write ({} buffered, {} "
+                    "evicted since the session started); events_lost={} rt_buffers_lost={} "
+                    "decode_failed={} loss_query_ok={} etw_running={} from_this_pid={} "
+                    "registry_capture_method={}",
+                    src->buffer_for_test().pushed() - pushed_before,
+                    src->buffer_for_test().size(), evicted, counter(loss.events_lost),
+                    counter(loss.rt_buffers_lost), loss.decode_failed,
+                    static_cast<int>(loss.query_ok), static_cast<int>(etw_running()),
+                    static_cast<int>(from_this_pid), t.db.get_config("registry_capture_method", ""));
+                // meson's job-log tail is the last 100 lines of the test's stdout then its
+                // stderr section, and hundreds of lines of per-case output follow this case,
+                // so a Catch2 message alone reaches only the uploaded meson-logs artifact.
+                // stderr is printed last: put the same text there too.
+                std::fputs(std::format("[#7135] {}\n", detail).c_str(), stderr);
+                // The session table is a separate line, after this one: QueryAllTracesW has no
+                // deadline, and in the unhealthy-ETW state this diagnoses a hang there must not
+                // lose the line above (#7173).
+                const std::string table = etw_session_table();
+                std::fputs(std::format("[#7135] {}\n", table).c_str(), stderr);
+                FAIL(detail + " " + table);
+            }
+        } else if (await_event) {
+            // The ETW attribution wait is skipped when the session is not running (a host that
+            // cannot start one, or one that died since start). Say so in the job-log tail, or a
+            // later assertion fails with no state text (#7135).
+            std::fputs("[#7135] ETW session not running at write time; ETW attribution wait skipped\n",
+                       stderr);
+        }
         tick(t.db, *src);
         g_clock_offset = kEtwSettle100ns + SEC;
         tick(t.db, *src);
@@ -2425,29 +6230,43 @@ TEST_CASE("registry live: set, change and delete through a pre-opened handle are
     if (std::stoi(run.t.db.get_config("registry_watch_roots", "0")) == 0)
         FAIL("the watch did not arm");
     if (const auto method = run.t.db.get_config("registry_capture_method", ""); method != "notify+etw") {
-        if (is_elevated())
-            FAIL("the token is elevated but the ETW session did not open: registry_capture_method="
-                 << method);
-        SKIP("ETW session unavailable (not elevated)");
+        require_etw_or_skip(run.etw_start_error ? run.etw_start_error() : 0,
+                            "registry_capture_method=" + method);
     }
 
     DWORD one = 1, two = 2;
     run.transition([&] { RegSetValueExW(key.h, L"LiveVal", 0, REG_DWORD, reinterpret_cast<BYTE*>(&one), 4); },
                    mine("LiveVal", RegistryEtwOp::Set));
-    run.transition([&] { RegSetValueExW(key.h, L"LiveVal", 0, REG_DWORD, reinterpret_cast<BYTE*>(&two), 4); },
-                   mine("LiveVal", RegistryEtwOp::Set));
+    // The key's own LastWriteTime right after the second write: the row's time must be this, not
+    // the moment the reader happened to look. (No other writer touches this salted key.)
+    std::int64_t changed_written_unix = 0;
+    run.transition(
+        [&] {
+            RegSetValueExW(key.h, L"LiveVal", 0, REG_DWORD, reinterpret_cast<BYTE*>(&two), 4);
+            FILETIME ft{};
+            if (RegQueryInfoKeyW(key.h, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+                                 nullptr, nullptr, nullptr, nullptr, &ft) == ERROR_SUCCESS) {
+                const auto ft100ns = (static_cast<std::uint64_t>(ft.dwHighDateTime) << 32) |
+                                     ft.dwLowDateTime;
+                changed_written_unix =
+                    static_cast<std::int64_t>((ft100ns - 116444736000000000ULL) / 10000000ULL);
+            }
+        },
+        mine("LiveVal", RegistryEtwOp::Set));
     run.transition([&] { RegDeleteValueW(key.h, L"LiveVal"); }, mine("LiveVal", RegistryEtwOp::DeleteValue));
 
-    const auto rows = q(run.t.db, "SELECT action, data, prev_data, actor_pid, actor_image, detail, source "
+    const auto rows = ql("SELECT action, data, prev_data, actor_pid, actor_image, detail, source, ts "
                                   "FROM registry_live WHERE value_name = 'LiveVal' ORDER BY id");
     REQUIRE(rows.rows.size() == 3);
     CHECK(rows.rows[0][0] == "added");
     CHECK(rows.rows[0][1] == "1");
     CHECK(rows.rows[1][0] == "changed");
     CHECK(rows.rows[1][1] == "2");
-    CHECK(rows.rows[1][2] == "1"); // prev
+    CHECK(rows.rows[1][2].empty()); // prev_data is not stored
+    REQUIRE(changed_written_unix > 0);
+    CHECK(std::stoll(rows.rows[1][7]) == changed_written_unix); // row time = the key's LastWriteTime
     CHECK(rows.rows[2][0] == "removed");
-    CHECK(rows.rows[2][2] == "2");
+    CHECK(rows.rows[2][2].empty());
     const auto me = std::to_string(::GetCurrentProcessId());
     for (const auto& r : rows.rows) {
         CHECK(r[3] == me); // this process wrote it
@@ -2468,7 +6287,7 @@ TEST_CASE("registry live: with the ETW leg disabled the same transitions land as
     tick(run.t.db, *run.src); // baseline
     DWORD v = 7;
     run.transition([&] { RegSetValueExW(key.h, L"OffVal", 0, REG_DWORD, reinterpret_cast<BYTE*>(&v), 4); });
-    const auto rows = q(run.t.db, "SELECT actor_pid, actor_image, detail FROM registry_live "
+    const auto rows = ql("SELECT actor_pid, actor_image, detail FROM registry_live "
                                   "WHERE value_name = 'OffVal'");
     REQUIRE(rows.rows.size() == 1);
     CHECK(rows.rows[0][0] == "0");
@@ -2490,13 +6309,12 @@ TEST_CASE("registry live: stop leaves no ETW session behind", "[echo][registry][
     g_clock_offset = 0;
     auto reader = live_reader();
     auto etw_running = reader.etw_running;
+    auto start_error = reader.etw_start_error;
     auto src = make_registry_cursor_source(RegistryScope{{"SOFTWARE\\yuzu_test_reg_none"}, {}}, std::move(reader));
     TestDb t = make_db();
     src->start(t.db); // ~RegistryCursorSource() stops the session even if a REQUIRE below throws
     if (!etw_running()) {
-        if (is_elevated())
-            FAIL("the token is elevated but the ETW session did not open");
-        SKIP("ETW session unavailable (not elevated)");
+        require_etw_or_skip(start_error ? start_error() : 0, "etw_running is false after start");
     }
     REQUIRE(session_exists()); // the positive control: the lookup does find a running session
     // A collect samples the session's loss (ControlTraceW QUERY), which writes into the block the
@@ -2525,7 +6343,7 @@ TEST_CASE("registry live: a deleted and recreated root re-arms (R13)", "[echo][r
         RegDeleteTreeW(HKEY_LOCAL_MACHINE, key.path.c_str());
         RegDeleteKeyW(HKEY_LOCAL_MACHINE, key.path.c_str());
     }); // Absent: values and the key removed
-    const auto removed = q(run.t.db, "SELECT COUNT(*) FROM registry_live WHERE action IN ('removed','key_removed')");
+    const auto removed = ql("SELECT COUNT(*) FROM registry_live WHERE action IN ('removed','key_removed')");
     CHECK(std::stoi(removed.rows[0][0]) >= 1);
 
     // Recreated: the root is unarmed, so this tick re-opens it and arms it again ...
@@ -2534,7 +6352,7 @@ TEST_CASE("registry live: a deleted and recreated root re-arms (R13)", "[echo][r
     CHECK(run.t.db.get_config("registry_watch_roots_unarmed", "") == "0"); // armed again
     // ... and a write after that is reported by the key watch itself, not by a hand-made mark.
     run.transition([&] { RegSetValueExW(key.h, L"Again", 0, REG_DWORD, reinterpret_cast<BYTE*>(&v), 4); });
-    CHECK(std::stoi(q(run.t.db, "SELECT COUNT(*) FROM registry_live WHERE value_name = 'Again' AND action = 'added'")
+    CHECK(std::stoi(ql("SELECT COUNT(*) FROM registry_live WHERE value_name = 'Again' AND action = 'added'")
                        .rows[0][0]) == 1);
 }
 
@@ -2661,6 +6479,167 @@ TEST_CASE("registry live: a symbolic-link key is read as the link and never foll
     REQUIRE(link_key.remove() == 0);
 }
 
+namespace {
+
+// Restores an allow-all DACL on denied test children before the owning TestKey deletes the tree
+// (RegDeleteTreeW cannot delete a key this token may not open). Declare it AFTER the TestKey.
+struct DeniedChildrenGuard {
+    HKEY parent;
+    std::vector<std::wstring> names;
+    explicit DeniedChildrenGuard(HKEY p) : parent(p) {}
+    DeniedChildrenGuard(const DeniedChildrenGuard&) = delete;
+    DeniedChildrenGuard& operator=(const DeniedChildrenGuard&) = delete;
+    ~DeniedChildrenGuard() {
+        PSECURITY_DESCRIPTOR allow = nullptr;
+        if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(L"D:PAI(A;;KA;;;WD)", SDDL_REVISION_1,
+                                                                   &allow, nullptr))
+            return;
+        for (const auto& n : names) {
+            HKEY h = nullptr;
+            if (RegOpenKeyExW(parent, n.c_str(), 0, WRITE_DAC, &h) == ERROR_SUCCESS) {
+                RegSetKeySecurity(h, DACL_SECURITY_INFORMATION, allow);
+                RegCloseKey(h);
+            }
+        }
+        LocalFree(allow);
+    }
+};
+
+// A key whose name holds U+0000: only the native API can create or delete one. The handle stays
+// open until the destructor deletes the key through it, so every exit path removes it. Declare
+// it AFTER the TestKey that owns `parent`.
+struct NulNamedKey {
+    using Fn = LONG(NTAPI*)(PHANDLE, ACCESS_MASK, void*, ULONG, void*, ULONG, PULONG);
+    struct Unicode {
+        USHORT Length, MaximumLength;
+        PWSTR Buffer;
+    };
+    struct ObjAttr {
+        ULONG Length;
+        HANDLE RootDirectory;
+        Unicode* ObjectName;
+        ULONG Attributes;
+        PVOID SecurityDescriptor, SecurityQualityOfService;
+    };
+    HANDLE h{nullptr};
+
+    // 0 on success, else the NTSTATUS (or ERROR_PROC_NOT_FOUND).
+    LONG create(HKEY parent, std::wstring name) {
+        const auto fn = reinterpret_cast<Fn>(
+            reinterpret_cast<void*>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtCreateKey")));
+        if (fn == nullptr)
+            return ERROR_PROC_NOT_FOUND;
+        Unicode u{static_cast<USHORT>(name.size() * sizeof(wchar_t)),
+                  static_cast<USHORT>(name.size() * sizeof(wchar_t)), name.data()};
+        ObjAttr oa{sizeof(ObjAttr), parent, &u, 0x40 /*OBJ_CASE_INSENSITIVE*/, nullptr, nullptr};
+        return fn(&h, KEY_ALL_ACCESS, &oa, 0, nullptr, 0, nullptr);
+    }
+    ~NulNamedKey() {
+        if (h == nullptr)
+            return;
+        using DelFn = LONG(NTAPI*)(HANDLE);
+        if (const auto del = reinterpret_cast<DelFn>(
+               reinterpret_cast<void*>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtDeleteKey"))))
+            del(h);
+        RegCloseKey(static_cast<HKEY>(h));
+    }
+};
+
+} // namespace
+
+TEST_CASE("registry live: 33 denied children do not stop a later sibling being read",
+          "[echo][registry][windows]") {
+    const std::string leaf = "yuzu_test_reg_" + salt();
+    TestKey key(leaf);
+    if (key.create() != ERROR_SUCCESS)
+        SKIP("cannot write HKLM (not elevated)");
+    DeniedChildrenGuard guard(key.h);
+    PSECURITY_DESCRIPTOR deny = nullptr;
+    REQUIRE(ConvertStringSecurityDescriptorToSecurityDescriptorW(L"D:PAI(D;;KR;;;WD)(A;;KA;;;SY)(A;;KA;;;BA)",
+                                                                  SDDL_REVISION_1, &deny, nullptr));
+    for (std::size_t i = 0; i < kSkippedCap + 1; ++i) {
+        const std::wstring name = L"Denied" + std::to_wstring(1000 + i);
+        guard.names.push_back(name);
+        HKEY k = nullptr;
+        REQUIRE(RegCreateKeyExW(key.h, name.c_str(), 0, nullptr, 0, KEY_ALL_ACCESS, nullptr, &k, nullptr) ==
+                ERROR_SUCCESS);
+        RegSetKeySecurity(k, DACL_SECURITY_INFORMATION, deny);
+        RegCloseKey(k);
+    }
+    LocalFree(deny);
+    HKEY later = nullptr; // sorts after every denied child
+    REQUIRE(RegCreateKeyExW(key.h, L"zz_later", 0, nullptr, 0, KEY_ALL_ACCESS, nullptr, &later, nullptr) ==
+            ERROR_SUCCESS);
+    DWORD seen = 9;
+    RegSetValueExW(later, L"Seen", 0, REG_DWORD, reinterpret_cast<BYTE*>(&seen), 4);
+    RegCloseKey(later);
+
+    auto reader = make_windows_registry_reader();
+    const std::string root = "HKLM\\SOFTWARE\\" + leaf;
+    const auto r = reader.read_subtree(root, reader.now_ts() + kSnapshotBudget100ns);
+    CHECK(r.status == RegistryReadStatus::Capped); // an unnamed denied child: no removals derived
+    CHECK(r.skipped.size() == kSkippedCap);
+    CHECK(r.skipped_overflow == 1);
+    REQUIRE(r.keys.contains(root + "\\zz_later")); // the sibling after the 33rd denied child is read
+    CHECK(r.keys.at(root + "\\zz_later").contains("Seen"));
+}
+
+TEST_CASE("registry live: value and subkey pairs that differ only in a lone surrogate are both captured",
+          "[echo][registry][windows]") {
+    const std::string leaf = "yuzu_test_reg_" + salt();
+    TestKey key(leaf);
+    if (key.create() != ERROR_SUCCESS)
+        SKIP("cannot write HKLM (not elevated)");
+    // Both convert to "p" + U+FFFD through the lossy path; as identities they must stay apart.
+    const std::wstring n1{L'p', static_cast<wchar_t>(0xD800)}, n2{L'p', static_cast<wchar_t>(0xD801)};
+    DWORD one = 1, two = 2;
+    REQUIRE(RegSetValueExW(key.h, n1.c_str(), 0, REG_DWORD, reinterpret_cast<BYTE*>(&one), 4) == ERROR_SUCCESS);
+    REQUIRE(RegSetValueExW(key.h, n2.c_str(), 0, REG_DWORD, reinterpret_cast<BYTE*>(&two), 4) == ERROR_SUCCESS);
+    for (const auto* n : {&n1, &n2}) {
+        HKEY k = nullptr;
+        REQUIRE(RegCreateKeyExW(key.h, n->c_str(), 0, nullptr, 0, KEY_ALL_ACCESS, nullptr, &k, nullptr) ==
+                ERROR_SUCCESS);
+        RegCloseKey(k);
+    }
+    auto reader = make_windows_registry_reader();
+    const std::string root = "HKLM\\SOFTWARE\\" + leaf;
+    const auto r = reader.read_subtree(root, reader.now_ts() + kSnapshotBudget100ns);
+    REQUIRE(r.status == RegistryReadStatus::Complete);
+    const std::string e1 = registry_name_utf8(std::u16string{u'p', char16_t(0xD800)});
+    const std::string e2 = registry_name_utf8(std::u16string{u'p', char16_t(0xD801)});
+    REQUIRE(e1 != e2);
+    CHECK(r.keys.at(root).size() == 2);
+    CHECK(r.keys.at(root).contains(e1));
+    CHECK(r.keys.at(root).contains(e2));
+    CHECK(r.keys.contains(root + "\\" + e1));
+    CHECK(r.keys.contains(root + "\\" + e2));
+}
+
+TEST_CASE("registry live: a NUL-named child is reported as skipped", "[echo][registry][windows]") {
+    const std::string leaf = "yuzu_test_reg_" + salt();
+    TestKey key(leaf);
+    if (key.create() != ERROR_SUCCESS)
+        SKIP("cannot write HKLM (not elevated)");
+    NulNamedKey nul_key; // after `key`: destroyed first
+    // HKLM is writable here, so a failure to build the test subject is a broken test, not an
+    // environment cause: it must be red, never a skip that leaves the NUL path unproven.
+    const LONG nul_st = nul_key.create(key.h, std::wstring{L'n', L'\0', L'm'});
+    INFO("NtCreateKey NTSTATUS " << nul_st);
+    REQUIRE(nul_st == 0);
+    HKEY later = nullptr;
+    REQUIRE(RegCreateKeyExW(key.h, L"zz_later", 0, nullptr, 0, KEY_ALL_ACCESS, nullptr, &later, nullptr) ==
+            ERROR_SUCCESS);
+    RegCloseKey(later);
+
+    auto reader = make_windows_registry_reader();
+    const std::string root = "HKLM\\SOFTWARE\\" + leaf;
+    const auto r = reader.read_subtree(root, reader.now_ts() + kSnapshotBudget100ns);
+    CHECK(r.status == RegistryReadStatus::Complete);
+    CHECK(r.skipped == std::vector<std::string>{root + "\\" + std::string("n\0m", 3)});
+    CHECK_FALSE(r.keys.contains(root + "\\" + std::string("n\0m", 3)));
+    CHECK(r.keys.contains(root + "\\zz_later")); // the siblings are still read
+}
+
 TEST_CASE("registry live: stop is idempotent and destruction after stop is clean",
           "[echo][registry][windows]") {
     {
@@ -2689,6 +6668,374 @@ TEST_CASE("registry live: a pid is named only if its process already existed whe
     CHECK_FALSE(process_basename_for_pid(pid, created_at).empty());         // stamped at creation
     CHECK_FALSE(process_basename_for_pid(pid, created_at - kSlack).empty()); // exactly the slack: named
     CHECK(process_basename_for_pid(pid, created_at - kSlack - 1).empty());   // past it: the pid was reused
+}
+
+// ── Offline (unloaded) hives: the real guarded mount ─────────────────────────
+// A hive file is saved from a scratch HKCU key (RegSaveKeyExW under SeBackupPrivilege) and
+// read back through the production read_offline_hive: the real with_user_hive ladder, the real
+// default hive-file guard, the real bounded worker. Each case SKIPs, naming the reason, when the
+// token cannot save or load a hive or the guard (correctly) refuses a fixture owned by an
+// account outside its allow-set; the run that counts as evidence reports RUN, not SKIP.
+
+namespace {
+
+// A SID no real profile carries, salted per process (a fixed width, so no SID is a prefix of
+// another): concurrent jobs on a shared runner never see each other's mounts (CLAUDE.md #1871).
+const std::string& offline_fake_sid() {
+    static const std::string sid = [] {
+        const auto salted = 1'000'000'000u + yuzu::test::process_random_salt() % 3'000'000'000u;
+        return "S-1-5-21-1-2-3-" + std::to_string(salted); // always 10 digits
+    }();
+    return sid;
+}
+
+// The HKEY_USERS subkeys CONTAINING the fake sid: the mount name is salted
+// (unique_hive_mount_name), so an exact-name check would never see a leak. A failed listing is
+// retried; one that never succeeds is recorded as a failure and reports listed=false, so it is
+// never read as "no mount".
+struct OfflineMounts {
+    std::vector<std::string> names;
+    bool listed{false};
+};
+
+OfflineMounts offline_fake_mounts() {
+    constexpr int kAttempts = 3;
+    for (int attempt = 1; attempt <= kAttempts; ++attempt) {
+        const auto hku = yuzu::win::enumerate_hku_subkeys_checked();
+        if (hku.error.empty()) {
+            OfflineMounts m;
+            m.listed = true;
+            for (const auto& n : hku.names)
+                if (n.find(offline_fake_sid()) != std::string::npos)
+                    m.names.push_back(n);
+            return m;
+        }
+        if (attempt == kAttempts)
+            FAIL_CHECK("the HKEY_USERS listing failed " << kAttempts
+                                                         << " times: " << hku.error);
+    }
+    return {};
+}
+
+// True when a mount is present or the listing could not say (that failure is already recorded).
+bool offline_fake_mount_present() {
+    const auto m = offline_fake_mounts();
+    return !m.listed || !m.names.empty();
+}
+
+// Unconditional on every exit path: the shared box must never keep a mount of ours.
+struct OfflineMountSweep {
+    ~OfflineMountSweep() {
+        constexpr int kPasses = 3;
+        for (int pass = 0; pass < kPasses; ++pass) {
+            const auto m = offline_fake_mounts();
+            if (!m.listed || m.names.empty())
+                return;
+            const yuzu::win::PrivilegeScope restore(L"SeRestorePrivilege");
+            const yuzu::win::PrivilegeScope backup(L"SeBackupPrivilege");
+            for (const auto& n : m.names)
+                RegUnLoadKeyW(HKEY_USERS, yuzu::win::to_wide(n).c_str());
+        }
+        const auto left = offline_fake_mounts();
+        if (left.listed && !left.names.empty())
+            FAIL_CHECK("a salted YUZU_HIVE mount of this process is still loaded after "
+                       << kPasses << " unload passes: " << left.names.front());
+    }
+};
+
+// A per-process-salted non-volatile HKCU scratch key, removed on exit.
+struct ScratchHiveKey {
+    std::wstring path;
+    HKEY h{nullptr};
+    ScratchHiveKey()
+        : path(L"Software\\yuzu_test_regoff_" + yuzu::win::to_wide(salt())) {
+        REQUIRE(RegCreateKeyExW(HKEY_CURRENT_USER, path.c_str(), 0, nullptr,
+                                REG_OPTION_NON_VOLATILE, KEY_ALL_ACCESS, nullptr, &h,
+                                nullptr) == ERROR_SUCCESS);
+    }
+    ~ScratchHiveKey() {
+        if (h != nullptr)
+            RegCloseKey(h);
+        RegDeleteTreeW(HKEY_CURRENT_USER, path.c_str());
+    }
+    ScratchHiveKey(const ScratchHiveKey&) = delete;
+    ScratchHiveKey& operator=(const ScratchHiveKey&) = delete;
+};
+
+// stop() is idempotent and safe on a reader that never started.
+struct ReaderStop {
+    RegistryReader& r;
+    ~ReaderStop() { r.stop(); }
+};
+
+} // namespace
+
+TEST_CASE("registry live: an offline hive is mounted once through the guarded ladder, read under its logical name, and unloaded",
+          "[echo][registry][windows]") {
+    OfflineMountSweep sweep;
+    ScratchHiveKey scratch;
+    {
+        yuzu::win::RegKey run;
+        REQUIRE(RegCreateKeyExW(scratch.h, L"Software\\yuzu_test_u\\Run", 0, nullptr,
+                                REG_OPTION_NON_VOLATILE, KEY_ALL_ACCESS, nullptr, run.put(),
+                                nullptr) == ERROR_SUCCESS);
+        const std::wstring v = L"1";
+        REQUIRE(RegSetValueExW(run.get(), L"v", 0, REG_SZ,
+                               reinterpret_cast<const BYTE*>(v.c_str()),
+                               static_cast<DWORD>((v.size() + 1) * sizeof(wchar_t))) ==
+                ERROR_SUCCESS);
+    }
+    yuzu::test::TempDir tmp("yuzu_test_regoffline_");
+    fs::create_directories(tmp.path);
+    {
+        const yuzu::win::PrivilegeScope backup(L"SeBackupPrivilege");
+        if (!backup.ok())
+            SKIP("saving a mountable hive needs SeBackupPrivilege: not held here");
+        const LONG rc = RegSaveKeyExW(scratch.h, (tmp.path / "NTUSER.DAT").c_str(), nullptr,
+                                      REG_LATEST_FORMAT);
+        if (rc == ERROR_PRIVILEGE_NOT_HELD)
+            SKIP("RegSaveKeyExW: privilege not held");
+        REQUIRE(rc == ERROR_SUCCESS);
+    }
+    const std::string profile = yuzu::win::from_wide(tmp.path.c_str());
+    const std::string sid = offline_fake_sid();
+    const std::string logical = "HKU\\" + sid + "\\Software\\yuzu_test_u\\Run";
+
+    auto reader = make_windows_registry_reader();
+    const ReaderStop stop{reader};
+    const auto hv = reader.read_offline_hive(sid, profile, {logical}, reader.now_ts() + 60 * SEC);
+    if (hv.reason == "offline:privilege_missing")
+        SKIP("the offline arm needs SeBackupPrivilege and SeRestorePrivilege: not held here");
+    if (hv.reason.starts_with("offline:hive_owner"))
+        SKIP("the default guard refuses a fixture hive owned by an account outside its allow-set "
+             "(run elevated)");
+    if (hv.reason.starts_with("offline:hive_path_"))
+        SKIP("the default guard refuses this runner's temp path (an 8.3 short name, a junction or a "
+             "path deeper than the guard allows): run where TEMP is a plain fixed-drive path");
+    INFO("reason=" << hv.reason);
+    REQUIRE(hv.attempted);
+    REQUIRE(hv.roots.contains(logical));
+    const auto& rd = hv.roots.at(logical);
+    REQUIRE(rd.status == RegistryReadStatus::Complete);
+    REQUIRE(rd.keys.contains(logical));
+    const auto& values = rd.keys.at(logical);
+    REQUIRE(values.contains("v"));
+    CHECK(values.at("v").type == 1); // REG_SZ
+    CHECK(values.at("v").bytes == utf16("1"));
+    for (const auto& [key, _] : rd.keys) { // labelled with the logical name, never the salted mount
+        CHECK(key.starts_with("HKU\\" + sid + "\\"));
+        CHECK(key.find("YUZU_HIVE") == std::string::npos);
+    }
+    CHECK_FALSE(offline_fake_mount_present());
+    CHECK(g_mount_workers_in_flight.load() == 0);
+
+    // The same hive read with a deadline that has already passed (a mount that landed late in the
+    // tick budget, or waited behind a sibling plugin's hold of the offline-hive lock): the reader
+    // answers Capped with nothing read, so the source must not keep it as a baseline (see
+    // "a Capped first read is not trusted" above, which pins what the source does with that answer).
+    const auto late = reader.read_offline_hive(sid, profile, {logical}, reader.now_ts() - SEC);
+    INFO("late reason=" << late.reason);
+    REQUIRE(late.attempted);
+    REQUIRE(late.roots.contains(logical));
+    CHECK(late.roots.at(logical).status == RegistryReadStatus::Capped);
+    CHECK(late.roots.at(logical).keys.empty());
+    CHECK_FALSE(offline_fake_mount_present());
+    CHECK(g_mount_workers_in_flight.load() == 0);
+}
+
+TEST_CASE("registry live: a profile path with no NTUSER.DAT answers every root Unreadable with an offline: reason and leaves no mount",
+          "[echo][registry][windows]") {
+    OfflineMountSweep sweep;
+    yuzu::test::TempDir tmp("yuzu_test_regoffline_empty_");
+    fs::create_directories(tmp.path);
+    const std::string profile = yuzu::win::from_wide(tmp.path.c_str());
+    const std::string sid = offline_fake_sid();
+    const std::string a = "HKU\\" + sid + "\\Software\\yuzu_test_u\\Run";
+    const std::string b = "HKU\\" + sid + "\\Software\\yuzu_test_u\\RunOnce";
+
+    auto reader = make_windows_registry_reader();
+    const ReaderStop stop{reader};
+    const auto hv = reader.read_offline_hive(sid, profile, {a, b}, reader.now_ts() + 60 * SEC);
+    if (hv.reason == "offline:privilege_missing")
+        SKIP("the offline arm needs SeBackupPrivilege and SeRestorePrivilege: not held here");
+    INFO("reason=" << hv.reason);
+    CHECK(hv.reason.starts_with("offline:"));
+    CHECK(hv.reason != "offline:ok");
+    for (const auto& root : {a, b}) {
+        REQUIRE(hv.roots.contains(root));
+        CHECK(hv.roots.at(root).status == RegistryReadStatus::Unreadable);
+        CHECK(hv.roots.at(root).reason.starts_with("offline:"));
+    }
+    CHECK_FALSE(offline_fake_mount_present());
+    CHECK(g_mount_workers_in_flight.load() == 0);
+}
+
+TEST_CASE("registry live: the start-up sweep unloads a leaked YUZU_HIVE_ mount and retains one a holder has open",
+          "[echo][registry][windows]") {
+    // A mount named by unique_hive_mount_name() itself, salted by this process's fake sid and swept
+    // through that sid's own prefix: the production sweep takes every YUZU_HIVE_* mount, and a
+    // concurrent job on a shared runner must never lose its own to this case.
+    // `tmp` is declared first so it is destroyed last: a REQUIRE that throws with a mount still
+    // loaded unloads it (`sweep`) before the directory holding its NTUSER.DAT is removed.
+    yuzu::test::TempDir tmp("yuzu_test_regsweep_");
+    OfflineMountSweep sweep;
+    ScratchHiveKey scratch;
+    fs::create_directories(tmp.path);
+    const fs::path hive = tmp.path / "NTUSER.DAT";
+    {
+        const yuzu::win::PrivilegeScope backup(L"SeBackupPrivilege");
+        if (!backup.ok())
+            SKIP("saving a mountable hive needs SeBackupPrivilege: not held here");
+        const LONG rc = RegSaveKeyExW(scratch.h, hive.c_str(), nullptr, REG_LATEST_FORMAT);
+        if (rc == ERROR_PRIVILEGE_NOT_HELD)
+            SKIP("RegSaveKeyExW: privilege not held");
+        REQUIRE(rc == ERROR_SUCCESS);
+    }
+    const std::string sid = offline_fake_sid();
+    const std::string prefix = std::string(kHiveMountPrefix) + sid + "_";
+    const std::string mount =
+        yuzu::win::from_wide(yuzu::win::unique_hive_mount_name(yuzu::win::to_wide(sid)).c_str());
+    // The sweep's prefix catches a name the shared minter really emits, not a look-alike.
+    REQUIRE(mount.starts_with(prefix));
+    const std::wstring wmount = yuzu::win::to_wide(mount);
+    // Both privileges revert when this returns, so the sweep must enable its own.
+    const auto load = [&]() -> LONG {
+        const yuzu::win::PrivilegeScope backup(L"SeBackupPrivilege");
+        const yuzu::win::PrivilegeScope restore(L"SeRestorePrivilege");
+        if (!backup.ok() || !restore.ok())
+            return ERROR_PRIVILEGE_NOT_HELD;
+        return RegLoadKeyW(HKEY_USERS, wmount.c_str(), hive.c_str());
+    };
+    REQUIRE_FALSE(offline_fake_mount_present());
+
+    SECTION("a leaked mount nothing holds is unloaded") {
+        const LONG rc = load();
+        if (rc == ERROR_PRIVILEGE_NOT_HELD)
+            SKIP("loading a hive needs SeBackupPrivilege and SeRestorePrivilege: not held here");
+        REQUIRE(rc == ERROR_SUCCESS);
+        REQUIRE(offline_fake_mount_present());
+        const auto r = sweep_leftover_hive_mounts(prefix);
+        CHECK(r.released == std::vector<std::string>{mount});
+        CHECK(r.retained.empty());
+        CHECK_FALSE(offline_fake_mount_present());
+        // Nothing left to sweep: a second run is a no-op.
+        const auto again = sweep_leftover_hive_mounts(prefix);
+        CHECK(again.released.empty());
+        CHECK(again.retained.empty());
+    }
+
+    SECTION("a mount a holder has open is retained, never forced, and released once the holder lets go") {
+        const LONG rc = load();
+        if (rc == ERROR_PRIVILEGE_NOT_HELD)
+            SKIP("loading a hive needs SeBackupPrivilege and SeRestorePrivilege: not held here");
+        REQUIRE(rc == ERROR_SUCCESS);
+        yuzu::win::RegKey holder; // closed before OfflineMountSweep's unconditional cleanup runs
+        REQUIRE(RegOpenKeyExW(HKEY_USERS, wmount.c_str(), 0, KEY_READ, holder.put()) == ERROR_SUCCESS);
+        const auto held = sweep_leftover_hive_mounts(prefix);
+        CHECK(held.released.empty());
+        CHECK(held.retained == std::vector<std::string>{mount});
+        CHECK(offline_fake_mount_present()); // still mounted: a holder's hive is not yanked
+        holder.reset();
+        const auto freed = sweep_leftover_hive_mounts(prefix);
+        CHECK(freed.released == std::vector<std::string>{mount});
+        CHECK(freed.retained.empty());
+        CHECK_FALSE(offline_fake_mount_present());
+    }
+}
+
+TEST_CASE("registry live: the checked HKU listing is complete and holds this process's loaded hives",
+          "[echo][registry][windows]") {
+    const auto listing = yuzu::win::enumerate_hku_subkeys_checked();
+    INFO("error=" << listing.error);
+    CHECK(listing.error.empty());
+    // .DEFAULT is always loaded, so an empty answer is a failed listing read as complete.
+    CHECK(std::find(listing.names.begin(), listing.names.end(), ".DEFAULT") != listing.names.end());
+}
+
+TEST_CASE("registry live: a root under an HKU hive that is not mounted reads Unreadable (hive_unloaded), never Absent",
+          "[echo][registry][windows]") {
+    // A user who logs off after collect() took its HKU snapshot leaves its root pointing at a hive
+    // that is gone. Absent would read as "every value was deleted" and blank the baseline.
+    OfflineMountSweep sweep;
+    auto reader = make_windows_registry_reader();
+    const ReaderStop stop{reader};
+    const std::string sid = offline_fake_sid();
+    REQUIRE_FALSE(offline_fake_mount_present());
+    const auto gone = reader.read_subtree("HKU\\" + sid + "\\Software\\yuzu_test_u\\Run",
+                                          reader.now_ts() + 60 * SEC);
+    INFO("reason=" << gone.reason);
+    CHECK(gone.status == RegistryReadStatus::Unreadable);
+    CHECK(gone.reason == "hive_unloaded");
+    CHECK(gone.keys.empty());
+
+    // A key that is missing under a hive that IS loaded stays Absent: only the whole hive's
+    // absence is a different answer. HKU\.DEFAULT is always loaded.
+    const auto missing = reader.read_subtree("HKU\\.DEFAULT\\Software\\yuzu_test_absent_" + salt(),
+                                             reader.now_ts() + 60 * SEC);
+    CHECK(missing.status == RegistryReadStatus::Absent);
+    CHECK(missing.reason.empty());
+}
+
+// Scoped owners for what process_user_sid() acquires: the process token and the LocalAlloc'd SID
+// string (an allocating call between acquire and release must not leak either).
+using TokenPtr = std::unique_ptr<void, decltype(&::CloseHandle)>;
+using LocalPtr = std::unique_ptr<void, decltype(&::LocalFree)>;
+
+// The SID of the account this process runs as.
+static std::string process_user_sid() {
+    HANDLE raw_token = nullptr;
+    REQUIRE(OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &raw_token));
+    const TokenPtr token{raw_token, ::CloseHandle};
+    DWORD len = 0;
+    GetTokenInformation(token.get(), TokenUser, nullptr, 0, &len);
+    std::vector<BYTE> buf(len);
+    REQUIRE(GetTokenInformation(token.get(), TokenUser, buf.data(), len, &len));
+    LPWSTR raw = nullptr;
+    // Aligned cast: vector<BYTE>::data() is a heap block aligned to the default new alignment.
+    // User.Sid points into `buf`, which outlives the conversion (the string is copied out by it).
+    REQUIRE(ConvertSidToStringSidW(reinterpret_cast<TOKEN_USER*>(buf.data())->User.Sid, &raw));
+    const LocalPtr guard{raw, ::LocalFree};
+    return yuzu::win::from_wide(raw);
+}
+
+TEST_CASE("registry live: the production profile discovery lists unloaded SID-named profiles with a path, and drops exactly the profile it is told is loaded",
+          "[echo][registry][windows]") {
+    auto reader = make_windows_registry_reader();
+    const ReaderStop stop{reader};
+    const auto loaded = yuzu::win::enumerate_hku_subkeys_checked().names;
+    const auto d = reader.offline_profiles(loaded);
+    INFO("profiles=" << d.profiles.size() << " partial=" << d.partial.size());
+    CHECK(d.complete); // a healthy host's ProfileList walk is complete
+    const std::string self = process_user_sid();
+    for (const auto& p : d.profiles) {
+        INFO("sid=" << p.sid << " path=" << p.path);
+        CHECK(is_user_hive_name(p.sid));
+        CHECK_FALSE(is_virtual_service_sid(p.sid));
+        CHECK_FALSE(p.path.empty());
+        CHECK(std::find(loaded.begin(), loaded.end(), p.sid) == loaded.end()); // disjoint
+        if (std::find(loaded.begin(), loaded.end(), self) != loaded.end())
+            CHECK(p.sid != self); // this session's own hive is loaded: never offline
+    }
+    if (d.profiles.empty())
+        SKIP("no unloaded profile with a recorded path on this host: there is nothing to tell the "
+             "walk is loaded");
+
+    // The argument is what decides: handed one more sid as loaded, the same walk loses exactly that
+    // profile and keeps every other it listed (compared as sets, so a profile that appears between
+    // the two walks on this shared box cannot fail the case).
+    const std::string victim = d.profiles.front().sid;
+    auto told = loaded;
+    told.push_back(victim);
+    const auto d2 = reader.offline_profiles(told);
+    std::set<std::string> after;
+    for (const auto& p : d2.profiles)
+        after.insert(p.sid);
+    CHECK_FALSE(after.contains(victim));
+    for (const auto& p : d.profiles)
+        if (p.sid != victim) {
+            INFO("kept sid=" << p.sid);
+            CHECK(after.contains(p.sid));
+        }
 }
 
 #endif // _WIN32

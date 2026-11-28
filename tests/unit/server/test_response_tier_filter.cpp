@@ -133,6 +133,33 @@ constexpr std::array<CommandCapability, 1> kDashedForensicsPlugin{{
     },
 }};
 
+
+// Rows for the stored-row flag: a plugin is Forensics-tier ONLY through `tier` when its securable is
+// not Forensics, so the single-target rule does not apply to it. The synthetic plugins below are a
+// flagged one, a flagged one that also has an ordinary row (the per-plugin response tier would
+// withhold the ordinary row's output too) and a flagged one whose name holds '-' (the hardware result
+// poll's command-id split cannot represent it, exactly as for a plugin on the Forensics securable).
+constexpr CommandCapability flag_row(std::string_view plugin, std::string_view action,
+                                     std::string_view securable, StoredRowTier tier) {
+    return {.plugin = plugin,
+            .action = action,
+            .dispatch_class = DispatchClass::ReadOnly,
+            .mutability = Mutability::None,
+            .securable = securable,
+            .operation = authz::Operation::Read,
+            .risk_tier = authz::RiskTier::High,
+            .system_reserved = false,
+            .execute_gate = ExecuteGate::AdminOrApproval,
+            .stored_rows = tier};
+}
+constexpr std::array<CommandCapability, 1> kFlaggedPlugin{
+    flag_row("Flagged", "read", "FileRetrieval", StoredRowTier::ForensicsRead)};
+constexpr std::array<CommandCapability, 2> kFlaggedAndOrdinaryPlugin{
+    flag_row("mixed_flag", "flagged_read", "FileRetrieval", StoredRowTier::ForensicsRead),
+    flag_row("Mixed_Flag", "ordinary_read", "Infrastructure", StoredRowTier::Ordinary)};
+constexpr std::array<CommandCapability, 1> kDashedFlaggedPlugin{
+    flag_row("dashed-flag", "read", "FileRetrieval", StoredRowTier::ForensicsRead)};
+
 } // namespace
 
 TEST_CASE("response tier filter: the types cannot be default-constructed",
@@ -239,6 +266,52 @@ TEST_CASE("an unsound catalogue is refused, not tolerated",
     }
 }
 
+TEST_CASE("a flagged catalogue that is unsound for a per-plugin tier is refused",
+          "[server][responses][security][forensics]") {
+    SECTION("a flagged plugin that also has an ordinary row") {
+        const CommandCapabilityRegistry registry{
+            std::span<const CommandCapability>(kFlaggedAndOrdinaryPlugin)};
+        const auto defect = forensics_catalogue_defect(registry);
+        REQUIRE(defect.has_value());
+        CHECK(defect->find("mixed_flag") != std::string::npos);
+        CHECK_FALSE(derive_forensics_plugin_set(registry).has_value());
+    }
+    SECTION("a flagged plugin whose name contains a dash") {
+        const CommandCapabilityRegistry registry{
+            std::span<const CommandCapability>(kDashedFlaggedPlugin)};
+        const auto defect = forensics_catalogue_defect(registry);
+        REQUIRE(defect.has_value());
+        CHECK(defect->find("dashed-flag") != std::string::npos);
+        CHECK_FALSE(derive_forensics_plugin_set(registry).has_value());
+    }
+    SECTION("a flagged plugin and an ordinary plugin side by side are sound") {
+        const CommandCapabilityRegistry registry{std::span<const CommandCapability>(kFlaggedPlugin),
+                                                 std::span<const CommandCapability>(kNoForensicsRows)};
+        CHECK_FALSE(forensics_catalogue_defect(registry).has_value());
+    }
+}
+
+TEST_CASE("a plugin flagged into the Forensics read tier joins the derived set without a Forensics row",
+          "[server][responses][security][forensics]") {
+    const CommandCapabilityRegistry registry{std::span<const CommandCapability>(kFlaggedPlugin),
+                                             std::span<const CommandCapability>(kMixedRows)};
+    CHECK_FALSE(forensics_catalogue_defect(registry).has_value());
+    // The flagged plugin is NOT on the Forensics securable: the set gets it from the flag alone.
+    CHECK(registry.plugins_on_securable(kForensicsSecurable) ==
+          std::vector<std::string>{"browser_inventory"});
+    const auto set = derive_forensics_plugin_set(registry);
+    REQUIRE(set.has_value());
+    CHECK(set->names() == std::vector<std::string>{"browser_inventory", "flagged", "~unverified"});
+    CHECK(set->contains("FLAGGED")); // the fold is ASCII-case-blind
+    CHECK_FALSE(set->contains("echo"));
+    SECTION("a registry whose only Forensics-tier plugin is a flagged one still derives a set") {
+        const CommandCapabilityRegistry only{std::span<const CommandCapability>(kFlaggedPlugin)};
+        const auto d = derive_forensics_plugin_set(only);
+        REQUIRE(d.has_value());
+        CHECK(d->names() == std::vector<std::string>{"flagged", "~unverified"});
+    }
+}
+
 TEST_CASE("the Forensics plugin set is derived from the catalogue, not a hand-kept list",
           "[server][responses][security][forensics]") {
     const CommandCapabilityRegistry registry{YUZU_ALL_CAPABILITY_FRAGMENTS};
@@ -248,8 +321,11 @@ TEST_CASE("the Forensics plugin set is derived from the catalogue, not a hand-ke
     // test_capability_catalogue.cpp, and confirm its stored rows are Forensics-tier on purpose.
     // `~unverified` (kUnverifiedProvenanceLabel, #4990) sorts last: the stored label of a
     // response whose command id has no server dispatch record is Forensics-tier by construction.
+    // `file_search` is the one member that is Forensics-tier through the catalogue's stored-row flag
+    // (its dispatch securable is FileRetrieval, not Forensics).
     CHECK(set->names() == std::vector<std::string>{"app_usage", "browser_inventory",
-                                                   "execution_artifacts", "privacy_permissions",
+                                                   "execution_artifacts", "file_search",
+                                                   "privacy_permissions", "process_introspect",
                                                    "remote_access_audit", "~unverified"});
 }
 
@@ -499,6 +575,29 @@ TEST_CASE("response.forensics.read detail: rows, plugins and a closed surface to
     // An out-of-range value is a fixed token, never an unbounded or empty one.
     CHECK(served.detail(static_cast<ForensicsSurface>(250)) ==
           "forensics_rows=2 plugins=app_usage,execution_artifacts surface=unknown");
+}
+
+// Option B: file_search's stored rows are Forensics-tier by one catalogue flag, so serving one is a
+// Forensics read -- counted, named and audited on the same verb as every other Forensics plugin. Over
+// the set the server derives from the real catalogue, not a hand-made one. Not a [pg] case: those
+// skip on the lanes and on braga, which would leave CI's pg shard as the first run.
+TEST_CASE("response.forensics.read: a served file_search row is counted and named over the real catalogue",
+          "[server][responses][security][forensics][audit]") {
+    const CommandCapabilityRegistry registry{YUZU_ALL_CAPABILITY_FRAGMENTS};
+    const auto set = derive_forensics_plugin_set(registry);
+    REQUIRE(set.has_value());
+
+    std::vector<StoredResponse> rows(3);
+    rows[0].plugin = "file_search";
+    rows[1].plugin = "FILE_SEARCH"; // ASCII case folded like the SQL predicate
+    rows[2].plugin = "shellexec";   // ordinary plugin: not counted
+
+    const auto served = summarize_forensics_served(rows, &*set);
+    REQUIRE(served.any());
+    CHECK(served.rows == 2);
+    CHECK(served.plugins == std::set<std::string>{"file_search"});
+    CHECK(served.detail(ForensicsSurface::kRest) == "forensics_rows=2 plugins=file_search surface=rest");
+    CHECK(std::string_view{kForensicsReadVerb} == "response.forensics.read");
 }
 
 TEST_CASE("response.forensics.read bundle summary counts only responded Forensics steps",

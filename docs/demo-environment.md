@@ -211,7 +211,7 @@ SBOMs are always release assets inside `SHA256SUMS`; a failed chisel build now
 blocks the release.
 
 The three-triplet **agent bundle** (`yuzu-agent-bundle-chisel`) is *not* built by
-this job — it repackages the release's own signed agent binaries for three OS
+this job — it repackages the release's own agent binaries (not code-signed) for three OS
 triplets and is published separately after the release (see `docs/agent-bundle.md`
 and `scripts/build-agent-bundle.sh`).
 

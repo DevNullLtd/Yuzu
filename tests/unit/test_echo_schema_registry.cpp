@@ -11,6 +11,7 @@
 //     `do_configure` is the de-duplicated union of all non-Unsupported
 //     methods, sorted, so error messages are stable.
 
+#include "echo_fold_schema.hpp"
 #include "echo_schema_registry.hpp"
 
 #include <catch2/catch_test_macros.hpp>
@@ -235,17 +236,18 @@ TEST_CASE("Echo schema: the registry source row (PR11.8)", "[echo][schema][regis
     REQUIRE(def != nullptr);
     CHECK(def->dollar_name == "Registry");
     CHECK(def->default_enabled);
-    CHECK(def->unique_key_column == "record_key");
     REQUIRE(def->os_support.size() == 3);
     CHECK(os_support_status("registry", "windows") == OsSupportStatus::kSupported);
     CHECK(supported_capture_method("registry", "windows") == "regnotify+etw");
     CHECK(os_support_status("registry", "linux") == OsSupportStatus::kUnsupported);
     CHECK(os_support_status("registry", "macos") == OsSupportStatus::kUnsupported);
-    REQUIRE(def->granularities.size() == 1); // one live tier, no rollups
-    CHECK(def->granularities[0].suffix == "live");
-    CHECK(def->granularities[0].retention_type == RetentionType::kRowCount);
-    CHECK(def->granularities[0].retention_default == 500000);
-    CHECK(is_queryable_table("registry_live"));
+    REQUIRE(def->granularities.size() == 2); // hourly + daily roll-up tiers, no raw table
+    CHECK(def->granularities[0].suffix == "hourly");
+    CHECK(def->granularities[0].retention_type == RetentionType::kTimeBased);
+    CHECK(def->granularities[0].retention_default == 7776000);
+    CHECK(def->granularities[1].suffix == "daily");
+    CHECK(is_queryable_table("registry_hourly"));
+    CHECK_FALSE(is_queryable_table("registry_live")); // the retired raw name is not queryable
 }
 
 // ── Per-source default-enabled (review R1) ──────────────────────────────────
@@ -274,13 +276,13 @@ TEST_CASE("Echo schema: software source is registered with three tiers + Windows
     REQUIRE(it != sources.end());
     CHECK(it->dollar_name == "Software");
 
-    // live + daily + monthly, in that declaration order (so run_aggregation rolls
-    // daily-from-live before monthly-from-daily within one tick).
+    // hourly + daily + monthly, the roll-up tiers the fold writes (there is no raw live table).
     REQUIRE(it->granularities.size() == 3);
-    CHECK(it->granularities[0].suffix == "live");
+    CHECK(it->granularities[0].suffix == "hourly");
     CHECK(it->granularities[1].suffix == "daily");
     CHECK(it->granularities[2].suffix == "monthly");
-    CHECK(it->granularities[0].retention_type == RetentionType::kRowCount);
+    for (const auto& g : it->granularities)
+        CHECK(g.retention_type == RetentionType::kTimeBased);
 
     // Windows is fully supported; Linux/macOS are planned (queryable-empty).
     for (const auto& os : it->os_support) {
@@ -322,30 +324,33 @@ TEST_CASE("Echo schema: perf + procperf are supported on Windows AND Linux (proc
 
 TEST_CASE("Echo schema: $Software dollar-names translate and DDL has the columns",
           "[echo][schema][software]") {
-    CHECK(translate_dollar_name("$Software_Live") == "software_live");
+    CHECK_FALSE(translate_dollar_name("$Software_Live").has_value()); // retired raw name
     CHECK(translate_dollar_name("$Software_Daily") == "software_daily");
     CHECK(translate_dollar_name("$Software_Monthly") == "software_monthly");
 
     // The warehouse tables are allowlisted for the read-only echo.sql sandbox.
-    CHECK(is_queryable_table("software_live"));
+    CHECK_FALSE(is_queryable_table("software_live"));
     CHECK(is_queryable_table("software_daily"));
 
-    const auto ddl = generate_warehouse_ddl();
-    CHECK(ddl.find("CREATE TABLE IF NOT EXISTS software_live") != std::string::npos);
-    CHECK(ddl.find("prev_version") != std::string::npos);
+    // No DDL creates software_live: a roll-up tier is created by the fold DDL (a table behind a
+    // view), and the retired raw name has neither a table nor a view.
+    CHECK(generate_warehouse_ddl().find("software_live") == std::string::npos);
+    CHECK(generate_fold_ddl().find("software_live") == std::string::npos);
+    CHECK(generate_fold_ddl().find("CREATE TABLE IF NOT EXISTS software_hourly_r") != std::string::npos);
+    CHECK(columns_for_table("software_live").empty());
 
-    // live carries the full event columns (machine scope only — no scope/user);
-    // daily/monthly carry the count rollup.
-    auto live_cols = columns_for_table("software_live");
-    for (const auto* c : {"action", "name", "version", "prev_version", "publisher",
-                          "install_date"}) {
-        INFO("software_live column=" << c);
-        CHECK(std::find(live_cols.begin(), live_cols.end(), c) != live_cols.end());
+    // The hourly tier carries the application identity and the event counts (machine scope only
+    // — no scope/user); daily/monthly carry the same count rollup.
+    auto hourly_cols = columns_for_table("software_hourly");
+    for (const auto* c : {"name", "version", "publisher", "install_count", "remove_count",
+                          "upgrade_count"}) {
+        INFO("software_hourly column=" << c);
+        CHECK(std::find(hourly_cols.begin(), hourly_cols.end(), c) != hourly_cols.end());
     }
     // scope/user were dropped with per-user scope (#1620) — they must NOT exist.
     for (const auto* c : {"scope", "user"}) {
-        INFO("software_live must NOT have column=" << c);
-        CHECK(std::find(live_cols.begin(), live_cols.end(), c) == live_cols.end());
+        INFO("software_hourly must NOT have column=" << c);
+        CHECK(std::find(hourly_cols.begin(), hourly_cols.end(), c) == hourly_cols.end());
     }
     auto daily_cols = columns_for_table("software_daily");
     for (const auto* c : {"install_count", "remove_count", "upgrade_count"}) {
@@ -363,7 +368,7 @@ TEST_CASE("Echo schema: usage tables are excluded from the echo.sql allowlist (#
     CHECK_FALSE(is_queryable_table("usage_daily_user"));
 
     // A generic warehouse table stays reachable -- this isn't a broken allowlist.
-    CHECK(is_queryable_table("process_live"));
+    CHECK(is_queryable_table("process_hourly"));
     CHECK(is_queryable_table("echo_config"));
     CHECK(is_queryable_table("echo_cursor"));
 }
@@ -397,11 +402,12 @@ TEST_CASE("Echo schema: netqual Windows is kSupportedConstrained via estats (ADR
     auto mac_methods = accepted_capture_methods_for_os("netqual", "macos");
     CHECK(std::find(mac_methods.begin(), mac_methods.end(), "nstat") != mac_methods.end());
 
-    // live + the per-boot retrospective baseline tier.
-    REQUIRE(it->granularities.size() == 2);
-    CHECK(it->granularities[0].suffix == "live");
-    CHECK(it->granularities[1].suffix == "boot");
-    CHECK(it->granularities[1].retention_type == RetentionType::kRowCount);
+    // The per-boot retrospective baseline tier (a plain table) plus the hourly and daily roll-ups.
+    REQUIRE(it->granularities.size() == 3);
+    CHECK(it->granularities[0].suffix == "boot");
+    CHECK(it->granularities[0].retention_type == RetentionType::kRowCount);
+    CHECK(it->granularities[1].suffix == "hourly");
+    CHECK(it->granularities[2].suffix == "daily");
 
     CHECK(translate_dollar_name("$NetQual_Boot") == "netqual_boot");
     CHECK(is_queryable_table("netqual_boot"));
@@ -412,7 +418,7 @@ TEST_CASE("Echo schema: netqual Windows is kSupportedConstrained via estats (ADR
     }
 }
 
-TEST_CASE("Echo schema: netconn source is registered live-only with Windows wevtapi support",
+TEST_CASE("Echo schema: netconn source is registered with hourly and daily tiers and Windows wevtapi support",
           "[echo][schema][netconn]") {
     const auto& sources = capture_sources();
     auto it = std::find_if(sources.begin(), sources.end(),
@@ -420,9 +426,11 @@ TEST_CASE("Echo schema: netconn source is registered live-only with Windows wevt
     REQUIRE(it != sources.end());
     CHECK(it->dollar_name == "NetConn");
 
-    REQUIRE(it->granularities.size() == 1);
-    CHECK(it->granularities[0].suffix == "live");
-    CHECK(it->granularities[0].retention_type == RetentionType::kRowCount);
+    REQUIRE(it->granularities.size() == 2);
+    CHECK(it->granularities[0].suffix == "hourly");
+    CHECK(it->granularities[1].suffix == "daily");
+    for (const auto& g : it->granularities)
+        CHECK(g.retention_type == RetentionType::kTimeBased);
 
     for (const auto& os : it->os_support) {
         INFO("netconn os=" << os.os);
@@ -434,14 +442,17 @@ TEST_CASE("Echo schema: netconn source is registered live-only with Windows wevt
         }
     }
 
-    CHECK(translate_dollar_name("$NetConn_Live") == "netconn_live");
-    CHECK(is_queryable_table("netconn_live"));
-    auto cols = columns_for_table("netconn_live");
+    CHECK_FALSE(translate_dollar_name("$NetConn_Live").has_value()); // retired raw name
+    CHECK_FALSE(is_queryable_table("netconn_live"));
+    CHECK(translate_dollar_name("$NetConn_Hourly") == "netconn_hourly");
+    CHECK(is_queryable_table("netconn_hourly"));
+    auto cols = columns_for_table("netconn_hourly");
     // The full column set IS the privacy contract: closed enum/numeric fields
     // only — any free-text addition (SSID, profile name, GUID) must fail here.
-    const std::vector<std::string> expected = {"id",         "ts",       "snapshot_id",
-                                               "action",     "channel",  "category",
-                                               "capability", "iface_kind", "reason_code"};
+    const std::vector<std::string> expected = {
+        "id",         "hour_ts",    "action",   "channel",    "category",
+        "capability", "iface_kind", "reason_code", "phy_type", "auth_alg",
+        "cipher_alg", "event_count", "last_ts"};
     CHECK(cols == expected);
 }
 

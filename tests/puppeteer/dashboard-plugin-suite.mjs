@@ -95,7 +95,7 @@ const GROUPS = [
     ['firewall rules', 1],
     ['bitlocker state', 1],
     ['certificates list', 1],
-    ['quarantine status', 1],
+    ['firewall quarantine_status', 1],
   ]],
   ['Windows Updates', [
     ['windows_updates installed', 0],  // may be 0

@@ -4,14 +4,18 @@
 The one summary parser for every gateway test gate: imported by
 scripts/test_gateway.py (the Meson gate, via require_tests_executed), and run
 as a CLI by scripts/test/eunit-gate.sh (/test) and the release workflow's
-EUnit step (`cancel-tolerant`) and by gateway/test_runner.sh (`cancel-tolerant`
-for eunit, `strict` for ct). Pinned by tests/test_gateway_test_summary.py.
+EUnit step and by gateway/test_runner.sh. Every gate is strict: cancellation,
+nonzero exit, failed assertions and zero execution cannot pass. The old
+`cancel-tolerant` CLI remains a fail-closed compatibility alias. Pinned by
+tests/test_gateway_test_summary.py.
 Kept in its own module (not inline in the wrapper) because the wrapper runs
 rebar3 at import time and so cannot be imported by a test.
 
 """
 import re
 import sys
+import tempfile
+from pathlib import Path
 
 # rebar3 exits 0 when it discovers nothing to run, so a green exit code
 # alone proves nothing. A run is only a pass if its final summary line
@@ -32,6 +36,7 @@ import sys
 # No recognisable summary on an otherwise-green run is ALSO a failure: we
 # cannot confirm anything ran.
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+_CANCELLED_RE = re.compile(r"^[ \t]*One or more tests were cancelled\.[ \t\r]*$", re.M)
 # Each alternative must be the WHOLE line (re.M + ^...$): rebar3 and eunit
 # always print their summary on a line of its own (eunit_tty.erl,
 # rebar_prv_common_test), so anchoring stops a test's own log text that
@@ -60,7 +65,7 @@ def last_summary(text):
     """(executed, failed, eunit_failed_line) from the LAST summary, or None.
 
     eunit_failed_line is True only for eunit's "Failed: F.  Skipped: S.
-    Passed: P." shape, the one shape #1005's cancellation tolerance applies to.
+    Passed: P." shape (retained for callers inspecting summary format).
     """
     last = None
     for m in _SUMMARY_RE.finditer(_ANSI_RE.sub("", text)):
@@ -89,64 +94,90 @@ def executed_count(text):
     return None if s is None else s[0]
 
 
-def require_tests_executed(text, label, returncode, prog="test_gateway.py"):
-    """Turn a green exit with zero executed tests into a failure."""
+def strict_verdict(text, returncode):
+    """Return (exit_code, level, message) without accepting partial cancellation.
+
+    A nonzero child status is preserved. Even a zero status cannot override
+    a failed summary or EUnit's cancellation marker. The final summary must
+    still establish that at least one test ran (#4800).
+    """
+    s = last_summary(text)
+    cancelled = bool(_CANCELLED_RE.search(_ANSI_RE.sub("", text)))
     if returncode != 0:
-        return returncode
-    executed = executed_count(text)
-    if executed is None:
-        print(f"\n[{prog}] {label}: rebar3 exited 0 but printed no "
-              "recognisable test summary -- cannot confirm any test ran. "
-              "Failing (#4800). If rebar3 changed its summary wording, "
-              "update scripts/gateway_test_summary.py.", file=sys.stderr)
-        return 1
+        detail = (f"summary reports {s[1]} failed of {s[0]} executed."
+                  if s else "no recognisable test summary.")
+        if cancelled:
+            detail += " EUnit cancelled tests; execution is incomplete."
+        return returncode, "error", f"Test run exited {returncode}; {detail}"
+    if s is None:
+        return 1, "error", (
+            "Test run printed no recognisable test summary -- cannot confirm any "
+            "test ran. Check the capture and summary format (#4800).")
+    executed, failed, _ = s
     if executed == 0:
-        print(f"\n[{prog}] {label}: rebar3 exited 0 but executed ZERO "
-              "tests -- nothing was discovered (wrong suite directory / --dir) "
-              "or every test was skipped (check the CT/eunit logs). Failing so "
-              "this cannot pass as a false green (#4800).", file=sys.stderr)
-        return 1
-    print(f"\n[{prog}] {label}: {executed} tests executed.")
-    return 0
+        return 1, "error", (
+            "Test run executed ZERO tests -- nothing was discovered or every "
+            "test was skipped/cancelled (#4800).")
+    if failed:
+        return 1, "error", f"Test summary reports {failed} failed of {executed} executed."
+    if cancelled:
+        return 1, "error", "EUnit cancelled tests; partial execution cannot pass."
+    return 0, None, f"{executed} tests executed."
+
+
+def failure_context(text):
+    """Bounded native context for Meson's console tail, never verdict evidence.
+
+    Successful tests intentionally emit ERROR REPORTs. Only callers that have
+    already established failure use this heuristic; the complete log is kept.
+    """
+    lines = _ANSI_RE.sub("", text).splitlines()
+    marker = re.compile(r"\*failed\*|\*{3}.*(?:failed|timed out|unexpected termination)|"
+                        r"==>.*: FAILED|^\*\*error:|init terminating in do_boot|"
+                        r"^===>.*(?:failed|Error)", re.I)
+    first = next((i for i, line in enumerate(lines) if marker.search(line)), None)
+    start = max(0, first - 2) if first is not None else max(0, len(lines) - 40)
+    excerpt = []
+    for i in range(start, min(start + 40, len(lines))):
+        line = lines[i]
+        excerpt.append(f"{i + 1}: {line[:500]}" + (" [line truncated]" if len(line) > 500 else ""))
+    return "\n".join(excerpt)
+
+
+def require_tests_executed(text, label, returncode, prog="test_gateway.py", *, log_dir=None):
+    """Require successful completion and a nonempty successful summary."""
+    code, level, message = strict_verdict(text, returncode)
+    if code and text:
+        log_path = None
+        if log_dir is not None:
+            try:
+                Path(log_dir).mkdir(parents=True, exist_ok=True)
+                slug = re.sub(r"[^a-zA-Z0-9_-]+", "_", label)[:80]
+                # Unique, closed files survive retries and concurrent Meson runs.
+                with tempfile.NamedTemporaryFile(
+                        mode="w", encoding="utf-8", newline="", delete=False,
+                        prefix=f"yuzu_test_gateway_{slug}_", suffix=".log", dir=log_dir) as log:
+                    log.write(text)
+                log_path = log.name
+            except OSError as exc:
+                # Diagnostics must not replace the actual child failure status.
+                print(f"[{prog}] could not save gateway output: {exc}", file=sys.stderr)
+        print(f"\n[{prog}] {label}: native failure context (excerpt; not the complete log):\n"
+              f"{failure_context(text)}", file=sys.stderr)
+        if log_path is not None:
+            print(f"[{prog}] Full gateway output: {log_path}", file=sys.stderr)
+    print(f"\n[{prog}] {label}: {message}", file=sys.stderr if level else sys.stdout)
+    return code
 
 
 def cancel_tolerant_verdict(text, returncode):
-    """Verdict for the EUnit gates that tolerate cancelled sets (#1005).
+    """Deprecated name retained for older callers; cancellations now fail.
 
-    Used by scripts/test/eunit-gate.sh (/test) and the release workflow's
-    EUnit step, so all three gateway test gates share ONE parser. Returns
-    (exit_code, level, message); level is None, "warning" or "error".
-
-      - no recognisable summary        -> 1 (rebar3 failed before tests ran,
-                                            or the capture was truncated)
-      - zero tests executed            -> 1 (every set cancelled, or nothing
-                                            discovered: the #4800 class)
-      - rc 0 with >= 1 executed        -> 0
-      - rc != 0, eunit "Failed: 0" line
-        with >= 1 passed               -> 0 with a warning (cancellations,
-                                            #1005)
-      - anything else                  -> 1
+    #1005 accepted a partially cancelled run when some tests passed. That
+    cannot establish completion of the requested suite, so all callers now
+    use the same strict verdict, including this compatibility entrypoint.
     """
-    s = last_summary(text)
-    if s is None:
-        return 1, "error", (
-            f"EUnit printed no recognisable test summary (rebar3 rc={returncode}) "
-            "-- rebar3 failed before any test ran, or the output was cut short. "
-            "If rebar3 changed its summary wording, update "
-            "scripts/gateway_test_summary.py.")
-    executed, failed, eunit_failed_line = s
-    if executed == 0:
-        return 1, "error", (
-            "EUnit executed zero tests (every set cancelled, or nothing was "
-            "discovered) -- nothing was tested (#4800).")
-    if returncode == 0:
-        return 0, None, None
-    if eunit_failed_line and failed == 0:
-        return 0, "warning", (
-            f"EUnit exited {returncode} but 0 tests failed and {executed} ran "
-            "-- cancelled sets are tolerated (#1005).")
-    return 1, "error", (
-        f"EUnit exited {returncode} with {failed} failed of {executed} executed.")
+    return strict_verdict(text, returncode)
 
 
 _USAGE = ("usage: gateway_test_summary.py cancel-tolerant RC LOGFILE [--github]\n"
@@ -156,10 +187,10 @@ _USAGE = ("usage: gateway_test_summary.py cancel-tolerant RC LOGFILE [--github]\
 def _main(argv):
     """CLI.
 
-    cancel-tolerant RC LOGFILE [--github]: the EUnit gates (#1005 tolerance).
+    cancel-tolerant RC LOGFILE [--github]: deprecated strict compatibility alias.
     strict LABEL RC LOGFILE: the Meson wrapper's rule for a gate that keeps
     rebar3's own exit code (a non-zero rc stays non-zero; a green rc must
-    have executed >= 1 test). Used by gateway/test_runner.sh for ct.
+    have executed >= 1 test without failure or cancellation). Used by all gates.
     """
     mode = argv[0] if argv else None
     if mode == "cancel-tolerant" and len(argv) >= 3:
@@ -177,9 +208,9 @@ def _main(argv):
         print(f"gateway_test_summary: {exc}", file=sys.stderr)
         return 2
     if mode == "strict":
-        return require_tests_executed(text, argv[1], rc, prog="gateway/test_runner.sh")
+        return require_tests_executed(text, argv[1], rc, prog="gateway_test_summary.py")
     code, level, message = cancel_tolerant_verdict(text, rc)
-    if message:
+    if message and level:
         if "--github" in argv[3:]:
             print(f"::{level}::{message}")
         else:

@@ -414,11 +414,20 @@ void run_per_user_surfaces(std::vector<LicRecord>& records, std::vector<ProbeOut
         outcomes.push_back({"per_user_files", false, 0, "profile_list_unreadable"});
         return;
     }
-    const auto hku_subkeys = yuzu::win::enumerate_hku_subkeys();
+    // A failed or unstable HKEY_USERS listing is not "no hives loaded": classifying every profile
+    // against it would send loaded hives down the offline-mount path. Same shape as the
+    // unreadable ProfileList above.
+    const auto hku = yuzu::win::enumerate_hku_subkeys_checked();
+    if (!hku.error.empty()) {
+        spdlog::warn("license_scan: HKEY_USERS listing incomplete ({})", hku.error);
+        outcomes.push_back({"per_user_hives", false, 0, "hku_list_incomplete"});
+        outcomes.push_back({"per_user_files", false, 0, "hku_list_incomplete"});
+        return;
+    }
     // System SIDs are filtered inside build_profile_list, and the D11
     // never-the-SID rule for profile_name is an invariant of that header —
     // this file no longer restates either.
-    const auto profiles = yuzu::profiles::build_profile_list(raw_profiles, hku_subkeys);
+    const auto profiles = yuzu::profiles::build_profile_list(raw_profiles, hku.names);
 
     WinRegProbeHost fs_host; // filesystem defaults only (per-user file probes)
     std::size_t hive_rows = 0;

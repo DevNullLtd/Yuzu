@@ -16,6 +16,7 @@
 
 #include "dex_app_perf_ui.hpp"
 
+#include "dex_pane.hpp"
 #include "web_utils.hpp"
 
 #include <algorithm>
@@ -36,6 +37,10 @@ std::string dex_fragment_style();
 namespace {
 
 std::string esc(const std::string& s) { return html_escape(s); }
+// Text-node twin for an agent-reported name (bidirectional-control and zero-width characters print as
+// visible markers). Never inside a tag: the search box and option values are sent back by the browser
+// and keep `esc` (#7535).
+std::string esc_text(const std::string& s) { return html_escape_marked(s); }
 
 // Percent-encode for a query-string value (RFC 3986 unreserved kept literal) —
 // same helper the sibling DEX renderers carry in their anonymous namespaces.
@@ -60,9 +65,7 @@ std::string placeholder(const std::string& title, const std::string& sub) {
 }
 
 std::string drill(const std::string& path_qs, const std::string& disp) {
-    return "<a hx-get=\"" + path_qs +
-           "\" hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\" style=\"cursor:pointer;\">" +
-           disp + "</a>";
+    return dex_pane_link(path_qs, disp);
 }
 
 std::string fmt_pct(double v) { return std::format("{:.1f}%", v); }
@@ -168,7 +171,7 @@ std::string days_phrase(std::int64_t n) { return count_phrase(n, "day"); }
 std::string vf_version_cell(const AppPerfVersionRow& r) {
     const std::string name = r.perf.version.empty()
                                  ? mute("(no version)")
-                                 : "<span style=\"font-family:var(--mono)\">" + esc(r.perf.version) +
+                                 : "<span style=\"font-family:var(--mono)\">" + esc_text(r.perf.version) +
                                        "</span>";
     // Rates are per exposed device over the window, not per day of use, so the
     // days the version appears in the trend ride beside the figures.
@@ -216,7 +219,7 @@ std::string vf_ratio_cell(const AppPerfFleetReport& rep, std::size_t idx) {
         if (o.perf.version == r.previous_version)
             prev = &o;
     const std::string vs = "<div class=\"gp-mute\">vs <span style=\"font-family:var(--mono)\">" +
-                           esc(r.previous_version) + "</span></div>";
+                           esc_text(r.previous_version) + "</span></div>";
     if (!r.failure_rate_ratio || !std::isfinite(r.failure_rate_ratio->lower)) {
         const auto positive = [](const std::optional<std::int64_t>& e) { return e && *e > 0; };
         const bool both_exposed = prev && positive(r.exposure_devices) && positive(prev->exposure_devices);
@@ -278,17 +281,14 @@ std::string render_dex_app_perf_picker(const std::vector<AppPerfAppSummary>& app
 
     h += "<div class=\"gp-filters\"><input class=\"dx-ctl\" name=\"q\" value=\"" + esc(q) +
          "\" placeholder=\"Search applications\xE2\x80\xA6\" "
-         "hx-get=\"/fragments/dex/perf/apps?window=" + w + qs_plat + qs_sort +
-         "\" hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\" "
-         "hx-trigger=\"keyup changed delay:300ms\"></div>";
+         "hx-get=\"/fragments/dex/perf/apps?window=" + w + qs_plat + qs_sort + "\"" +
+         std::string(kDexPaneSwapAttrs) + " hx-trigger=\"keyup changed delay:300ms\"></div>";
 
     {
         auto chip = [&](const char* val, const char* label) {
-            const std::string on = (plat.empty() ? std::string("all") : plat) == val ? " on" : "";
+            const bool on = (plat.empty() ? std::string("all") : plat) == val;
             const std::string val_qs = std::string(val) == "all" ? "" : "&platform=" + std::string(val);
-            return "<a class=\"gp-chip" + on + "\" hx-get=\"/fragments/dex/perf/apps?window=" + w +
-                   val_qs + qs_sort + qs_q +
-                   "\" hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\">" + label + "</a>";
+            return dex_pane_chip("/fragments/dex/perf/apps?window=" + w + val_qs + qs_sort + qs_q, label, on);
         };
         h += "<div class=\"gp-filters\"><span class=\"dx-lbl\">Platform</span>" +
              chip("all", "All") + chip("windows", "Windows") + chip("linux", "Linux") + "</div>";
@@ -304,7 +304,7 @@ std::string render_dex_app_perf_picker(const std::vector<AppPerfAppSummary>& app
         };
         h += "<div class=\"gp-filters\"><span class=\"dx-lbl\">Sort</span><select class=\"dx-ctl\" name=\"sort\" "
              "hx-get=\"/fragments/dex/perf/apps?window=" + w + qs_plat + qs_q +
-             "\" hx-trigger=\"change\" hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\">" +
+             "\" hx-trigger=\"change\"" + std::string(kDexPaneSwapAttrs) + ">" +
              opt("last_seen", "Last seen (most recent)") + opt("name", "Name (A-Z)") +
              opt("versions", "Versions (most first)") + "</select></div>";
     }
@@ -346,7 +346,7 @@ std::string render_dex_app_perf_picker(const std::vector<AppPerfAppSummary>& app
         const auto& a = *ap;
         h += "<tr><td>" +
              drill("/fragments/dex/perf/app?app=" + url_encode(a.app_name) + "&amp;window=" + w,
-                   esc(a.app_name)) +
+                   esc_text(a.app_name)) +
              "</td><td>" + std::to_string(a.versions) + "</td><td>" + ymd(a.last_day) +
              "</td></tr>";
     }
@@ -437,9 +437,7 @@ std::string render_dex_app_perf_trend(const std::string& app_name,
     const bool is_model = !is_group && !active_model.empty();
     const bool is_filtered = !active_version.empty();
     std::string h = dex_fragment_style();
-    h += "<a class=\"gp-back\" hx-get=\"/fragments/dex/perf/apps?window=" + w +
-         "\" hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\" "
-         "style=\"cursor:pointer;\">&larr; All applications</a>";
+    h += dex_pane_link("/fragments/dex/perf/apps?window=" + w, "&larr; All applications", "gp-back");
 
     // Header. The scope is named in the subtitle so a group rollup is never
     // mistaken for the fleet aggregate.
@@ -448,13 +446,13 @@ std::string render_dex_app_perf_trend(const std::string& app_name,
         scope_name = "a management group";
         for (const auto& g : groups)
             if (g.id == scope_group_id) {
-                scope_name = esc(g.name);
+                scope_name = esc_text(g.name);
                 break;
             }
     } else if (is_model) {
-        scope_name = "devices modeled " + esc(active_model);
+        scope_name = "devices modeled " + esc_text(active_model);
     }
-    h += "<div class=\"gp-head\"><div><div class=\"gp-titleline\"><h1>" + esc(app_name) +
+    h += "<div class=\"gp-head\"><div><div class=\"gp-titleline\"><h1>" + esc_text(app_name) +
          " <span class=\"gp-mute dx-sub\">&mdash; by version, "
          "over time</span></h1></div><div class=\"gp-sub\">CPU &amp; memory per version across <b>" +
          scope_name + "</b>. Each row's trend is the daily mean over the retained history; the "
@@ -475,7 +473,7 @@ std::string render_dex_app_perf_trend(const std::string& app_name,
     if (is_filtered) {
         const std::string all_qs = "app=" + url_encode(app_name) + "&amp;window=" + w + cohort_qs;
         h += "<div class=\"gp-note\">Filtered to version <span style=\"font-family:var(--mono)\">" +
-             esc(active_version) + "</span> &mdash; " +
+             esc_text(active_version) + "</span> &mdash; " +
              drill("/fragments/dex/perf/app?" + all_qs, "all versions &rarr;") + "</div>";
     }
 
@@ -502,7 +500,7 @@ std::string render_dex_app_perf_trend(const std::string& app_name,
         for (const auto& g : groups) {
             const bool on = (g.id == scope_group_id);
             h += "<option value=\"" + esc(g.id) + "\"" + (on ? " selected" : "") + ">" +
-                 esc(g.name) + "</option>";
+                 esc_text(g.name) + "</option>";
         }
         h += "</select></div>";
     }
@@ -523,7 +521,7 @@ std::string render_dex_app_perf_trend(const std::string& app_name,
              ">Whole fleet</option>";
         for (const auto& mv : model_values) {
             const bool on = is_model && mv == active_model;
-            h += "<option value=\"" + esc(mv) + "\"" + (on ? " selected" : "") + ">" + esc(mv) +
+            h += "<option value=\"" + esc(mv) + "\"" + (on ? " selected" : "") + ">" + esc_text(mv) +
                  "</option>";
         }
         h += "</select></div>";
@@ -586,12 +584,12 @@ std::string render_dex_app_perf_trend(const std::string& app_name,
         if (v.version.empty()) {
             ver = "<span class=\"gp-mute\">(no version)</span>";
         } else if (is_filtered) {
-            ver = "<span style=\"font-family:var(--mono)\">" + esc(v.version) + "</span>";
+            ver = "<span style=\"font-family:var(--mono)\">" + esc_text(v.version) + "</span>";
         } else {
             std::string qs = "app=" + url_encode(app_name) + "&amp;window=" + w +
                              "&amp;version=" + url_encode(v.version) + cohort_qs;
             ver = drill("/fragments/dex/perf/app?" + qs,
-                        "<span style=\"font-family:var(--mono)\">" + esc(v.version) + "</span>");
+                        "<span style=\"font-family:var(--mono)\">" + esc_text(v.version) + "</span>");
         }
         if (v.suppressed) {
             // Sub-floor slice → count only (the one floor constant; one device
@@ -623,11 +621,13 @@ std::string render_dex_app_perf_trend(const std::string& app_name,
             // reports, echo_proc_perf.cpp).
             const std::string devices_qs =
                 "app=" + url_encode(app_name) + "&amp;version=" + url_encode(v.version);
-            devices_cell += " <a style=\"cursor:pointer\" class=\"gp-mute\" "
+            // A native button (keyboard reachable) styled as the muted text link it replaces. It
+            // swaps a row, not the pane, so it carries none of the pane attributes.
+            devices_cell += " <button type=\"button\" class=\"dx-lk gp-mute\" "
                             "hx-get=\"/fragments/dex/perf/app/devices?" +
                             devices_qs +
                             "\" hx-target=\"closest tr\" hx-swap=\"afterend\" "
-                            "hx-trigger=\"click once\">&#9656; devices</a>";
+                            "hx-trigger=\"click once\">&#9656; devices</button>";
         }
         h += "<tr><td>" + ver + tag + "</td><td>" + fmt_pct(v.cpu_mean) + "</td><td>" +
              pctile_cell(v.cpu_p95) + "</td><td>" + spark(v.cpu_series) + "</td><td>" +
@@ -684,7 +684,7 @@ std::string render_dex_app_perf_version_devices(const std::vector<AppPerfVersion
                     "<thead><tr><th>Device</th><th>Last seen</th><th>CPU</th>"
                     "<th>Working set</th></tr></thead><tbody>";
     for (const auto& d : devices) {
-        h += "<tr><td class=\"mono\">" + esc(d.agent_id) +
+        h += "<tr><td class=\"mono\">" + esc_text(d.agent_id) +
              "</td><td>" + ymd(d.last_day) + "</td><td>" + fmt_pct(d.cpu_avg) + "</td><td>" +
              fmt_bytes(static_cast<double>(d.ws_avg_bytes)) + "</td></tr>";
     }
@@ -717,7 +717,7 @@ std::string device_metric_cells(const AppPerfDeviceVersion& v) {
 
 std::string version_label(const AppPerfDeviceVersion& v) {
     return v.version.empty() ? "<span class=\"gp-mute\">(no version)</span>"
-                             : "<span style=\"font-family:var(--mono)\">" + esc(v.version) + "</span>";
+                             : "<span style=\"font-family:var(--mono)\">" + esc_text(v.version) + "</span>";
 }
 
 } // namespace
@@ -737,7 +737,7 @@ std::string render_dex_device_app_perf(const std::vector<AppPerfDeviceApp>& apps
         if (app.versions.size() == 1) {
             // Common case: collapse the app + its one version into a single row.
             const auto& v = app.versions.front();
-            h += "<tr><td><b>" + esc(app.app_name) + "</b> " + version_label(v) + "</td>" +
+            h += "<tr><td><b>" + esc_text(app.app_name) + "</b> " + version_label(v) + "</td>" +
                  device_metric_cells(v) + "</tr>";
             continue;
         }
@@ -750,7 +750,7 @@ std::string render_dex_device_app_perf(const std::vector<AppPerfDeviceApp>& apps
         std::int64_t newest = 0;
         for (const auto& v : app.versions)
             newest = (std::max)(newest, v.latest_day);
-        h += "<tr class=\"dx-apphead\"><td>" + esc(app.app_name) +
+        h += "<tr class=\"dx-apphead\"><td>" + esc_text(app.app_name) +
              " <span class=\"gp-mute\">&middot; " +
              std::to_string(app.versions.size()) +
              " versions</span></td><td colspan=\"7\" class=\"gp-mute\">per-version below</td></tr>";

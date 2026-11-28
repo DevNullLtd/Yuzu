@@ -58,15 +58,30 @@ updates:
     #     Digest refreshes of 24.04 still flow and keep it patched. Next hop
     #     is the 26.04 LTS (already used by the chiselled images), done by
     #     hand (declined #1140).
+    #   hexpm/erlang: Dockerfile.gateway's builder (WP15). Its tag is the full
+    #     OTP and Alpine release (28.5.0.8-alpine-3.23.8). Dependabot compares
+    #     only tags with the same suffix (-alpine-3.23.8), so it offers an OTP
+    #     patch only while hexpm still publishes one on that Alpine patch, and
+    #     never a tag on another Alpine release: once hexpm moves to a newer
+    #     Alpine patch, re-pin the builder by hand (docs/dependency-updates.md).
+    #     The major is blocked, as for erlang above. A hand re-pin onto another
+    #     Alpine release fails the build's abi-guard and
+    #     scripts/ci/check-gateway-base-index.py's tag check.
     #   alpine: only Dockerfile.gateway's runtime stage uses it, and it must
-    #     stay on the Alpine release erlang:28-alpine is built on (#2150).
+    #     stay on the Alpine release the hexpm/erlang builder is built on (#2150).
     #     The 3.23 -> 3.24 auto-bump (#1377, reported in #2110) put the
     #     runtime on musl 1.2.6, which makes OTP 28's beam.smp abort at boot
     #     on AMX CPUs (#1743). Block major AND minor; digest refreshes of 3.23
     #     still flow. Move it by hand, together with the builder, once the
     #     gateway is on OTP 29.1 or newer (the build's abi-guard enforces this).
+    #     A change to the builder pin is also checked by
+    #     scripts/ci/check-gateway-base-index.py (docker-healthcheck-invariants.yml):
+    #     the platforms Dockerfile.gateway supports (linux/amd64 only, #6711) must
+    #     be shown in the index as built on the runtime stage's Alpine release.
     ignore:
       - dependency-name: "erlang"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "hexpm/erlang"
         update-types: ["version-update:semver-major"]
       - dependency-name: "alpine"
         update-types: ["version-update:semver-major", "version-update:semver-minor"]
