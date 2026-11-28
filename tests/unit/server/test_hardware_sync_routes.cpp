@@ -140,7 +140,8 @@ struct SyncHarness {
                 return r;
             };
             env.dispatch = [this](const auth::Session&, const std::vector<std::string>& ids,
-                                  std::int64_t delay_max_s, const std::string& execution_id) {
+                                  std::int64_t delay_max_s, const std::string& execution_id,
+                                  const ss::RunTargets&) {
                 ++dispatch_calls;
                 events.push_back("dispatch");
                 dispatched.insert(dispatched.end(), ids.begin(), ids.end());

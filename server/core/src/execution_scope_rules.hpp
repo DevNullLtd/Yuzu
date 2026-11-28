@@ -169,6 +169,10 @@ confined_projection(const std::vector<AgentExecStatus>& statuses, const authz::V
         } else if (a.status == "failure" || a.status == "timeout" || a.status == "rejected") {
             ++c.agents_responded;
             ++c.agents_failure;
+        } else if (a.status == "timed_out" || a.status == "unknown") {
+            // #2673: decided by the server (see `overlay_server_outcomes`): final and not a
+            // success, but not an answer.
+            ++c.agents_failure;
         }
         if (!a.error_detail.empty() && a.completed_at >= newest_error_at) {
             newest_error_at = a.completed_at;

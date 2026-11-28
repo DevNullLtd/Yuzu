@@ -886,7 +886,7 @@ The `202` body carries counts only (`requested`, `agents_reached`, `skipped_offl
 
 #### `GET /api/v1/hardware/sync/{execution_id}`
 
-Reports how an on-demand software sync run is going, by the `execution_id` that `POST /api/v1/hardware/sync` answered with. MCP twin: `get_software_sync_status` (see [mcp.md](mcp.md)). **Permission:** `Execution:Execute`, checked as a global grant, like the POST. A caller reads the runs it started, or any sync run when its `Execution:Execute` is unfiltered; an unknown id, another operator's run and an execution that is not a sync run all answer the same `404`, so the route does not reveal which ids exist. The `200` body carries `execution_id`, `state` (the execution record's state), `targeted` (the frames the server's sessions accepted), `acknowledged` (agents that armed the sync), `failed` (agents that answered with a failure, for example because their daily-sync scheduler is not running), `dispatched_at`, `delay_max_s` and `estimated_completion_at`. An agent answers when it **arms** the sync, not when its report lands, so `acknowledged` counts requests taken up, not reports received; a count of reports per run is not reported. `delay_max_s` and `estimated_completion_at` are estimates (see above). An execution record that cannot be read is a `503` with `retry_after_ms`, never an empty `200`; a server with no execution tracking answers `503` too. No audit row is written for a read.
+Reports how an on-demand software sync run is going, by the `execution_id` that `POST /api/v1/hardware/sync` answered with. MCP twin: `get_software_sync_status` (see [mcp.md](mcp.md)). **Permission:** `Execution:Execute`, checked as a global grant, like the POST. A caller reads the runs it started, or any sync run when its `Execution:Execute` is unfiltered; an unknown id, another operator's run and an execution that is not a sync run all answer the same `404`, so the route does not reveal which ids exist. The `200` body carries `execution_id`, `state` (the execution record's state), `targeted` (the frames the server's sessions accepted), `acknowledged` (agents that armed the sync), `failed` (agents that answered with a failure, for example because their daily-sync scheduler is not running), `dispatched_at`, `delay_max_s` and `estimated_completion_at`. When the run's coverage is recorded, `failed` counts device answers only (otherwise every unsuccessful result) and the body adds `timed_out`, `not_delivered`, `unknown` and `not_reached` (selected devices that were offline, not sent to or unable to run the sync, including agents too old for it; devices skipped as already fresh are not counted). An agent answers when it **arms** the sync, not when its report lands, so `acknowledged` counts requests taken up, not reports received; a count of reports per run is not reported. `delay_max_s` and `estimated_completion_at` are estimates (see above). An execution record that cannot be read is a `503` with `retry_after_ms`, never an empty `200`; a server with no execution tracking answers `503` too. No audit row is written for a read.
 
 ---
 
@@ -2605,28 +2605,43 @@ Quarantine a device.
 > MIXED partial dispatch the way this route's success body does — tracked as a
 > follow-up.
 >
-> **Its `503` now names the cause.** Several conditions previously shared one
-> body ("failed to send command to any agent"), and two of them are
+> **A zero-reach answer names its cause.** Several conditions previously shared one
+> `503` body ("failed to send command to any agent"), and two of them are
 > fleet-wide/request-wide states rather than a transport failure:
 >
 > | `error.reason` | Meaning | `retry_after_ms` |
 > |---|---|---|
+> | `target_resolution_failed` (#2673) | `503`. The target list could not be read (including an unreadable agent presence directory with nobody listed), so nobody was resolved. A server condition. | `5000` |
 > | `containment_unreadable` | The gate is failing closed: containment state cannot be read, so **every** target on **every** dispatch is refused. A server condition, not a device one. | `5000` |
 > | `quarantined` | Every target named is contained. The dispatch was withheld, not attempted. | `null` — retrying will not help until the device is released |
 > | `plugin_not_found` (#3511) | The dispatched plugin is absent from every target's reported inventory — a command guaranteed to fail, withheld before dispatch rather than reported as a false success. Permanent for the current plugin name. If the plugin name and spelling are correct and it genuinely is installed on the target, the agent's REPORTED inventory is stale: it is populated once at registration and does not refresh until the agent's management connection next re-registers (a reconnect — daemon restart, or any dropped/re-established connection) — this reason can persist until then even after installation completes. | `null` — retrying will not help; check the plugin name/spelling instead, or trigger a reconnect on the target agent if the plugin was only just installed |
 > | `kill_switched_os` (#5294) | Every reachable target runs an OS for which this plugin action's per-OS kill switch is OFF. The dispatch was withheld, not attempted. | `null` — retrying will not help until the switch is turned back on for that OS |
 > | `os_gate_unreadable` (#5294) | Agent presence could not be read while a per-OS kill switch is set, so the dispatch failed closed rather than reaching only this replica's local agents. Transient. | `5000` |
-> | *(absent)* | Genuinely no agent reachable — the pre-existing meaning. | *(absent)* |
+> | `no_targets` (#2650) | **`422`, not `503`.** The target list was read and is empty: nothing you may dispatch to matched (an empty group, a scope or broadcast matching no **connected** agent, or only ids outside your visible set). If no agent is reachable at all, this route answers the `503` `no agent connected` below instead. Just after a server or gateway restart, wait for agents to reconnect before treating it as final. | `null` — the same request will not succeed until a matching agent connects or your access changes |
+> | *(absent)* | `503`. Targets were resolved but none was reached, including an unconfined caller naming a device id that does not exist, and a caller who can see no device at all. | *(absent)* |
+>
+> Every row without a status of its own is a `503`.
+>
+> **No agent reachable at all.** Before any of the causes above, this route and the diagnostic
+> routes below answer `503` with the message `no agent connected`, no `reason` and no
+> `retry_after_ms`, when the server has no reachable agent.
 >
 > `plugin_not_found`, `kill_switched_os` and `os_gate_unreadable` are never produced for a
 > protective action (the firewall plugin's four containment actions and `__guard__.push_rules`); see
 > [Upgrading](upgrading.md#behaviour-change-protective-actions-exempt-from-plugin-enablement).
 >
+> The legacy diagnostic dispatch routes (`POST /api/chargen/start`,
+> `POST /api/chargen/stop`, `POST /api/procfetch/fetch`), which broadcast one
+> fixed command, answer `422` `no_targets` and `503` `target_resolution_failed`
+> in the same way, beside the other causes in this table; they rank
+> `target_resolution_failed` first.
+>
 > `reason` is a top-level key on the error object, not part of the A4
 > `error.data` envelope. `POST /api/instructions/{id}/execute` carries the
-> same `reason` `503` split as `POST /api/command` above
-> (`containment_unreadable` / `quarantined` / `plugin_not_found` /
-> `kill_switched_os` / `os_gate_unreadable`, same `retry_after_ms` values) — closed alongside the architect finding that its
+> same `reason` split as `POST /api/command` above
+> (`target_resolution_failed` / `containment_unreadable` / `route_unreadable` /
+> `quarantined` / `plugin_not_found` / `kill_switched_os` / `os_gate_unreadable`
+> at `503`, and `no_targets` at `422`, same `retry_after_ms` values) — closed alongside the architect finding that its
 > response-building code
 > was reading `dispatch_outcome.command_id`/`.sent` only, discarding the
 > richer fields already available on the same struct.
@@ -2636,7 +2651,7 @@ Quarantine a device.
 > /api/command`) accepts a caller-supplied `scope` expression; a malformed
 > one is a client mistake, not a fleet-state fact, so it reports
 > `error.reason: "invalid_scope"` at `400` with `retry_after_ms: null`,
-> checked before the `503` cascade so a bad expression is never shadowed by
+> checked before the other causes so a bad expression is never shadowed by
 > `containment_unreadable`. Its generic catch-all
 > (no `reason` key, matching the *(absent)* row above) additionally covers
 > ADR-1007's per-device concurrency-claim exclusion, unique to this route
@@ -4428,7 +4443,7 @@ The request body is required: send `{}` when you have no `agent_ids`, `scope` or
 }
 ```
 
-**Zero agents reached** is an error, discriminated by `error.reason`: `dispatch_denied` is `403` (the dispatch chokepoint refused the command for the caller at send time); `invalid_scope` is `400`; `containment_unreadable`, `route_unreadable`, `os_gate_unreadable`, `quarantined`, `plugin_not_found`, `kill_switched_os` and `no_agents_reached` are `503`. `retry_after_ms` is `5000` for `containment_unreadable`, `route_unreadable`, `os_gate_unreadable` and `no_agents_reached`, and `null` for the permanent causes (`dispatch_denied`, `invalid_scope`, `quarantined`, `plugin_not_found`, `kill_switched_os`), where retrying the same request cannot succeed. The error object also carries `command_id`, `execution_id` (the cancelled execution row) and the counts `agents_quarantined`, `agents_unknown_plugin`, `agents_kill_switched_os`. `no_agents_reached` includes the case where a per-device claim excluded every target.
+**Zero agents reached** is an error, discriminated by `error.reason`: `dispatch_denied` is `403` (the dispatch chokepoint refused the command for the caller at send time); `invalid_scope` is `400`; `containment_unreadable`, `route_unreadable`, `os_gate_unreadable`, `quarantined`, `plugin_not_found`, `kill_switched_os`, `no_agents_reached` and `target_resolution_failed` (the target list could not be read) are `503`; `no_targets` is `422` (the list was read and is empty: nothing you may dispatch to matched, and scope and broadcast consider only connected agents, so just after a server or gateway restart wait for agents to reconnect before treating it as final). An unconfined caller who names a device id that does not exist, and a caller who can see no device at all, get `no_agents_reached`, not `no_targets`. `retry_after_ms` is `5000` for `target_resolution_failed`, `containment_unreadable`, `route_unreadable`, `os_gate_unreadable` and `no_agents_reached`, and `null` for the permanent causes (`dispatch_denied`, `invalid_scope`, `quarantined`, `plugin_not_found`, `kill_switched_os`, `no_targets`), where retrying the same request cannot succeed. The error object also carries `command_id`, `execution_id` (the cancelled execution row) and the counts `agents_quarantined`, `agents_unknown_plugin`, `agents_kill_switched_os`. `no_agents_reached` includes the case where a per-device claim excluded every target.
 
 Other errors use the A4 envelope with a `reason`: `500` `dispatch_exception` (the dispatch threw; a `failure` audit row with `reason=dispatch_exception` is written). The execution row is **not** cancelled: whether any agent already received the command is unknown, so the row is left `running` and results from any agent that did receive it are still recorded against it. The error carries two typed fields, so nothing has to be parsed out of the remediation text: `error.execution_id` (always present for this refusal; an empty string when no execution row exists) and `error.agents_sent` (present only when the send path had accepted the command for at least one agent before the failure; a lower bound, because a send in flight when the dispatch threw is not counted; a gateway-routed agent counts once its command is queued for forwarding, which can still fail). The `failure` audit row carries `agents_sent=<n>` (before `correlation_id=`) whenever at least one send was accepted by the send path, whether or not the count could be stored, and it is written before the count is stored. The remediation depends on what happened:
 
@@ -7992,6 +8007,7 @@ with `error.reason` and `error.execution_id` (the run exists and is readable). T
 check passed, so the caller's grant or the action's gate moved between the two),
 `containment_unreadable`, `route_unreadable`, `os_gate_unreadable`, `no_agents_reached` (offline
 devices, or a per-device concurrency claim), `quarantined`, `plugin_not_found`, `kill_switched_os`,
+`no_targets`, `target_resolution_failed`,
 `late_denied`, `deadline_exceeded` (the 60 second run budget ended the run before any step reached
 an agent) and `run_failed` (the engine ended the run without a single dispatch attempt, or its final
 state could not be read).
@@ -8003,9 +8019,10 @@ forward (use a new idempotency key). Read the run with `GET /api/v1/workflow-exe
 start another under a new key.
 
 *Without a key* nothing was sent, so a retry is safe for the causes that carry `retry_after_ms: 5000`
-(`containment_unreadable`, `route_unreadable`, `os_gate_unreadable`, `no_agents_reached`);
-`dispatch_denied`, `quarantined`, `plugin_not_found`, `kill_switched_os`, `late_denied`, `deadline_exceeded` and
-`run_failed` are permanent (`retry_after_ms: null`). Send a key anyway: it is what makes a lost
+(`containment_unreadable`, `route_unreadable`, `os_gate_unreadable`, `no_agents_reached`, `target_resolution_failed`);
+`dispatch_denied`, `quarantined`, `plugin_not_found`, `kill_switched_os`, `no_targets`, `late_denied`, `deadline_exceeded` and
+`run_failed` are permanent (`retry_after_ms: null`). On this route `no_targets` stays a `503` (the
+other dispatch routes answer `422`). Send a key anyway: it is what makes a lost
 answer safe to ask about.
 
 A missing `Workflow:Execute` permission is a `403` from the surface gate, before any of the above.
@@ -8163,6 +8180,92 @@ yet). Unlike the bare request, this expansion **is** audited (`execution.detail.
 fail-closed 503 on an audit-persist failure) because it discloses raw agent identities. Response
 bodies are a **separate** route (below), not part of this expansion.
 
+**`coverage` (both the bare and the expanded read; MCP `get_execution_status` carries the same
+object).** Counts of who the run was meant for and what happened (#2673):
+
+| Field | Meaning |
+|---|---|
+| `state` | `recorded`, or `unrecorded` (every other field is then `null`; unknown is not zero): the run does not track a device list, none has been saved yet (including while a send is in progress), a saved list was ever partial, a later send started before an earlier list was saved, a command was sent again after the run finished or was cancelled, or the saved list covers fewer devices than the run reports contacting |
+| `population` | `listed`, or `connected_only` when a scope, broadcast or fleet selector chose the targets: only connected agents are considered. `null` for a confined caller |
+| `intended` | Targets the run was meant to reach: `contacted + offline + not_sent + withheld`. A device id listed twice is sent once and counted once |
+| `contacted` | Sends accepted (for a gateway-routed agent, queued, not delivered): `responded + failed + timed_out + not_delivered + unknown + pending` |
+| `responded` | Answered successfully (not the same as the legacy `agents_responded`) |
+| `failed` | Answered with a failure, timeout or rejection |
+| `timed_out` | The server recorded no result before the deadline. This can include a reply lost for a reason the server could not detect |
+| `not_delivered` | A failure the server or gateway made up for a command that certainly never reached the device: gateway `not_connected`, or the server could not start the forward, was refused as unauthenticated by the gateway, or has no address for the agent's gateway cluster. The device's own later answer replaces it |
+| `unknown` | The server cannot say what happened. Either a gateway-routed command that may have reached the device (the agent disconnected while awaited; a gateway forward that failed, found the gateway unavailable or got no response for the targeted agent, including a command still running at the 300-second forward limit). A later answer from the device replaces it if it reaches the server (after the 300-second limit it does not). Or the deadline sweep knows it could not have recorded an answer (the run's command correlation record could not be written, the run is more than 24 hours old and those records are removed, or saving the device's status failed on this server, remembered in memory until the run finishes, so after a restart or on another replica such a device can read `timed_out`); this kind stands |
+| `offline`, `not_sent`, `withheld` | Not reached: no session or route; send not accepted; withheld by quarantine, plugin absence, a per-OS switch, a concurrency claim, a containment gate, or (software sync) an agent too old to run it |
+| `pending` | Contacted and still awaited |
+| `late` | An answer arrived after the deadline sweep marked the device `timed_out` or `unknown`; a subset of `timed_out + unknown`. An answer that replaces a made-up delivery failure is not late |
+| `deadline_at` | Epoch seconds of the response deadline. `null` for a confined caller |
+
+Example for a run of three intended devices (detail read, other fields shortened):
+
+```json
+{
+  "data": {
+    "id": "exec-1",
+    "status": "completed",
+    "agents_targeted": 2,
+    "agents_responded": 1,
+    "agents_success": 1,
+    "agents_failure": 1,
+    "coverage": {
+      "state": "recorded",
+      "population": "listed",
+      "intended": 3,
+      "contacted": 2,
+      "responded": 1,
+      "failed": 0,
+      "timed_out": 1,
+      "offline": 1,
+      "not_sent": 0,
+      "withheld": 0,
+      "pending": 0,
+      "late": 0,
+      "not_delivered": 0,
+      "unknown": 0,
+      "deadline_at": 1735690280
+    }
+  },
+  "meta": { "api_version": "v1" }
+}
+```
+
+**Run status.** A run is `succeeded` only when every intended device answered successfully, otherwise
+`completed`. A run that reads `unrecorded` because its list was partial or not saved can be
+`completed` at best; its counts come from the saved list where that covers the devices contacted, and
+otherwise from reported results plus the devices the server gave up on (counted as failures). The
+first final result from a device stands, except that a server- or gateway-made delivery failure
+(`not_delivered`, or `unknown` from the gateway path) gives way to the device's own later answer. The
+run's status does not change once it has finished.
+
+**Counters on a recorded run.** `agents_targeted` counts the devices the send accepted.
+`agents_failure` counts failure, timeout, rejection, `not_delivered`, `timed_out` and `unknown`.
+`agents_responded` includes the made-up delivery failures but not the devices the deadline sweep marked
+`timed_out` or `unknown`. `progress_pct` (summary and MCP reads) is
+success plus failure over targeted.
+
+**Deadline.** The response window is the definition's `gather_ttl_seconds` (300 when none applies;
+software sync 300 plus `delay_max_s`), never less than 660 seconds without a signal. A server sweep
+about every 30 seconds marks silent devices and can lag after an outage (see the runbook in
+[metrics.md](metrics.md#execution-deadline-sweep-runbook-2673)). A run with a saved list, no send
+outstanding, at least one contacted device and none still awaited is finished one window past its
+deadline, as `completed`, if the ordinary rules have not finished it. Any other run with nothing
+awaited is force-finished only 24 hours after dispatch, and only if it reached somebody; a run that
+reached nobody is left to the stuck-execution sweep. A window longer than 300 seconds does not help a
+gateway-routed command, which the gateway forward ends at 300 seconds (recorded as `unknown`).
+
+**Limits.** `coverage` gives counts only. In the `agents` array and `kpi` of `?include=agents` (and of
+MCP `get_execution_status`), a device the server gave up on is listed as `timed_out` or `unknown` and
+counted as failed, even if its answer arrived later; a gateway-made delivery failure shows as
+`failure`. Devices that were never reached are not listed, and no route lists them. The legacy
+`GET /api/executions/{id}/agents` route and the Executions page's per-device views show reported
+results only. A management-group-confined caller gets counts over visible devices only. Its list,
+detail and summary counts (REST, MCP and dashboard) include the `timed_out` and `unknown` devices the
+server decided, as failures. A confined caller who did not dispatch the run still needs a reported
+result from a visible device to read it.
+
 #### `GET /api/v1/executions/{id}/responses`
 
 **Permission:** `Response:Read`, gated on the fleet-read chokepoint — deliberately a **different**
@@ -8270,7 +8373,10 @@ the change was applied, the success response carries `Sec-Audit-Failed: true`.
 
 **`POST /api/v1/executions/{id}/rerun`** takes an optional JSON object with one field,
 `failed_only` (boolean, default `false`; an empty body means `false`). `failed_only: true` sizes the
-new record to the original's failed, timed-out and rejected devices. The legacy
+new record, for an original with a saved device list, to the listed devices without a successful
+result (failed, rejected, timed out, not delivered or unknown; devices never reached and devices
+still awaited are not counted), and otherwise to the original's reported failed, timed-out and
+rejected devices plus any the server gave up on. The legacy
 `{"scope": "failed_only"}` string is **not** accepted: any other field, a non-object body or a
 non-boolean `failed_only` is a `400`. Each call creates another record. `201`:
 
@@ -10610,6 +10716,13 @@ This guarantee is scoped to the stores the cascade actually fans across: a lefto
 
 Fleet-wide and per-entity execution metrics.
 
+**What the success rates cover.** The fleet summary's `overall_success_rate` and the per-definition
+`success_rate` are successes divided by contacted devices (`agents_targeted`, the devices the send
+accepted), over finished runs. Devices that were never reached are not in the figure, so a run with one
+success and 99 offline devices contributes 100%. Contacted devices that timed out are in it. The
+per-agent route is computed from reported results, so a device that never answered a run is not in
+its total.
+
 #### `GET /api/v1/execution-statistics`
 
 Get fleet-wide execution summary.
@@ -10640,6 +10753,8 @@ genuinely matches nothing is still `200` with an empty `data` array.
 #### `GET /api/v1/execution-statistics/agents`
 
 Get per-agent execution statistics.
+
+These figures come from the per-device result rows, not from a run's coverage. A device that sends nothing before its deadline (`timed_out`) adds nothing, and a late `success` from it counts as a success although the run's own counts do not change. A delivery failure made up by the server or gateway (`not_delivered`, or the gateway's `unknown`) counts as a failure unless the device's own answer replaces it. Use a run's `coverage` for what the run concluded.
 
 **Permission:** `Execution:Read`, through the fleet-read chokepoint (ADR-0017 admit-then-filter, #3526): a management-group-confined caller is admitted and sees only the rows of the agents it can see (filtered in SQL before the `limit`), while a global grant sees every agent. A caller holding only a management-group-scoped grant, refused with `403` before, is admitted as a confined view. A service-scoped API token, also refused before, is admitted as a confined view only when RBAC enforcement is on (it must clear the `ITServiceOwner` authority ceiling, which holds `Execution:Read`, and the rows are then intersected with the token's service tag scope); with RBAC off it is refused with `403`. With RBAC off (the shipped default) the rollup is unfiltered for every authenticated non-service, non-engine caller. The sibling `/definitions` route and the fleet summary carry no agent identity and keep the plain `Execution:Read` gate. A malformed `since` or `limit` is `400`, and so is a negative `since`.
 
@@ -13024,7 +13139,7 @@ Dispatches a read-only instruction to the live agent **now** and synchronously r
 - **Query parameter:** `kind` — **required**. `uptime` dispatches `os_info/uptime`; `processes` dispatches `processes/list_hashed` (`proc|pid|name|sha256|path`; the SHA-256 is of each on-disk executable, resolved from the kernel, not argv[0], bounded at 512 MiB per image).
 - **Dashboard-only kinds:** the dashboard **"Get live info"** grid renders twenty additional card kinds: `process_tree`, `services`, `users`, `netconfig`, `arp`, `dns_cache`, `listening`, `connections`, `capture_sources`, `disk` and the ten hardware kinds `hw_disks`, `hw_memory`, `hw_processors`, `hw_drivers`, `battery`, `thermal`, `smart`, `volumes`, `adapters` and `wifi`. These are **not yet available on this REST endpoint** — passing any of them returns `400`. REST/JSON parity for them is deferred to [#1649](https://github.com/Tr3kkR/Yuzu/issues/1649); to probe e.g. the process tree via REST today, dispatch `processes/list_tree` directly through the async execution surface.
 - **Response:** `data` object — `kind=uptime` → `{kind, uptime_display, uptime_seconds}`; `kind=processes` → `{kind, processes[].pid/name/sha256/path}`. The REST answer is never cut and carries no `truncated` field (only the MCP twin does): a joined device answer over 4 MiB, or a process list of more than 20000 rows, is refused with `502`. The answer is given only after the device has finished: output without a final row inside the budget is discarded (`incomplete`), never returned as a partial answer; the one exception is an answer already over the size cap, which this route refuses at once without waiting for the device to finish (the MCP tool cuts it and flags `truncated` instead). The poll reads at most 64 stored rows, so a REST answer spread over more than 64 stored rows is refused `502` `output_too_large` even when it is under 4 MiB (the MCP tool flags the same case `truncated`). A stored failure, the final row (any stored row with status 1 or higher) and an `error|` first chunk are read over every stored row of this device's answer that the poll may read, not only the 64 the poll keeps, so a late chunk past that cut cannot hide a device failure behind a `200`: the route answers `502` `device_failed` or `device_error` instead, even for an answer spread over more than 64 stored rows. When the cut dropped the oldest rows, the `error|` text is the first chunk only, not the chunks that follow it. The chunks of a multi-row answer are joined with a newline in the order the server stored them. On every OS a `processes` row can carry an empty `sha256` and `path` (a protected, kernel or pseudo process, or an image on a network, device or non-fixed path) or a `hash_unavailable:<cause>` marker in the `sha256` field (for example `hash_unavailable:timeout` or `hash_unavailable:skipped`), passed through exactly as the device sent it. An unprivileged Linux agent additionally cannot read other users' images, and Linux kernel threads have no executable link even for a privileged agent. The `processes:exe_unreadable` constraint status the plugin reports is not surfaced by this route, so the answer still reads as complete. **Data handling:** the live answer is stored in the response store for `response_retention_days` (90 by default) like any command result, so it persists on the server; process paths and names can contain user names and are behavioural personal data. **Known limit:** if the server fails to store one middle chunk of a multi-chunk device answer, the read cannot detect the hole and may return the surviving rows as a complete answer; this is a property of how the response store ingests chunks and affects every reader of stored results, and it is tracked as a follow-up. A chunk the device or the gateway delivers twice is stored twice and both copies are joined, so its text can appear twice in a successful answer; the checks above protect the verdict, not the content of the answer (only a chunk sequence number on the wire could tell the copies apart).
-- **Errors:** `400` — `kind` missing/unrecognised, or the device id is over 256 bytes or carries a byte below 0x20 (`Invalid device id.`, before the scoped gates, any audit row or any dispatch, counted `bad_device_id` under the requested kind). `401`: not authenticated, or, after the `requested` audit row was written, the credential no longer resolves or now resolves to a different principal than the one the audit rows name (nothing is sent; the audit detail is `caller_unresolved`). `403` — outside the operator's scope, missing `Execution:Execute`, or the dispatch chokepoint refused the pair for the caller (an A4 error whose message is `dispatch denied: reason=<token>`; `500` for `unclassified` / `ambiguous`, a server catalogue fault, with a remediation that says to report it to the administrator). `409`: every target was withheld by the quarantine containment gate (`error.reason` `quarantined`; permanent, no `retry_after_ms`, release the device first). `422`: the probe's plugin is not in the device's reported inventory (`error.reason` `plugin_not_found`; permanent). `403` is also answered when the probe's action is switched off for the device's operating system by a per-OS kill switch (`error.reason` `kill_switched_os`; permanent). `429` — the caller already has 2 live reads in progress, or the server already has 4 (one shared budget with the MCP tool, `error.reason` `per_principal_stream_cap` or `surface_stream_cap`, or `global_stream_cap` when the server's whole held-open budget is full): `Retry-After: 2` and `retry_after_ms` 2000; nothing was audited or sent. `502` — the device reported an error or the query failed (`error.reason` `device_failed` or `device_error`, no `retry_after_ms`; `device_error` also covers a device that finished with nothing usable, no process rows or no uptime fields), or its joined answer exceeded the 4 MiB output limit, held more than 20000 process rows, or was spread over more than 64 stored rows (`output_too_large`; refused, never truncated, unless a stored failure or an `error|` first chunk decides it as `device_failed` or `device_error`). `503` — a zero-reach cause that can clear on its own (the device is offline or unreachable, the containment or routing state could not be read, or agent presence could not be read while a per-OS kill switch is set): `error.reason` is `no_agents_reached`, `containment_unreadable`, `route_unreadable` or `os_gate_unreadable`, with `retry_after_ms` 5000; **or** `503` + `Sec-Audit-Failed: true` when the audit row cannot persist (the command is **not** dispatched — see Audit); **or** `503` with `retry_after_ms` 2000 (120000 for `processes`, whose first run may still be hashing, so a retry would start a second hash) and `error.reason` `store_degraded` when every read of the stored answer failed (retryable; it used to be a `504`; the hint is a ceiling and applies even if the store recovers sooner, and the answer is not returned, so a retry runs the read again; a store fault that begins part way through the wait is answered `timeout` or `incomplete`, by what was seen before it); **or** `503` with `retry_after_ms` 5000 and `error.reason` `gate_unreadable` when the permission store could not be read at the second permission check (retryable, and not a revocation; where the permission gate itself already answered `503` for the outage, its own body stands); **or** `503` with `error.reason` `shutting_down` and no `retry_after_ms` while the server is shutting down (a new read is refused and nothing is sent; a read already waiting is abandoned with the same answer and the command may have been sent). `504` — the device did not answer inside the budget: `error.reason` `timeout` when nothing came back (`retry_after_ms` 3000, or 120000 for kind `processes`, whose run can hash for up to 120 seconds), or `incomplete` when the device began to answer and never finished (`retry_after_ms` 25000 for a quick kind (the poll's own wall deadline, by which its first run has finished) or 120000 for `processes`, whose first run can hash for up to 120 seconds; a retry that lands inside a first run that is still hashing only adds device load). **The `error.reason` words of this route and of the MCP tool are not one identical set.** Both stamp `device_failed`, `device_error`, `store_degraded`, `timeout`, `incomplete`, `shutting_down`, the zero-reach and cap words above and the dispatch-denial token; `output_too_large` is answered only here. The MCP tool additionally stamps `permission_revoked`, `caller_unresolved` and `exception`: this route answers the permission gate's own `403` or the resolver's own refusal for the first two (no `reason` of its own) and a bare `500` for an exception. A credential that resolves to a different principal at the second look AND lacks a grant gets the gate's `403` on this route (the two gates run again first, and the failure row reads `permission_revoked`), but `caller_unresolved` on the MCP tool (the principal is compared first); when the different principal does hold both grants this route answers `401` and writes a `caller_unresolved` row that also names that principal (`now=<principal>`); nothing is sent either way. `gate_unreadable` is stamped by this route only when it restates the `503` itself (a gate that already answered `503` for the outage keeps its own body, without it). `audit_failed`, `not_configured`, `tier` and `render_failed` carry no `reason` on either surface, and neither does `bad_device_id` (REST only, a plain `400`).
+- **Errors:** `400` — `kind` missing/unrecognised, or the device id is over 256 bytes or carries a byte below 0x20 (`Invalid device id.`, before the scoped gates, any audit row or any dispatch, counted `bad_device_id` under the requested kind). `401`: not authenticated, or, after the `requested` audit row was written, the credential no longer resolves or now resolves to a different principal than the one the audit rows name (nothing is sent; the audit detail is `caller_unresolved`). `403` — outside the operator's scope, missing `Execution:Execute`, or the dispatch chokepoint refused the pair for the caller (an A4 error whose message is `dispatch denied: reason=<token>`; `500` for `unclassified` / `ambiguous`, a server catalogue fault, with a remediation that says to report it to the administrator). `409`: every target was withheld by the quarantine containment gate (`error.reason` `quarantined`; permanent, no `retry_after_ms`, release the device first). `422`: the probe's plugin is not in the device's reported inventory (`error.reason` `plugin_not_found`; permanent). `403` is also answered when the probe's action is switched off for the device's operating system by a per-OS kill switch (`error.reason` `kill_switched_os`; permanent). `422` is also answered when the device is no longer one the caller may dispatch to at the moment of the send (`error.reason` `no_targets`; permanent). `429` — the caller already has 2 live reads in progress, or the server already has 4 (one shared budget with the MCP tool, `error.reason` `per_principal_stream_cap` or `surface_stream_cap`, or `global_stream_cap` when the server's whole held-open budget is full): `Retry-After: 2` and `retry_after_ms` 2000; nothing was audited or sent. `502` — the device reported an error or the query failed (`error.reason` `device_failed` or `device_error`, no `retry_after_ms`; `device_error` also covers a device that finished with nothing usable, no process rows or no uptime fields), or its joined answer exceeded the 4 MiB output limit, held more than 20000 process rows, or was spread over more than 64 stored rows (`output_too_large`; refused, never truncated, unless a stored failure or an `error|` first chunk decides it as `device_failed` or `device_error`). `503` — a zero-reach cause that can clear on its own (the device is offline or unreachable, the containment or routing state could not be read, or agent presence could not be read while a per-OS kill switch is set): `error.reason` is `no_agents_reached`, `containment_unreadable`, `route_unreadable`, `os_gate_unreadable` or `target_resolution_failed`, with `retry_after_ms` 5000; **or** `503` + `Sec-Audit-Failed: true` when the audit row cannot persist (the command is **not** dispatched — see Audit); **or** `503` with `retry_after_ms` 2000 (120000 for `processes`, whose first run may still be hashing, so a retry would start a second hash) and `error.reason` `store_degraded` when every read of the stored answer failed (retryable; it used to be a `504`; the hint is a ceiling and applies even if the store recovers sooner, and the answer is not returned, so a retry runs the read again; a store fault that begins part way through the wait is answered `timeout` or `incomplete`, by what was seen before it); **or** `503` with `retry_after_ms` 5000 and `error.reason` `gate_unreadable` when the permission store could not be read at the second permission check (retryable, and not a revocation; where the permission gate itself already answered `503` for the outage, its own body stands); **or** `503` with `error.reason` `shutting_down` and no `retry_after_ms` while the server is shutting down (a new read is refused and nothing is sent; a read already waiting is abandoned with the same answer and the command may have been sent). `504` — the device did not answer inside the budget: `error.reason` `timeout` when nothing came back (`retry_after_ms` 3000, or 120000 for kind `processes`, whose run can hash for up to 120 seconds), or `incomplete` when the device began to answer and never finished (`retry_after_ms` 25000 for a quick kind (the poll's own wall deadline, by which its first run has finished) or 120000 for `processes`, whose first run can hash for up to 120 seconds; a retry that lands inside a first run that is still hashing only adds device load). **The `error.reason` words of this route and of the MCP tool are not one identical set.** Both stamp `device_failed`, `device_error`, `store_degraded`, `timeout`, `incomplete`, `shutting_down`, the zero-reach and cap words above and the dispatch-denial token; `output_too_large` is answered only here. The MCP tool additionally stamps `permission_revoked`, `caller_unresolved` and `exception`: this route answers the permission gate's own `403` or the resolver's own refusal for the first two (no `reason` of its own) and a bare `500` for an exception. A credential that resolves to a different principal at the second look AND lacks a grant gets the gate's `403` on this route (the two gates run again first, and the failure row reads `permission_revoked`), but `caller_unresolved` on the MCP tool (the principal is compared first); when the different principal does hold both grants this route answers `401` and writes a `caller_unresolved` row that also names that principal (`now=<principal>`); nothing is sent either way. `gate_unreadable` is stamped by this route only when it restates the `503` itself (a gate that already answered `503` for the outage keeps its own body, without it). `audit_failed`, `not_configured`, `tier` and `render_failed` carry no `reason` on either surface, and neither does `bad_device_id` (REST only, a plain `400`).
 - **Headers:** `X-Correlation-Id` is echoed on **every** response path.
 - **Audit:** emits `device.live.uptime` or `device.live.processes` (`target_type=Agent`, `target_id=<agent_id>`, `result=requested`, `detail` carries `cid=<correlation_id>`) **before** the command is dispatched — the operator's *request* is the works-council-relevant event, kept separately countable per kind. **Fail-closed:** if the audit row cannot persist, whether the store refuses it or the audit sink throws, the endpoint returns `503` + `Sec-Audit-Failed: true` and the command is **not** dispatched (no usage-class probe without durable evidence); a throwing sink used to surface as a generic `500` and is now this `503`. A dispatch that reaches no agent writes a `result=failure` row after the `requested` row, with `detail` `reason=<token> cid=<correlation_id>` (the token is the `error.reason` of the answer). A dispatch that reaches an agent carries its outcome in the HTTP response, not in a second audit row; `command_id` is recoverable from the response store / metrics by `cid`. **Recheck after the row (#7110):** once the `requested` row is stored the route decides both scoped permissions again and resolves the caller again (the one dispatched). A permission withdrawn in between answers the permission gate's own `403`, writes `result=failure` with `detail` `permission_revoked cid=<correlation_id>` (`caller_unresolved cid=<correlation_id>` when the caller no longer resolves or now resolves to a different principal than the first session, in which case the answer is a `401` and nothing is sent, `gate_unreadable cid=<correlation_id>` when the permission store could not be read, which is an outage and not a revocation; a row that cannot be stored puts `Sec-Audit-Failed: true` on the answer, since it is the only record that nothing was sent) and dispatches nothing (`permission_revoked` and `caller_unresolved` are audit-detail tokens, not response fields). Both kinds classify `Inventory:Read` with no execute gate, so this recheck is the only place the two named grants are decided after the row. This route runs no pre-send dry run, so the dispatch chokepoint alone decides the pair's `Inventory:Read`: a refusal there (#7114) answers the A4 `403` above, writes `result=failure` with `detail` `dispatch_denied reason=<token> cid=<correlation_id>` and is never reported as the retryable `503` offline device. **Known limits of the recheck:** the authenticator returns a session or nothing, so a session or authentication store that degrades between the `requested` row and the caller's re-resolution cannot be told from a withdrawn credential and is answered `caller_unresolved` (the authenticator's own refusal, not retryable), never `gate_unreadable`; and an exception after the `requested` row writes no `failure` row on this route (it answers a bare `500` and the `requested` row stands alone), where the MCP tool writes `failure` with `reason=exception`. With audit switched off the route proceeds and writes no rows. Every row of a call is written as the session that made it, even if the credential is revoked mid-call. The REST route and the MCP tool write the `requested` row before the dispatch and fail closed; the dashboard **Get live info** path audits after the dispatch and sets-and-proceeds. The boundary of the recheck is stated under `POST /api/v1/instructions/{id}/execute` ("Refused after the audit row"). `yuzu_server_live_requests_total` carries the labels `surface` (`rest` here, `mcp` for the tool), `kind` (`uptime`, `processes` or `unknown`; any other `kind` value is counted as `unknown`) and `outcome`, a closed set of words (for example `ok`, `bad_kind`, `bad_device_id`, `gate_refused`, `over_budget_principal`, `audit_failed`, `quarantined`, `device_error`, `timeout`, `incomplete`, `shutting_down`); the earlier HTTP-status `outcome` values are gone (see [upgrading.md](upgrading.md)).
 
@@ -13945,13 +14060,15 @@ marked cancelled), `agents_reached: 0` and the withheld counts in the `error` ob
 |---|---|---|---|---|
 | 0 | `dispatch_denied` | `403` | `null` | The dispatch chokepoint refused the `plugin`/`action` pair for the caller when the command was sent (for example `approval_required`), after the pre-send admission check had passed: an authorization denial, never unreachability. Permanent: retrying alone will not help. |
 | 1 | `invalid_scope` | `400` | `null` | The scope expression did not parse; fix it. |
+| 1b | `target_resolution_failed` | `503` | `5000` | The target list could not be read, including an unreadable agent presence directory with nobody listed. |
 | 2 | `containment_unreadable` | `503` | `5000` | The quarantine state is unreadable; dispatch fails closed. |
 | 3 | `route_unreadable` | `503` | `5000` | The gateway routing directory could not be read for some targets. |
 | 4 | `os_gate_unreadable` | `503` | `5000` | Presence could not be read while a per-OS kill switch is set. |
 | 5 | `quarantined` | `409` | `null` | Every target is quarantined. |
 | 6 | `plugin_not_found` | `422` | `null` | The plugin is in no target agent's inventory. |
 | 7 | `kill_switched_os` | `403` | `null` | Every target runs an OS for which the action is switched off. |
-| 8 | `no_agents_reached` | `503` | `5000` | Every target was unreachable. |
+| 7b | `no_targets` | `422` | `null` | The target list was read and nothing you may dispatch to matched; scope and broadcast consider only connected agents, so just after a server or gateway restart wait for agents to reconnect before treating it as final. A caller who can see no device at all gets `no_agents_reached` instead. |
+| 8 | `no_agents_reached` | `503` | `5000` | Targets were resolved but none was reached, including an unconfined caller naming a device id that does not exist, and a caller who can see no device at all. |
 
 A protective action (the quarantine and firewall control actions and `__guard__.push_rules`) never yields
 `os_gate_unreadable`, `plugin_not_found` or `kill_switched_os`. Refusals in the targeting family
@@ -14339,7 +14456,7 @@ outside-scope id.
 #### `GET /api/executions/{id}/summary`
 
 **Permission:** `Execution:Read`. Get an execution summary (counts of targeted, responded,
-success, failure agents, `progress_pct`). **Response (404):** unknown or outside-scope id.
+success, failure agents, `progress_pct`, which is success plus failure over targeted). **Response (404):** unknown or outside-scope id.
 
 #### `GET /api/executions/{id}/agents`
 
@@ -15079,7 +15196,7 @@ inline drawer's live updates on the **Instructions → Executions** tab.
 |---|---|---|
 | `agent-transition` | One per agent state change (`update_agent_status` write) | `AgentExecStatus` snapshot — `agent_id`, `status`, `exit_code`, `duration_ms`, `error` |
 | `execution-progress` | Every `refresh_counts` recompute | counts snapshot — `total`, `succeeded`, `failed`, `running`, `pending` |
-| `execution-completed` | Crossing the all-agents-responded threshold OR `mark_cancelled` | terminal status — `{"status":"succeeded"\|"completed"\|"cancelled"}`. Client should close the EventSource after this event. |
+| `execution-completed` | No contacted device is still awaited (answers, server-decided `timed_out`/`unknown` and delivery failures all close a device), the server finishing an overdue run, OR `mark_cancelled`. A run without a saved device list finishes when as many devices have answered as were targeted | terminal status — `{"status":"succeeded"\|"completed"\|"cancelled"}`; a status other than `cancelled` also carries `agents_success` and `agents_failure`. Client should close the EventSource after this event. |
 
 **Confined-subscriber event projection (#1634).** A management-group-confined subscriber (not the execution's dispatcher) does not receive the raw event stream verbatim — a shared projector (`execution_event_scope.hpp`) applies one of three treatments per event, so a subscriber can never learn about agents outside their visible set:
 

@@ -101,6 +101,7 @@
 #include "bundle_service.hpp"           // validate_bundle_steps / aggregate_to_json
 #include "dispatch_destructive_gate.hpp" // #3685: evaluate_destructive_targeting — shared with /api/command
 #include "dispatch_target_shape.hpp" // kBroadcastScope (#2500)
+#include "dispatch_zero_reach.hpp"   // #2673: the shared no-targets wording
 #include "execution_model.hpp" // #4030: shared execution list/agent/kpi/response row builders
 #include "execution_mutation.hpp" // cancel_execution / record_execution_rerun: the shared admit-audit-effect sequence
 #include "execution_scope_rules.hpp" // #2146 A2-R1: execution_visible, shared with rest_api_v1.cpp/execution_routes.cpp
@@ -1276,9 +1277,18 @@ static const ToolDef kTools[] = {
      "plugin (an action on the Forensics securable) a failure message is kept only when it "
      "is a short machine token (scope:cause[:detail], e.g. windows:amcache:hive_locked); "
      "any other text is replaced by the fixed value forensics_error. Status and exit code are "
-     "unchanged.",
+     "unchanged. Status succeeded means every intended device answered successfully; completed "
+     "means finished with at least one that did not (failed, timed out, not delivered, unknown "
+     "or never reached), or with a device list the server could not save in full, even when "
+     "every listed device succeeded. coverage counts the intended devices: state unrecorded "
+     "means the "
+     "counts are not known (never zero); population connected_only means only connected agents "
+     "were considered; a silent device is timed_out after the response window (at least 660 s) "
+     "and a later answer counts as late without changing the result. The agents array and kpi "
+     "include devices the server gave up on, as timed_out or unknown; no tool lists devices "
+     "that were never reached.",
      R"({"type":"object","properties":{"execution_id":{"type":"string","description":"Execution ID"},"include":{"type":"array","items":{"type":"string","enum":["agents"]},"description":"Optional; \"agents\" adds a confined per-agent array + kpi summary"}},"required":["execution_id"]})",
-     R"j({"type":"object","properties":{"id":{"type":"string"},"definition_id":{"type":"string"},"status":{"type":"string"},"scope_expression":{"type":"string"},"parameter_values":{"type":"string","description":"Redacted to \"(redacted - confined view)\" for a confined caller"},"dispatched_by":{"type":"string"},"dispatched_at":{"type":"integer"},"agents_targeted":{"type":"integer"},"agents_responded":{"type":"integer"},"agents_success":{"type":"integer"},"agents_failure":{"type":"integer"},"progress_pct":{"type":"integer"},"completed_at":{"type":"integer"},"parent_id":{"type":"string"},"rerun_of":{"type":"string"},"retry_after_ms":{"type":"integer","description":"Present only while status is non-terminal — minimum ms before polling again"},"agents":{"type":"array","description":"Present only when include contains \"agents\"","items":{"type":"object","properties":{"agent_id":{"type":"string"},"status":{"type":"string"},"dispatched_at":{"type":"integer"},"first_response_at":{"type":"integer"},"completed_at":{"type":"integer"},"exit_code":{"type":"integer"},"error_detail":{"type":"string"}}}},"kpi":{"type":"object","description":"Present only when include contains \"agents\"","properties":{"total":{"type":"integer"},"succeeded":{"type":"integer"},"failed":{"type":"integer"},"p50_ms":{"type":["number","null"]},"p95_ms":{"type":["number","null"]}}},"audit_persisted":{"type":"boolean","description":"Present and false only when the per-agent expansion's audit row failed to persist"}},"required":["id","definition_id","status","scope_expression","parameter_values","dispatched_by","dispatched_at","agents_targeted","agents_responded","agents_success","agents_failure","progress_pct","completed_at","parent_id","rerun_of"]})j"},
+     R"j({"type":"object","properties":{"id":{"type":"string"},"definition_id":{"type":"string"},"status":{"type":"string"},"scope_expression":{"type":"string"},"parameter_values":{"type":"string","description":"Redacted to \"(redacted - confined view)\" for a confined caller"},"dispatched_by":{"type":"string"},"dispatched_at":{"type":"integer"},"agents_targeted":{"type":"integer"},"agents_responded":{"type":"integer"},"agents_success":{"type":"integer"},"agents_failure":{"type":"integer"},"progress_pct":{"type":"integer"},"completed_at":{"type":"integer"},"parent_id":{"type":"string"},"rerun_of":{"type":"string"},"retry_after_ms":{"type":"integer","description":"Present only while status is non-terminal — minimum ms before polling again"},"agents":{"type":"array","description":"Present only when include contains \"agents\"","items":{"type":"object","properties":{"agent_id":{"type":"string"},"status":{"type":"string"},"dispatched_at":{"type":"integer"},"first_response_at":{"type":"integer"},"completed_at":{"type":"integer"},"exit_code":{"type":"integer"},"error_detail":{"type":"string"}}}},"kpi":{"type":"object","description":"Present only when include contains \"agents\"","properties":{"total":{"type":"integer"},"succeeded":{"type":"integer"},"failed":{"type":"integer"},"p50_ms":{"type":["number","null"]},"p95_ms":{"type":["number","null"]}}},"coverage":{"type":"object","description":"Per-target counts over the visible agents; every count is null while state is unrecorded","properties":{"state":{"type":"string","enum":["recorded","unrecorded"]},"population":{"type":["string","null"],"description":"listed, or connected_only when a scope or broadcast chose the targets (only connected agents are considered); null for a confined caller"},"intended":{"type":["integer","null"],"description":"Targets the run was meant to reach."},"contacted":{"type":["integer","null"],"description":"Targets whose send was accepted (queued, for a gateway-routed agent)."},"responded":{"type":["integer","null"],"description":"Targets that answered successfully."},"failed":{"type":["integer","null"],"description":"Targets that answered with a failure, timeout or rejection."},"timed_out":{"type":["integer","null"],"description":"Targets for which the server recorded no result before the response deadline."},"offline":{"type":["integer","null"],"description":"Targets with no session or route."},"not_sent":{"type":["integer","null"],"description":"Targets whose send was not accepted."},"withheld":{"type":["integer","null"],"description":"Targets withheld by quarantine, plugin absence, a per-OS switch, a concurrency claim, a containment gate, or (software sync) an agent too old to run it."},"pending":{"type":["integer","null"],"description":"Contacted targets still being waited for."},"late":{"type":["integer","null"],"description":"Targets the server gave up on that answered afterwards; a subset of timed_out plus unknown."},"not_delivered":{"type":["integer","null"],"description":"Targets the server or gateway reported it could not deliver to."},"unknown":{"type":["integer","null"],"description":"Targets whose delivery or answer is not known: the server could not have recorded it, or the gateway could not say whether the command arrived."},"deadline_at":{"type":["integer","null"],"description":"Epoch seconds of the response deadline; null for a confined caller."}},"required":["state","population","intended","contacted","responded","failed","timed_out","offline","not_sent","withheld","pending","late","not_delivered","unknown","deadline_at"]},"audit_persisted":{"type":"boolean","description":"Present and false only when the per-agent expansion's audit row failed to persist"}},"required":["id","definition_id","status","scope_expression","parameter_values","dispatched_by","dispatched_at","agents_targeted","agents_responded","agents_success","agents_failure","progress_pct","completed_at","parent_id","rerun_of","coverage"]})j"},
 
     {"get_execution_children",
      "List an execution's child executions (spawned reruns, workflow-step "
@@ -1331,7 +1341,7 @@ static const ToolDef kTools[] = {
      "anything because of this call, and the new record stays 'pending'. Do NOT read a success "
      "result as 'the devices were re-run'; the result carries dispatched_to_devices:false. To run "
      "the work again on devices, dispatch it with execute_instruction. failed_only (default "
-     "false) sizes the new record to the original's failed, timed-out and rejected devices "
+     "false) sizes the new record to the original's reached devices without a successful result (failed, rejected, timed out, not delivered or unknown; never-reached and still-pending devices are not counted) "
      "instead of its whole targeted list; it is a boolean (the legacy REST scope=\"failed_only\" "
      "string is not accepted here). Each call creates another record (not idempotent). A caller "
      "confined to management groups may use it only on an execution they dispatched that no "
@@ -1343,7 +1353,7 @@ static const ToolDef kTools[] = {
      "(execution.rerun) BEFORE the record is created and refuses with a retryable error, "
      "creating nothing, if that row cannot be saved. Requires Execution:Execute and "
      "Execution:Read.",
-     R"j({"type":"object","properties":{"execution_id":{"type":"string","pattern":"^[A-Za-z0-9_-]{1,128}$","maxLength":128,"description":"Id of the execution to record a rerun of, from list_executions or get_execution_status"},"failed_only":{"type":"boolean","description":"Default false. True sizes the new record to the original's failed, timed-out and rejected devices"},"approval_id":{"type":"string","description":"Approval ticket id from a prior kApprovalRequired response; supply after administrator approval"}},"required":["execution_id"],"additionalProperties":false})j",
+     R"j({"type":"object","properties":{"execution_id":{"type":"string","pattern":"^[A-Za-z0-9_-]{1,128}$","maxLength":128,"description":"Id of the execution to record a rerun of, from list_executions or get_execution_status"},"failed_only":{"type":"boolean","description":"Default false. True sizes the new record to the original's reached devices without a successful result (failed, rejected, timed out, not delivered or unknown; never-reached and still-pending devices are not counted)"},"approval_id":{"type":"string","description":"Approval ticket id from a prior kApprovalRequired response; supply after administrator approval"}},"required":["execution_id"],"additionalProperties":false})j",
      R"j({"type":"object","properties":{"execution_id":{"type":"string","description":"Id of the NEW pending record"},"rerun_of":{"type":"string"},"status":{"const":"pending"},"failed_only":{"type":"boolean"},"dispatched_to_devices":{"const":false},"audit_persisted":{"type":"boolean","description":"Present (false) only when the outcome audit row failed to persist after the record had been created"}},"required":["execution_id","rerun_of","status","failed_only","dispatched_to_devices"]})j"},
 
     {"list_executions", "List recent command executions. Confined by management group: a "
@@ -1557,7 +1567,8 @@ static const ToolDef kTools[] = {
      "agents_reached 0 on every step, one of: \"dispatch_denied\" (the dispatch chokepoint "
      "refused a step for the caller at send time), \"containment_unreadable\", \"route_unreadable\", "
      "\"os_gate_unreadable\", \"no_agents_reached\" (offline devices, or a concurrency claim), "
-     "\"quarantined\", \"plugin_not_found\", \"kill_switched_os\", \"late_denied\", "
+     "\"quarantined\", \"plugin_not_found\", \"kill_switched_os\", \"no_targets\", "
+     "\"target_resolution_failed\", \"late_denied\", "
      "\"definition_changed\", \"deadline_exceeded\" (the 60 second budget ended the run before "
      "any step reached an agent) or \"run_failed\" (the engine closed the run without a single "
      "dispatch attempt). This call always carries an idempotency_key and the key is bound to the "
@@ -1579,7 +1590,7 @@ static const ToolDef kTools[] = {
      R"j("idempotent_replay":{"type":"boolean","description":"Present (true) only when the idempotency_key was already bound to a run and this call sent nothing: the other fields then describe that run, thinly (status, started_at, message), and steps and late_denied are absent"},)j"
      R"j("started_at":{"type":"integer","description":"Present only on an idempotent replay: when the run started, epoch seconds"},)j"
      R"j("workflow_id":{"type":"string"},)j"
-     R"j("status":{"type":"string","description":"The engine's recorded status (completed, failed, ...), partial, aborted or interrupted for a run that sent something and did not succeed, or the zero-reach cause token when no step reached any agent (one of dispatch_denied, containment_unreadable, route_unreadable, os_gate_unreadable, no_agents_reached, quarantined, plugin_not_found, kill_switched_os, late_denied, definition_changed, deadline_exceeded, run_failed). On an idempotent replay: the first answer's class judged from the stored steps, never from the engine's status alone: completed (only for a run that succeeded), partial, failed, aborted or interrupted (each retryable false), running (retry_after_ms 2000: poll, never re-send) or indeterminate (a run still running long after it started, or a completed run whose stored steps cannot prove its outcome; retryable false)"},)j"
+     R"j("status":{"type":"string","description":"The engine's recorded status (completed, failed, ...), partial, aborted or interrupted for a run that sent something and did not succeed, or the zero-reach cause token when no step reached any agent (one of dispatch_denied, containment_unreadable, route_unreadable, os_gate_unreadable, target_resolution_failed, no_agents_reached, quarantined, plugin_not_found, kill_switched_os, no_targets, late_denied, definition_changed, deadline_exceeded, run_failed). On an idempotent replay: the first answer's class judged from the stored steps, never from the engine's status alone: completed (only for a run that succeeded), partial, failed, aborted or interrupted (each retryable false), running (retry_after_ms 2000: poll, never re-send) or indeterminate (a run still running long after it started, or a completed run whose stored steps cannot prove its outcome; retryable false)"},)j"
      R"j("late_denied":{"type":"boolean","description":"True when a step was refused at send time because its definition changed after the precheck"},)j"
      R"j("steps":{"type":"array","items":{"type":"object","properties":{"instruction_id":{"type":"string"},"attempt":{"type":"integer","minimum":1,"description":"The 1-based send attempt of this step this entry records: a retry has the next number and the next step starts again at 1. A step is judged by its last attempt"},"command_id":{"type":"string"},"agents_reached":{"type":"integer","minimum":0},"reason":{"type":"string","description":"Present when agents_reached is 0"},"retryable":{"type":"boolean"},"agents_quarantined":{"type":"integer","minimum":0},"agents_unknown_plugin":{"type":"integer","minimum":0},"agents_kill_switched_os":{"type":"integer","minimum":0}},"required":["instruction_id","command_id","agents_reached"]}},)j"
      R"j("remediation":{"type":"string","description":"Present on an idempotent replay of every status but completed and running, and when no step reached any agent (use a new idempotency key (MCP: a new approval) for another run). A replay's text says a step recorded pending or skipped may still have been sent"},)j"
@@ -2997,6 +3008,9 @@ static const ToolDef kTools[] = {
      "\"containment_unreadable\" is a transient systemic gate "
      "failure and \"route_unreadable\" (WS-4 4.2b) is a transient systemic gateway "
      "routing-directory read failure - both are retryable, retry_after_ms names the wait. "
+     "\"no_targets\" (permanent, retry_after_ms null) means the target list was read and is "
+     "empty - scope and broadcast consider only connected agents; "
+     "\"target_resolution_failed\" (retry_after_ms 5000) means it could not be read. "
      "\"no_agents_reached\" is the generic case (offline "
      "device, or a residual approval-required race) - retry_after_ms is non-null here too, since "
      "the offline-device case within it is retryable and a mixed cause must not be understated as "
@@ -3059,7 +3073,9 @@ static const ToolDef kTools[] = {
      R"j({"type":"object","properties":{"status":{"const":"plugin_not_found"},"command_id":{"type":"string"},"execution_id":{"type":"string"},"agents_reached":{"const":0},"plugin":{"type":"string"},"action":{"type":"string"},"message":{"type":"string"},"retry_after_ms":{"const":null},"agents_quarantined":{"type":"integer","minimum":0},"agents_unknown_plugin":{"type":"integer","minimum":0},"agents_kill_switched_os":{"type":"integer","minimum":0}},"required":["status","command_id","execution_id","agents_reached","plugin","action","message","retry_after_ms","agents_quarantined","agents_unknown_plugin","agents_kill_switched_os"],"additionalProperties":false},)j"
      R"j({"type":"object","properties":{"status":{"const":"kill_switched_os"},"command_id":{"type":"string"},"execution_id":{"type":"string"},"agents_reached":{"const":0},"plugin":{"type":"string"},"action":{"type":"string"},"message":{"type":"string"},"retry_after_ms":{"const":null},"agents_quarantined":{"type":"integer","minimum":0},"agents_unknown_plugin":{"type":"integer","minimum":0},"agents_kill_switched_os":{"type":"integer","minimum":0}},"required":["status","command_id","execution_id","agents_reached","plugin","action","message","retry_after_ms","agents_quarantined","agents_unknown_plugin","agents_kill_switched_os"],"additionalProperties":false},)j"
      R"j({"type":"object","properties":{"status":{"const":"os_gate_unreadable"},"command_id":{"type":"string"},"execution_id":{"type":"string"},"agents_reached":{"const":0},"plugin":{"type":"string"},"action":{"type":"string"},"message":{"type":"string"},"retry_after_ms":{"const":5000},"agents_quarantined":{"type":"integer","minimum":0},"agents_unknown_plugin":{"type":"integer","minimum":0},"agents_kill_switched_os":{"type":"integer","minimum":0}},"required":["status","command_id","execution_id","agents_reached","plugin","action","message","retry_after_ms","agents_quarantined","agents_unknown_plugin","agents_kill_switched_os"],"additionalProperties":false},)j"
-     R"j({"type":"object","properties":{"status":{"const":"no_agents_reached"},"command_id":{"type":"string"},"execution_id":{"type":"string"},"agents_reached":{"const":0},"plugin":{"type":"string"},"action":{"type":"string"},"message":{"type":"string"},"retry_after_ms":{"const":5000},"agents_quarantined":{"type":"integer","minimum":0},"agents_unknown_plugin":{"type":"integer","minimum":0},"agents_kill_switched_os":{"type":"integer","minimum":0}},"required":["status","command_id","execution_id","agents_reached","plugin","action","message","retry_after_ms","agents_quarantined","agents_unknown_plugin","agents_kill_switched_os"],"additionalProperties":false})j"
+     R"j({"type":"object","properties":{"status":{"const":"no_agents_reached"},"command_id":{"type":"string"},"execution_id":{"type":"string"},"agents_reached":{"const":0},"plugin":{"type":"string"},"action":{"type":"string"},"message":{"type":"string"},"retry_after_ms":{"const":5000},"agents_quarantined":{"type":"integer","minimum":0},"agents_unknown_plugin":{"type":"integer","minimum":0},"agents_kill_switched_os":{"type":"integer","minimum":0}},"required":["status","command_id","execution_id","agents_reached","plugin","action","message","retry_after_ms","agents_quarantined","agents_unknown_plugin","agents_kill_switched_os"],"additionalProperties":false},)j"
+     R"j({"type":"object","properties":{"status":{"const":"no_targets"},"command_id":{"type":"string"},"execution_id":{"type":"string"},"agents_reached":{"const":0},"plugin":{"type":"string"},"action":{"type":"string"},"message":{"type":"string"},"retry_after_ms":{"const":null},"agents_quarantined":{"type":"integer","minimum":0},"agents_unknown_plugin":{"type":"integer","minimum":0},"agents_kill_switched_os":{"type":"integer","minimum":0}},"required":["status","command_id","execution_id","agents_reached","plugin","action","message","retry_after_ms","agents_quarantined","agents_unknown_plugin","agents_kill_switched_os"],"additionalProperties":false},)j"
+     R"j({"type":"object","properties":{"status":{"const":"target_resolution_failed"},"command_id":{"type":"string"},"execution_id":{"type":"string"},"agents_reached":{"const":0},"plugin":{"type":"string"},"action":{"type":"string"},"message":{"type":"string"},"retry_after_ms":{"const":5000},"agents_quarantined":{"type":"integer","minimum":0},"agents_unknown_plugin":{"type":"integer","minimum":0},"agents_kill_switched_os":{"type":"integer","minimum":0}},"required":["status","command_id","execution_id","agents_reached","plugin","action","message","retry_after_ms","agents_quarantined","agents_unknown_plugin","agents_kill_switched_os"],"additionalProperties":false})j"
      R"j(]})j"},
 
     // #2146 (ledger row post.api-instructions-param-execute): the MCP twin of POST
@@ -3112,10 +3128,11 @@ static const ToolDef kTools[] = {
      "one exactly one, both confined to the agents you may see. "
      "ZERO AGENTS: a SUCCESS result with agents_reached 0 carries a status to branch on, not "
      "message text: dispatch_denied (the dispatch chokepoint refused the command for you at send "
-     "time), invalid_scope, quarantined, plugin_not_found and kill_switched_os are "
+     "time), invalid_scope, quarantined, plugin_not_found, kill_switched_os and no_targets are "
      "PERMANENT (retry_after_ms is null; retrying the same request cannot help); "
-     "containment_unreadable, route_unreadable, os_gate_unreadable and no_agents_reached are "
-     "transient (retry_after_ms 5000). A dispatch-authorization denial is a JSON-RPC error whose "
+     "target_resolution_failed, containment_unreadable, route_unreadable, os_gate_unreadable and "
+     "no_agents_reached are transient (retry_after_ms 5000). no_targets means nothing you may "
+     "dispatch to matched (scope and broadcast consider only connected agents). A dispatch-authorization denial is a JSON-RPC error whose "
      "error.data.reason is one of unclassified, ambiguous, anonymous_operator, forbidden, "
      "approval_required, kill_switched, or permission_revoked (-32003, permanent): the "
      "permission, the credential or the administrator standing a role-gated definition requires "
@@ -3152,7 +3169,7 @@ static const ToolDef kTools[] = {
      R"j({"oneOf":[)j"
      R"j({"type":"object","properties":{"command_id":{"type":"string"},"execution_id":{"type":"string"},"agents_reached":{"type":"integer","minimum":1},"definition_id":{"type":"string"},"plugin":{"type":"string"},"action":{"type":"string"},"audit_persisted":{"const":false}},"required":["command_id","execution_id","agents_reached","definition_id","plugin","action"],"additionalProperties":false},)j"
      R"j({"type":"object","properties":{"status":{"const":"pending_approval"},"approval_id":{"type":"string"},"approval_mode":{"type":"string"},"definition_id":{"type":"string"},"audit_persisted":{"const":false}},"required":["status","approval_id","approval_mode","definition_id"],"additionalProperties":false},)j"
-     R"j({"type":"object","properties":{"status":{"enum":["dispatch_denied","invalid_scope","containment_unreadable","route_unreadable","os_gate_unreadable","quarantined","plugin_not_found","kill_switched_os","no_agents_reached"]},"command_id":{"type":"string"},"execution_id":{"type":"string"},"agents_reached":{"const":0},"definition_id":{"type":"string"},"plugin":{"type":"string"},"action":{"type":"string"},"message":{"type":"string"},"retry_after_ms":{"type":["integer","null"]},"agents_quarantined":{"type":"integer","minimum":0},"agents_unknown_plugin":{"type":"integer","minimum":0},"agents_kill_switched_os":{"type":"integer","minimum":0},"audit_persisted":{"const":false}},"required":["status","command_id","execution_id","agents_reached","definition_id","plugin","action","message","retry_after_ms","agents_quarantined","agents_unknown_plugin","agents_kill_switched_os"],"additionalProperties":false})j"
+     R"j({"type":"object","properties":{"status":{"enum":["dispatch_denied","invalid_scope","containment_unreadable","route_unreadable","os_gate_unreadable","quarantined","plugin_not_found","kill_switched_os","no_agents_reached","no_targets","target_resolution_failed"]},"command_id":{"type":"string"},"execution_id":{"type":"string"},"agents_reached":{"const":0},"definition_id":{"type":"string"},"plugin":{"type":"string"},"action":{"type":"string"},"message":{"type":"string"},"retry_after_ms":{"type":["integer","null"]},"agents_quarantined":{"type":"integer","minimum":0},"agents_unknown_plugin":{"type":"integer","minimum":0},"agents_kill_switched_os":{"type":"integer","minimum":0},"audit_persisted":{"const":false}},"required":["status","command_id","execution_id","agents_reached","definition_id","plugin","action","message","retry_after_ms","agents_quarantined","agents_unknown_plugin","agents_kill_switched_os"],"additionalProperties":false})j"
      R"j(]})j"},
 
     // ── Live-query bundle (ADR-0011) — MCP/REST parity for /api/v1/bundles ─────
@@ -5771,7 +5788,10 @@ static const ToolDef kTools[] = {
     {"get_software_sync_status",
      "How one software sync run is going: the execution record that sync_hardware_software "
      "returns the id of. Returns state, targeted (the frames the registry accepted), acknowledged "
-     "(agents that armed the sync) and failed (agents that answered with a failure), dispatched_at, "
+     "(agents that armed the sync) and failed (agents that answered with a failure; when the run's "
+     "target list was not saved in full, every unsuccessful result), dispatched_at, "
+     "plus, once the run's target list is saved in full, timed_out, not_delivered and unknown (no device "
+     "answer) and not_reached (selected but offline, not sent or unable to run it), "
      "delay_max_s and estimated_completion_at (dispatch time plus the spread, an estimate). An "
      "agent answers when it ARMS the sync, not when its report lands, so these count requests "
      "taken up, not reports received. You read only the runs you started, or any run when your "
@@ -5782,7 +5802,7 @@ static const ToolDef kTools[] = {
      "here without an approval ticket, because a read needs none. Read-only. Audited as "
      "mcp.get_software_sync_status. Mirrors GET /api/v1/hardware/sync/{execution_id}.",
      R"j({"type":"object","properties":{"execution_id":{"type":"string","minLength":1,"maxLength":128,"pattern":"^[A-Za-z0-9_-]{1,128}$","description":"execution_id from sync_hardware_software"}},"required":["execution_id"],"additionalProperties":false})j",
-     R"j({"type":"object","properties":{"execution_id":{"type":"string"},"state":{"type":"string"},"targeted":{"type":"integer"},"acknowledged":{"type":"integer"},"failed":{"type":"integer"},"dispatched_at":{"type":"integer"},"delay_max_s":{"type":"integer"},"estimated_completion_at":{"type":"integer"},"audit_persisted":{"type":"boolean","description":"Present (false) only when the audit write for this read itself failed"}},"required":["execution_id","state","targeted","acknowledged","failed","dispatched_at","delay_max_s","estimated_completion_at"]})j"},
+     R"j({"type":"object","properties":{"execution_id":{"type":"string"},"state":{"type":"string"},"targeted":{"type":"integer"},"acknowledged":{"type":"integer"},"failed":{"type":"integer"},"dispatched_at":{"type":"integer"},"delay_max_s":{"type":"integer"},"estimated_completion_at":{"type":"integer"},"timed_out":{"type":"integer"},"not_delivered":{"type":"integer"},"unknown":{"type":"integer"},"not_reached":{"type":"integer"},"audit_persisted":{"type":"boolean","description":"Present (false) only when the audit write for this read itself failed"}},"required":["execution_id","state","targeted","acknowledged","failed","dispatched_at","delay_max_s","estimated_completion_at"]})j"},
 };
 #undef YUZU_MCP_RESULT_SET_ROW_PROPS
 #undef YUZU_MCP_RESULT_SET_ROW_REQUIRED
@@ -16691,6 +16711,18 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
+                // #2673: the REST twin's coverage read and fail-closed posture.
+                std::optional<std::vector<std::string>> coverage_filter;
+                if (gate.scope)
+                    coverage_filter.emplace(gate.scope->begin(), gate.scope->end());
+                const auto coverage =
+                    execution_tracker->get_coverage_checked(exec_id, coverage_filter);
+                if (!coverage) {
+                    res.set_content(a4_error(kInternalError, "execution tracker degraded", {},
+                                             /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                                    "application/json");
+                    return;
+                }
                 int64_t agents_targeted = exec->agents_targeted;
                 int64_t agents_responded = exec->agents_responded;
                 int64_t agents_success = exec->agents_success;
@@ -16716,7 +16748,15 @@ McpServer::HandlerFn McpServer::build_handler(
                     // loop previously counted 'running' rows as responded
                     // too, which fed a self-contradictory progress_pct==100
                     // below while agents were still executing.
-                    for (const auto& a : agents) {
+                    auto counted = agents; // #2673: plus the outcomes the server decided
+                    if (!execution_tracker->overlay_server_outcomes(exec_id, counted,
+                    std::vector<std::string>(gate.scope->begin(), gate.scope->end()))) {
+                        res.set_content(a4_error(kInternalError, "execution tracker degraded", {},
+                                                 /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                                        "application/json");
+                        return;
+                    }
+                    for (const auto& a : counted) {
                         if (!authz::in_scope(gate.scope, a.agent_id))
                             continue;
                         ++agents_targeted;
@@ -16727,10 +16767,21 @@ McpServer::HandlerFn McpServer::build_handler(
                                 a.status == "rejected") {
                             ++agents_responded;
                             ++agents_failure;
+                        } else if (a.status == "timed_out" || a.status == "unknown") {
+                            ++agents_failure; // #2673: decided by the server
                         }
                     }
+                    if (coverage->recorded) { // #2673: as the REST twin
+                        agents_targeted = coverage->contacted;
+                        agents_success = coverage->responded;
+                        agents_failure = coverage->failed + coverage->timed_out +
+                                         coverage->not_delivered + coverage->unknown;
+                        agents_responded = coverage->responded + coverage->failed +
+                                           coverage->not_delivered + coverage->undetermined;
+                    }
                     progress_pct = agents_targeted > 0
-                                       ? (agents_responded * 100 / agents_targeted)
+                                       ? ((agents_success + agents_failure) * 100 /
+                                          agents_targeted)
                                        : 0;
                     scope_expression = "(redacted - confined view)";
                     parameter_values = "(redacted - confined view)";
@@ -16754,7 +16805,8 @@ McpServer::HandlerFn McpServer::build_handler(
                                .add("progress_pct", progress_pct)
                                .add("completed_at", exec->completed_at)
                                .add("parent_id", exec->parent_id)
-                               .add("rerun_of", exec->rerun_of);
+                               .add("rerun_of", exec->rerun_of)
+                               .raw("coverage", execution_coverage_json(*coverage, gate.scope.has_value()).dump());
                 // #3344: retry_after_ms is emitted ONLY while non-terminal, via
                 // the shared mcp::is_execution_terminal() predicate (Gate 8
                 // fold: this and query_responses' poll-hint independently
@@ -16777,8 +16829,20 @@ McpServer::HandlerFn McpServer::build_handler(
                     // hard error (see docs/api-twin-recipe.md §4).
                     JArr agent_rows;
                     std::vector<AgentExecStatus> kpi_source;
-                    kpi_source.reserve(agents.size());
-                    for (const auto& a : agents) {
+                    // #2673: a device the server gave up on is listed as timed_out or unknown.
+                    auto listed = agents;
+                    if (!execution_tracker->overlay_server_outcomes(
+                            exec_id, listed,
+                            gate.scope ? std::optional(std::vector<std::string>(
+                                             gate.scope->begin(), gate.scope->end()))
+                                       : std::nullopt)) {
+                        res.set_content(a4_error(kInternalError, "execution tracker degraded", {},
+                                                 /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                                        "application/json");
+                        return;
+                    }
+                    kpi_source.reserve(listed.size());
+                    for (const auto& a : listed) {
                         if (gate.scope && !authz::in_scope(gate.scope, a.agent_id))
                             continue;
                         agent_rows.add_raw(execution_agent_status_json(a).dump());
@@ -17086,6 +17150,15 @@ McpServer::HandlerFn McpServer::build_handler(
                         return;
                     }
                     statuses_by_exec = std::move(*statuses_opt);
+                    // #2673: counts also include the outcomes the server decided itself.
+                    if (!execution_tracker->overlay_server_outcomes(statuses_by_exec, exec_ids,
+                    std::vector<std::string>(gate.scope->begin(), gate.scope->end()))) {
+                        res.set_content(
+                            a4_error(kInternalError, "execution tracker degraded", {},
+                                     /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                            "application/json");
+                        return;
+                    }
                 }
                 // #4030: reconciled field set (docs/api-twin-recipe.md Rule 1) —
                 // shared builder with GET /fragments/executions and the new
@@ -17118,6 +17191,8 @@ McpServer::HandlerFn McpServer::build_handler(
                                           a.status == "rejected") {
                                     ++agents_responded;
                                     ++agents_failure;
+                                } else if (a.status == "timed_out" || a.status == "unknown") {
+                                    ++agents_failure; // #2673: decided by the server
                                 }
                                 if (!a.error_detail.empty() && a.completed_at >= newest_error_at) {
                                     newest_error_at = a.completed_at;
@@ -17959,6 +18034,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 // registered before any RPC so a fast loopback agent can't
                 // reply ahead of the mapping.
                 Execution exec;
+                exec.expects_targets = true; // #2673: dispatched through the confined seam
                 exec.definition_id = std::string(src_kind);
                 exec.status = "running";
                 exec.scope_expression = scope_expr;
@@ -18100,7 +18176,11 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
-                if (!execution_tracker->set_agents_targeted(exec_id, sent)) {
+                const bool targeted = execution_tracker->set_agents_targeted(exec_id, sent);
+                // #2673: every reply may already be in, and only a recount finishes the run.
+                if (targeted)
+                    execution_tracker->refresh_counts(exec_id);
+                if (!targeted) {
                     spdlog::error("result-set: set_agents_targeted failed for execution_id={}", exec_id);
                     // #4982
                     if (metrics)
@@ -25173,6 +25253,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     // dispatched_by — `session` was authenticated at
                     // handler entry (line ~363) and is in scope here.
                     exec.dispatched_by = session->username;
+                    exec.expects_targets = true; // #2673: dispatched through the confined seam
                     if (auto created = execution_tracker->create_execution(exec);
                         created.has_value()) {
                         execution_id = *created;
@@ -25379,6 +25460,10 @@ McpServer::HandlerFn McpServer::build_handler(
                                        "retrying the same scope will not help; fix the "
                                        "expression and resubmit.";
                         zero_retry_after_ms_json = "null";
+                    } else if (dispatch_outcome.resolution_failed) {
+                        zero_status = "target_resolution_failed";
+                        zero_message = std::string(kTargetResolutionFailedMessage);
+                        zero_retry_after_ms_json = "5000";
                     } else if (dispatch_outcome.containment_unreadable) {
                         zero_status = "containment_unreadable";
                         zero_message =
@@ -25449,6 +25534,13 @@ McpServer::HandlerFn McpServer::build_handler(
                             "command was withheld before dispatch. Retrying will not help "
                             "until an operator re-enables it (get_plugin_kill_switch with "
                             "the os argument shows the state).";
+                        zero_retry_after_ms_json = "null";
+                    } else if (dispatch_outcome.intended_count &&
+                               *dispatch_outcome.intended_count == 0) {
+                        // #2673: the target list was read and is empty -- permanent for this
+                        // request, unlike the catch-all below.
+                        zero_status = "no_targets";
+                        zero_message = std::string(kNoTargetsMessage);
                         zero_retry_after_ms_json = "null";
                     } else {
                         // Deliberately non-null, unlike its two permanent siblings
@@ -27552,7 +27644,17 @@ McpServer::HandlerFn McpServer::build_handler(
                         int agents_targeted = exec->agents_targeted;
                         int agents_responded = exec->agents_responded;
                         if (gate.scope) {
-                            const auto counts = confined_projection(exec_agents, gate.scope);
+                            auto counted = exec_agents; // #2673: plus server-decided outcomes
+                            if (!execution_tracker->overlay_server_outcomes(target_id, counted,
+                    std::vector<std::string>(gate.scope->begin(), gate.scope->end()))) {
+                                res.set_content(a4_error(kInternalError,
+                                                         "execution tracker degraded", {},
+                                                         /*retry_after_ms=*/
+                                                         mcp::kMcpStoreFaultRetryMs),
+                                                "application/json");
+                                return;
+                            }
+                            const auto counts = confined_projection(counted, gate.scope);
                             agents_targeted = counts.agents_targeted;
                             agents_responded = counts.agents_responded;
                         }

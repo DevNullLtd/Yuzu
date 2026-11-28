@@ -91,7 +91,8 @@ CommandOutboxDelivery::CommandOutboxDelivery(Deps deps) : d_(std::move(deps)) {
             "delivery loop's retry decision when a systemic per-tick gate degrades instead of "
             "answering - `containment_unreadable` (quarantine/containment read) or "
             "`route_unreadable` (GatewayRouteStore directory read) or `os_gate_unreadable` (#5294: "
-            "agent presence read while a per-OS kill switch is OFF). Any cause reschedules the "
+            "agent presence read while a per-OS kill switch is OFF) or `target_resolution_failed` "
+            "(#2673: the target list could not be read). Any cause reschedules the "
             "WHOLE occurrence with back-off, even when some sends already succeeded.",
             "counter");
         d_.metrics->counter("yuzu_server_command_outbox_deliver_retry_cause_total",
@@ -100,6 +101,8 @@ CommandOutboxDelivery::CommandOutboxDelivery(Deps deps) : d_(std::move(deps)) {
                             {{"cause", "route_unreadable"}});
         d_.metrics->counter("yuzu_server_command_outbox_deliver_retry_cause_total",
                             {{"cause", "os_gate_unreadable"}});
+        d_.metrics->counter("yuzu_server_command_outbox_deliver_retry_cause_total",
+                            {{"cause", "target_resolution_failed"}});
         // #3678: pre-seed so the first dead-letter is a visible step from 0, not a series that
         // appears already at 1 (the lone-incident reason above).
         d_.metrics->describe(
@@ -459,6 +462,16 @@ void CommandOutboxDelivery::deliver(const OutboxCommand& c, const std::string& l
     const auto outcome = d_.dispatch_fn(c.plugin, c.action, agent_ids, c.scope_expr, params,
                                         c.execution_id, caller, c.command_id);
 
+    // #2673: this attempt's device list was not saved. If it could not announce itself either,
+    // nothing else says the run's saved list (from an earlier attempt) is short, and the run
+    // could finish `succeeded` without this attempt's devices. Store that BEFORE anything below
+    // lets the run finish; if it cannot be stored, leave the occurrence pending (not finishable)
+    // and re-drive it, exactly as a degraded mark does.
+    const bool list_unsaved =
+        outcome.targets_record_failed && d_.execution_tracker && !c.execution_id.empty();
+    const bool unsaved_stored =
+        !list_unsaved || d_.execution_tracker->mark_targets_incomplete(c.execution_id);
+
     // 5. A systemic transient gate/directory failure — a degraded containment
     //    read, OR (WS-4 4.2b Task D) a degraded gateway routing-directory read
     //    (`route_unreadable`), OR (#5294) a degraded presence read while a
@@ -480,8 +493,10 @@ void CommandOutboxDelivery::deliver(const OutboxCommand& c, const std::string& l
     //    the double-EXECUTION a fresh command_id would cause. Do NOT "fix" this
     //    to gate on `sent == 0`: that would drop the directory-degraded devices
     //    instead of re-driving them.
+    // #2673: a target list that could not be read reached nobody for a reason that can clear,
+    // like the three below: re-drive it, never settle it as "no agents reached".
     if (outcome.containment_unreadable || outcome.route_unreadable ||
-        outcome.os_gate_unreadable) {
+        outcome.os_gate_unreadable || (outcome.resolution_failed && outcome.sent == 0)) {
         // The existing unlabeled retry counter keeps firing for EITHER cause
         // (dashboards/alerts already key on it); the cause-labeled counter is
         // additive so a route-store degradation is separately countable
@@ -492,12 +507,15 @@ void CommandOutboxDelivery::deliver(const OutboxCommand& c, const std::string& l
                 ->counter("yuzu_server_command_outbox_deliver_retry_cause_total",
                          {{"cause", outcome.containment_unreadable ? "containment_unreadable"
                                     : outcome.route_unreadable        ? "route_unreadable"
-                                                                      : "os_gate_unreadable"}})
+                                    : outcome.os_gate_unreadable
+                                        ? "os_gate_unreadable"
+                                        : "target_resolution_failed"}})
                 .increment();
         spdlog::warn("command_outbox_delivery: occurrence '{}' {} — rescheduling",
                      c.occurrence_id,
                      outcome.containment_unreadable ? "containment unreadable"
                      : outcome.route_unreadable     ? "gateway route directory unreadable"
+                     : outcome.resolution_failed    ? "target list unreadable"
                                                     : "agent presence unreadable (per-OS kill switch set)");
         // R4 (#3678): when THIS call wrote the stamp and the attempt provably reached no agent
         // (`sent == 0`), no earlier attempt can have sent either, so the stamp guards nothing:
@@ -543,6 +561,13 @@ void CommandOutboxDelivery::deliver(const OutboxCommand& c, const std::string& l
     //    harmless (both converge on `cancelled`; `mark_cancelled`'s
     //    own terminal-exclusion guard makes a second cancel a clean, event-
     //    free no-op).
+    if (!unsaved_stored) {
+        count("yuzu_server_command_outbox_deliver_degrade_total");
+        spdlog::warn("command_outbox_delivery: occurrence '{}' — could not store that its device "
+                     "list is incomplete; will re-drive",
+                     c.occurrence_id);
+        return;
+    }
     const bool bookkeep_target = d_.execution_tracker && !c.execution_id.empty();
     bool owns_delivery = false;
     if (bookkeep_target && outcome.sent > 0) {
@@ -556,6 +581,8 @@ void CommandOutboxDelivery::deliver(const OutboxCommand& c, const std::string& l
             return;
         }
         owns_delivery = *marked;
+        if (owns_delivery) // #2673: every reply may already be in; only a recount finishes it
+            d_.execution_tracker->refresh_counts(c.execution_id);
     } else {
         auto marked = d_.outbox->mark_sent(c.occurrence_id, lock_name, epoch);
         if (!marked.has_value()) {

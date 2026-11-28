@@ -122,6 +122,10 @@ void send_zero_reach(httplib::Response& res, const ZeroReach& z) {
     case ZeroReachCause::Denied:
         status = 403;
         break;
+    case ZeroReachCause::NoTargets:
+        status = 422;
+        break;
+    case ZeroReachCause::TargetResolutionFailed:
     case ZeroReachCause::ContainmentUnreadable:
     case ZeroReachCause::RouteUnreadable:
     case ZeroReachCause::OsGateUnreadable:

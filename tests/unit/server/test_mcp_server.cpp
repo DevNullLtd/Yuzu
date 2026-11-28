@@ -41029,6 +41029,10 @@ TEST_CASE("MCP Integration: execute_instruction progress bridge - GET-only mode 
             a.agent_id = "agent-001";
             a.status = "success";
             tracker.update_agent_status(execution_id, a);
+            // #2673: the real dispatch seam records the target list; without it the run could
+            // finish only as `completed`.
+            (void)tracker.record_dispatch_targets(
+                execution_id, {{"agent-001", yuzu::server::TargetDisposition::Contacted}}, false);
             return {.sent = 1, .command_id = "cmd-early"};
         };
         ts.start_with_dispatch(dispatch, "operator");
@@ -48971,7 +48975,7 @@ struct SyncToolRig {
             return r;
         };
         e.dispatch = [this](const yuzu::server::auth::Session&, const std::vector<std::string>& ids,
-                            std::int64_t, const std::string&) {
+                            std::int64_t, const std::string&, const ss::RunTargets&) {
             ++dispatches;
             dispatched = ids;
             return ss::DispatchResult{ids.size(), "__sync__-mcp-test"};
@@ -49166,7 +49170,9 @@ TEST_CASE("MCP sync_hardware_software: every Runner refusal maps to the intended
         {"every send refused -> internal error with a hint",
          [](ss::Env& e) {
              e.dispatch = [](const yuzu::server::auth::Session&, const std::vector<std::string>&, std::int64_t,
-                             const std::string&) { return ss::DispatchResult{0, "x"}; };
+                             const std::string&, const ss::RunTargets&) {
+                 return ss::DispatchResult{0, "x"};
+             };
          },
          yuzu::server::mcp::kInternalError, true},
         {"the scope's last_synced_before read degraded -> internal error with a hint",
@@ -49189,7 +49195,9 @@ TEST_CASE("MCP sync_hardware_software: every Runner refusal maps to the intended
             return r;
         };
         env.dispatch = [](const yuzu::server::auth::Session&, const std::vector<std::string>& ids, std::int64_t,
-                          const std::string&) { return ss::DispatchResult{ids.size(), "__sync__-t"}; };
+                          const std::string&, const ss::RunTargets&) {
+            return ss::DispatchResult{ids.size(), "__sync__-t"};
+        };
         env.caller_unfiltered = [](const yuzu::server::auth::Session&) { return true; };
         env.fleet_admin = [](const yuzu::server::auth::Session&) { return true; };
         env.agent_version = [](const std::string&) { return std::optional<std::string>("0.13.1"); };
@@ -49222,7 +49230,9 @@ TEST_CASE("MCP sync_hardware_software: a busy pacing budget is answered as a ret
         return r;
     };
     env.dispatch = [](const yuzu::server::auth::Session&, const std::vector<std::string>& ids, std::int64_t,
-                      const std::string&) { return ss::DispatchResult{ids.size(), "__sync__-t"}; };
+                      const std::string&, const ss::RunTargets&) {
+        return ss::DispatchResult{ids.size(), "__sync__-t"};
+    };
     env.caller_unfiltered = [](const yuzu::server::auth::Session&) { return true; };
     env.fleet_admin = [](const yuzu::server::auth::Session&) { return true; };
     env.agent_version = [](const std::string&) { return std::optional<std::string>("0.13.1"); };
@@ -62490,7 +62500,7 @@ TEST_CASE("MCP sync_hardware_software: confirm and last_synced_before are advert
         return r;
     };
     env.dispatch = [&](const yuzu::server::auth::Session&, const std::vector<std::string>& ids,
-                       std::int64_t, const std::string&) {
+                       std::int64_t, const std::string&, const ss::RunTargets&) {
         ++dispatches;
         dispatched = ids;
         return ss::DispatchResult{ids.size(), "__sync__-sam21"};

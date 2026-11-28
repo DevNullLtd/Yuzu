@@ -30,13 +30,19 @@
 #include <chrono>
 #include <cstdint>
 #include <expected>
+#include <functional>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
+#include "recount_coalescer.hpp"
 #include "dispatch_position.hpp"    // DispatchPosition (#3678)
 #include "response_provenance.hpp" // CommandRecord
+
+struct pg_conn; // libpq's PGconn
 
 namespace yuzu::server::pg {
 class PgPool;
@@ -74,6 +80,116 @@ struct Execution {
     /// behind `perm_fn(req, res, "Execution", "Read")` before serializing to
     /// any caller (mirrors mcp_server.cpp:get_execution_status).
     std::string last_error_detail;
+    /// #2673: write-only on create. How long dispatched targets may stay silent before the
+    /// server marks them `timed_out`; 0 means the default. Never below
+    /// `kMinResponseWindowSecs`.
+    int64_t response_window_s{0};
+    /// #2673: write-only on create. Set by a caller whose dispatch will record this run's
+    /// targets; until the whole list is recorded the run cannot finish `succeeded`.
+    bool expects_targets{false};
+    /// #2673: parts of a recorded run that are not device answers. Filled only by the software
+    /// sync status read; unset for every other read and for an unrecorded run.
+    struct Unanswered {
+        int64_t failed{0}; ///< device answers that were not a success
+        int64_t timed_out{0};
+        int64_t not_delivered{0};
+        int64_t unknown{0};
+        int64_t not_reached{0}; ///< offline, not sent or withheld
+    };
+    std::optional<Unanswered> unanswered;
+};
+
+/// #2673: the response window used when a run names none.
+inline constexpr int64_t kDefaultResponseWindowSecs = 300;
+/// #2673: the floor under every response window. A live agent sends a `running` keepalive for
+/// each in-flight command every 300 s (agent.cpp), so a shorter window would time out work that
+/// is still running; this leaves room for one late or lost keepalive.
+inline constexpr int64_t kMinResponseWindowSecs = 660;
+
+/// #2673: what dispatch did with one intended target. Only `Contacted` means the send accepted
+/// the frame (for a gateway-routed agent, queued for the gateway, not delivered).
+enum class TargetDisposition {
+    Contacted,
+    Offline,
+    NotSent,
+    Quarantined,
+    PluginAbsent,
+    OsKillSwitched,
+    ConcurrencySkipped,
+    Withheld,
+};
+
+/// The stored token of a disposition.
+[[nodiscard]] inline const char* to_token(TargetDisposition d) {
+    switch (d) {
+    case TargetDisposition::Contacted:
+        return "contacted";
+    case TargetDisposition::Offline:
+        return "offline";
+    case TargetDisposition::NotSent:
+        return "not_sent";
+    case TargetDisposition::Quarantined:
+        return "quarantined";
+    case TargetDisposition::PluginAbsent:
+        return "plugin_absent";
+    case TargetDisposition::OsKillSwitched:
+        return "os_kill_switched";
+    case TargetDisposition::ConcurrencySkipped:
+        return "concurrency_skipped";
+    case TargetDisposition::Withheld:
+        return "withheld";
+    }
+    return "withheld";
+}
+
+struct DispatchTarget {
+    std::string agent_id;
+    TargetDisposition disposition{TargetDisposition::Contacted};
+};
+
+/// #2673: per-run coverage counts. When `recorded` is false the counts are unknown, not zero.
+/// `intended = contacted + offline + not_sent + withheld` and `contacted = responded + failed +
+/// timed_out + not_delivered + unknown + pending`; `late` (an answer that arrived after the
+/// server gave up) is a subset of `timed_out + unknown`.
+struct ExecutionCoverage {
+    bool recorded{false};
+    /// True when the target set came from a filter or broadcast, which see only connected agents.
+    bool connected_only{false};
+    int64_t intended{0};
+    int64_t contacted{0};
+    int64_t responded{0}; ///< answered successfully
+    int64_t failed{0};    ///< answered with failure, timeout or rejected
+    int64_t timed_out{0}; ///< the server recorded no result before its deadline
+    int64_t not_delivered{0}; ///< the server or gateway reported it could not deliver the command
+    int64_t unknown{0};       ///< delivery or the answer is not known
+    /// The part of `unknown` a gateway-made frame reported (it counts as a response, as such a
+    /// frame always has). Not served: only used to derive `agents_responded`.
+    int64_t undetermined{0};
+    int64_t offline{0};
+    int64_t not_sent{0};
+    int64_t withheld{0}; ///< quarantine, plugin absent, per-OS switch, concurrency or gate
+    int64_t pending{0};
+    int64_t late{0};
+    int64_t deadline_at{0};
+};
+
+/// #2673: one `sweep_response_deadlines` pass.
+struct ResponseDeadlineSweepOutcome {
+    struct Run {
+        std::string execution_id;
+        int64_t timed_out{0};
+        int64_t unknown{0};
+        std::string finished_status; ///< empty when the run is still running
+    };
+    int64_t timed_out_targets{0};
+    int64_t unknown_targets{0};
+    std::vector<Run> runs; ///< runs this pass changed, in the order swept
+    std::vector<std::string> execution_ids; ///< the ids of `runs`
+    int64_t failed_runs{0};                 ///< runs whose transaction failed and rolled back
+    bool held{false}; ///< expiry held back after missed passes, a restart or a clock change
+    bool skipped{false};       ///< another replica held the sweep lock
+    bool clock_anomaly{false}; ///< declined on an implausible database clock reading
+    bool capped{false};        ///< the pass left eligible runs: limit, time budget or stop
 };
 
 struct ExecutionQuery {
@@ -161,6 +277,10 @@ struct AgentExecStatus {
     /// status and STICKY: the stored value is the OR of every write, so no later write clears it.
     /// Not part of the event payload.
     bool response_dropped{false};
+    /// #2673: non-empty when the server or gateway made this status up: `not_delivered` (the
+    /// command certainly never arrived) or `undetermined` (it may have). It is not the device's
+    /// answer, a later answer from the device replaces it. Not part of the event payload.
+    std::string server_outcome;
 };
 
 // ── Execution statistics (capability 1.9) ────────────────────────────
@@ -355,7 +475,7 @@ public:
 
     /// ADR-1007 — optional observability sink for the per-device
     /// concurrency-claim path (skip counts, force-releases) and, since #3834,
-    /// the read-degrade counter of the five `_checked` readers
+    /// the read-degrade counter of the six `_checked` readers
     /// (`yuzu_server_execution_tracker_read_degrade_total{method,reason}`).
     /// nullptr (the default) means no metrics — matches every sibling store's
     /// `set_metrics` idiom (a post-construction setter, not a constructor
@@ -372,7 +492,7 @@ public:
     /// site uses those constants (a convention: `note_read_degrade` accepts any string). Call once
     /// at boot, next to `set_metrics()`. Static: it needs no store.
     ///
-    /// The five readers it covers: `query_executions_checked`, `get_execution_checked`,
+    /// The six readers it covers: `get_coverage_checked`, `query_executions_checked`, `get_execution_checked`,
     /// `get_agent_statuses_checked`, `get_agent_statuses_for_executions_checked`,
     /// `get_children_checked`. The counter is bumped INSIDE those bodies, so the unchecked wrappers
     /// that delegate to them (`query_executions`, `get_agent_statuses`,
@@ -523,6 +643,68 @@ public:
     /// is closed or the upsert failed twice).
     bool update_agent_status(const std::string& execution_id, const AgentExecStatus& status);
     void refresh_counts(const std::string& execution_id);
+
+    /// #2673: say that a dispatch for this running run is about to send. Until
+    /// `record_dispatch_targets` completes, the run cannot finish `succeeded`, and it has a
+    /// deadline so the sweep can end it. Called again before the earlier send's list was saved,
+    /// it marks the run's list incomplete for good. False when nothing was announced: a store
+    /// failure, no such run, or a run that is no longer running. For a run that tracks targets
+    /// and is no longer running it also marks the list incomplete, before the caller sends.
+    [[nodiscard]] bool mark_targets_expected(const std::string& execution_id);
+
+    /// #2673: record who one dispatch was meant for and what happened to each, and set the run's
+    /// response deadline from the database clock. May be called more than once per run (batches,
+    /// redrive): a later call can raise a target to `contacted`, never lower it. `complete`
+    /// false (the caller knows the list may be partial) leaves the run unable to read
+    /// `succeeded`. A run with no execution row (the side-channel correlation ids) is a
+    /// successful no-op. Does NOT write `agents_targeted`. False on a store failure, in which
+    /// case nothing was recorded.
+    [[nodiscard]] bool record_dispatch_targets(const std::string& execution_id,
+                                               const std::vector<DispatchTarget>& targets,
+                                               bool connected_only, bool complete = true);
+
+    /// #2673: a send announced by `mark_targets_expected` returned normally having sent nothing
+    /// and named nobody (an unreadable or empty target list), so there is no list to save. Not
+    /// for a send that threw. False on a store failure.
+    [[nodiscard]] bool close_empty_attempt(const std::string& execution_id);
+
+    /// #2673: a send's device list was not saved. Sticky: the run cannot read `succeeded`. For
+    /// the caller that makes the run able to finish, to store BEFORE it does so (the send's own
+    /// announcement may have failed too). False on a store failure.
+    [[nodiscard]] bool mark_targets_incomplete(const std::string& execution_id);
+
+    /// #2673: a dispatch for this run could not store its command correlation record, so its
+    /// replies cannot be matched: targets still silent at the deadline read `unknown`.
+    void mark_correlation_lost(const std::string& execution_id);
+
+    /// #2673: for COUNTING only, add the outcomes the server decided itself (`timed_out`,
+    /// `unknown`) to the agent rows of the named runs: an existing row of that agent takes the
+    /// outcome's status (a late answer counts for nothing), and an agent with no row gains one.
+    /// A caller must decide visibility from the rows BEFORE this. False on a store failure.
+    /// `visible_agents` engaged limits the read to those agents (applied in SQL).
+    [[nodiscard]] bool overlay_server_outcomes(
+        std::unordered_map<std::string, std::vector<AgentExecStatus>>& by_execution,
+        const std::vector<std::string>& execution_ids,
+        const std::optional<std::vector<std::string>>& visible_agents = std::nullopt) const;
+    /// The one-run form.
+    [[nodiscard]] bool overlay_server_outcomes(
+        const std::string& execution_id, std::vector<AgentExecStatus>& statuses,
+        const std::optional<std::vector<std::string>>& visible_agents = std::nullopt) const;
+
+    /// #2673: coverage counts for one run. With `visible_agents` engaged, only those agents are
+    /// counted (applied in SQL; engaged-empty counts nobody). `nullopt` on a store failure, which
+    /// a caller must not read as zero. An unknown run reads `recorded=false`.
+    [[nodiscard]] std::optional<ExecutionCoverage> get_coverage_checked(
+        const std::string& execution_id,
+        const std::optional<std::vector<std::string>>& visible_agents = std::nullopt) const;
+
+    /// #2673: give contacted targets that stayed silent past their run's deadline a final
+    /// outcome (`timed_out`, or `unknown`), then recount and finish those runs, one
+    /// transaction per run. Replica-safe (advisory try-lock), database-clock driven, capped per
+    /// pass, and held back after missed passes; see docs/clock-guarded-retention.md.
+    /// `should_stop` is asked between runs.
+    [[nodiscard]] std::expected<ResponseDeadlineSweepOutcome, std::string>
+    sweep_response_deadlines(const std::function<bool()>& should_stop = {});
 
     /// PR 2: set agents_targeted post-creation. Used by the workflow execute
     /// handler which now creates the execution row BEFORE dispatch (to thread
@@ -1075,7 +1257,40 @@ private:
     /// abandon (row-lock contention) or a lease-acquire failure; `true`
     /// otherwise, including the ordinary "nothing changed" case. See
     /// `refresh_counts`'s retry-and-log wrapper for why this is split out.
-    bool refresh_counts_once(const std::string& execution_id);
+    bool refresh_counts_once(const std::string& execution_id,
+                             const std::vector<std::string>* only_agents);
+    /// `refresh_counts` with the retry. `only_agents` non-null settles early target rows for
+    /// those agents only (the per-reply path); null checks the whole run.
+    void refresh_counts_retrying(const std::string& execution_id,
+                                 const std::vector<std::string>* only_agents);
+    /// The per-reply recount, coalesced per run (see the definition).
+    void recount_after_reply(const std::string& execution_id, const std::string& agent_id);
+    RecountCoalescer recounts_;
+    /// Events a recount appended to the outbox, to publish in-process after commit (defined in
+    /// the .cpp, which keeps the JSON type out of this header).
+    struct RefreshEvents;
+    /// The recount, terminal transition and outbox appends on the CALLER's transaction.
+    /// (`pg_conn` is libpq's `PGconn`, named by its struct tag to keep libpq out of here.)
+    bool refresh_counts_in_txn(pg_conn* conn, const std::string& execution_id,
+                               RefreshEvents& events,
+                               const std::vector<std::string>* only_agents = nullptr,
+                               bool force_incomplete = false);
+    /// A final status write failed twice: remembered so the sweep says `unknown`.
+    void note_lost_reply(const std::string& execution_id, const std::string& agent_id);
+    /// Targets of a recorded run whose outcome is final and not `success`; -1 when the run is
+    /// not recorded (count agent rows instead), nullopt on a store failure.
+    [[nodiscard]] std::optional<int>
+    count_unsuccessful_targets(const std::string& execution_id) const;
+    void forget_lost_replies(const std::string& execution_id);
+    /// Guards the three members below.
+    std::mutex lost_replies_mu_;
+    std::unordered_map<std::string, std::unordered_set<std::string>> lost_replies_;
+    std::size_t lost_reply_agents_{0};
+    /// Runs whose sweep transaction failed, with the order of their last attempt: swept after
+    /// the others, least recently attempted first, until one succeeds.
+    std::unordered_map<std::string, std::uint64_t> failed_sweeps_;
+    std::uint64_t sweep_attempt_{0};
+    void publish_refresh_events(const std::string& execution_id, const RefreshEvents& events);
 
     /// One attempt at `update_agent_status`'s upsert + agent-transition SSE
     /// publish. Returns `nullopt` on a lease-acquire failure or a query

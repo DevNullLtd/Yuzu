@@ -578,7 +578,7 @@ namespace {
 
 /// The zero-reach causes a workflow step's dispatch can note (`classify_zero_reach` minus
 /// `invalid_scope`: a workflow names its agents, so the dispatch never parses a scope).
-constexpr std::array<std::string_view, 8> kStepZeroReachCauses{
+constexpr std::array<std::string_view, 10> kStepZeroReachCauses{
     zero_reach_token(ZeroReachCause::Denied),
     zero_reach_token(ZeroReachCause::ContainmentUnreadable),
     zero_reach_token(ZeroReachCause::RouteUnreadable),
@@ -586,7 +586,9 @@ constexpr std::array<std::string_view, 8> kStepZeroReachCauses{
     zero_reach_token(ZeroReachCause::Generic),
     zero_reach_token(ZeroReachCause::Quarantined),
     zero_reach_token(ZeroReachCause::PluginNotFound),
-    zero_reach_token(ZeroReachCause::KillSwitchedOs)};
+    zero_reach_token(ZeroReachCause::KillSwitchedOs),
+    zero_reach_token(ZeroReachCause::NoTargets),
+    zero_reach_token(ZeroReachCause::TargetResolutionFailed)};
 
 constexpr std::string_view kReasonDeadlineExceeded = "deadline_exceeded";
 constexpr std::string_view kReasonServerShutdown = "server_shutdown";

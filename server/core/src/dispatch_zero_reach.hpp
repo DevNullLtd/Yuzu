@@ -23,13 +23,21 @@
 //
 //   0. dispatch_denied          outcome.denied set (#7114)        permanent
 //   1. invalid_scope            outcome.scope_parse_error set     permanent
+//   1b. target_resolution_failed outcome.resolution_failed        retryable
 //   2. containment_unreadable   outcome.containment_unreadable    retryable
 //   3. route_unreadable         outcome.route_unreadable          retryable
 //   4. os_gate_unreadable       outcome.os_gate_unreadable        retryable
 //   5. quarantined              denied_quarantined_count > 0      permanent
 //   6. plugin_not_found         unknown_plugin_count > 0          permanent
 //   7. kill_switched_os         kill_switched_os_count > 0        permanent
+//   7b. no_targets              intended_count == 0 (#2673)       permanent
 //   8. no_agents_reached        catch-all                         retryable
+//
+// `target_resolution_failed` and `no_targets` (#2673) separate "the target list could not be
+// read" from "the list was read and is empty" (an empty group, a scope or broadcast matching no
+// CONNECTED agent, or only ids outside the caller's visible set, which for a confined caller
+// reads the same as ids that do not exist; an unconfined caller naming a nonexistent id gets
+// `no_agents_reached`). An unset `intended_count` is never "zero targets".
 //
 // `dispatch_denied` ranks first: the chokepoint refused before targeting, so no
 // other outcome signal is set alongside it.
@@ -85,18 +93,29 @@
 
 namespace yuzu::server {
 
+/// The `no_targets` and `target_resolution_failed` wording, used by the surfaces that share this
+/// classifier (the older routes word their own) so the connected-agents limit is stated the same way everywhere (#2673).
+inline constexpr std::string_view kNoTargetsMessage =
+    "No targets: nothing you can dispatch to matched this request. Scope and broadcast targeting "
+    "consider only connected agents.";
+inline constexpr std::string_view kTargetResolutionFailedMessage =
+    "No agents reached: the target list could not be read, so nobody was resolved. This is a "
+    "server-side read failure, not an empty target.";
+
 /// Closed set of reasons a dispatch can reach zero agents. `Generic` is the
 /// catch-all (unreachable targets, or a residual race); every other value is a
 /// specific, named cause.
 enum class ZeroReachCause {
     Denied,
     InvalidScope,
+    TargetResolutionFailed,
     ContainmentUnreadable,
     RouteUnreadable,
     OsGateUnreadable,
     Quarantined,
     PluginNotFound,
     KillSwitchedOs,
+    NoTargets,
     Generic,
 };
 
@@ -110,6 +129,8 @@ enum class ZeroReachCause {
         return ZeroReachCause::Denied;
     if (outcome.scope_parse_error)
         return ZeroReachCause::InvalidScope;
+    if (outcome.resolution_failed)
+        return ZeroReachCause::TargetResolutionFailed;
     if (outcome.containment_unreadable)
         return ZeroReachCause::ContainmentUnreadable;
     if (outcome.route_unreadable)
@@ -122,6 +143,8 @@ enum class ZeroReachCause {
         return ZeroReachCause::PluginNotFound;
     if (!protective_action && outcome.kill_switched_os_count > 0)
         return ZeroReachCause::KillSwitchedOs;
+    if (outcome.intended_count && *outcome.intended_count == 0)
+        return ZeroReachCause::NoTargets;
     return ZeroReachCause::Generic;
 }
 
@@ -133,6 +156,8 @@ enum class ZeroReachCause {
         return "dispatch_denied";
     case ZeroReachCause::InvalidScope:
         return "invalid_scope";
+    case ZeroReachCause::TargetResolutionFailed:
+        return "target_resolution_failed";
     case ZeroReachCause::ContainmentUnreadable:
         return "containment_unreadable";
     case ZeroReachCause::RouteUnreadable:
@@ -145,6 +170,8 @@ enum class ZeroReachCause {
         return "plugin_not_found";
     case ZeroReachCause::KillSwitchedOs:
         return "kill_switched_os";
+    case ZeroReachCause::NoTargets:
+        return "no_targets";
     case ZeroReachCause::Generic:
         return "no_agents_reached";
     }
@@ -158,6 +185,7 @@ enum class ZeroReachCause {
 /// (retryable) with a residual approval-denial race (permanent).
 [[nodiscard]] constexpr bool zero_reach_retryable(ZeroReachCause cause) noexcept {
     switch (cause) {
+    case ZeroReachCause::TargetResolutionFailed:
     case ZeroReachCause::ContainmentUnreadable:
     case ZeroReachCause::RouteUnreadable:
     case ZeroReachCause::OsGateUnreadable:
@@ -168,6 +196,7 @@ enum class ZeroReachCause {
     case ZeroReachCause::Quarantined:
     case ZeroReachCause::PluginNotFound:
     case ZeroReachCause::KillSwitchedOs:
+    case ZeroReachCause::NoTargets:
         return false;
     }
     return false;

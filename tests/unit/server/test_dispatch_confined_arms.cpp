@@ -882,6 +882,7 @@ TEST_CASE("wire_and_dispatch_confined: the Ids arm intersects exec_visible again
 // ═══════════════════════════════════════════════════════════════════════════
 
 #include "test_execution_tracker_pg_helper.hpp"
+#include "pg/pg_exec.hpp"
 
 TEST_CASE("wire_and_dispatch_confined: concurrency_mode=\"per-device\" with a live "
           "ExecutionTracker excludes an already-claimed agent",
@@ -966,6 +967,145 @@ TEST_CASE("wire_and_dispatch_confined: a non-\"per-device\" concurrency_mode lea
             /*concurrency_mode=*/"unlimited");
         CHECK(outcome.sent == 1);
     }
+}
+
+TEST_CASE("wire_and_dispatch_confined: a send that resolves nobody does not stop a later "
+          "re-drive from succeeding",
+          "[server][dispatch][scope][integration][pg][coverage]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    yuzu::server::ExecutionTracker& tracker = *tracker_bundle;
+
+    EventBus bus;
+    yuzu::MetricsRegistry metrics;
+    AgentRegistry registry(bus, metrics);
+    (void)registry.register_agent(make_wiring_test_info("dev-A"));
+    REQUIRE(registry.set_gateway_route(
+        "dev-A", /*session_id=*/{}, "test-gateway",
+        {std::string(yuzu::server::detail::kGatewayWireCapabilityDispatchTagV1)}));
+
+    yuzu::agent::v1::CommandRequest cmd;
+    cmd.set_command_id("wiring-redrive-cmd");
+    cmd.set_plugin("os_info");
+    cmd.set_action("version");
+    cmd.set_dispatch_tag("v1|ro|none|0123456789abcdef0123456789abcdef");
+    auto classified = ClassifiedCommandTestAccess::make(cmd);
+
+    auto noop_audit = [](const std::string&, const std::string&, const std::string&,
+                         const std::string&) {};
+    std::vector<std::string> agent_ids{"dev-A"};
+
+    yuzu::server::Execution exec;
+    exec.definition_id = "def-redrive-test";
+    exec.dispatched_by = "admin";
+    exec.status = "running";
+    exec.expects_targets = true;
+    const auto id = tracker.create_execution(exec);
+    REQUIRE(id.has_value());
+
+    const auto dispatch = [&](yuzu::server::authz::VisibleSet visible) {
+        return yuzu::server::wire_and_dispatch_confined(
+            registry, nullptr, nullptr, nullptr, nullptr, &tracker, noop_audit, noop_audit,
+            "wiring-redrive-cmd-1", *id, /*principal_role=*/"", agent_ids, /*scope_expr=*/"",
+            visible, /*broadcast_on_none=*/false, kNoContainment, classified);
+    };
+
+    // Nobody is visible: nothing intended, nothing sent.
+    const auto first = dispatch(
+        yuzu::server::authz::VisibleSet{std::unordered_set<std::string>{}});
+    REQUIRE(first.sent == 0);
+    REQUIRE(first.intended.empty());
+
+    const auto second = dispatch(yuzu::server::authz::VisibleSet{std::nullopt});
+    REQUIRE(second.sent == 1);
+    REQUIRE(tracker.set_agents_targeted(*id, 1));
+    yuzu::server::AgentExecStatus reply;
+    reply.agent_id = "dev-A";
+    reply.status = "success";
+    reply.completed_at = 1;
+    REQUIRE(tracker.update_agent_status(*id, reply));
+
+    const auto done = tracker.get_execution(*id);
+    REQUIRE(done.has_value());
+    CHECK(done->status == "succeeded");
+}
+
+TEST_CASE("wire_and_dispatch_confined: a send that could not announce itself neither closes an "
+          "earlier open send nor saves a complete list over it",
+          "[server][dispatch][scope][integration][pg][coverage]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    yuzu::server::ExecutionTracker& tracker = *tracker_bundle;
+
+    EventBus bus;
+    yuzu::MetricsRegistry metrics;
+    AgentRegistry registry(bus, metrics);
+    (void)registry.register_agent(make_wiring_test_info("dev-A"));
+    REQUIRE(registry.set_gateway_route(
+        "dev-A", /*session_id=*/{}, "test-gateway",
+        {std::string(yuzu::server::detail::kGatewayWireCapabilityDispatchTagV1)}));
+
+    yuzu::agent::v1::CommandRequest cmd;
+    cmd.set_command_id("wiring-unannounced-cmd");
+    cmd.set_plugin("os_info");
+    cmd.set_action("version");
+    cmd.set_dispatch_tag("v1|ro|none|0123456789abcdef0123456789abcdef");
+    auto classified = ClassifiedCommandTestAccess::make(cmd);
+
+    auto noop_audit = [](const std::string&, const std::string&, const std::string&,
+                         const std::string&) {};
+    std::vector<std::string> agent_ids{"dev-A"};
+
+    yuzu::server::Execution exec;
+    exec.definition_id = "def-unannounced-test";
+    exec.dispatched_by = "admin";
+    exec.status = "running";
+    exec.expects_targets = true;
+    const auto id = tracker.create_execution(exec);
+    REQUIRE(id.has_value());
+    REQUIRE(tracker.mark_targets_expected(*id)); // an earlier send that never saved its list
+
+    // Refuse exactly the next announcement: the one that would mark the run incomplete while
+    // leaving the send open.
+    const auto sql = [&](const std::string& statement) {
+        auto conn = tracker_bundle.pool().acquire();
+        REQUIRE(conn);
+        auto res =
+            yuzu::server::pg::exec_params(conn.get(), statement.c_str(), std::vector<std::string>{});
+        INFO(PQresultErrorMessage(res.get()));
+        REQUIRE(res.status() == PGRES_COMMAND_OK);
+    };
+    sql("CREATE FUNCTION public.yuzu_test_refuse() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN "
+        "RAISE EXCEPTION 'refused'; END $$");
+    sql("CREATE TRIGGER yuzu_test_refuse BEFORE UPDATE ON execution_tracker.executions "
+        "FOR EACH ROW WHEN (OLD.attempt_open AND NEW.attempt_open AND NEW.targets_incomplete "
+        "AND NOT OLD.targets_incomplete) EXECUTE FUNCTION public.yuzu_test_refuse()");
+
+    const auto flag = [&](const char* column) {
+        auto conn = tracker_bundle.pool().acquire();
+        REQUIRE(conn);
+        const std::string query = std::string("SELECT ") + column +
+                                  " FROM execution_tracker.executions WHERE id = $1";
+        auto res = yuzu::server::pg::exec_params(conn.get(), query.c_str(),
+                                                 std::vector<std::string>{*id});
+        REQUIRE(res.status() == PGRES_TUPLES_OK);
+        REQUIRE(PQntuples(res.get()) == 1);
+        return std::string(PQgetvalue(res.get(), 0, 0)) == "t";
+    };
+    const auto dispatch = [&](yuzu::server::authz::VisibleSet visible) {
+        return yuzu::server::wire_and_dispatch_confined(
+            registry, nullptr, nullptr, nullptr, nullptr, &tracker, noop_audit, noop_audit,
+            "wiring-unannounced-cmd-1", *id, /*principal_role=*/"", agent_ids, /*scope_expr=*/"",
+            visible, /*broadcast_on_none=*/false, kNoContainment, classified);
+    };
+
+    const auto empty = dispatch(
+        yuzu::server::authz::VisibleSet{std::unordered_set<std::string>{}});
+    REQUIRE(empty.sent == 0);
+    CHECK(flag("attempt_open")); // not closed: the open send is somebody else's
+
+    const auto full = dispatch(yuzu::server::authz::VisibleSet{std::nullopt});
+    REQUIRE(full.sent == 1);
+    CHECK_FALSE(full.targets_record_failed);
+    CHECK(flag("targets_incomplete"));
 }
 
 // ADR-1007 fix round (PR #3784 external review, important-finding-#1, converged on
@@ -1745,4 +1885,139 @@ TEST_CASE("kSystemReservedPushes lists the five internal pushes, labelled",
     CHECK_FALSE(labels.contains("unknown"));
     CHECK(std::ranges::find(kSystemReservedPushes, SystemReservedPush::inventory_settings_push) !=
           kSystemReservedPushes.end());
+}
+
+// ── #2673: target-set collection ─────────────────────────────────────────────
+
+TEST_CASE("resolve_and_dispatch_confined: collected targets name the visible set, who was "
+          "contacted and who was withheld",
+          "[server][dispatch][scope][coverage]") {
+    RecordingSink sink;
+    const auto gate = ContainmentGate::enforcing(/*fail_closed=*/false, {"dev-B"});
+    const auto outcome = resolve_and_dispatch_confined(
+        {"dev-A", "dev-B", "dev-C", "dev-hidden"}, "", only({"dev-A", "dev-B"}),
+        /*broadcast_on_none=*/false, gate, no_group_no_scope_resolvers(), sink.make(),
+        /*claim_fn=*/nullptr, {}, {}, /*collect_targets=*/true);
+    CHECK(outcome.intended_count == 2u);
+    CHECK(outcome.intended == std::vector<std::string>{"dev-A", "dev-B"});
+    CHECK(outcome.contacted == std::vector<std::string>{"dev-A"});
+
+    const auto targets = yuzu::server::build_dispatch_targets(outcome, {});
+    REQUIRE(targets.size() == 2);
+    CHECK(targets[0].disposition == yuzu::server::TargetDisposition::Contacted);
+    CHECK(targets[1].disposition == yuzu::server::TargetDisposition::Quarantined);
+}
+
+TEST_CASE("resolve_and_dispatch_confined: a fail-closed gate leaves every target withheld",
+          "[server][dispatch][scope][coverage]") {
+    RecordingSink sink;
+    const auto gate = ContainmentGate::enforcing(/*fail_closed=*/true, {});
+    const auto outcome = resolve_and_dispatch_confined(
+        {"dev-A"}, "", unfiltered(), false, gate, no_group_no_scope_resolvers(), sink.make(),
+        nullptr, {}, {}, /*collect_targets=*/true);
+    const auto targets = yuzu::server::build_dispatch_targets(outcome, {});
+    REQUIRE(targets.size() == 1);
+    CHECK(targets[0].disposition == yuzu::server::TargetDisposition::Withheld);
+}
+
+TEST_CASE("resolve_and_dispatch_confined: a collecting broadcast names every candidate",
+          "[server][dispatch][scope][coverage]") {
+    RecordingSink sink;
+    const auto outcome = resolve_and_dispatch_confined(
+        {}, "__all__", unfiltered(), true, kNoContainment, no_group_no_scope_resolvers(),
+        sink.make(), nullptr, {}, {}, /*collect_targets=*/true);
+    CHECK_FALSE(sink.unfiltered_broadcast_used); // the fast path names no ids
+    CHECK(outcome.contacted.size() == 3);
+    CHECK(outcome.intended_count == 3u);
+}
+
+TEST_CASE("resolve_and_dispatch_confined: a concurrency claim keeps the skipped target intended",
+          "[server][dispatch][scope][coverage]") {
+    RecordingSink sink;
+    const auto outcome = resolve_and_dispatch_confined(
+        {"dev-A", "dev-B"}, "", unfiltered(), false, kNoContainment,
+        no_group_no_scope_resolvers(), sink.make(),
+        [](const std::vector<std::string>&) { return std::vector<std::string>{"dev-A"}; }, {}, {},
+        /*collect_targets=*/true);
+    CHECK(outcome.intended_count == 2u);
+    CHECK(outcome.concurrency_skipped == std::vector<std::string>{"dev-B"});
+    const auto targets = yuzu::server::build_dispatch_targets(outcome, {});
+    REQUIRE(targets.size() == 2);
+    CHECK(targets[1].disposition == yuzu::server::TargetDisposition::ConcurrencySkipped);
+}
+
+TEST_CASE("resolve_and_dispatch_confined: a present-empty visible set never counts as no "
+          "targets",
+          "[server][dispatch][scope][coverage][security]") {
+    // Deny-all is also what a failed or unwired visibility derivation yields.
+    RecordingSink sink;
+    const auto outcome = resolve_and_dispatch_confined(
+        {"dev-A"}, "", only({}), false, kNoContainment, no_group_no_scope_resolvers(), sink.make());
+    CHECK(outcome.sent == 0);
+    CHECK_FALSE(outcome.intended_count.has_value());
+
+    // A caller who can see devices, targeting one they cannot, did resolve to nothing.
+    const auto hidden = resolve_and_dispatch_confined(
+        {"dev-A"}, "", only({"dev-B"}), false, kNoContainment, no_group_no_scope_resolvers(),
+        sink.make());
+    CHECK(hidden.intended_count == 0u);
+}
+
+TEST_CASE("resolve_and_dispatch_confined: an unreadable group is a failed resolution, an empty "
+          "group is zero targets",
+          "[server][dispatch][scope][coverage]") {
+    RecordingSink sink;
+    DispatchResolvers resolvers;
+    resolvers.group_members_fn = [](const std::string&) -> std::optional<std::vector<std::string>> {
+        return std::nullopt;
+    };
+    auto failed = resolve_and_dispatch_confined({}, "group:eng", unfiltered(), false,
+                                                kNoContainment, resolvers, sink.make());
+    CHECK(failed.resolution_failed);
+    CHECK_FALSE(failed.intended_count.has_value());
+
+    resolvers.group_members_fn = [](const std::string&) -> std::optional<std::vector<std::string>> {
+        return std::vector<std::string>{};
+    };
+    auto empty = resolve_and_dispatch_confined({}, "group:eng", unfiltered(), false,
+                                               kNoContainment, resolvers, sink.make());
+    CHECK_FALSE(empty.resolution_failed);
+    CHECK(empty.intended_count == 0u);
+    CHECK(sink.reached.empty());
+}
+
+TEST_CASE("resolve_and_dispatch_confined: an id named twice is sent to and counted once",
+          "[server][dispatch][scope][coverage]") {
+    RecordingSink sink;
+    const auto out = resolve_and_dispatch_confined(
+        {"dev-A", "dev-A", "dev-B"}, "", unfiltered(), false, kNoContainment,
+        no_group_no_scope_resolvers(), sink.make(), nullptr, {}, {}, /*collect_targets=*/true);
+    CHECK(sink.reached.size() == 2);
+    CHECK(out.sent == 2);
+    CHECK(out.intended_count == 2u);
+    CHECK(out.intended.size() == 2);
+    CHECK(out.contacted.size() == 2);
+}
+
+TEST_CASE("resolve_and_dispatch_confined: a broadcast list that may be incomplete is never zero "
+          "targets",
+          "[server][dispatch][scope][coverage]") {
+    RecordingSink sink;
+    sink.fleet.clear();
+    auto raw = sink.make();
+    raw.membership_degraded = [] { return true; };
+    const auto none = resolve_and_dispatch_confined({}, "__all__", unfiltered(), false,
+                                                    kNoContainment, no_group_no_scope_resolvers(),
+                                                    raw);
+    CHECK(none.membership_partial);
+    CHECK(none.resolution_failed);
+    CHECK_FALSE(none.intended_count.has_value());
+
+    sink.fleet = {"dev-A"};
+    const auto some = resolve_and_dispatch_confined({}, "__all__", unfiltered(), false,
+                                                    kNoContainment, no_group_no_scope_resolvers(),
+                                                    raw);
+    CHECK(some.membership_partial);
+    CHECK_FALSE(some.resolution_failed);
+    CHECK(some.sent == 1);
 }

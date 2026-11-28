@@ -327,9 +327,10 @@ inline constexpr std::string_view kReasonCredentialIndeterminate = "credential_i
 /// parses a scope); `late_denied` and `definition_changed` are a step refused at send time;
 /// `deadline_exceeded` is the run budget ending the run first; `run_failed` is the engine closing
 /// the run without a single dispatch attempt.
-inline constexpr std::array<std::string_view, 12> kWorkflowZeroReachStatuses{
+inline constexpr std::array<std::string_view, 14> kWorkflowZeroReachStatuses{
     "dispatch_denied",        "containment_unreadable", "route_unreadable", "os_gate_unreadable",
     "no_agents_reached",      "quarantined",            "plugin_not_found", "kill_switched_os",
+    "no_targets",             "target_resolution_failed",
     "late_denied",            "definition_changed",     "deadline_exceeded", "run_failed"};
 
 /// What a step's absence of a `command_id` does NOT prove. The command id is stored only in the

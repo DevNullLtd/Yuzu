@@ -51,7 +51,7 @@ constexpr std::string_view kBody = R"HTM(</style>
 <label><input type="radio" name="est" value="" checked>All</label>
 <label><input type="radio" name="est" value="running">Running</label>
 <label><input type="radio" name="est" value="succeeded">Succeeded</label>
-<label><input type="radio" name="est" value="completed">With failures</label>
+<label><input type="radio" name="est" value="completed">Completed, not fully successful</label>
 <label><input type="radio" name="est" value="cancelled">Cancelled</label>
 <label><input type="radio" name="est" value="pending">Pending</label>
 </div></div>

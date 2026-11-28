@@ -796,6 +796,10 @@ void register_command_routes(HttpRouteSink& sink, Deps deps) {
         // has no aggregation of its own (each arm branch below runs the walk
         // once), so this is simply whatever the arm that ran reported.
         bool route_unreadable = false;
+        // #2673: how many targets the arm that ran resolved (unset: nothing was resolved), and
+        // whether the list itself could not be read.
+        std::optional<std::size_t> intended_count;
+        bool resolution_failed = false;
         // `__all__` is the PUBLISHED ground scope kind, handled here as "no
         // scope expression" so the ordering matches the shared closure and
         // the MCP one exactly: an explicit agent_ids list still wins.
@@ -819,9 +823,14 @@ void register_command_routes(HttpRouteSink& sink, Deps deps) {
             // mechanism, not an authz exemption from it.
             auto group_id = scope_expr.substr(6);
             std::vector<std::string> members;
-            if (deps.mgmt_group_store)
-                for (const auto& m : deps.mgmt_group_store->get_members(group_id))
+            if (auto read = deps.mgmt_group_store
+                                ? deps.mgmt_group_store->get_members_checked(group_id)
+                                : std::nullopt) {
+                for (const auto& m : *read)
                     members.push_back(m.agent_id);
+            } else {
+                resolution_failed = true; // reach nobody, and say why
+            }
             yuzu::server::ConfinedDispatchTargets t;
             t.group_members = &members;
             const auto result = yuzu::server::dispatch_confined_arms(
@@ -833,6 +842,11 @@ void register_command_routes(HttpRouteSink& sink, Deps deps) {
             unknown_plugin_count = result.unknown_plugin_count;
             kill_switched_os_count = result.kill_switched_os_count;
             route_unreadable = result.route_unreadable;
+            if (!resolution_failed)
+                intended_count = result.intended_count;
+            // #2673: a partial device list with nobody on it is a failed read.
+            if (result.membership_partial && result.sent == 0 && !result.intended_count)
+                resolution_failed = true;
         } else if (arm == yuzu::server::DispatchArm::Scope) {
             // Scope expression dispatch.
             //
@@ -900,6 +914,15 @@ void register_command_routes(HttpRouteSink& sink, Deps deps) {
                 unknown_plugin_count = result.unknown_plugin_count;
                 kill_switched_os_count = result.kill_switched_os_count;
                 route_unreadable = result.route_unreadable;
+                if (!resolution_failed)
+                    intended_count = result.intended_count;
+                // #2673: a partial device list with nobody on it is a failed read.
+                if (result.membership_partial && result.sent == 0 && !result.intended_count)
+                    resolution_failed = true;
+            } else {
+                resolution_failed =
+                    ladder.abort_reason == yuzu::server::ScopeAbortReason::DbDegraded ||
+                    ladder.abort_reason == yuzu::server::ScopeAbortReason::PresenceDegraded;
             }
             // else: the ladder already audited the abort (db_degraded /
             // owner_check_failed / principal_unresolved / presence_degraded /
@@ -920,6 +943,11 @@ void register_command_routes(HttpRouteSink& sink, Deps deps) {
             unknown_plugin_count = result.unknown_plugin_count;
             kill_switched_os_count = result.kill_switched_os_count;
             route_unreadable = result.route_unreadable;
+            if (!resolution_failed)
+                intended_count = result.intended_count;
+            // #2673: a partial device list with nobody on it is a failed read.
+            if (result.membership_partial && result.sent == 0 && !result.intended_count)
+                resolution_failed = true;
         } else if (arm == yuzu::server::DispatchArm::Broadcast) {
             // Explicitly asked for the fleet by its published name — #1788
             // still narrows delivery to the operator's visible set; the
@@ -932,6 +960,11 @@ void register_command_routes(HttpRouteSink& sink, Deps deps) {
             unknown_plugin_count = result.unknown_plugin_count;
             kill_switched_os_count = result.kill_switched_os_count;
             route_unreadable = result.route_unreadable;
+            if (!resolution_failed)
+                intended_count = result.intended_count;
+            // #2673: a partial device list with nobody on it is a failed read.
+            if (result.membership_partial && result.sent == 0 && !result.intended_count)
+                resolution_failed = true;
         } else {
             // Broadcast ONLY when the caller named no target at all (#2500).
             // The shape check above already refuses a supplied-but-empty
@@ -1001,6 +1034,11 @@ void register_command_routes(HttpRouteSink& sink, Deps deps) {
             unknown_plugin_count = result.unknown_plugin_count;
             kill_switched_os_count = result.kill_switched_os_count;
             route_unreadable = result.route_unreadable;
+            if (!resolution_failed)
+                intended_count = result.intended_count;
+            // #2673: a partial device list with nobody on it is a failed read.
+            if (result.membership_partial && result.sent == 0 && !result.intended_count)
+                resolution_failed = true;
         }
 
         // #881: emitted BEFORE the sent==0 -> 503 branch below, so a
@@ -1051,7 +1089,11 @@ void register_command_routes(HttpRouteSink& sink, Deps deps) {
             // shape — a silent deny-all reported as an empty fleet —
             // as a gate violation.
             res.status = 503;
-            if (containment_gate.fail_closed) {
+            if (resolution_failed) {
+                res.set_content(
+                    R"({"error":{"code":503,"message":"the target list could not be read, so nobody was resolved","reason":"target_resolution_failed","retry_after_ms":5000},"meta":{"api_version":"v1"}})",
+                    "application/json");
+            } else if (containment_gate.fail_closed) {
                 res.set_content(
                     R"({"error":{"code":503,"message":"containment state is unreadable — dispatch is failing closed and reaching no agent; check the quarantine store","reason":"containment_unreadable","retry_after_ms":5000},"meta":{"api_version":"v1"}})",
                     "application/json");
@@ -1081,6 +1123,12 @@ void register_command_routes(HttpRouteSink& sink, Deps deps) {
                 // switch is OFF -- withheld, not an empty fleet.
                 res.set_content(
                     R"({"error":{"code":503,"message":"every target runs an OS for which this plugin action is switched off — dispatch was withheld, not attempted","reason":"kill_switched_os","retry_after_ms":null},"meta":{"api_version":"v1"}})",
+                    "application/json");
+            } else if (intended_count && *intended_count == 0) {
+                // #2673/#2650: an empty target is the caller's request, not an outage.
+                res.status = 422;
+                res.set_content(
+                    R"({"error":{"code":422,"message":"no targets: nothing you can dispatch to matched this request. Scope and broadcast targeting consider only connected agents.","reason":"no_targets","retry_after_ms":null},"meta":{"api_version":"v1"}})",
                     "application/json");
             } else {
                 res.set_content(

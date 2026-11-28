@@ -38,6 +38,10 @@ namespace yuzu::server::live {
         return LiveOutcome::kPluginNotFound;
     case ZeroReachCause::KillSwitchedOs:
         return LiveOutcome::kKillSwitchedOs;
+    case ZeroReachCause::TargetResolutionFailed:
+        return LiveOutcome::kTargetResolutionFailed;
+    case ZeroReachCause::NoTargets:
+        return LiveOutcome::kNoTargets;
     case ZeroReachCause::Generic:
         return LiveOutcome::kUnavailable;
     }

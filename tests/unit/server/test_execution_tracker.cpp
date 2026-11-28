@@ -6,9 +6,15 @@
  */
 
 #include "execution_tracker.hpp"
+#include "execution_scope_rules.hpp" // confined_projection
+#include "execution_model.hpp"       // execution_coverage_json
+#include "gateway_delivery_failure.hpp"
 #include "execution_mutation.hpp" // #2146: make_tracker_mutation_ports against a real tracker
 #include "command_outbox_store.hpp" // #4982 Part B: reap_stuck_running_executions' cross-schema tests
 #include "execution_event_bus.hpp"
+#include "sweep_audit_queue.hpp"
+#include "recount_coalescer.hpp"
+#include "dispatch_announcement.hpp"
 #include "pg/pg_exec.hpp"
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
@@ -26,6 +32,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <deque>
 #include <expected>
 #include <functional>
 #include <latch>
@@ -610,9 +617,9 @@ TEST_CASE("ExecutionTracker: a stale 'running' update arriving AFTER a terminal 
     // column independently of the terminal guard — confirm both hold together.
     CHECK(statuses[0].first_response_at == 1001);
 
-    // A genuine SECOND terminal write (e.g. HA WS-0 redelivery) still applies
-    // normally — the guard is scoped to 'running' overwriting terminal, not
-    // to terminal-vs-terminal.
+    // #2673: the FIRST final result stands. A second, different terminal write is
+    // refused too (an HA WS-0 redelivery replays the original outcome, so a
+    // differing one is not a normal redelivery).
     AgentExecStatus second_terminal;
     second_terminal.agent_id = "agent-1";
     second_terminal.status = "failure";
@@ -623,9 +630,10 @@ TEST_CASE("ExecutionTracker: a stale 'running' update arriving AFTER a terminal 
 
     auto restatuses = tracker.get_agent_statuses(*id_result);
     REQUIRE(restatuses.size() == 1);
-    CHECK(restatuses[0].status == "failure");
-    CHECK(restatuses[0].completed_at == 2000);
-    CHECK(restatuses[0].error_detail == "redelivered as failure");
+    CHECK(restatuses[0].status == "success");
+    CHECK(restatuses[0].completed_at == 1002);
+    CHECK(restatuses[0].exit_code == 0);
+    CHECK(restatuses[0].error_detail.empty());
 }
 
 TEST_CASE("ExecutionTracker: update_agent_status failure with error_detail",
@@ -1485,7 +1493,7 @@ TEST_CASE("ExecutionTracker: migration v10 applies on a v9 database and old rows
         REQUIRE(tracker.is_open());
         CHECK(scalar(column_count_sql) == "1");
         CHECK(scalar("SELECT version FROM public.schema_meta WHERE store = "
-                     "'execution_tracker'") == "10");
+                     "'execution_tracker'") == "11");
         CHECK(scalar("SELECT response_dropped::text FROM execution_tracker.agent_exec_status "
                      "WHERE agent_id = 'agent-old'") == "false");
         if (open == 0) {
@@ -4598,7 +4606,7 @@ TEST_CASE("ExecutionTracker: reap_stuck_running_executions does NOT recover "
 // ── #3834: read-degrade counter ─────────────────────────────────────────────
 //
 // yuzu_server_execution_tracker_read_degrade_total{method,reason} is bumped at every degrade
-// branch of the five `_checked` readers. These tests pin: the closed label sets (5 x 3 = 15
+// branch of the six `_checked` readers. These tests pin: the closed label sets (6 x 3 = 18
 // series, all pre-seeded to 0, label VALUES included), that each reason is attributed to the
 // right (method, reason) pair and to NOTHING else, that the unchecked wrappers that delegate are
 // counted, that a healthy read - including an empty or not-found one - is not a degrade, and that
@@ -4608,9 +4616,9 @@ TEST_CASE("ExecutionTracker: reap_stuck_running_executions does NOT recover "
 // production constant must fail a test, not be mirrored by it.
 
 static constexpr const char* kDegradeMetric = "yuzu_server_execution_tracker_read_degrade_total";
-static constexpr std::array<const char*, 5> kDegradeMethods{
+static constexpr std::array<const char*, 6> kDegradeMethods{
     "query_executions", "get_execution", "get_agent_statuses", "get_agent_statuses_for_executions",
-    "get_children"};
+    "get_children",     "get_coverage"};
 static constexpr std::array<const char*, 3> kDegradeReasons{"store_not_open", "pool_acquire_timeout",
                                                             "query_error"};
 
@@ -4620,7 +4628,7 @@ static double degrade_count(yuzu::MetricsRegistry& m, const std::string& method,
 }
 
 // Every series of the family must be 0 except (method, reason), which must be exactly `expected`.
-// Checking all 15 (not just the one) is what catches a branch attributed to the wrong label.
+// Checking all 18 (not just the one) is what catches a branch attributed to the wrong label.
 // Pass method == "" to assert that NOTHING moved.
 static void check_only_degrade_series(yuzu::MetricsRegistry& m, const std::string& method,
                                       const std::string& reason, double expected = 1.0) {
@@ -4670,12 +4678,14 @@ std::vector<DegradeReader> degrade_readers() {
          [](ExecutionTracker& t) { (void)t.get_agent_statuses_for_executions_checked({"exec-1"}); }},
         {"get_children",
          [](ExecutionTracker& t) { (void)t.get_children_checked("exec-1", std::nullopt); }},
+        {"get_coverage",
+         [](ExecutionTracker& t) { (void)t.get_coverage_checked("exec-1"); }},
     };
 }
 
 } // namespace
 
-TEST_CASE("ExecutionTracker: seed_read_degrade_metrics pre-seeds exactly the 15 closed series at 0",
+TEST_CASE("ExecutionTracker: seed_read_degrade_metrics pre-seeds exactly the 18 closed series at 0",
           "[execution_tracker]") {
     yuzu::MetricsRegistry m;
     ExecutionTracker::seed_read_degrade_metrics(m);
@@ -5238,4 +5248,1176 @@ TEST_CASE("ExecutionTracker: invalid UTF-8 never becomes a stored error_detail (
     }
     CHECK(seen_valid == 1);                 // the loop body ran for the control row
     CHECK(seen_utf8 == (accepted ? 1u : 0u)); // refused write => no row; accepted => stored clean
+}
+
+// ── #2673: per-target coverage and the response-deadline sweep ───────────────
+//
+// The sweep reads command_outbox_store.outbox, so these use the two-schema fixture above.
+
+namespace {
+
+std::string recorded_run(ExecutionTracker& t, const std::vector<std::string>& contacted,
+                         const std::vector<std::string>& offline = {}) {
+    auto id = t.create_execution(make_execution());
+    REQUIRE(id.has_value());
+    std::vector<DispatchTarget> targets;
+    for (const auto& a : contacted)
+        targets.push_back({a, TargetDisposition::Contacted});
+    for (const auto& a : offline)
+        targets.push_back({a, TargetDisposition::Offline});
+    REQUIRE(t.record_dispatch_targets(*id, targets, /*connected_only=*/false));
+    REQUIRE(t.set_agents_targeted(*id, static_cast<int>(contacted.size())));
+    return *id;
+}
+
+void report(ExecutionTracker& t, const std::string& id, const std::string& agent,
+            const std::string& status) {
+    AgentExecStatus s;
+    s.agent_id = agent;
+    s.status = status;
+    s.completed_at = status == "running" ? 0 : 1;
+    REQUIRE(t.update_agent_status(id, s));
+}
+
+ExecutionCoverage coverage_of(const ExecutionTracker& t, const std::string& id) {
+    auto c = t.get_coverage_checked(id);
+    REQUIRE(c.has_value());
+    return *c;
+}
+
+std::string status_of(const ExecutionTracker& t, const std::string& id) {
+    auto e = t.get_execution(id);
+    REQUIRE(e.has_value());
+    return e->status;
+}
+
+void sql(pg::PgPool& pool, const std::string& statement,
+         const std::vector<std::string>& params = {}) {
+    auto lease = pool.acquire();
+    REQUIRE(lease);
+    auto res = pg::exec_params(lease.get(), statement.c_str(), params);
+    INFO(PQresultErrorMessage(res.get()));
+    REQUIRE(res.status() == PGRES_COMMAND_OK);
+}
+
+// Ends the sweep's hold, as if it had been served.
+void release_hold(pg::PgPool& pool) {
+    sql(pool, "UPDATE execution_tracker.reap_meta SET value = '0' "
+              "WHERE key = 'target_deadline_hold'");
+}
+
+// Moves one run's deadline and every signal on it into the past.
+void expire(pg::PgPool& pool, const std::string& id) {
+    sql(pool, "UPDATE execution_tracker.executions SET deadline_at = deadline_at - 100000 "
+              "WHERE id = $1", {id});
+    sql(pool, "UPDATE execution_tracker.execution_target SET last_signal_at = "
+              "GREATEST(last_signal_at - 100000, 0) WHERE execution_id = $1", {id});
+}
+
+} // namespace
+
+TEST_CASE("ExecutionTracker coverage: succeeded needs every intended agent to succeed",
+          "[pg][execution_tracker][coverage]") {
+    StuckExecPg db;
+    auto& t = db.tracker();
+
+    const auto clean = recorded_run(t, {"a", "b"});
+    report(t, clean, "a", "success");
+    CHECK(status_of(t, clean) == "running");
+    report(t, clean, "b", "success");
+    CHECK(status_of(t, clean) == "succeeded");
+
+    // The same answers with one intended agent offline is finished, not succeeded.
+    const auto partial = recorded_run(t, {"a", "b"}, {"c"});
+    report(t, partial, "a", "success");
+    report(t, partial, "b", "success");
+    CHECK(status_of(t, partial) == "completed");
+    const auto c = coverage_of(t, partial);
+    CHECK(c.recorded);
+    CHECK(c.intended == 3);
+    CHECK(c.contacted == 2);
+    CHECK(c.responded == 2);
+    CHECK(c.offline == 1);
+    CHECK(c.pending == 0);
+}
+
+TEST_CASE("ExecutionTracker coverage: the first final result stands",
+          "[pg][execution_tracker][coverage]") {
+    StuckExecPg db;
+    auto& t = db.tracker();
+    const auto id = recorded_run(t, {"a", "b"});
+
+    report(t, id, "a", "success");
+    report(t, id, "a", "failure"); // a second, different final frame
+    report(t, id, "a", "running"); // and a stale keepalive
+    const auto rows = t.get_agent_statuses(id);
+    REQUIRE(rows.size() == 1);
+    CHECK(rows[0].status == "success");
+    const auto c = coverage_of(t, id);
+    CHECK(c.responded == 1);
+    CHECK(c.failed == 0);
+    CHECK(c.pending == 1);
+}
+
+TEST_CASE("ExecutionTracker coverage: an agent outside the intended set counts for nothing",
+          "[pg][execution_tracker][coverage]") {
+    StuckExecPg db;
+    auto& t = db.tracker();
+    const auto id = recorded_run(t, {"a"});
+
+    report(t, id, "stranger", "success");
+    CHECK(status_of(t, id) == "running");
+    CHECK(t.get_execution(id)->agents_responded == 0);
+    const auto c = coverage_of(t, id);
+    CHECK(c.intended == 1);
+    CHECK(c.pending == 1);
+}
+
+TEST_CASE("ExecutionTracker coverage: a reply that beats the target record is reconciled",
+          "[pg][execution_tracker][coverage]") {
+    StuckExecPg db;
+    auto& t = db.tracker();
+    auto id = t.create_execution(make_execution());
+    REQUIRE(id.has_value());
+
+    report(t, *id, "a", "success");
+    REQUIRE(t.record_dispatch_targets(*id, {{"a", TargetDisposition::Contacted}}, false));
+    REQUIRE(t.set_agents_targeted(*id, 1));
+    t.refresh_counts(*id);
+    CHECK(status_of(t, *id) == "succeeded");
+    CHECK(coverage_of(t, *id).responded == 1);
+}
+
+TEST_CASE("ExecutionTracker coverage: recording alone settles replies that came first and "
+          "finishes the run",
+          "[pg][execution_tracker][coverage]") {
+    StuckExecPg db;
+    auto& t = db.tracker();
+    auto id = t.create_execution(make_execution());
+    REQUIRE(id.has_value());
+    REQUIRE(t.set_agents_targeted(*id, 3));
+    report(t, *id, "a", "success");
+    report(t, *id, "b", "success");
+    CHECK(status_of(t, *id) == "running");
+
+    // No later reply and no explicit recount: the record itself must settle both early rows.
+    REQUIRE(t.record_dispatch_targets(*id,
+                                      {{"a", TargetDisposition::Contacted},
+                                       {"b", TargetDisposition::Contacted},
+                                       {"c", TargetDisposition::Contacted}},
+                                      false));
+    CHECK(coverage_of(t, *id).responded == 2);
+    CHECK(coverage_of(t, *id).pending == 1);
+    CHECK(t.get_execution(*id)->agents_responded == 2);
+    CHECK(status_of(t, *id) == "running");
+
+    report(t, *id, "c", "success");
+    CHECK(status_of(t, *id) == "succeeded");
+}
+
+TEST_CASE("ExecutionTracker coverage: when every reply beats the record, the record finishes the "
+          "run by itself",
+          "[pg][execution_tracker][coverage]") {
+    StuckExecPg db;
+    auto& t = db.tracker();
+    auto exec = make_execution();
+    exec.expects_targets = true; // so the early replies alone cannot read `succeeded`
+    auto id = t.create_execution(exec);
+    REQUIRE(id.has_value());
+    report(t, *id, "a", "success");
+    report(t, *id, "b", "success");
+    REQUIRE(t.record_dispatch_targets(
+        *id, {{"a", TargetDisposition::Contacted}, {"b", TargetDisposition::Contacted}}, false));
+    CHECK(coverage_of(t, *id).pending == 0);
+    // The dispatcher writes the count afterwards, then recounts.
+    REQUIRE(t.set_agents_targeted(*id, 2));
+    t.refresh_counts(*id);
+    CHECK(status_of(t, *id) == "succeeded");
+}
+
+TEST_CASE("ExecutionTracker coverage: a later record raises a target to contacted, never lowers it",
+          "[pg][execution_tracker][coverage]") {
+    StuckExecPg db;
+    auto& t = db.tracker();
+    auto id = t.create_execution(make_execution());
+    REQUIRE(id.has_value());
+
+    REQUIRE(t.record_dispatch_targets(
+        *id, {{"a", TargetDisposition::Offline}, {"b", TargetDisposition::Contacted}}, false));
+    REQUIRE(t.record_dispatch_targets(
+        *id, {{"a", TargetDisposition::Contacted}, {"b", TargetDisposition::Offline}}, true));
+    const auto c = coverage_of(t, *id);
+    CHECK(c.contacted == 2);
+    CHECK(c.offline == 0);
+    CHECK(c.connected_only);
+
+    // A run with no execution row (the side-channel correlation ids) records nothing, cleanly.
+    CHECK(t.record_dispatch_targets("preflight-x-y", {{"a", TargetDisposition::Contacted}}, false));
+    CHECK_FALSE(coverage_of(t, "preflight-x-y").recorded);
+}
+
+TEST_CASE("ExecutionTracker coverage: unrecorded and partly recorded runs keep the count-only rule",
+          "[pg][execution_tracker][coverage]") {
+    StuckExecPg db;
+    auto& t = db.tracker();
+
+    auto plain = t.create_execution(make_execution());
+    REQUIRE(plain.has_value());
+    REQUIRE(t.set_agents_targeted(*plain, 1));
+    report(t, *plain, "a", "success");
+    CHECK(status_of(t, *plain) == "succeeded");
+    CHECK_FALSE(coverage_of(t, *plain).recorded);
+
+    // Fewer recorded than dispatch reached: the record cannot finish the run early.
+    auto partial = t.create_execution(make_execution());
+    REQUIRE(partial.has_value());
+    REQUIRE(t.record_dispatch_targets(*partial, {{"a", TargetDisposition::Contacted}}, false));
+    REQUIRE(t.set_agents_targeted(*partial, 2));
+    report(t, *partial, "a", "success");
+    CHECK(status_of(t, *partial) == "running");
+    CHECK_FALSE(coverage_of(t, *partial).recorded);
+}
+
+TEST_CASE("ExecutionTracker coverage: counts honour the visible-agent filter",
+          "[pg][execution_tracker][coverage]") {
+    StuckExecPg db;
+    auto& t = db.tracker();
+    const auto id = recorded_run(t, {"a", "b"}, {"c"});
+    report(t, id, "b", "failure");
+
+    auto seen = t.get_coverage_checked(id, std::vector<std::string>{"a"});
+    REQUIRE(seen.has_value());
+    CHECK(seen->intended == 1);
+    CHECK(seen->failed == 0);
+    CHECK(seen->offline == 0);
+    auto none = t.get_coverage_checked(id, std::vector<std::string>{});
+    REQUIRE(none.has_value());
+    CHECK(none->intended == 0);
+}
+
+TEST_CASE("ExecutionTracker sweep: a silent target times out and a late answer changes nothing",
+          "[pg][execution_tracker][coverage]") {
+    StuckExecPg db;
+    auto& t = db.tracker();
+    const auto id = recorded_run(t, {"a", "b"});
+    report(t, id, "a", "success");
+
+    // Before the deadline the pass does nothing.
+    auto early = t.sweep_response_deadlines();
+    REQUIRE(early.has_value());
+    CHECK(early->timed_out_targets == 0);
+    CHECK(status_of(t, id) == "running");
+
+    expire(db.pool(), id);
+    auto swept = t.sweep_response_deadlines();
+    REQUIRE(swept.has_value());
+    CHECK(swept->timed_out_targets == 1);
+    CHECK(swept->execution_ids == std::vector<std::string>{id});
+    CHECK(status_of(t, id) == "completed");
+
+    report(t, id, "b", "success");
+    CHECK(status_of(t, id) == "completed");
+    CHECK(t.get_execution(id)->agents_failure == 1);
+    const auto c = coverage_of(t, id);
+    CHECK(c.timed_out == 1);
+    CHECK(c.late == 1);
+    CHECK(c.responded == 1);
+}
+
+TEST_CASE("ExecutionTracker sweep: a recent running signal keeps a target pending",
+          "[pg][execution_tracker][coverage]") {
+    StuckExecPg db;
+    auto& t = db.tracker();
+    const auto id = recorded_run(t, {"a"});
+    expire(db.pool(), id);
+    report(t, id, "a", "running"); // the agent's keepalive
+
+    auto swept = t.sweep_response_deadlines();
+    REQUIRE(swept.has_value());
+    CHECK(swept->timed_out_targets == 0);
+    CHECK(coverage_of(t, id).pending == 1);
+}
+
+TEST_CASE("ExecutionTracker sweep: a run the outbox still owns is left alone",
+          "[pg][execution_tracker][coverage]") {
+    StuckExecPg db;
+    auto& t = db.tracker();
+    const auto id = recorded_run(t, {"a"});
+    expire(db.pool(), id);
+    insert_outbox_row(db.pool(), "occ-2673", id, "pending");
+
+    auto swept = t.sweep_response_deadlines();
+    REQUIRE(swept.has_value());
+    CHECK(swept->timed_out_targets == 0);
+    CHECK(status_of(t, id) == "running");
+}
+
+TEST_CASE("ExecutionTracker sweep: an implausible clock reading is accepted only once it has "
+          "persisted, and then still waits",
+          "[pg][execution_tracker][coverage]") {
+    StuckExecPg db;
+    auto& t = db.tracker();
+    const auto id = recorded_run(t, {"a"});
+    expire(db.pool(), id);
+    sql(db.pool(), "INSERT INTO execution_tracker.reap_meta (key, value) VALUES "
+                   "('target_deadline_anchor', "
+                   "(extract(epoch FROM now())::bigint - 86400)::text)");
+
+    for (int pass = 0; pass < 2; ++pass) { // a quick repeat is not persistence
+        auto declined = t.sweep_response_deadlines();
+        REQUIRE(declined.has_value());
+        CHECK(declined->clock_anomaly);
+        CHECK(status_of(t, id) == "running");
+    }
+
+    // As if the same shifted clock had been seen for longer than the persistence window.
+    sql(db.pool(), "UPDATE execution_tracker.reap_meta SET value = 'forward:' || "
+                   "(extract(epoch FROM now())::bigint - 700)::text || ':' || "
+                   "(extract(epoch FROM now())::bigint - 30)::text "
+                   "WHERE key = 'target_deadline_declined'");
+    auto accepted = t.sweep_response_deadlines();
+    REQUIRE(accepted.has_value());
+    CHECK_FALSE(accepted->clock_anomaly);
+    CHECK(accepted->held);
+    CHECK(status_of(t, id) == "running");
+
+    release_hold(db.pool());
+    auto swept = t.sweep_response_deadlines();
+    REQUIRE(swept.has_value());
+    CHECK(swept->timed_out_targets == 1);
+    CHECK(status_of(t, id) == "completed");
+}
+
+TEST_CASE("ExecutionTracker sweep: missed passes hold expiry back before anything times out",
+          "[pg][execution_tracker][coverage]") {
+    StuckExecPg db;
+    auto& t = db.tracker();
+    const auto id = recorded_run(t, {"a"});
+    REQUIRE(t.sweep_response_deadlines().has_value()); // an ordinary pass sets the anchor
+    expire(db.pool(), id);
+    // The last pass was five minutes ago: the server or database was away.
+    sql(db.pool(), "UPDATE execution_tracker.reap_meta SET value = "
+                   "(extract(epoch FROM now())::bigint - 300)::text "
+                   "WHERE key = 'target_deadline_anchor'");
+
+    for (int pass = 0; pass < 2; ++pass) {
+        auto held = t.sweep_response_deadlines();
+        REQUIRE(held.has_value());
+        CHECK(held->held);
+        CHECK(held->timed_out_targets == 0);
+    }
+    release_hold(db.pool());
+    auto swept = t.sweep_response_deadlines();
+    REQUIRE(swept.has_value());
+    CHECK(swept->timed_out_targets == 1);
+    REQUIRE(swept->runs.size() == 1);
+    CHECK(swept->runs[0].finished_status == "completed");
+}
+
+TEST_CASE("ExecutionTracker coverage: any device that did not succeed keeps the run from "
+          "succeeded",
+          "[pg][execution_tracker][coverage]") {
+    StuckExecPg db;
+    auto& t = db.tracker();
+    for (const char* answer : {"failure", "timeout", "rejected"}) {
+        INFO(answer);
+        const auto id = recorded_run(t, {"a", "b"});
+        report(t, id, "a", answer);
+        report(t, id, "b", "success");
+        CHECK(status_of(t, id) == "completed");
+        CHECK(coverage_of(t, id).failed == 1);
+    }
+}
+
+TEST_CASE("ExecutionTracker coverage: a recount waits for the run and then counts everything "
+          "committed by then",
+          "[pg][execution_tracker][coverage][concurrency]") {
+    StuckExecPg db;
+    auto& t = db.tracker();
+    // Deterministic form of "two last replies overlap": the test holds the run row, lets reply
+    // `a`'s recount reach it, then commits a failure from `b` before letting go. A recount that
+    // counted or decided from anything read before the lock finishes the run `succeeded`, or
+    // stores counts without `b`.
+    for (const bool saved_list : {true, false}) {
+        INFO("saved list " << saved_list);
+        std::string id;
+        if (saved_list) {
+            id = recorded_run(t, {"a", "b"});
+        } else {
+            auto created = t.create_execution(make_execution());
+            REQUIRE(created.has_value());
+            id = *created;
+            REQUIRE(t.set_agents_targeted(id, 2));
+        }
+        auto holder = db.pool().acquire();
+        REQUIRE(holder);
+        const auto run = [&](const std::string& statement) {
+            auto res = pg::exec_params(holder.get(), statement.c_str(), std::vector<std::string>{});
+            INFO(PQresultErrorMessage(res.get()));
+            REQUIRE((res.status() == PGRES_COMMAND_OK || res.status() == PGRES_TUPLES_OK));
+        };
+        run("BEGIN");
+        run("SELECT 1 FROM execution_tracker.executions WHERE id = '" + id + "' FOR UPDATE");
+        bool wrote = false;
+        std::thread reply([&] {
+            AgentExecStatus s;
+            s.agent_id = "a";
+            s.status = "success";
+            s.completed_at = 1;
+            wrote = t.update_agent_status(id, s);
+        });
+        // Wait until that recount is blocked on a lock in this database.
+        bool blocked = false;
+        for (int i = 0; i < 400 && !blocked; ++i) {
+            auto probe = db.pool().acquire();
+            REQUIRE(probe);
+            auto res = pg::exec_params(
+                probe.get(),
+                "SELECT 1 FROM pg_stat_activity WHERE datname = current_database() "
+                "AND wait_event_type = 'Lock'",
+                std::vector<std::string>{});
+            blocked = res.status() == PGRES_TUPLES_OK && PQntuples(res.get()) > 0;
+            if (!blocked)
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        run("INSERT INTO execution_tracker.agent_exec_status (execution_id, agent_id, status, "
+            "completed_at) VALUES ('" + id + "', 'b', 'failure', 1)");
+        run("UPDATE execution_tracker.execution_target SET outcome = 'failure' "
+            "WHERE execution_id = '" + id + "' AND agent_id = 'b'");
+        run("COMMIT");
+        reply.join();
+        CHECK(blocked);
+        CHECK(wrote);
+        CHECK(status_of(t, id) == "completed");
+        const auto e = t.get_execution(id);
+        REQUIRE(e.has_value());
+        CHECK(e->agents_success == 1);
+        CHECK(e->agents_failure == 1);
+    }
+}
+
+TEST_CASE("ExecutionTracker coverage: a later send cannot make an unsaved earlier one count as "
+          "complete",
+          "[pg][execution_tracker][coverage]") {
+    StuckExecPg db;
+    auto& t = db.tracker();
+    auto exec = make_execution();
+    exec.expects_targets = true;
+    auto id = t.create_execution(exec);
+    REQUIRE(id.has_value());
+
+    SECTION("the first list was never saved") {
+        REQUIRE(t.mark_targets_expected(*id)); // attempt one: its record fails
+        REQUIRE(t.mark_targets_expected(*id)); // attempt two (a re-drive)
+        REQUIRE(t.record_dispatch_targets(*id, {{"a", TargetDisposition::Contacted}}, false));
+        REQUIRE(t.set_agents_targeted(*id, 1));
+        report(t, *id, "a", "success");
+        CHECK(status_of(t, *id) == "completed");
+        CHECK_FALSE(coverage_of(t, *id).recorded);
+    }
+    SECTION("a later send that reaches nobody does not lose a saved list") {
+        REQUIRE(t.mark_targets_expected(*id));
+        REQUIRE(t.record_dispatch_targets(*id, {{"a", TargetDisposition::Contacted}}, false));
+        REQUIRE(t.mark_targets_expected(*id));
+        REQUIRE(t.close_empty_attempt(*id));
+        REQUIRE(t.set_agents_targeted(*id, 1));
+        report(t, *id, "a", "success");
+        CHECK(status_of(t, *id) == "succeeded");
+        CHECK(coverage_of(t, *id).recorded);
+    }
+    SECTION("closing a later empty send does not forgive an earlier unsaved one") {
+        REQUIRE(t.mark_targets_expected(*id)); // never saved, never closed: it threw
+        REQUIRE(t.mark_targets_expected(*id));
+        REQUIRE(t.close_empty_attempt(*id));
+        REQUIRE(t.mark_targets_expected(*id));
+        REQUIRE(t.record_dispatch_targets(*id, {{"a", TargetDisposition::Contacted}}, false));
+        REQUIRE(t.set_agents_targeted(*id, 1));
+        report(t, *id, "a", "success");
+        CHECK(status_of(t, *id) == "completed");
+        CHECK_FALSE(coverage_of(t, *id).recorded);
+    }
+    SECTION("a run that finishes while a later send is still open reads completed") {
+        // The safe direction: until that send ends, the saved list may not be the whole list.
+        REQUIRE(t.mark_targets_expected(*id));
+        REQUIRE(t.record_dispatch_targets(*id, {{"a", TargetDisposition::Contacted}}, false));
+        REQUIRE(t.set_agents_targeted(*id, 1));
+        REQUIRE(t.mark_targets_expected(*id));
+        report(t, *id, "a", "success");
+        CHECK(status_of(t, *id) == "completed");
+        REQUIRE(t.close_empty_attempt(*id));
+        CHECK(status_of(t, *id) == "completed");
+    }
+}
+
+TEST_CASE("ExecutionTracker coverage: a partial list still counts what the server decided",
+          "[pg][execution_tracker][coverage]") {
+    StuckExecPg db;
+    auto& t = db.tracker();
+    auto id = t.create_execution(make_execution());
+    REQUIRE(id.has_value());
+    REQUIRE(t.record_dispatch_targets(
+        *id, {{"a", TargetDisposition::Contacted}, {"b", TargetDisposition::Contacted}}, true,
+        /*complete=*/false));
+    REQUIRE(t.set_agents_targeted(*id, 2));
+    report(t, *id, "a", "success");
+    expire(db.pool(), *id);
+    REQUIRE(t.sweep_response_deadlines().has_value());
+    CHECK(status_of(t, *id) == "completed");
+    CHECK(t.get_execution(*id)->agents_failure == 1);
+    auto rerun = t.create_rerun_checked(*id, "admin", /*failed_only=*/true);
+    REQUIRE(rerun.has_value());
+    CHECK(t.get_execution(*rerun)->agents_targeted == 1);
+}
+
+TEST_CASE("ExecutionTracker coverage: a record that arrives after the run finished keeps its "
+          "counts",
+          "[pg][execution_tracker][coverage]") {
+    StuckExecPg db;
+    auto& t = db.tracker();
+    auto id = t.create_execution(make_execution());
+    REQUIRE(id.has_value());
+    REQUIRE(t.set_agents_targeted(*id, 2));
+    report(t, *id, "a", "success");
+    REQUIRE(t.mark_cancelled(*id, "admin"));
+    // Refuse every write to the run after the record's own, so the recount that follows it
+    // cannot put back counts the record wiped.
+    sql(db.pool(), "CREATE FUNCTION public.yuzu_test_refuse() RETURNS trigger LANGUAGE plpgsql "
+                   "AS $$ BEGIN RAISE EXCEPTION 'refused'; END $$");
+    sql(db.pool(), "CREATE TRIGGER yuzu_test_refuse BEFORE UPDATE ON "
+                   "execution_tracker.executions FOR EACH ROW "
+                   "WHEN (OLD.targets_state = 'recorded') "
+                   "EXECUTE FUNCTION public.yuzu_test_refuse()");
+    REQUIRE(t.record_dispatch_targets(
+        *id, {{"a", TargetDisposition::Contacted}, {"b", TargetDisposition::Contacted}}, false));
+    CHECK(status_of(t, *id) == "cancelled");
+    CHECK(t.get_execution(*id)->agents_success == 1);
+}
+
+TEST_CASE("ExecutionTracker sweep: one run that cannot be swept does not hold back the others",
+          "[pg][execution_tracker][coverage]") {
+    StuckExecPg db;
+    auto& t = db.tracker();
+    const auto bad = recorded_run(t, {"a"});
+    const auto good = recorded_run(t, {"a"});
+    expire(db.pool(), bad);
+    expire(db.pool(), good);
+    sql(db.pool(), "UPDATE execution_tracker.executions SET deadline_at = deadline_at - 1000 "
+                   "WHERE id = $1", {bad}); // swept first
+    sql(db.pool(), "CREATE FUNCTION public.yuzu_test_refuse() RETURNS trigger LANGUAGE plpgsql "
+                   "AS $$ BEGIN IF OLD.execution_id = '" + bad +
+                   "' THEN RAISE EXCEPTION 'refused'; END IF; RETURN NEW; END $$");
+    sql(db.pool(), "CREATE TRIGGER yuzu_test_refuse BEFORE UPDATE ON "
+                   "execution_tracker.execution_target FOR EACH ROW "
+                   "EXECUTE FUNCTION public.yuzu_test_refuse()");
+
+    for (int pass = 0; pass < 2; ++pass) {
+        auto swept = t.sweep_response_deadlines();
+        REQUIRE(swept.has_value());
+        CHECK(swept->failed_runs == 1);
+    }
+    CHECK(status_of(t, good) == "completed");
+    CHECK(status_of(t, bad) == "running");
+}
+
+TEST_CASE("ExecutionTracker sweep: failed runs are retried least recently attempted first",
+          "[pg][execution_tracker][coverage]") {
+    StuckExecPg db;
+    auto& t = db.tracker();
+    const auto first = recorded_run(t, {"a"});
+    const auto second = recorded_run(t, {"a"});
+    expire(db.pool(), first);
+    expire(db.pool(), second);
+    sql(db.pool(), "UPDATE execution_tracker.executions SET deadline_at = deadline_at - 1000 "
+                   "WHERE id = $1", {first}); // the earlier deadline
+    const auto refuse = [&](const std::string& condition) {
+        sql(db.pool(), "CREATE OR REPLACE FUNCTION public.yuzu_test_refuse() RETURNS trigger "
+                       "LANGUAGE plpgsql AS $$ BEGIN IF " + condition +
+                       " THEN RAISE EXCEPTION 'refused'; END IF; RETURN NEW; END $$");
+    };
+    refuse("true");
+    sql(db.pool(), "CREATE TRIGGER yuzu_test_refuse BEFORE UPDATE ON "
+                   "execution_tracker.execution_target FOR EACH ROW "
+                   "EXECUTE FUNCTION public.yuzu_test_refuse()");
+    // A pass with room for exactly one run.
+    const auto one_run = [&] {
+        int asked = 0;
+        auto swept = t.sweep_response_deadlines([&] { return asked++ > 0; });
+        REQUIRE(swept.has_value());
+    };
+    REQUIRE(t.sweep_response_deadlines().has_value()); // both fail
+    one_run();                                         // `first` fails again
+    refuse("OLD.execution_id = '" + first + "'");      // only `first` stays broken
+    one_run();
+    CHECK(status_of(t, second) == "completed");
+    CHECK(status_of(t, first) == "running");
+}
+
+TEST_CASE("ExecutionTracker coverage: a reply does not queue behind a running recount, and the "
+          "recount still counts it",
+          "[pg][execution_tracker][coverage][concurrency]") {
+    StuckExecPg db;
+    auto& t = db.tracker();
+    const auto id = recorded_run(t, {"a", "b"});
+    auto holder = db.pool().acquire();
+    REQUIRE(holder);
+    const auto run = [&](const std::string& statement) {
+        auto res = pg::exec_params(holder.get(), statement.c_str(), std::vector<std::string>{});
+        INFO(PQresultErrorMessage(res.get()));
+        REQUIRE((res.status() == PGRES_COMMAND_OK || res.status() == PGRES_TUPLES_OK));
+    };
+    // Hold the first recount AFTER it has counted and before it writes: the trigger waits on a
+    // lock this connection owns. Only a further recount can then see `b`.
+    sql(db.pool(), "CREATE FUNCTION public.yuzu_test_gate() RETURNS trigger LANGUAGE plpgsql "
+                   "AS $$ BEGIN PERFORM pg_advisory_xact_lock(2673); RETURN NEW; END $$");
+    sql(db.pool(), "CREATE TRIGGER yuzu_test_gate BEFORE UPDATE ON execution_tracker.executions "
+                   "FOR EACH ROW EXECUTE FUNCTION public.yuzu_test_gate()");
+    run("BEGIN");
+    run("SELECT pg_advisory_xact_lock(2673)");
+    const auto success = [&](const std::string& agent) {
+        AgentExecStatus s;
+        s.agent_id = agent;
+        s.status = "success";
+        s.completed_at = 1;
+        return t.update_agent_status(id, s);
+    };
+    const auto lock_waiters = [&] {
+        auto probe = db.pool().acquire();
+        REQUIRE(probe);
+        auto res = pg::exec_params(probe.get(),
+                                   "SELECT 1 FROM pg_stat_activity WHERE datname = "
+                                   "current_database() AND wait_event_type = 'Lock'",
+                                   std::vector<std::string>{});
+        REQUIRE(res.status() == PGRES_TUPLES_OK);
+        return PQntuples(res.get());
+    };
+    std::atomic<bool> first_ok{false};
+    std::atomic<bool> second_ok{false};
+    std::atomic<bool> second_done{false};
+    // jthread: a failing REQUIRE joins instead of terminating the test binary.
+    std::jthread first([&] { first_ok = success("a"); });
+    for (int i = 0; i < 400 && lock_waiters() == 0; ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    CHECK(lock_waiters() == 1);
+    std::jthread second([&] {
+        second_ok = success("b");
+        second_done = true;
+    });
+    for (int i = 0; i < 150 && !second_done; ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    CHECK(second_done.load()); // returned while the first recount is still held
+    run("COMMIT");
+    first.join();
+    second.join();
+    CHECK(first_ok.load());
+    CHECK(second_ok.load());
+    CHECK(status_of(t, id) == "succeeded");
+    CHECK(t.get_execution(id)->agents_success == 2);
+}
+
+TEST_CASE("recount coalescer: one runner per run, and every reply gets a later recount",
+          "[execution_tracker][coverage]") {
+    RecountCoalescer c;
+    auto turn = c.join("run", "a");
+    REQUIRE(turn.has_value());
+    CHECK(turn->agents == std::vector<std::string>{"a"});
+    CHECK_FALSE(c.join("run", "b").has_value());
+    CHECK(c.join("other", "z").has_value());
+    REQUIRE(c.next(*turn));
+    CHECK(turn->agents == std::vector<std::string>{"b"});
+    CHECK_FALSE(c.next(*turn));
+    CHECK(c.join("run", "c").has_value()); // released
+}
+
+TEST_CASE("recount coalescer: a runner under constant traffic is relieved after a few rounds",
+          "[execution_tracker][coverage]") {
+    RecountCoalescer c;
+    auto first = c.join("run", "r0");
+    REQUIRE(first.has_value());
+    int recounts = 1;
+    std::optional<RecountCoalescer::Turn> successor;
+    // A reply arrives during every recount.
+    for (int i = 1; i < 50; ++i) {
+        auto joined = c.join("run", "r" + std::to_string(i));
+        if (joined) {
+            successor = std::move(joined);
+            break;
+        }
+        REQUIRE(c.next(*first));
+        ++recounts;
+    }
+    REQUIRE(successor.has_value());
+    CHECK(recounts == RecountCoalescer::kRoundsBeforeHandoff + 1);
+    CHECK(successor->agents ==
+          std::vector<std::string>{"r" + std::to_string(recounts)});
+    CHECK_FALSE(c.next(*first)); // relieved
+    c.abandon(*first);           // and cannot release its successor's run
+    CHECK_FALSE(c.join("run", "late").has_value());
+    REQUIRE(c.next(*successor));
+    CHECK(successor->agents == std::vector<std::string>{"late"});
+    CHECK_FALSE(c.next(*successor));
+    auto fresh = c.join("run", "again");
+    REQUIRE(fresh.has_value());
+    CHECK_FALSE(c.next(*first)); // a stale turn stays stale after the run is re-entered
+    c.abandon(*fresh);
+    CHECK(c.join("run", "after").has_value());
+}
+
+TEST_CASE("deadline sweep audit queue: a failed write is retried, one attempt per pass",
+          "[execution_tracker][coverage]") {
+    std::deque<int> queue{1, 2, 3};
+    std::vector<int> written;
+    std::vector<int> gone;
+    std::vector<int> announced_rows;
+    std::size_t announced = 0;
+    bool healthy = false;
+    int attempts = 0;
+    const auto flush = [&](std::size_t cap) {
+        return flush_audit_queue(
+            queue, announced,
+            [&](int row) {
+                ++attempts;
+                if (healthy)
+                    written.push_back(row);
+                return healthy;
+            },
+            [] { return false; }, cap, [&](int row) { announced_rows.push_back(row); },
+            [&](int row) { gone.push_back(row); });
+    };
+    auto out = flush(10);
+    CHECK(out.write_failed);
+    CHECK(attempts == 1);
+    CHECK(queue.size() == 3);
+    CHECK(announced_rows == std::vector<int>{1, 2, 3}); // every waiting row, logged
+    static_cast<void>(flush(10));
+    CHECK(announced_rows.size() == 3); // once each
+    healthy = true;
+    out = flush(10);
+    CHECK_FALSE(out.write_failed);
+    CHECK(written == std::vector<int>{1, 2, 3});
+    CHECK(queue.empty());
+    healthy = false;
+    queue = {4, 5, 6};
+    out = flush(2);
+    CHECK(out.dropped == 1);
+    CHECK(gone == std::vector<int>{4}); // the oldest goes first
+    CHECK(announced_rows == std::vector<int>{1, 2, 3, 4, 5, 6});
+    CHECK(announced == 2);
+}
+
+TEST_CASE("dispatch announcement: a send that could not announce itself neither closes an open "
+          "send nor saves a complete list",
+          "[pg][execution_tracker][coverage]") {
+    StuckExecPg db;
+    auto& t = db.tracker();
+    auto exec = make_execution();
+    exec.expects_targets = true;
+    auto id = t.create_execution(exec);
+    REQUIRE(id.has_value());
+    const auto flag = [&](const std::string& column) {
+        auto conn = db.pool().acquire();
+        REQUIRE(conn);
+        auto res = pg::exec_params(
+            conn.get(),
+            ("SELECT " + column + " FROM execution_tracker.executions WHERE id = $1").c_str(),
+            std::vector<std::string>{*id});
+        REQUIRE(res.status() == PGRES_TUPLES_OK);
+        REQUIRE(PQntuples(res.get()) == 1);
+        return std::string(PQgetvalue(res.get(), 0, 0)) == "t";
+    };
+    const std::vector<DispatchTarget> a{{"a", TargetDisposition::Contacted}};
+
+    SECTION("an announced send closes its own empty attempt") {
+        DispatchAnnouncement send(&t, *id, "test");
+        CHECK(flag("attempt_open"));
+        send.close_if_empty(false);
+        CHECK(flag("attempt_open")); // it named somebody: only a saved list closes it
+        send.close_if_empty(true);
+        CHECK_FALSE(flag("attempt_open"));
+    }
+    SECTION("an announced send saves a complete list, or an incomplete one when partial") {
+        DispatchAnnouncement send(&t, *id, "test");
+        REQUIRE(send.record(a, false, /*partial_list=*/false));
+        CHECK_FALSE(flag("targets_incomplete"));
+        DispatchAnnouncement partial(&t, *id, "test");
+        REQUIRE(partial.record(a, false, /*partial_list=*/true));
+        CHECK(flag("targets_incomplete"));
+    }
+    SECTION("an unannounced send") {
+        REQUIRE(t.mark_targets_expected(*id)); // an earlier send that never saved its list
+        // Refuse the next announcement only: the one that would mark the run incomplete while
+        // leaving the send open.
+        sql(db.pool(), "CREATE FUNCTION public.yuzu_test_refuse() RETURNS trigger LANGUAGE "
+                       "plpgsql AS $$ BEGIN RAISE EXCEPTION 'refused'; END $$");
+        sql(db.pool(), "CREATE TRIGGER yuzu_test_refuse BEFORE UPDATE ON "
+                       "execution_tracker.executions FOR EACH ROW WHEN (OLD.attempt_open AND "
+                       "NEW.attempt_open AND NEW.targets_incomplete AND NOT "
+                       "OLD.targets_incomplete) EXECUTE FUNCTION public.yuzu_test_refuse()");
+        DispatchAnnouncement send(&t, *id, "test");
+        send.close_if_empty(true);
+        CHECK(flag("attempt_open")); // not closed: the open send is somebody else's
+        REQUIRE(send.record(a, false, /*partial_list=*/false));
+        CHECK(flag("targets_incomplete"));
+    }
+    SECTION("an untracked dispatch is inert") {
+        DispatchAnnouncement send(&t, "", "test");
+        CHECK_FALSE(send.tracked());
+        send.close_if_empty(true);
+        CHECK(send.record(a, false, false));
+        CHECK_FALSE(flag("attempt_open"));
+    }
+}
+
+TEST_CASE("dispatch announcement: a re-drive against a run that is no longer running cannot "
+          "cover for an earlier unsaved send",
+          "[pg][execution_tracker][coverage]") {
+    StuckExecPg db;
+    auto& t = db.tracker();
+    auto exec = make_execution();
+    exec.expects_targets = true;
+    auto id = t.create_execution(exec);
+    REQUIRE(id.has_value());
+    const auto flag = [&](const std::string& column) {
+        auto conn = db.pool().acquire();
+        REQUIRE(conn);
+        auto res = pg::exec_params(
+            conn.get(),
+            ("SELECT " + column + " FROM execution_tracker.executions WHERE id = $1").c_str(),
+            std::vector<std::string>{*id});
+        REQUIRE(res.status() == PGRES_TUPLES_OK);
+        REQUIRE(PQntuples(res.get()) == 1);
+        return std::string(PQgetvalue(res.get(), 0, 0)) == "t";
+    };
+    const std::vector<DispatchTarget> first{{"a", TargetDisposition::Contacted}};
+    const std::vector<DispatchTarget> redrive{{"a", TargetDisposition::Contacted},
+                                              {"c", TargetDisposition::Contacted}};
+    REQUIRE(t.mark_targets_expected(*id)); // attempt one: saved
+    REQUIRE(t.record_dispatch_targets(*id, first, false));
+    REQUIRE(t.mark_targets_expected(*id)); // attempt two: reached more, never saved
+
+    for (const bool cancelled : {true, false}) {
+        DYNAMIC_SECTION((cancelled ? "cancelled run" : "finished run")) {
+            if (cancelled) {
+                REQUIRE(t.mark_cancelled(*id, "admin"));
+            } else {
+                REQUIRE(t.set_agents_targeted(*id, 1));
+                report(t, *id, "a", "success");
+                REQUIRE(status_of(t, *id) == "completed");
+            }
+            REQUIRE(flag("attempt_open"));
+            CHECK_FALSE(t.mark_targets_expected(*id));
+
+            DispatchAnnouncement send(&t, *id, "test");
+            SECTION("a re-drive that reaches nobody leaves the send open") {
+                send.close_if_empty(true);
+                CHECK(flag("attempt_open"));
+                CHECK_FALSE(coverage_of(t, *id).recorded);
+            }
+            SECTION("a re-drive that reaches devices saves an incomplete list") {
+                REQUIRE(send.record(redrive, false, /*partial_list=*/false));
+                CHECK(flag("targets_incomplete"));
+                CHECK_FALSE(coverage_of(t, *id).recorded);
+            }
+        }
+    }
+}
+
+TEST_CASE("dispatch announcement: a send on a finished run that stops before saving leaves the "
+          "list incomplete",
+          "[pg][execution_tracker][coverage]") {
+    StuckExecPg db;
+    auto& t = db.tracker();
+    auto exec = make_execution();
+    exec.expects_targets = true;
+    auto id = t.create_execution(exec);
+    REQUIRE(id.has_value());
+    const auto incomplete = [&] {
+        auto conn = db.pool().acquire();
+        REQUIRE(conn);
+        auto res = pg::exec_params(
+            conn.get(),
+            "SELECT targets_incomplete FROM execution_tracker.executions WHERE id = $1",
+            std::vector<std::string>{*id});
+        REQUIRE(res.status() == PGRES_TUPLES_OK);
+        REQUIRE(PQntuples(res.get()) == 1);
+        return std::string(PQgetvalue(res.get(), 0, 0)) == "t";
+    };
+    REQUIRE(t.mark_targets_expected(*id));
+    REQUIRE(t.record_dispatch_targets(*id, {{"a", TargetDisposition::Contacted}}, false));
+    REQUIRE(t.set_agents_targeted(*id, 1));
+
+    for (const bool cancelled : {true, false}) {
+        DYNAMIC_SECTION((cancelled ? "cancelled run" : "finished run")) {
+            if (cancelled)
+                REQUIRE(t.mark_cancelled(*id, "admin"));
+            else
+                report(t, *id, "a", "success");
+            REQUIRE(status_of(t, *id) == (cancelled ? "cancelled" : "succeeded"));
+            REQUIRE(coverage_of(t, *id).recorded);
+            REQUIRE_FALSE(incomplete());
+            // Announced, then nothing: the send threw, or the process stopped.
+            DispatchAnnouncement send(&t, *id, "test");
+            CHECK(incomplete());
+            CHECK_FALSE(coverage_of(t, *id).recorded);
+        }
+    }
+}
+
+TEST_CASE("ExecutionTracker coverage: announcing leaves a finished run that tracks no targets "
+          "alone",
+          "[pg][execution_tracker][coverage]") {
+    StuckExecPg db;
+    auto& t = db.tracker();
+    auto id = t.create_execution(make_execution());
+    REQUIRE(id.has_value());
+    REQUIRE(t.mark_cancelled(*id, "admin"));
+    CHECK_FALSE(t.mark_targets_expected(*id));
+    auto conn = db.pool().acquire();
+    REQUIRE(conn);
+    auto res = pg::exec_params(conn.get(),
+                               "SELECT targets_incomplete, targets_state FROM "
+                               "execution_tracker.executions WHERE id = $1",
+                               std::vector<std::string>{*id});
+    REQUIRE(res.status() == PGRES_TUPLES_OK);
+    REQUIRE(PQntuples(res.get()) == 1);
+    CHECK(std::string(PQgetvalue(res.get(), 0, 0)) == "f");
+    CHECK(std::string(PQgetvalue(res.get(), 0, 1)).empty());
+}
+
+TEST_CASE("ExecutionTracker coverage: only a running run can be announced",
+          "[pg][execution_tracker][coverage]") {
+    StuckExecPg db;
+    CHECK_FALSE(db.tracker().mark_targets_expected("no-such-run"));
+}
+
+TEST_CASE("dispatch announcement: every fan-out that records targets goes through it",
+          "[execution_tracker][coverage]") {
+    // Wiring pin: the rules above hold for a fan-out only while it uses the one copy. Counted in
+    // comment-free source. It proves the calls are absent or present, not that they run.
+    for (const char* file : {"server.cpp", "dispatch_scope_ladder.hpp"}) {
+        INFO(file);
+        const std::string& src = yuzu::test::source_scan::comment_free_source(file);
+        CHECK(src.find("DispatchAnnouncement announcement(") != std::string::npos);
+        CHECK(src.find("announcement.close_if_empty(") != std::string::npos);
+        CHECK(src.find("announcement.record(") != std::string::npos);
+        CHECK(src.find("mark_targets_expected(") == std::string::npos);
+        CHECK(src.find("close_empty_attempt(") == std::string::npos);
+        CHECK(src.find("record_dispatch_targets(") == std::string::npos);
+    }
+    // The software-sync push: announced before it sends, and its partial-list fact reaches the
+    // record.
+    const std::string& server = yuzu::test::source_scan::comment_free_source("server.cpp");
+    const auto push = server.find("push_sync_now_confined(const auth::Session&");
+    REQUIRE(push != std::string::npos);
+    const auto announce = server.find("DispatchAnnouncement announcement(", push);
+    const auto send = server.find("dispatch_system_reserved_ids(", push);
+    REQUIRE(announce != std::string::npos);
+    REQUIRE(send != std::string::npos);
+    CHECK(announce < send);
+    const auto record = server.find("announcement.record(targets, run && run->connected_only,", send);
+    REQUIRE(record != std::string::npos);
+    CHECK(server.substr(record, 200).find("run && run->partial_list))") != std::string::npos);
+}
+
+TEST_CASE("execution coverage JSON: a confined caller gets no run-wide value",
+          "[execution_tracker][coverage]") {
+    ExecutionCoverage c;
+    c.recorded = true;
+    c.connected_only = true;
+    c.deadline_at = 123;
+    c.intended = 2;
+    const auto confined = execution_coverage_json(c, /*confined=*/true);
+    CHECK(confined["deadline_at"].is_null());
+    CHECK(confined["population"].is_null());
+    CHECK(confined["intended"] == 2);
+    const auto open = execution_coverage_json(c);
+    CHECK(open["deadline_at"] == 123);
+    CHECK(open["population"] == "connected_only");
+}
+
+TEST_CASE("ExecutionTracker coverage: a tracked run whose list was not saved is never succeeded",
+          "[pg][execution_tracker][coverage]") {
+    StuckExecPg db;
+    auto& t = db.tracker();
+    auto exec = make_execution();
+    exec.expects_targets = true;
+
+    SECTION("a run that reached nobody is left to the stuck-run reaper") {
+        auto id = t.create_execution(exec);
+        REQUIRE(id.has_value());
+        REQUIRE(t.mark_targets_expected(*id));
+        expire(db.pool(), *id);
+        backdate_dispatched_at(db.pool(), *id, 90000);
+        REQUIRE(t.sweep_response_deadlines().has_value());
+        CHECK(status_of(t, *id) == "running");
+    }
+    SECTION("nothing recorded: the count-only rule finishes it as completed") {
+        auto id = t.create_execution(exec);
+        REQUIRE(id.has_value());
+        REQUIRE(t.mark_targets_expected(*id));
+        REQUIRE(t.set_agents_targeted(*id, 1));
+        report(t, *id, "a", "success");
+        CHECK(status_of(t, *id) == "completed");
+        CHECK_FALSE(coverage_of(t, *id).recorded);
+    }
+    SECTION("a partial list stays unable to succeed") {
+        auto id = t.create_execution(exec);
+        REQUIRE(id.has_value());
+        REQUIRE(t.record_dispatch_targets(*id, {{"a", TargetDisposition::Contacted}}, true,
+                                          /*complete=*/false));
+        REQUIRE(t.set_agents_targeted(*id, 1));
+        report(t, *id, "a", "success");
+        CHECK(status_of(t, *id) == "completed");
+    }
+    SECTION("the whole list saved: it can succeed") {
+        auto id = t.create_execution(exec);
+        REQUIRE(id.has_value());
+        REQUIRE(t.mark_targets_expected(*id));
+        REQUIRE(t.record_dispatch_targets(*id, {{"a", TargetDisposition::Contacted}}, false));
+        REQUIRE(t.set_agents_targeted(*id, 1));
+        report(t, *id, "a", "success");
+        CHECK(status_of(t, *id) == "succeeded");
+    }
+    SECTION("nothing saved and nobody answers: ended only once no reply could be matched") {
+        auto id = t.create_execution(exec);
+        REQUIRE(id.has_value());
+        REQUIRE(t.mark_targets_expected(*id));
+        REQUIRE(t.set_agents_targeted(*id, 1));
+        expire(db.pool(), *id);
+        REQUIRE(t.sweep_response_deadlines().has_value());
+        CHECK(status_of(t, *id) == "running"); // a device may still be working
+        backdate_dispatched_at(db.pool(), *id, 90000);
+        REQUIRE(t.sweep_response_deadlines().has_value());
+        CHECK(status_of(t, *id) == "completed");
+    }
+}
+
+TEST_CASE("ExecutionTracker coverage: a delivery failure is not the device's answer",
+          "[pg][execution_tracker][coverage]") {
+    StuckExecPg db;
+    auto& t = db.tracker();
+    const auto id = recorded_run(t, {"a", "b"});
+    AgentExecStatus undelivered;
+    undelivered.agent_id = "a";
+    undelivered.status = "failure";
+    undelivered.completed_at = 1;
+    undelivered.server_outcome = "not_delivered";
+    REQUIRE(t.update_agent_status(id, undelivered));
+    auto c = coverage_of(t, id);
+    CHECK(c.not_delivered == 1);
+    CHECK(c.failed == 0);
+    CHECK(c.pending == 1);
+
+    SECTION("a later answer from the device replaces it") {
+        report(t, id, "a", "success");
+        report(t, id, "b", "success");
+        const auto after = coverage_of(t, id);
+        CHECK(after.not_delivered == 0);
+        CHECK(after.responded == 2);
+        CHECK(status_of(t, id) == "succeeded");
+    }
+    SECTION("without one the run is completed, with the device listed apart") {
+        report(t, id, "b", "success");
+        CHECK(status_of(t, id) == "completed");
+        CHECK(coverage_of(t, id).not_delivered == 1);
+        CHECK(t.get_execution(id)->agents_failure == 1);
+    }
+}
+
+TEST_CASE("ExecutionTracker sweep: unmatched replies read unknown, and a rerun counts them",
+          "[pg][execution_tracker][coverage]") {
+    StuckExecPg db;
+    auto& t = db.tracker();
+    const auto id = recorded_run(t, {"a"});
+    t.mark_correlation_lost(id);
+    expire(db.pool(), id);
+    auto swept = t.sweep_response_deadlines();
+    REQUIRE(swept.has_value());
+    CHECK(swept->unknown_targets == 1);
+    CHECK(swept->timed_out_targets == 0);
+    CHECK(coverage_of(t, id).unknown == 1);
+    CHECK(status_of(t, id) == "completed");
+
+    auto rerun = t.create_rerun(id, "admin", /*failed_only=*/true);
+    REQUIRE(rerun.has_value());
+    CHECK(t.get_execution(*rerun)->agents_targeted == 1);
+}
+
+TEST_CASE("ExecutionTracker sweep: a run whose target count was never written still finishes",
+          "[pg][execution_tracker][coverage]") {
+    StuckExecPg db;
+    auto& t = db.tracker();
+    auto id = t.create_execution(make_execution());
+    REQUIRE(id.has_value());
+    REQUIRE(t.record_dispatch_targets(
+        *id, {{"a", TargetDisposition::Contacted}, {"b", TargetDisposition::Contacted}}, false));
+    report(t, *id, "a", "success");
+    expire(db.pool(), *id);
+
+    auto swept = t.sweep_response_deadlines();
+    REQUIRE(swept.has_value());
+    CHECK(swept->timed_out_targets == 1);
+    CHECK(status_of(t, *id) == "completed");
+    CHECK(t.get_execution(*id)->agents_targeted == 2);
+}
+
+TEST_CASE("ExecutionTracker coverage: an id that cannot be stored does not lose the record",
+          "[pg][execution_tracker][coverage]") {
+    StuckExecPg db;
+    auto& t = db.tracker();
+    auto id = t.create_execution(make_execution());
+    REQUIRE(id.has_value());
+    const std::string with_nul = std::string("a\0x", 3);
+    REQUIRE(t.record_dispatch_targets(*id,
+                                      {{"a", TargetDisposition::Contacted},
+                                       {with_nul, TargetDisposition::Offline},
+                                       {std::string(4000, 'z'), TargetDisposition::Offline}},
+                                      false));
+    const auto c = coverage_of(t, *id);
+    CHECK(c.intended == 3);
+    CHECK(c.offline == 2);
+}
+
+TEST_CASE("ExecutionTracker coverage: server-decided outcomes are added for counting",
+          "[pg][execution_tracker][coverage]") {
+    StuckExecPg db;
+    auto& t = db.tracker();
+    const auto id = recorded_run(t, {"a", "b"});
+    report(t, id, "a", "success");
+    expire(db.pool(), id);
+    REQUIRE(t.sweep_response_deadlines().has_value());
+    report(t, id, "b", "success"); // late
+
+    auto rows = t.get_agent_statuses(id);
+    REQUIRE(t.overlay_server_outcomes(id, rows));
+    REQUIRE(rows.size() == 2);
+    for (const auto& r : rows)
+        CHECK(r.status == (r.agent_id == "a" ? "success" : "timed_out"));
+    const auto counts = confined_projection(rows, authz::VisibleSet{std::unordered_set<std::string>{"b"}});
+    CHECK(counts.agents_targeted == 1);
+    CHECK(counts.agents_success == 0);
+    CHECK(counts.agents_failure == 1);
+}
+
+TEST_CASE("gateway delivery outcome: certain non-delivery is kept apart from undetermined",
+          "[execution_tracker][coverage]") {
+    using yuzu::server::gateway_delivery_outcome;
+    const auto frame = [](const char* code, const char* output) {
+        ::yuzu::agent::v1::CommandResponse r;
+        r.set_status(::yuzu::agent::v1::CommandResponse::FAILURE);
+        r.set_exit_code(-1);
+        if (*code)
+            r.mutable_error()->set_code(code);
+        r.set_output(output);
+        return r;
+    };
+    CHECK(gateway_delivery_outcome(frame("", "not_connected")) == "not_delivered");
+    CHECK(gateway_delivery_outcome(frame("gateway_unknown_cluster", "")) == "not_delivered");
+    CHECK(gateway_delivery_outcome(frame("gateway_unauthenticated", "")) == "not_delivered");
+    CHECK(gateway_delivery_outcome(frame("gateway_forward_failed", "")) == "undetermined");
+    CHECK(gateway_delivery_outcome(frame("gateway_unavailable", "")) == "undetermined");
+    CHECK(gateway_delivery_outcome(frame("", "agent_disconnected")) == "undetermined");
+    CHECK(gateway_delivery_outcome(frame("some_plugin_error", "boom")).empty());
+    auto answered = frame("", "not_connected");
+    answered.set_exit_code(1); // a device's own failure keeps its exit code
+    CHECK(gateway_delivery_outcome(answered).empty());
 }

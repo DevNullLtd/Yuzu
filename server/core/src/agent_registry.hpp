@@ -999,7 +999,7 @@ public:
     // this replica has no local session for — local ids always take
     // precedence, no id is ever duplicated. Unconfigured (no presence store
     // wired), this is byte-identical to the pre-WS-5 local-only behavior.
-    std::vector<std::string> all_ids() const;
+    std::vector<std::string> all_ids(bool* degraded = nullptr) const;
 
     // The ids of the sessions held ON THIS REPLICA only, under the same lock all_ids() takes, and
     // with NO presence read at all: nothing here can fail, be truncated or hit Postgres. The

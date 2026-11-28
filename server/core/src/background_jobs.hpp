@@ -94,7 +94,7 @@ struct BackgroundJobDecl {
     std::string_view mechanism;     ///< why the class holds (the recorded rationale)
 };
 
-/// The exhaustive inventory (55 passes). Verified against the source sweep
+/// The exhaustive inventory (56 passes). Verified against the source sweep
 /// 2026-09-07 per the SWEEP METHODOLOGY above (plus the WS-4 4.2a addition of
 /// `gateway_route_store.reap_stale_routes`, 2026-09-11, the HA WS-8 addition
 /// of `pg_reachability_probe.tick`, 2026-09-24, and the #4982 Part B addition
@@ -107,7 +107,8 @@ struct BackgroundJobDecl {
 /// `software_inventory_store.run_retention_prune_changes`, the SAM-17 addition of
 /// `software_catalog_rollup.refresh_component_rollup`, the SAM-33 addition of
 /// `software_catalog_rollup.refresh_fleet_snapshot`, and the collation-version recheck
-/// `pg_collation_recheck.tick`, and the WP01 addition of `reregistration_audit.flush_summary`); keep the count
+/// `pg_collation_recheck.tick`, the WP01 addition of `reregistration_audit.flush_summary`, and the
+/// #2673 addition of `execution_tracker.sweep_response_deadlines`); keep the count
 /// tripwire in `test_background_jobs.cpp` in step with any add/remove here.
 inline constexpr std::array kBackgroundJobs = std::to_array<BackgroundJobDecl>({
     // ---- result_set_maint_thread_ (2s tick) ----
@@ -142,6 +143,11 @@ inline constexpr std::array kBackgroundJobs = std::to_array<BackgroundJobDecl>({
      "authority. Runs on the single replica today; the class gates a 2nd replica on the fix"},
     {"execution_tracker.reap_event_outbox", "result_set_maint_thread_",
      BackgroundJobClass::ReplicaSafe, "clock-guarded + pg_try_advisory_xact_lock"},
+    {"execution_tracker.sweep_response_deadlines", "result_set_maint_thread_",
+     BackgroundJobClass::ReplicaSafe,
+     "clock-guarded + pg_try_advisory_xact_lock, all-but-holder skip (#2673); the whole "
+     "candidate select, target update, recount and outbox append commit in the lock-held "
+     "transaction"},
     {"execution_tracker.reap_stuck_running_executions", "result_set_maint_thread_",
      BackgroundJobClass::ReplicaSafe,
      "clock-guarded + pg_try_advisory_xact_lock, all-but-holder skip (#4982 fix round 2 — was "

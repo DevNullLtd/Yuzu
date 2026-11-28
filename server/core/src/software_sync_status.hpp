@@ -11,6 +11,7 @@
 #include "execution_tracker.hpp"     // Execution
 #include "software_sync_decision.hpp" // kSyncDefinitionId
 
+#include <algorithm>
 #include <yuzu/server/auth.hpp>
 
 #include <nlohmann/json.hpp>
@@ -36,7 +37,8 @@ enum class SyncStatusFault {
 };
 
 /// The run's progress body: `execution_id, state, targeted, acknowledged, failed, dispatched_at,
-/// delay_max_s, estimated_completion_at`. `targeted` is the frames the registry accepted,
+/// delay_max_s, estimated_completion_at`, plus `timed_out, not_delivered, unknown, not_reached`
+/// for a run whose targets were recorded (#2673). `targeted` is the frames the registry accepted,
 /// `acknowledged` the agents that armed the sync and `failed` the agents that answered with a
 /// failure: an agent answers when it ARMS the sync, not when its report lands, so this counts
 /// requests taken up, not reports received. `estimated_completion_at` is an estimate: the
@@ -62,7 +64,7 @@ sync_status(const std::expected<std::optional<Execution>, std::string>& read, bo
         if (const auto it = params.find("delay_max_s");
             it != params.end() && it->is_number_integer() && it->get<std::int64_t>() > 0)
             delay_max_s = it->get<std::int64_t>();
-    return nlohmann::json{{"execution_id", e.id},
+    nlohmann::json body{{"execution_id", e.id},
                           {"state", e.status},
                           {"targeted", e.agents_targeted},
                           {"acknowledged", e.agents_success},
@@ -70,6 +72,15 @@ sync_status(const std::expected<std::optional<Execution>, std::string>& read, bo
                           {"dispatched_at", e.dispatched_at},
                           {"delay_max_s", delay_max_s},
                           {"estimated_completion_at", e.dispatched_at + delay_max_s}};
+    // #2673: for a recorded run `failed` is device answers only; the rest is listed apart.
+    if (const auto& u = e.unanswered) {
+        body["failed"] = u->failed;
+        body["timed_out"] = u->timed_out;
+        body["not_delivered"] = u->not_delivered;
+        body["unknown"] = u->unknown;
+        body["not_reached"] = u->not_reached;
+    }
+    return body;
 }
 
 } // namespace yuzu::server::software_sync

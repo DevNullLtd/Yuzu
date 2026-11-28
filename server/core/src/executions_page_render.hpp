@@ -37,11 +37,12 @@ struct ExecState {
 };
 
 /// running -> info "Running"; succeeded -> ok "Succeeded"; cancelled -> idle "Cancelled";
-/// pending -> warn "Pending"; completed with failures -> bad when every responder failed,
-/// else warn, label "<N> failed"; completed without -> ok "Completed"; anything this build
-/// does not know -> idle with the raw status as the label (never a guessed colour).
+/// pending -> warn "Pending"; completed with failures -> bad when nothing succeeded, else warn,
+/// label "<N> failed"; completed without -> warn "Not fully successful" (#2673: `completed`
+/// means some intended device did not succeed, so it is never green); anything this build does
+/// not know -> idle with the raw status as the label (never a guessed colour).
 [[nodiscard]] ExecState derive_state(std::string_view status, int agents_failure,
-                                     int agents_responded);
+                                     int agents_success);
 
 struct ExecRow {
     std::string id;

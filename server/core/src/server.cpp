@@ -22,6 +22,7 @@
 
 #include <yuzu/log_token.hpp>
 #include <yuzu/metrics.hpp>
+#include "sweep_audit_queue.hpp"
 #include "response_export_metrics.hpp"
 #include <yuzu/secure_zero.hpp>
 #include <yuzu/tls_policy.hpp> // #4722: shared TLS 1.2 cipher allow-list
@@ -191,6 +192,7 @@
 #include "dispatch_confined_arms.hpp" // the ONE per-arm intersection, shared with /api/command
 #include "dispatch_destructive_gate.hpp" // #3685: the Destructive-class targeting verdict
 #include "dispatch_route_fallback.hpp" // WS-4 4.2b Task C: GatewayRouteFallback (fallback-only directory consult)
+#include "dispatch_announcement.hpp"
 #include "dispatch_scope_ladder.hpp" // A-3/QE-2: the shared scope-resolution ladder + caller wiring
 #include "json_extract.hpp" // #2557: shared JSON body-extraction helpers (was 7 ServerImpl statics)
 #include "command_routes.hpp" // #2557: POST /api/command, extracted onto the HttpRouteSink seam
@@ -1857,7 +1859,7 @@ public:
                           "definition_changed (a step was refused at send time), a zero-reach cause "
                           "(dispatch_denied, containment_unreadable, route_unreadable, "
                           "os_gate_unreadable, no_agents_reached, quarantined, plugin_not_found, "
-                          "kill_switched_os), "
+                          "kill_switched_os, no_targets, target_resolution_failed), "
                           "run_failed (the engine ended the run before any dispatch), "
                           "dispatch_exception (the run threw after its requested audit row; steps "
                           "may have been sent), or none. A run killed with the process never "
@@ -4408,7 +4410,8 @@ public:
                           "ExecutionTracker::set_agents_targeted / ::mark_cancelled calls that "
                           "failed (pool exhaustion or a failed statement) at a dispatch call "
                           "site, by op (set_agents_targeted|mark_cancelled) and surface "
-                          "(rest|mcp|workflow|schedule|outbox). No retry is attempted inline - "
+                          "(rest|mcp|workflow|schedule|outbox), and failed target-list records "
+                          "(op=record_targets, surface=dispatch). No retry is attempted inline - "
                           "retrying in an already-degraded-store request handler/background "
                           "worker risks doubling request latency or delaying the next tick for "
                           "no reliability gain.",
@@ -4417,6 +4420,26 @@ public:
             for (auto surface : {"rest", "mcp", "workflow", "schedule", "outbox"})
                 metrics_.counter("yuzu_exec_tracker_bookkeeping_failed_total",
                                  {{"op", op}, {"surface", surface}});
+        // #2673: per-target coverage. A failed target record leaves that run on the count-only
+        // rules; the sweep outcomes are a closed set, pre-seeded so absent() stays meaningful.
+        metrics_.counter("yuzu_exec_tracker_bookkeeping_failed_total",
+                         {{"op", "record_targets"}, {"surface", "dispatch"}});
+        metrics_.describe("yuzu_exec_tracker_conflicting_final_total",
+                          "Agent results ignored because a different final result for the same "
+                          "run and agent was already recorded (#2673)",
+                          "counter");
+        metrics_.counter("yuzu_exec_tracker_conflicting_final_total");
+        metrics_.describe("yuzu_exec_tracker_deadline_sweep_total",
+                          "sweep_response_deadlines() results (#2673), by outcome: timed_out "
+                          "and unknown (count targets marked), run_failed (counts runs), "
+                          "audit_dropped (counts audit rows given up), audit_failed (counts "
+                          "failed audit writes, retried next pass), capped, skipped, held, "
+                          "clock_anomaly and degraded (count passes)",
+                          "counter");
+        for (auto outcome : {"timed_out", "unknown", "run_failed", "audit_failed",
+                             "audit_dropped", "capped", "skipped", "held", "clock_anomaly",
+                             "degraded"})
+            metrics_.counter("yuzu_exec_tracker_deadline_sweep_total", {{"outcome", outcome}});
         // #4982 Part B — the recovery side of the counter above:
         // reap_stuck_running_executions() (execution_tracker.cpp) cancels an
         // execution row permanently wedged at status='running',
@@ -15072,7 +15095,8 @@ private:
     software_sync_resolve(const auth::Session& sess, const yuzu::server::software_sync::Selector& sel) {
         namespace software_sync = yuzu::server::software_sync;
         software_sync::Expansion ex;
-        ex.all_ids = [this] { return registry_.all_ids(); };
+        bool partial = false; // #2673: set by the same read that lists the fleet
+        ex.all_ids = [this, &partial] { return registry_.all_ids(&partial); };
         ex.group_members =
             [this](const std::string& group_id)
             -> std::optional<std::vector<std::string>> {
@@ -15122,8 +15146,9 @@ private:
                                        : "unknown";
             return out;
         };
-        return software_sync::resolve_targets(sel, derive_exec_visible(sess),
-                                               ex);
+        auto resolved = software_sync::resolve_targets(sel, derive_exec_visible(sess), ex);
+        resolved.partial_list = partial;
+        return resolved;
     }
 
     /// ManagementGroup:Write as a GLOBAL grant, decided from a session alone (the sync Runner has no
@@ -15154,12 +15179,25 @@ private:
         return yuzu::server::software_sync::fleet_admin_answer(facts);
     }
 
+    /// #2673: sweep audit rows awaiting a write. Touched only by the maintenance thread.
+    static constexpr std::size_t kMaxPendingSweepAudits = 1000;
+    std::deque<AuditEvent> pending_sweep_audits_;
+    std::size_t announced_sweep_audits_{0}; ///< front rows already logged as unwritten
+
+    void count_target_record_failure() {
+        metrics_
+            .counter("yuzu_exec_tracker_bookkeeping_failed_total",
+                     {{"op", "record_targets"}, {"surface", "dispatch"}})
+            .increment();
+    }
+
     /// The tracker row of one dispatch, created BEFORE it is sent so a fast reply cannot beat it. The
     /// ONE place this file writes an execution row's dispatcher (the v1 command routes' creator and
     /// the sync Runner's both go through it). `definition_id` is empty for a plain operator command.
     [[nodiscard]] std::expected<std::string, std::string>
     create_execution_row(const std::string& definition_id, const std::string& by,
-                         const std::string& scope, const std::string& parameter_values_json) {
+                         const std::string& scope, const std::string& parameter_values_json,
+                         std::int64_t response_window_s = 0) {
         if (!execution_tracker_)
             return std::unexpected(std::string("no execution tracker"));
         Execution exec;
@@ -15168,6 +15206,10 @@ private:
         exec.scope_expression = scope;
         exec.parameter_values = parameter_values_json;
         exec.dispatched_by = by;
+        exec.response_window_s = response_window_s;
+        // #2673: every caller of this seam sends through a dispatch that records the run's
+        // targets.
+        exec.expects_targets = true;
         return execution_tracker_->create_execution(exec);
     }
 
@@ -15182,9 +15224,10 @@ private:
                 return software_sync_resolve(sess, sel);
             };
             env.dispatch = [this](const auth::Session& sess, const std::vector<std::string>& ids,
-                                  std::int64_t delay_max_s, const std::string& execution_id) {
+                                  std::int64_t delay_max_s, const std::string& execution_id,
+                                  const software_sync::RunTargets& run) {
                 return push_sync_now_confined(sess, ids, std::string(software_sync::kSource),
-                                              delay_max_s, execution_id);
+                                              delay_max_s, execution_id, &run);
             };
             env.caller_unfiltered = [this](const auth::Session& sess) {
                 return !derive_exec_visible(sess).has_value();
@@ -15222,8 +15265,11 @@ private:
                 nlohmann::json params = {{"source", std::string(software_sync::kSource)}};
                 if (delay_max_s > 0)
                     params["delay_max_s"] = delay_max_s;
+                // #2673: the agents report at an offset inside `delay_max_s`, so the
+                // response window starts counting after it.
                 auto created = create_execution_row(std::string(software_sync::kSyncDefinitionId),
-                                                    sess.username, sel.expr, params.dump());
+                                                    sess.username, sel.expr, params.dump(),
+                                                    kDefaultResponseWindowSecs + delay_max_s);
                 if (!created) {
                     spdlog::warn("software sync: execution record not created ({}); the run goes on "
                                  "untracked",
@@ -15275,7 +15321,8 @@ private:
     [[nodiscard]] yuzu::server::software_sync::DispatchResult
     push_sync_now_confined(const auth::Session& sess, const std::vector<std::string>& ids,
                            const std::string& source, std::int64_t delay_max_s = 0,
-                           const std::string& execution_id = {}) {
+                           const std::string& execution_id = {},
+                           const yuzu::server::software_sync::RunTargets* run = nullptr) {
         yuzu::server::software_sync::DispatchResult out;
         if (ids.empty())
             return out;
@@ -15284,8 +15331,13 @@ private:
         if (!cmd)
             return out; // a command that cannot be classified sends nothing and reports no id
         out.command_id = command_id;
+        // #2673: said BEFORE the send, so a run whose list is never recorded cannot read
+        // `succeeded`.
+        yuzu::server::DispatchAnnouncement announcement(execution_tracker_.get(), execution_id,
+                                                        "software sync");
+        const auto visible = derive_exec_visible(sess);
         const auto result = yuzu::server::dispatch_system_reserved_ids(
-            ids, derive_exec_visible(sess),
+            ids, visible,
             [this, &cmd](const std::string& id) {
                 // One failing stream does not abandon the rest of the run: a send that throws is a
                 // frame that was not accepted, and `sent` stays exact.
@@ -15296,8 +15348,34 @@ private:
                     spdlog::warn("software sync: a send threw and counts as not accepted: {}", e.what());
                     return false;
                 }
-            });
+            },
+            /*collect_targets=*/!execution_id.empty());
         out.sent = static_cast<std::size_t>(result.sent);
+        announcement.close_if_empty(result.intended.empty() && result.sent == 0);
+        // #2673: this fan-out bypasses `wire_and_dispatch_confined`, so it records its own
+        // targets, before the gateway flush so a reply finds them.
+        if (announcement.tracked() && !result.intended.empty()) {
+            ConfinedDispatchOutcome recorded;
+            recorded.intended = result.intended;
+            recorded.contacted = result.contacted;
+            recorded.not_sent = result.not_sent;
+            std::unordered_set<std::string> known;
+            if (!recorded.not_sent.empty()) {
+                const auto all = registry_.all_ids();
+                known.insert(all.begin(), all.end());
+            }
+            auto targets = yuzu::server::build_dispatch_targets(recorded, known);
+            // Selected devices the run did not ask: intended, and not reached.
+            if (run) {
+                for (const auto& id : yuzu::server::authz::filter_to_scope(run->offline, visible))
+                    targets.push_back({id, yuzu::server::TargetDisposition::Offline});
+                for (const auto& id : yuzu::server::authz::filter_to_scope(run->too_old, visible))
+                    targets.push_back({id, yuzu::server::TargetDisposition::Withheld});
+            }
+            if (!announcement.record(targets, run && run->connected_only,
+                                     run && run->partial_list))
+                count_target_record_failure();
+        }
         if (out.sent > 0)
             forward_gateway_pending(); // gateway agents are only QUEUED
         return out;
@@ -15463,6 +15541,8 @@ private:
         // (per dispatch), never a ServerImpl member.
         auto route_fallback = std::make_shared<yuzu::server::GatewayRouteFallback>(
             registry_, gateway_route_store_.get());
+        // #2673: set by the SAME call that builds the broadcast list.
+        auto membership_degraded = std::make_shared<bool>(false);
         return yuzu::server::ConfinedDispatchSink{
             [this, &cmd, route_fallback](const std::string& aid) {
                 if (auto cluster = route_fallback->cluster_for(aid))
@@ -15470,20 +15550,21 @@ private:
                 return registry_.send_to(aid, cmd);
             },
             [this, &cmd] { return registry_.send_to_all(cmd); },
-            [this] {
+            [this, membership_degraded] {
                 // all_ids() copies only the ids under the registry lock — NOT
                 // to_json_obj()'s full 5-field-per-agent JSON serialisation under
                 // the heartbeat/dispatch hot-path mutex (gov perf-S2, the same
                 // rationale recorded at the inventory site ~12706). A confined
                 // operator broadcasting `__all__` is the enterprise-normal case.
-                return registry_.all_ids();
+                return registry_.all_ids(membership_degraded.get());
             },
             [route_fallback](const std::vector<std::string>& candidates) {
                 return route_fallback->prepare(candidates);
             },
             [this](const std::vector<std::string>& candidates) {
                 return registry_.has_remote_presence(candidates);
-            }};
+            },
+            [membership_degraded] { return *membership_degraded; }};
     }
 
     /// #881: the ONE place a `ContainmentGate` is built. Called once per
@@ -15818,6 +15899,8 @@ private:
             // consult. Null when the store failed to open at boot — a
             // GatewayRouteFallback with a null store is a pure no-op.
             gateway_route_store_.get());
+        if (outcome.targets_record_failed)
+            count_target_record_failure();
 
         // #881: this seam serves the MAJORITY of dispatch (MCP, workflows,
         // schedules, REST v1) — without this, quarantine enforcement here
@@ -20658,6 +20741,9 @@ private:
                 // execution_tracker.cpp's kStuckExecWindowSecs/kStuckExecMax-
                 // PlausibleSkewSecs for how this cadence sizes those constants.
                 constexpr int kStuckExecReapEveryNTicks = 450; // ~15 minutes at 2s/tick
+                // #2673: the response-deadline sweep. Frequent, because a silent device holds its
+                // run at `running` until this pass marks it.
+                constexpr int kDeadlineSweepEveryNTicks = 15; // ~30 seconds at 2s/tick
                 // ADR-1007: per-device concurrency claim stale-claim reconciler
                 // cadence — see the call site's own comment for the rationale.
                 constexpr int kConcurrencyClaimReconcileEveryNTicks = 150; // ~5 minutes at 2s/tick
@@ -21079,6 +21165,91 @@ private:
                             }
                         }
 
+                        // 2e3) #2673: time out dispatched agents that stayed silent past
+                        // their run's response deadline, then finish those runs.
+                        if (execution_tracker_ && execution_tracker_->is_open() &&
+                            tick % kDeadlineSweepEveryNTicks == 0 &&
+                            !stop_requested_.load(std::memory_order_acquire)) {
+                            YUZU_ASSERT_BACKGROUND_JOB( // WS-10 ReplicaSafe
+                                "execution_tracker.sweep_response_deadlines");
+                            const auto count = [this](const char* outcome, double n) {
+                                metrics_
+                                    .counter("yuzu_exec_tracker_deadline_sweep_total",
+                                             {{"outcome", outcome}})
+                                    .increment(n);
+                            };
+                            if (auto swept = execution_tracker_->sweep_response_deadlines([this] {
+                                    return stop_requested_.load(std::memory_order_acquire);
+                                })) {
+                                if (swept->timed_out_targets > 0)
+                                    count("timed_out",
+                                          static_cast<double>(swept->timed_out_targets));
+                                if (swept->unknown_targets > 0)
+                                    count("unknown",
+                                          static_cast<double>(swept->unknown_targets));
+                                if (swept->failed_runs > 0)
+                                    count("run_failed", static_cast<double>(swept->failed_runs));
+                                if (swept->held)
+                                    count("held", 1);
+                                if (swept->capped)
+                                    count("capped", 1);
+                                if (swept->skipped)
+                                    count("skipped", 1);
+                                if (swept->clock_anomaly)
+                                    count("clock_anomaly", 1);
+                                // A background writer changing run results is audited. The
+                                // rows are queued and written below, so a failed write costs
+                                // this shared thread one attempt and is retried next pass.
+                                for (const auto& run : swept->runs) {
+                                    AuditEvent ev;
+                                    ev.timestamp =
+                                        std::chrono::duration_cast<std::chrono::seconds>(
+                                            std::chrono::system_clock::now().time_since_epoch())
+                                            .count();
+                                    ev.principal = "system";
+                                    ev.action = "execution.deadline_sweep";
+                                    ev.target_type = "execution";
+                                    ev.target_id = run.execution_id;
+                                    ev.detail =
+                                        "timed_out=" + std::to_string(run.timed_out) +
+                                        " unknown=" + std::to_string(run.unknown) + " finished=" +
+                                        (run.finished_status.empty() ? std::string("no")
+                                                                     : run.finished_status);
+                                    ev.result = "success";
+                                    pending_sweep_audits_.push_back(std::move(ev));
+                                }
+                            } else {
+                                spdlog::warn("response deadline sweep failed: {}", swept.error());
+                                count("degraded", 1);
+                            }
+                            const auto flushed = yuzu::server::flush_audit_queue(
+                                pending_sweep_audits_, announced_sweep_audits_,
+                                [this](const AuditEvent& ev) {
+                                    return audit_store_ && audit_store_->is_open() &&
+                                           audit_store_->log(ev);
+                                },
+                                [this] { return stop_requested_.load(std::memory_order_acquire); },
+                                kMaxPendingSweepAudits,
+                                [](const AuditEvent& ev) {
+                                    spdlog::error("deadline sweep: audit row not yet written for "
+                                                  "execution_id={} ({})",
+                                                  ev.target_id, ev.detail);
+                                },
+                                [](const AuditEvent& ev) {
+                                    spdlog::error("deadline sweep: audit row dropped for "
+                                                  "execution_id={} ({})",
+                                                  ev.target_id, ev.detail);
+                                });
+                            if (flushed.dropped > 0)
+                                count("audit_dropped", static_cast<double>(flushed.dropped));
+                            if (flushed.write_failed) {
+                                count("audit_failed", 1);
+                                spdlog::warn("deadline sweep: audit write failed; {} row(s) "
+                                             "will be retried",
+                                             pending_sweep_audits_.size());
+                            }
+                        }
+
                         // 2f) Per-device concurrency claim stale-claim reconciler
                         // (ADR-1007) — piggybacks this thread's tick counter like
                         // the reaps above. A ~5m cadence: frequent enough that a
@@ -21265,6 +21436,11 @@ private:
                         spdlog::error("result_set_maint: tick threw unknown — thread continuing");
                     }
                 }
+                // #2673: the queue is in memory, so say what is lost with it.
+                for (const auto& ev : pending_sweep_audits_)
+                    spdlog::error("deadline sweep: audit row not written before shutdown for "
+                                  "execution_id={} ({})",
+                                  ev.target_id, ev.detail);
             });
         }
 
@@ -22435,7 +22611,21 @@ private:
             -> std::expected<std::optional<Execution>, std::string> {
             if (!execution_tracker_)
                 return std::unexpected(std::string("no execution tracker"));
-            return execution_tracker_->get_execution_checked(execution_id);
+            auto read = execution_tracker_->get_execution_checked(execution_id);
+            if (!read || !*read)
+                return read;
+            // #2673: keep "answered with a failure" apart from devices that never answered.
+            const auto coverage = execution_tracker_->get_coverage_checked(execution_id);
+            if (!coverage)
+                return std::unexpected(std::string("coverage read degraded"));
+            if (coverage->recorded)
+                // All from the one coverage read, so a sweep between the two reads cannot
+                // hide a device's failure.
+                (*read)->unanswered = Execution::Unanswered{
+                    coverage->failed, coverage->timed_out, coverage->not_delivered,
+                    coverage->unknown,
+                    coverage->offline + coverage->not_sent + coverage->withheld};
+            return read;
         };
         const software_sync::UnfilteredFn sync_unfiltered_fn = [this](const auth::Session& sess) {
             return !derive_exec_visible(sess).has_value();
@@ -26223,6 +26413,7 @@ private:
         // which this route previously had no branch for and now needs one.
         auto legacy_route_fallback = std::make_shared<yuzu::server::GatewayRouteFallback>(
             registry_, gateway_route_store_.get());
+        bool legacy_membership_degraded = false; // #2673: set by the list read below
         const yuzu::server::ConfinedDispatchSink sink{
             [&](const std::string& aid) {
                 if (auto cluster = legacy_route_fallback->cluster_for(aid))
@@ -26230,13 +26421,14 @@ private:
                 return registry_.send_to(aid, *classified);
             },
             [&] { return registry_.send_to_all(*classified); },
-            [&] { return registry_.all_ids(); },
+            [&] { return registry_.all_ids(&legacy_membership_degraded); },
             [legacy_route_fallback](const std::vector<std::string>& candidates) {
                 return legacy_route_fallback->prepare(candidates);
             },
             [&](const std::vector<std::string>& candidates) {
                 return registry_.has_remote_presence(candidates);
-            }};
+            },
+            [&] { return legacy_membership_degraded; }};
         // #881: one of the two production sites that hits the unfiltered
         // `send_to_all_unfiltered` fast path in practice — a default install
         // with RBAC disabled (or a legacy-admin superuser) resolves
@@ -26313,7 +26505,11 @@ private:
             // fact, and must not fall through to the generic catch-all
             // below — mirrors command_routes.cpp's identical branch.
             res.status = 503;
-            if (containment_gate.fail_closed) {
+            if (result.membership_partial && !result.intended_count) {
+                res.set_content(
+                    R"({"error":{"code":503,"message":"the target list could not be read, so nobody was resolved","reason":"target_resolution_failed","retry_after_ms":5000},"meta":{"api_version":"v1"}})",
+                    "application/json");
+            } else if (containment_gate.fail_closed) {
                 res.set_content(
                     R"({"error":{"code":503,"message":"containment state is unreadable — dispatch is failing closed and reaching no agent; check the quarantine store","reason":"containment_unreadable","retry_after_ms":5000},"meta":{"api_version":"v1"}})",
                     "application/json");
@@ -26332,6 +26528,11 @@ private:
             } else if (result.kill_switched_os_count > 0) {
                 res.set_content(
                     R"({"error":{"code":503,"message":"every target runs an OS for which this plugin action is switched off — dispatch was withheld, not attempted","reason":"kill_switched_os","retry_after_ms":null},"meta":{"api_version":"v1"}})",
+                    "application/json");
+            } else if (result.intended_count == 0) {
+                res.status = 422;
+                res.set_content(
+                    R"({"error":{"code":422,"message":"no targets: nothing you can dispatch to matched this request. Broadcast targeting considers only connected agents.","reason":"no_targets","retry_after_ms":null},"meta":{"api_version":"v1"}})",
                     "application/json");
             } else {
                 res.set_content(

@@ -568,6 +568,10 @@ std::string zero_reach_text(ZeroReachCause cause, const ConfinedDispatchOutcome&
                            o.denied ? detail::to_string(o.denied->reason) : std::string_view{"unknown"});
     case ZeroReachCause::InvalidScope:
         return "invalid scope: " + o.scope_parse_error.value_or("(unparsed)");
+    case ZeroReachCause::TargetResolutionFailed:
+        return std::string(kTargetResolutionFailedMessage);
+    case ZeroReachCause::NoTargets:
+        return std::string(kNoTargetsMessage);
     case ZeroReachCause::ContainmentUnreadable:
         return "containment state is unreadable: dispatch is failing closed and reaching no agent; "
                "check the quarantine store";
@@ -693,6 +697,7 @@ Outcome dispatch_stage(Ctx& c, Plan plan) {
         row.parameter_values =
             nlohmann::json(redact_sensitive_instruction_params(plan.params)).dump();
         row.dispatched_by = rq.caller.principal;
+        row.response_window_s = def.gather_ttl_seconds;
         // up8-3: the port may throw (a pool or driver fault). The `requested` row is already
         // written, so an unwound exception would leave it with no outcome row. Nothing has been
         // dispatched yet, so this refuses (retryable) after writing the `failure` row.
