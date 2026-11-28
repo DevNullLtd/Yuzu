@@ -35,9 +35,17 @@ checks read the source text (stdlib only, no Windows):
   any block and before the first plugin subdir, and the `deploy_dlls`
   custom_target has `depends: yuzu_plugin_libs`.
 
-Limits, by design: one library per plugin directory (a second one fails
-here, so the rule is widened deliberately rather than missed), and the
-append must name the library variable directly rather than an alias.
+Limits, by design. Each fails safe (red) unless marked otherwise:
+- One library per plugin directory: a second one fails here, so the rule is
+  widened deliberately rather than missed.
+- The append must name the library variable directly, not an alias.
+- Block depth is read line by line, so a multi-line string with a line that
+  starts with `if`/`endif` can skew it and fail a correct file.
+- The on-disk set is a filesystem glob, so an untracked plugin directory in a
+  local tree fails here until it is registered or removed.
+- Not caught (green): a `.dll` produced by a `custom_target` in a plugin
+  directory, a literal `subdir('agents/plugins/...')` inside a root string,
+  and a second `custom_target('deploy_dlls', ...)` (meson rejects that).
 
 Each check also runs against a mutated copy of the sources and must fail
 there, so a check that has stopped matching anything cannot pass silently.
@@ -115,7 +123,7 @@ def plugin_problems(d: str, text) -> list:
     where = f"agents/plugins/{d}/meson.build"
     calls = LIB_CALL_RE.findall(code)
     if len(calls) != 1:
-        return [f"{where}: expected one library call (shared_library, shared_module, both_libraries or library), found {len(calls)}; deploy_dlls copies every DLL in the directory, so each must be in yuzu_plugin_libs"]
+        return [f"{where}: expected one library call (shared_library, shared_module, both_libraries or library), found {len(calls)}; this lint allows one library per plugin directory, because deploy_dlls copies every DLL in it, so a second library needs this lint widened to check it too"]
     assigned = LIB_ASSIGN_RE.search(code)
     if not assigned:
         return [f"{where}: the library call is not assigned to a variable, so it cannot be appended to yuzu_plugin_libs"]
@@ -283,6 +291,9 @@ class DeployDllsPluginDepends(unittest.TestCase):
         }
         for name, transform in variants.items():
             with self.subTest(variant=name):
+                original = read_plugin_meson_from_tree("wol")
+                self.assertNotEqual(transform(original), original, f"variant {name!r} no longer changes the file")
+
                 def reader(d, transform=transform):
                     text = read_plugin_meson_from_tree(d)
                     return transform(text) if d == "wol" else text
