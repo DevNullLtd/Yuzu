@@ -35,20 +35,23 @@ checks read the source text (stdlib only, no Windows):
   any block and before the first plugin subdir, and the `deploy_dlls`
   custom_target has `depends: yuzu_plugin_libs`.
 
-Limits, by design. Each fails safe (red) unless marked otherwise:
+Limits, by design.
+
+Fails red (a correct or fixable file is rejected):
 - One library per plugin directory: a second one fails here, so the rule is
   widened deliberately rather than missed.
 - The append must name the library variable directly, not an alias.
-- Block depth is read line by line, so a multi-line string with a line that
-  starts with `if`/`endif` can skew it and fail a correct file.
 - The on-disk set is a filesystem glob, so an untracked plugin directory in a
   local tree fails here until it is registered or removed.
-- Not caught (green): a `.dll` produced by a `custom_target` in a plugin
-  directory, a literal `subdir('agents/plugins/...')` inside a root string,
-  and a second `custom_target('deploy_dlls', ...)` (meson rejects that).
 
-Each check also runs against a mutated copy of the sources and must fail
-there, so a check that has stopped matching anything cannot pass silently.
+Not caught (green):
+- A `.dll` produced by a `custom_target` in a plugin directory.
+- A literal `subdir('agents/plugins/...')` inside a root string.
+- A second `custom_target('deploy_dlls', ...)` (meson rejects that).
+
+Either way: block depth is read line by line, so a multi-line string with a
+line that starts with `if`, `foreach`, `endif` or `endforeach` skews it. That
+can fail a correct file, or pass an append that is really inside a block.
 """
 
 import re
