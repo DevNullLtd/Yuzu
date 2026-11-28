@@ -628,8 +628,9 @@ const std::vector<pg::PgMigration>& migrations() {
         // `targets_state` is '' (targets not tracked: the count-only rules), 'expected' (a
         // dispatch is meant to record them and none has yet) or 'recorded' (a list was saved).
         // `attempt_open` is true from just before a send until that send's list is saved, and
-        // `targets_incomplete` is sticky: a saved list was partial, or a later send started
-        // while an earlier one was still unsaved. A run can read `succeeded` only when it is
+        // `targets_incomplete` is sticky: a saved list was partial, a later send started
+        // while an earlier one was still unsaved, a list could not be stored, or a send started
+        // after the run had finished. A run can finish `succeeded` only when it is
         // untracked, or recorded with neither flag. `correlation_lost` says a reply of this run cannot be
         // matched to it. `server_outcome` marks a status the server or gateway made up
         // (`not_delivered` or `undetermined`) instead of the device. `execution_target` holds one row per intended agent and is never

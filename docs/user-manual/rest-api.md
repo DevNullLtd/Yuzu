@@ -8185,7 +8185,7 @@ object).** Counts of who the run was meant for and what happened (#2673):
 
 | Field | Meaning |
 |---|---|
-| `state` | `recorded`, or `unrecorded` (every other field is then `null`; unknown is not zero): the run does not track a device list, none has been saved yet (including while a send is in progress), a saved list was ever partial, a later send started before an earlier list was saved, or the saved list covers fewer devices than the run reports contacting |
+| `state` | `recorded`, or `unrecorded` (every other field is then `null`; unknown is not zero): the run does not track a device list, none has been saved yet (including while a send is in progress), a saved list was ever partial, a later send started before an earlier list was saved, a command was sent again after the run finished or was cancelled, or the saved list covers fewer devices than the run reports contacting |
 | `population` | `listed`, or `connected_only` when a scope, broadcast or fleet selector chose the targets: only connected agents are considered. `null` for a confined caller |
 | `intended` | Targets the run was meant to reach: `contacted + offline + not_sent + withheld`. A device id listed twice is sent once and counted once |
 | `contacted` | Sends accepted (for a gateway-routed agent, queued, not delivered): `responded + failed + timed_out + not_delivered + unknown + pending` |
