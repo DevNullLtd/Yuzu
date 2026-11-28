@@ -2152,7 +2152,8 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        `202` when no slot is free. The metric `yuzu_server_live_requests_total`
        is relabelled `{surface, kind, outcome}` with a closed outcome word set
        of 32 words (31 at first, plus `bad_device_id`, added on 2026-11-25 for the
-       device-id floor that #7811 put in front of the route), every series
+       device-id floor that #7811 put in front of the route; 34 since #2673 added
+       `no_targets` and `target_resolution_failed`), every series
        pre-seeded at boot; the HTTP status label is removed, and the gauge is renamed `yuzu_server_live_in_flight`. The
        upgrade note is in `docs/user-manual/upgrading.md`.
      - **Versioning basis.** The REST changes in this entry (the status and

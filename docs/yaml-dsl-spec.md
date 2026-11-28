@@ -203,7 +203,7 @@ Each column object:
 
 | Field | Type | Required | Default | Description |
 |---|---|---|---|---|
-| `ttlSeconds` | integer | No | `300` | Maximum time (in seconds) the agent has to respond. After this window, the execution is marked as timed out. |
+| `ttlSeconds` | integer | No | `300` | Response window in seconds. A device that sends nothing is marked `timed_out` after max(`ttlSeconds`, 660) seconds without a signal, and the run then finishes `completed`. Applies to runs of a stored definition (instruction execute and schedules). Software sync runs use 300 plus their `delay_max_s` (floor 660), and dispatches with no definition use 660. A longer window does not help a gateway-routed command, which the gateway forward ends at 300 seconds. |
 
 #### `spec.response`
 
@@ -446,7 +446,7 @@ spec:
         - count
   readablePayload: "Inspect service '${serviceName}'"
   gather:
-    ttlSeconds: 300                      # agent must respond within this window
+    ttlSeconds: 300                      # response window; at least 660 s is applied
   response:
     retentionDays: 90
   approval:

@@ -1,0 +1,1 @@
+- **`/health` now counts successful runs as completed (#2673).** `executions.completed_last_hour` on `/health` and `/api/health` counts runs that finished `succeeded` as well as `completed`. It counted only `completed`, so successful runs were missing and the figure now rises.

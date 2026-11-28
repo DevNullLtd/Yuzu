@@ -719,6 +719,17 @@ ZeroReachReply zero_reach_reply(ZeroReachCause cause, std::string_view scope_err
                     "). This is a caller error, not a fleet-state fact.";
         r.remediation = "fix the scope expression and resubmit; retrying the same scope will not help";
         break;
+    case ZeroReachCause::TargetResolutionFailed:
+        r.status = 503;
+        r.message = std::string(kTargetResolutionFailedMessage);
+        r.remediation = "retry after the retry_after_ms interval";
+        break;
+    case ZeroReachCause::NoTargets:
+        r.status = 422;
+        r.message = std::string(kNoTargetsMessage);
+        r.remediation = "check the agent ids, group or scope; retrying the same target will not "
+                        "help unless a matching agent connects or your access changes";
+        break;
     case ZeroReachCause::ContainmentUnreadable:
         r.status = 503;
         r.message = "No agents reached: the quarantine containment gate's state is unreadable, so "

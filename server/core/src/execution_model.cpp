@@ -37,11 +37,12 @@ nlohmann::json execution_agent_status_json(const AgentExecStatus& a) {
 
 namespace {
 
-// Matches execution_scope_rules.hpp::confined_projection's definition of
-// "responded" — running must never count as terminal.
+// The statuses an agent or the server treats as final. running must never count.
 bool is_terminal_status(const std::string& status) {
+    // `timed_out` and `unknown` are the server's own final outcomes (#2673); they reach this
+    // only through `overlay_server_outcomes`.
     return status == "success" || status == "failure" || status == "timeout" ||
-           status == "rejected";
+           status == "rejected" || status == "timed_out" || status == "unknown";
 }
 
 } // namespace
@@ -95,6 +96,33 @@ nlohmann::json execution_kpi_json(const ExecutionKpi& k) {
         j["p95_ms"] = nullptr;
     }
     return j;
+}
+
+nlohmann::json execution_coverage_json(const ExecutionCoverage& c, bool confined) {
+    const auto count = [&c](int64_t v) -> nlohmann::json {
+        return c.recorded ? nlohmann::json(v) : nlohmann::json(nullptr);
+    };
+    return nlohmann::json{
+        {"state", c.recorded ? "recorded" : "unrecorded"},
+        {"population", c.recorded && !confined
+                           ? nlohmann::json(c.connected_only ? "connected_only" : "listed")
+                           : nlohmann::json(nullptr)},
+        {"intended", count(c.intended)},
+        {"contacted", count(c.contacted)},
+        {"responded", count(c.responded)},
+        {"failed", count(c.failed)},
+        {"timed_out", count(c.timed_out)},
+        {"offline", count(c.offline)},
+        {"not_sent", count(c.not_sent)},
+        {"withheld", count(c.withheld)},
+        {"pending", count(c.pending)},
+        {"late", count(c.late)},
+        {"not_delivered", count(c.not_delivered)},
+        {"unknown", count(c.unknown)},
+        // The deadline and the population describe the whole run (a large run's deadline
+        // scales with its device count), so a confined caller gets neither.
+        {"deadline_at", confined ? nlohmann::json(nullptr) : count(c.deadline_at)},
+    };
 }
 
 nlohmann::json execution_child_row_json(const Execution& c) {

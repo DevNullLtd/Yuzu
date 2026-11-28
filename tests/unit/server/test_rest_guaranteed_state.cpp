@@ -4602,7 +4602,7 @@ TEST_CASE("REST dex/devices/{id}/live: every {surface, kind, outcome} series and
     constexpr std::size_t kExpected = yuzu::server::live::kAllLiveSurfaces.size() *
                                       yuzu::server::live::kAllKindLabels.size() *
                                       yuzu::server::live::kAllLiveOutcomes.size();
-    static_assert(kExpected == 2 * 3 * 32, "the closed set the docs state");
+    static_assert(kExpected == 2 * 3 * 34, "the closed set the docs state");
     CHECK(series == kExpected);
     // Every outcome token, both surfaces, every kind label, each at exactly 0.
     for (const auto surface : yuzu::server::live::kAllLiveSurfaces)

@@ -43,14 +43,15 @@ TEST_CASE("LiveOutcome: the closed token set is exactly the ruled one", "[live][
         "route_unreadable", "os_gate_unreadable", "quarantined", "plugin_not_found",
         "kill_switched_os", "device_failed", "device_error", "output_too_large", "timeout",
         "store_degraded", "internal", "tier_refused", "read_only_refused", "approval_refused",
-        "shutting_down", "incomplete", "gate_unreadable", "bad_device_id"};
+        "shutting_down", "incomplete", "gate_unreadable", "bad_device_id",
+        "target_resolution_failed", "no_targets"};
     std::set<std::string> actual;
     for (const auto o : live::kAllLiveOutcomes)
         actual.insert(std::string(live::to_token(o)));
     CHECK(actual == expected);
-    // The vocabulary is 32 tokens: 2 surfaces x 3 kinds x 32 outcomes = 192 series once pre-seeded.
-    CHECK(live::kAllLiveOutcomes.size() == 32);
-    CHECK(expected.size() == 32);
+    // The vocabulary is 34 tokens: 2 surfaces x 3 kinds x 34 outcomes = 204 series once pre-seeded.
+    CHECK(live::kAllLiveOutcomes.size() == 34);
+    CHECK(expected.size() == 34);
 }
 
 TEST_CASE("LiveOutcome: the tokens added after the first release keep their spelling and index", "[live][outcome]") {
@@ -65,6 +66,9 @@ TEST_CASE("LiveOutcome: the tokens added after the first release keep their spel
     // Appended by the merge with dev's device-id floor: the earlier enumerator values did not move.
     CHECK(live::to_token(live::LiveOutcome::kBadDeviceId) == "bad_device_id");
     CHECK(static_cast<std::size_t>(live::LiveOutcome::kBadDeviceId) == 31);
+    // Appended with run coverage (#2673): the earlier enumerator values did not move.
+    CHECK(static_cast<std::size_t>(live::LiveOutcome::kTargetResolutionFailed) == 32);
+    CHECK(static_cast<std::size_t>(live::LiveOutcome::kNoTargets) == 33);
 }
 
 TEST_CASE("live_outcome_for: every ZeroReachCause maps to the outcome with its own token", "[live][outcome]") {
@@ -72,7 +76,8 @@ TEST_CASE("live_outcome_for: every ZeroReachCause maps to the outcome with its o
     constexpr ZeroReachCause kAllCauses[] = {
         ZeroReachCause::Denied,         ZeroReachCause::InvalidScope,    ZeroReachCause::ContainmentUnreadable,
         ZeroReachCause::RouteUnreadable, ZeroReachCause::OsGateUnreadable, ZeroReachCause::Quarantined,
-        ZeroReachCause::PluginNotFound,  ZeroReachCause::KillSwitchedOs,   ZeroReachCause::Generic};
+        ZeroReachCause::PluginNotFound,  ZeroReachCause::KillSwitchedOs,   ZeroReachCause::Generic,
+        ZeroReachCause::TargetResolutionFailed, ZeroReachCause::NoTargets};
     for (const auto cause : kAllCauses) {
         const auto outcome = live::live_outcome_for(cause);
         CAPTURE(static_cast<int>(cause), live::to_token(outcome), yuzu::server::zero_reach_token(cause));
@@ -98,6 +103,8 @@ TEST_CASE("LiveOutcome: the zero-reach tokens match the shared classifier's spel
     CHECK(live::to_token(live::LiveOutcome::kQuarantined) == "quarantined");
     CHECK(live::to_token(live::LiveOutcome::kPluginNotFound) == "plugin_not_found");
     CHECK(live::to_token(live::LiveOutcome::kKillSwitchedOs) == "kill_switched_os");
+    CHECK(live::to_token(live::LiveOutcome::kTargetResolutionFailed) == "target_resolution_failed");
+    CHECK(live::to_token(live::LiveOutcome::kNoTargets) == "no_targets");
 }
 
 TEST_CASE("LiveSurface and kind_label: bounded label values", "[live][outcome]") {

@@ -8,6 +8,8 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include <spdlog/spdlog.h>
@@ -19,6 +21,7 @@
 #include "dispatch_route_fallback.hpp"
 #include "dispatch_send_progress.hpp"
 #include "dispatch_target_shape.hpp"
+#include "dispatch_announcement.hpp"
 #include "execution_tracker.hpp"
 #include "gateway_route_store.hpp"
 #include "management_group_store.hpp"
@@ -245,7 +248,9 @@ inline ScopeLadderResult resolve_scope_targets(
 /// management-group store; `scope_ladder_fn` wraps `resolve_scope_targets`
 /// with the caller's principal + audit wiring already bound in.
 struct DispatchResolvers {
-    std::function<std::vector<std::string>(const std::string& group_id)> group_members_fn;
+    /// #2673: `nullopt` means the group could not be READ, which is not an empty group.
+    std::function<std::optional<std::vector<std::string>>(const std::string& group_id)>
+        group_members_fn;
     std::function<ScopeLadderResult(std::string_view scope_expr)> scope_ladder_fn;
 };
 
@@ -288,8 +293,45 @@ inline ConfinedDispatchOutcome resolve_and_dispatch_confined(
     const DispatchResolvers& resolvers, const ConfinedDispatchSink& sink,
     const ConcurrencyClaimFn& claim_fn = nullptr,
     const std::unordered_set<std::string>& plugin_missing = {},
-    const std::unordered_set<std::string>& os_kill_switched = {}) {
+    const std::unordered_set<std::string>& os_kill_switched = {},
+    bool collect_targets = false) {
     ConfinedDispatchOutcome outcome;
+    // ADR-1007 claim on an already visible-set-confined list, remembering (#2673) which intended
+    // targets the claim held back.
+    std::vector<std::string> skipped;
+    const auto claim = [&](const std::vector<std::string>& candidates) {
+        auto eligible = authz::filter_to_scope(candidates, exec_visible);
+        auto claimed = claim_fn(eligible);
+        const std::unordered_set<std::string_view> held(claimed.begin(), claimed.end());
+        for (auto& id : eligible)
+            if (!held.contains(id))
+                skipped.push_back(std::move(id));
+        return claimed;
+    };
+    // The one copy of an arm's result onto the outcome, shared by every arm below.
+    const auto finish = [&](ArmDispatchResult r) {
+        outcome.sent = r.sent;
+        outcome.denied_quarantined = std::move(r.denied_quarantined);
+        outcome.denied_quarantined_count = r.denied_quarantined_count;
+        outcome.not_sent = std::move(r.not_sent);
+        outcome.unknown_plugin = std::move(r.unknown_plugin);
+        outcome.unknown_plugin_count = r.unknown_plugin_count;
+        outcome.kill_switched_os = std::move(r.kill_switched_os);
+        outcome.kill_switched_os_count = r.kill_switched_os_count;
+        outcome.route_unreadable = r.route_unreadable;
+        outcome.membership_partial = r.membership_partial;
+        if (r.membership_partial && r.sent == 0 && !r.intended_count)
+            outcome.resolution_failed = true;
+        if (r.intended_count)
+            outcome.intended_count = *r.intended_count + skipped.size();
+        if (collect_targets) {
+            outcome.intended = std::move(r.intended);
+            outcome.intended.insert(outcome.intended.end(), skipped.begin(), skipped.end());
+            outcome.contacted = std::move(r.contacted);
+            outcome.concurrency_skipped = std::move(skipped);
+        }
+        return std::move(outcome);
+    };
     outcome.containment_unreadable = gate.enforced && gate.fail_closed;
     const auto arm = classify_dispatch_arm(!agent_ids.empty(), scope_expr);
 
@@ -309,24 +351,23 @@ inline ConfinedDispatchOutcome resolve_and_dispatch_confined(
     // a second copy of the intersection RULE.
     if (arm == DispatchArm::Group) {
         std::vector<std::string> members;
-        if (resolvers.group_members_fn)
-            members = resolvers.group_members_fn(scope_expr.substr(6));
+        if (resolvers.group_members_fn) {
+            if (auto read = resolvers.group_members_fn(scope_expr.substr(6)))
+                members = std::move(*read);
+            else
+                outcome.resolution_failed = true; // reach nobody, and say why
+        }
         if (claim_fn)
-            members = claim_fn(authz::filter_to_scope(members, exec_visible));
+            members = claim(members);
         ConfinedDispatchTargets t;
         t.group_members = &members;
-        const auto r = dispatch_confined_arms(arm, t, exec_visible, broadcast_on_none, gate, sink,
-                                              plugin_missing, os_kill_switched);
-        outcome.sent = r.sent;
-        outcome.denied_quarantined = r.denied_quarantined;
-        outcome.denied_quarantined_count = r.denied_quarantined_count;
-        outcome.not_sent = r.not_sent;
-        outcome.unknown_plugin = r.unknown_plugin;
-        outcome.unknown_plugin_count = r.unknown_plugin_count;
-        outcome.kill_switched_os = r.kill_switched_os;
-        outcome.kill_switched_os_count = r.kill_switched_os_count;
-        outcome.route_unreadable = r.route_unreadable;
-        return outcome;
+        auto r = dispatch_confined_arms(arm, t, exec_visible, broadcast_on_none, gate, sink,
+                                        plugin_missing, os_kill_switched, collect_targets);
+        const bool failed = outcome.resolution_failed;
+        auto done = finish(std::move(r));
+        if (failed)
+            done.intended_count.reset();
+        return done;
     }
 
     if (arm == DispatchArm::Scope) {
@@ -334,48 +375,76 @@ inline ConfinedDispatchOutcome resolve_and_dispatch_confined(
             return outcome; // no resolver wired — reach nobody, matching a null store
         auto ladder = resolvers.scope_ladder_fn(scope_expr);
         outcome.scope_parse_error = ladder.parse_error;
-        if (!ladder.matched)
-            return outcome; // ABORTED — the ladder already audited it
+        if (!ladder.matched) {
+            // ABORTED — the ladder already audited it. Only a degrade is a failed resolution;
+            // an owner-check or result-set refusal is about the caller's own request.
+            outcome.resolution_failed =
+                ladder.abort_reason == ScopeAbortReason::DbDegraded ||
+                ladder.abort_reason == ScopeAbortReason::PresenceDegraded;
+            return outcome;
+        }
         if (claim_fn)
-            *ladder.matched = claim_fn(authz::filter_to_scope(*ladder.matched, exec_visible));
+            *ladder.matched = claim(*ladder.matched);
         ConfinedDispatchTargets t;
         t.scope_matched = &*ladder.matched;
-        const auto r = dispatch_confined_arms(arm, t, exec_visible, broadcast_on_none, gate, sink,
-                                              plugin_missing, os_kill_switched);
-        outcome.sent = r.sent;
-        outcome.denied_quarantined = r.denied_quarantined;
-        outcome.denied_quarantined_count = r.denied_quarantined_count;
-        outcome.not_sent = r.not_sent;
-        outcome.unknown_plugin = r.unknown_plugin;
-        outcome.unknown_plugin_count = r.unknown_plugin_count;
-        outcome.kill_switched_os = r.kill_switched_os;
-        outcome.kill_switched_os_count = r.kill_switched_os_count;
-        outcome.route_unreadable = r.route_unreadable;
-        return outcome;
+        return finish(dispatch_confined_arms(arm, t, exec_visible, broadcast_on_none, gate, sink,
+                                             plugin_missing, os_kill_switched, collect_targets));
     }
 
     ConfinedDispatchTargets t;
+    std::vector<std::string> unique_ids;
     std::vector<std::string> claimed_ids;
     if (arm == DispatchArm::Ids) {
+        // #2673: de-duplicated BEFORE the claim, or a repeat would claim once and then read as
+        // held back by another run.
+        std::unordered_set<std::string_view> seen;
+        unique_ids.reserve(agent_ids.size());
+        for (const auto& id : agent_ids)
+            if (seen.insert(id).second)
+                unique_ids.push_back(id);
         if (claim_fn) {
-            claimed_ids = claim_fn(authz::filter_to_scope(agent_ids, exec_visible));
+            claimed_ids = claim(unique_ids);
             t.agent_ids = &claimed_ids;
         } else {
-            t.agent_ids = &agent_ids;
+            t.agent_ids = &unique_ids;
         }
     }
-    const auto r = dispatch_confined_arms(arm, t, exec_visible, broadcast_on_none, gate, sink,
-                                          plugin_missing, os_kill_switched);
-    outcome.sent = r.sent;
-    outcome.denied_quarantined = r.denied_quarantined;
-    outcome.denied_quarantined_count = r.denied_quarantined_count;
-    outcome.not_sent = r.not_sent;
-    outcome.unknown_plugin = r.unknown_plugin;
-    outcome.unknown_plugin_count = r.unknown_plugin_count;
-    outcome.kill_switched_os = r.kill_switched_os;
-    outcome.kill_switched_os_count = r.kill_switched_os_count;
-    outcome.route_unreadable = r.route_unreadable;
-    return outcome;
+    auto done = finish(dispatch_confined_arms(arm, t, exec_visible, broadcast_on_none, gate, sink,
+                                              plugin_missing, os_kill_switched, collect_targets));
+    // "No target named" that does not broadcast resolved nothing at all.
+    if (arm == DispatchArm::None && !broadcast_on_none)
+        done.intended_count.reset();
+    return done;
+}
+
+/// #2673: one record per intended agent, saying what dispatch did with it. Precedence when an
+/// id is on more than one list: contacted, then the specific withholding reason, then the send
+/// failure. `known_ids` are the agents with a session or route; an undelivered id outside it was
+/// `offline`. An intended id on no list (a fail-closed containment gate names none) is `withheld`.
+[[nodiscard]] inline std::vector<DispatchTarget>
+build_dispatch_targets(const ConfinedDispatchOutcome& outcome,
+                       const std::unordered_set<std::string>& known_ids) {
+    std::unordered_map<std::string_view, TargetDisposition> reason;
+    const auto note = [&reason](const std::vector<std::string>& ids, TargetDisposition d) {
+        for (const auto& id : ids)
+            reason.emplace(id, d); // first writer wins: call in precedence order
+    };
+    note(outcome.contacted, TargetDisposition::Contacted);
+    note(outcome.denied_quarantined, TargetDisposition::Quarantined);
+    note(outcome.kill_switched_os, TargetDisposition::OsKillSwitched);
+    note(outcome.unknown_plugin, TargetDisposition::PluginAbsent);
+    note(outcome.concurrency_skipped, TargetDisposition::ConcurrencySkipped);
+    for (const auto& id : outcome.not_sent)
+        reason.emplace(id, known_ids.contains(id) ? TargetDisposition::NotSent
+                                                  : TargetDisposition::Offline);
+    std::vector<DispatchTarget> targets;
+    targets.reserve(outcome.intended.size());
+    for (const auto& id : outcome.intended) {
+        const auto it = reason.find(id);
+        targets.push_back(
+            {id, it == reason.end() ? TargetDisposition::Withheld : it->second});
+    }
+    return targets;
 }
 
 /// K-1 (QE-2 residual): the wiring `ServerImpl::dispatch_confined` builds
@@ -418,11 +487,17 @@ inline ConfinedDispatchOutcome wire_and_dispatch_confined(
     // to before this slice.
     GatewayRouteStore* gateway_route_store = nullptr) {
     DispatchResolvers resolvers;
-    resolvers.group_members_fn = [mgmt_group_store](const std::string& group_id) {
+    resolvers.group_members_fn =
+        [mgmt_group_store](const std::string& group_id) -> std::optional<std::vector<std::string>> {
+        if (!mgmt_group_store)
+            return std::nullopt;
+        auto read = mgmt_group_store->get_members_checked(group_id);
+        if (!read)
+            return std::nullopt;
         std::vector<std::string> members;
-        if (mgmt_group_store)
-            for (const auto& m : mgmt_group_store->get_members(group_id))
-                members.push_back(m.agent_id);
+        members.reserve(read->size());
+        for (const auto& m : *read)
+            members.push_back(m.agent_id);
         return members;
     };
     resolvers.scope_ladder_fn = [&](std::string_view expr) {
@@ -461,6 +536,8 @@ inline ConfinedDispatchOutcome wire_and_dispatch_confined(
     // per-id consult) and `prepare_route_fallback` (the batched read).
     auto route_fallback =
         std::make_shared<yuzu::server::GatewayRouteFallback>(registry, gateway_route_store);
+    // #2673: set by the SAME call that builds the broadcast list.
+    auto membership_degraded = std::make_shared<bool>(false);
     yuzu::server::ConfinedDispatchSink raw_sink{
         [&registry, &cmd, route_fallback](const std::string& aid) {
             // A session that CAN deliver ALWAYS wins (route_fallback->prepare() never
@@ -472,7 +549,7 @@ inline ConfinedDispatchOutcome wire_and_dispatch_confined(
             return registry.send_to(aid, cmd);
         },
         [&registry, &cmd] { return registry.send_to_all(cmd); },
-        [&registry] { return registry.all_ids(); },
+        [&registry, membership_degraded] { return registry.all_ids(membership_degraded.get()); },
         [route_fallback](const std::vector<std::string>& candidates) {
             return route_fallback->prepare(candidates);
         },
@@ -487,7 +564,8 @@ inline ConfinedDispatchOutcome wire_and_dispatch_confined(
         // even single-replica) had it shipped unwired.
         [&registry](const std::vector<std::string>& candidates) {
             return registry.has_remote_presence(candidates);
-        }};
+        },
+        [membership_degraded] { return *membership_degraded; }};
     // Counts sends accepted by the send path into the caller's SendProgressScope when one is open (the
     // instruction-execute core and POST /api/v1/commands), so a throw mid fan-out still tells
     // them how many agents hold the command. Identity otherwise.
@@ -588,10 +666,35 @@ inline ConfinedDispatchOutcome wire_and_dispatch_confined(
         };
     }
 
-    auto outcome =
-        resolve_and_dispatch_confined(agent_ids, scope_expr, exec_visible, broadcast_on_none, gate,
-                                      resolvers, sink, claim_fn, plugin_missing, *os_kill_switched);
+    // #2673: collect the target sets only for a dispatch that belongs to a run.
+    const bool collect_targets = execution_tracker && !execution_id.empty();
+    // Say so BEFORE anything is sent: until the whole list is recorded below, the run cannot
+    // read `succeeded`, whatever happens to this call (a throw mid fan-out included).
+    DispatchAnnouncement announcement(execution_tracker, execution_id,
+                                      "wire_and_dispatch_confined");
+    auto outcome = resolve_and_dispatch_confined(agent_ids, scope_expr, exec_visible,
+                                                 broadcast_on_none, gate, resolvers, sink, claim_fn,
+                                                 plugin_missing, *os_kill_switched, collect_targets);
     outcome.command_id = command_id;
+
+    announcement.close_if_empty(outcome.intended.empty() && outcome.sent == 0);
+
+    // #2673: record who this dispatch was meant for. Best effort: a failure never fails the
+    // dispatch (the frames are already sent), and leaves the run on the count-only rules.
+    if (collect_targets && !outcome.intended.empty()) {
+        std::unordered_set<std::string> known;
+        if (!outcome.not_sent.empty()) {
+            const auto ids = registry.all_ids();
+            known.insert(ids.begin(), ids.end());
+        }
+        const auto arm = classify_dispatch_arm(!agent_ids.empty(), scope_expr);
+        const bool connected_only = arm == DispatchArm::Scope || arm == DispatchArm::Broadcast ||
+                                    arm == DispatchArm::None;
+        // A device list narrowed by an unreadable presence directory is recorded, but as
+        // partial.
+        outcome.targets_record_failed = !announcement.record(
+            build_dispatch_targets(outcome, known), connected_only, outcome.membership_partial);
+    }
 
     // ADR-1007 claim-leak fix: `claim_fn` above ran BEFORE the send, so every
     // id in `outcome.not_sent` (send attempted, registry reported failure)

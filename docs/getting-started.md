@@ -166,7 +166,7 @@ Expected response:
 
 1. The server received your `POST /api/command` request and authenticated your session.
 2. It constructed a gRPC `CommandRequest` with `plugin=os_info` and `action=os_name`.
-3. The request was dispatched to all connected agents over the bidirectional gRPC stream.
+3. The request was dispatched to all connected agents over the bidirectional gRPC stream. If nothing you may dispatch to matches (for example, no agent is connected), the server answers `422` with `reason: no_targets`.
 4. Each agent's plugin host loaded the `os_info` plugin, invoked the `os_name` action, and streamed the result back as a `CommandResponse`.
 5. The server's `ResponseStore` persisted each response in PostgreSQL with the command ID, agent ID, timestamp, status, and output.
 6. An audit event was logged with your username, the action taken, and the number of agents targeted.

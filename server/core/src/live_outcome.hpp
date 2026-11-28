@@ -92,6 +92,8 @@ enum class LiveOutcome {
     kIncomplete,           ///< the device sent output but never a terminal row inside the budget
     kGateUnreadable,       ///< the permission store could not be read at the re-decision (not a revocation)
     kBadDeviceId,          ///< the REST device id (the path id) was over-long or carried a control byte: refused before any gate or audit row
+    kTargetResolutionFailed, ///< zero-reach cause
+    kNoTargets,              ///< zero-reach cause
 };
 
 [[nodiscard]] constexpr std::string_view to_token(LiveOutcome o) noexcept {
@@ -160,15 +162,19 @@ enum class LiveOutcome {
         return "gate_unreadable";
     case LiveOutcome::kBadDeviceId:
         return "bad_device_id";
+    case LiveOutcome::kTargetResolutionFailed:
+        return "target_resolution_failed";
+    case LiveOutcome::kNoTargets:
+        return "no_targets";
     }
     return "internal"; // unreachable for a valid enumerator; keeps the function total
 }
 
 /// Every enumerator, in declaration order, so a test (and any exporter that pre-registers label
 /// values) can walk the closed set. The `static_assert` ties its length to the last enumerator:
-/// a new enumerator appended after `kBadDeviceId` must update both, and the `to_token`
+/// a new enumerator appended after `kNoTargets` must update both, and the `to_token`
 /// switch above refuses to compile until it has a token.
-inline constexpr std::array<LiveOutcome, 32> kAllLiveOutcomes = {
+inline constexpr std::array<LiveOutcome, 34> kAllLiveOutcomes = {
     LiveOutcome::kOk,
     LiveOutcome::kNotConfigured,
     LiveOutcome::kGateRefused,
@@ -201,9 +207,11 @@ inline constexpr std::array<LiveOutcome, 32> kAllLiveOutcomes = {
     LiveOutcome::kIncomplete,
     LiveOutcome::kGateUnreadable,
     LiveOutcome::kBadDeviceId,
+    LiveOutcome::kTargetResolutionFailed,
+    LiveOutcome::kNoTargets,
 };
 static_assert(kAllLiveOutcomes.size() ==
-                  static_cast<std::size_t>(LiveOutcome::kBadDeviceId) + 1,
+                  static_cast<std::size_t>(LiveOutcome::kNoTargets) + 1,
               "kAllLiveOutcomes must list every LiveOutcome enumerator");
 
 } // namespace yuzu::server::live

@@ -67,9 +67,8 @@ nlohmann::json execution_agent_status_json(const AgentExecStatus& a);
 
 /// KPI summary (succeeded/failed counts + p50/p95 duration in ms) computed
 /// from a set of already-fetched, already-confined `AgentExecStatus` rows.
-/// Only TERMINAL rows (success/failure/timeout/rejected — matches
-/// `execution_scope_rules.hpp::confined_projection`'s definition of
-/// "responded") with a usable `completed_at >= dispatched_at` contribute a
+/// Only TERMINAL rows (success/failure/timeout/rejected, plus the server's own timed_out and
+/// unknown) with a usable `completed_at >= dispatched_at` contribute a
 /// duration sample; an agent still `running` has no duration yet and must
 /// not skew the percentile.
 struct ExecutionKpi {
@@ -84,6 +83,11 @@ struct ExecutionKpi {
 };
 [[nodiscard]] ExecutionKpi compute_execution_kpi(const std::vector<AgentExecStatus>& agents);
 nlohmann::json execution_kpi_json(const ExecutionKpi& k);
+
+/// #2673: the `coverage` object of an execution detail read (REST v1 and MCP). The caller has
+/// already filtered the counts to the visible agents. An unrecorded run carries `state` and null
+/// counts: unknown is never zero.
+nlohmann::json execution_coverage_json(const ExecutionCoverage& c, bool confined = false);
 
 /// One row of a resolved, already-confined child-execution read (`GET
 /// /api/v1/executions/{id}/children`, the legacy `GET

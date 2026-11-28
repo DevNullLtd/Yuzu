@@ -542,7 +542,8 @@ void register_health_routes(HttpRouteSink& sink, Deps deps) {
                 auto recent = deps.execution_tracker->query_executions({.limit = 1000});
                 for (const auto& e : recent) {
                     if (e.completed_at >= hour_ago) {
-                        if (e.status == "completed")
+                        // A run finishes `succeeded` or `completed` (#2673): both count here.
+                        if (e.status == "completed" || e.status == "succeeded")
                             ++completed_last_hour;
                         else if (e.status == "failed")
                             ++failed_last_hour;

@@ -279,7 +279,7 @@ spec:
 | `parameters` | object | No | `{}` | Input parameter schema. See [Section 5](#5-parameter-type-system). |
 | `result` | object | No | `{}` | Output column schema. See [Section 6](#6-result-schema-and-aggregation). |
 | `readablePayload` | string | No | `""` | Template for audit display. Supports `${paramName}` interpolation. |
-| `gather` | object | No | -- | `ttlSeconds`: agent response window (default 300). |
+| `gather` | object | No | -- | `ttlSeconds`: response window (default 300). A silent device is marked `timed_out` after max(`ttlSeconds`, 660) seconds without a signal. See [Execution lifecycle](#10-execution-lifecycle). |
 | `response` | object | No | -- | `retentionDays`: how long to keep response data (default 90). |
 | `approval` | object | No | -- | `mode`: `auto`, `role-gated`, or `always`. See [Section 7](#7-approval-workflows). |
 | `permissions` | object | No | -- | `executeRoles` and `authorRoles` arrays. |
@@ -295,7 +295,7 @@ spec:
 | `concurrency` | string | `per-device` | One of: `per-device`, `per-definition`, `per-set`, `global:<N>`, `unlimited`. Only `per-device` is enforced — see [Section 8](#8-concurrency-model). |
 | `stagger.maxDelaySeconds` | int | `0` | Max random delay per agent before execution. `0` = no stagger. |
 | `stagger.fixedDelaySeconds` | int | `0` | Fixed delay per agent before execution, added before the random stagger. `0` = no fixed delay. Total wait = `fixedDelaySeconds` + random(`0`, `maxDelaySeconds`). |
-| `minSuccessPercent` | int | `100` | Minimum success percentage. `0` = best-effort. |
+| `minSuccessPercent` | int | `100` | Minimum success percentage. `0` = best-effort. Not applied to run status: `succeeded` requires every intended device. |
 
 ### Compatibility
 
@@ -1041,13 +1041,27 @@ Each scheduled dispatch creates a normal `Execution` record. The schedule tracks
 
 ### States
 
-An execution progresses through these states:
+An execution record has one of these statuses:
 
 ```
-pending → dispatching → gathering → completed
-                                  → failed
-                                  → cancelled
+running → succeeded
+        → completed
+        → cancelled
+pending   (a rerun record: nothing is sent)
 ```
+
+| Status | Meaning |
+|---|---|
+| `running` | At least one contacted device is still awaited, or the run is not yet finished. |
+| `succeeded` | Every intended device answered successfully. |
+| `completed` | Finished, but not recorded as fully successful: a device failed, timed out, could not be delivered to, has an unknown outcome or was never reached, or the run's device list was partial or not saved. |
+| `cancelled` | Marked cancelled. |
+
+On the Executions page a `completed` run shows "N failed" or "Not fully successful" and is never shown as successful; the status filter for it is "Completed, not fully successful".
+
+**Coverage.** `GET /api/v1/executions/{id}` and the MCP tool `get_execution_status` carry a `coverage` object counting the intended devices and what happened to them. It gives counts only. The `?include=agents` expansion and `get_execution_status` list the devices the server gave up on as `timed_out` or `unknown`; no route lists the devices that were never reached. See [the REST reference](rest-api.md#get-apiv1executionsidincludeagents).
+
+**Response deadline.** A contacted device that sends nothing is marked `timed_out` after the response window: the definition's `gather.ttlSeconds` (300 when none applies; software sync 300 plus `delay_max_s`), never less than 660 seconds without a signal. `timed_out` means the server recorded no result. A longer window does not help a gateway-routed command, which the gateway forward ends at 300 seconds; a command still running then reads `unknown`. An agent does not re-send the result of a command that finishes while it is disconnected.
 
 ### Per-Agent Tracking
 
@@ -1069,11 +1083,11 @@ The execution record maintains real-time counters:
 
 | Counter | Description |
 |---|---|
-| `agents_targeted` | Total agents in scope at dispatch time. |
-| `agents_responded` | Agents that have sent at least one response. |
+| `agents_targeted` | Devices the send accepted. Devices never reached are counted in `coverage`, not here. |
+| `agents_responded` | Devices with a final reported result, including a server- or gateway-made delivery failure; excludes devices the deadline sweep marked `timed_out` or `unknown`. |
 | `agents_success` | Agents that completed successfully. |
-| `agents_failure` | Agents that reported failure. |
-| `progress_pct` | `(agents_responded / agents_targeted) * 100`. |
+| `agents_failure` | Devices with failure, timeout, rejection, `not_delivered`, `timed_out` or `unknown`. |
+| `progress_pct` | `(agents_success + agents_failure) / agents_targeted * 100`. |
 
 ### Rerun
 
@@ -1087,7 +1101,7 @@ curl -s -b cookies.txt \
   -H "Content-Type: application/json" \
   -d '{"scope": "all"}'
 
-# Rerun only failed agents
+# Rerun record for the devices that did not succeed
 curl -s -b cookies.txt \
   -H "Origin: http://localhost:8080" \
   -X POST http://localhost:8080/api/executions/EXEC-001/rerun \
@@ -1095,7 +1109,7 @@ curl -s -b cookies.txt \
   -d '{"scope": "failed_only"}'
 ```
 
-The `scope` field controls which agents are included. Set `"scope": "failed_only"` to target only agents that reported failure; any other value (or omitting the field) reruns all agents.
+The `scope` field sizes the new record. With `"scope": "failed_only"` it counts, for an original with a saved device list, the listed devices without a successful result (failed, rejected, timed out, not delivered or unknown; devices never reached are not counted), and otherwise the devices that reported failure, timeout or rejection plus any the server gave up on. Any other value (or omitting the field) takes the original's targeted count.
 
 **What a rerun does.** It creates a new `pending` execution record linked to the original; it does not send anything to any device. The REST v1 route `POST /api/v1/executions/{id}/rerun` and the MCP tool `record_execution_rerun` do the same, take a boolean `failed_only` instead of the `scope` string, and answer `dispatched_to_devices: false`. Likewise `POST /api/v1/executions/{id}/cancel` and `cancel_execution` only mark the execution cancelled; they do not stop a command a device already received. See `docs/user-manual/rest-api.md`.
 
@@ -1676,7 +1690,7 @@ POST /api/executions/{id}/rerun
 ```
 
 ```bash
-# Rerun failed agents only
+# Rerun record for the devices that did not succeed
 curl -s -b cookies.txt \
   -H "Origin: http://localhost:8080" \
   -X POST http://localhost:8080/api/executions/EXEC-001/rerun \
@@ -1713,7 +1727,7 @@ The Instruction Management page is accessible from the main dashboard. It uses H
 | **Schedules** | Create, enable/disable, and delete recurring schedules. Shows next and last execution times. |
 | **Approvals** | Review pending approval requests. Approve or reject with comments. The sidebar's Approvals entry shows the pending count. A submitting account cannot review its own request (account names are compared; see [Who can approve](#who-can-approve)). A pending row you submitted shows a "You submitted this" hint saying another reviewer must approve, instead of buttons, and any backend denial (self-review, already-reviewed) surfaces as an error toast. |
 
-**Executions and Approvals pages.** `/executions` and `/approvals` are read-only pages in the sidebar under Instructions: Executions lists the dispatch history with the same status counters as the tab, and Approvals lists the approval queue, pending first. Both honour your access scope and show a note, not an empty list, when a store cannot be read. Executing stays on the Instructions tab. On `/approvals`, pending rows carry Approve and Reject buttons (dialog with an optional comment). The page shows a request's scope in full up to 17,408 bytes (a bound request is at most 16 KiB, so it is always shown whole). The scope of an `import_definition` or `save_definition_yaml` ticket opens with the tool and the definition's `approval_mode`, `plugin`, `action`, `definition_id` and `name` (or `parse_error: true` when the document could not be read), and ends with the byte length and SHA-256 of the document, so the digest identifies the exact bytes. The short scope cell shows only the START of that subject (the dispatch-relevant fields come first); open the request for the whole subject. An import always shows the `approval_mode` it will store: the document's, else for a signed document the one in its `yaml_source`, else `auto` (a signed document's `yaml_source` is read for `plugin`, `action` and `approval_mode` only; the id and name come from the document, and an omitted id is generated by the server at import); a YAML save shows the YAML's `approval_mode` when it states one, otherwise `auto` for a create (which stores `auto`) and none for an update (which keeps the stored value). A larger scope, which only an unbound request from a tool with no bound of its own can have, is shown clipped: the row is tagged "Scope clipped", the detail panel states the true size, Approve is withheld and Reject stays. Read the full scope with `GET /api/v1/approvals`, then approve with `POST /api/approvals/{id}/approve` from a signed-in session (an API token or an MCP client cannot approve). The older Approvals tab does the same. On `/executions`, selecting a row shows per-device results; a running execution updates live over SSE (a chip shows the stream state); and **Cancel execution** (dialog, shown when you may cancel and the execution is not finished) cancels it. Fleet-wide figures (today, all time, device success rate, average duration) appear for unconfined operators only and are hidden when the store cannot be read.
+**Executions and Approvals pages.** `/executions` and `/approvals` are read-only pages in the sidebar under Instructions: Executions lists the dispatch history with the same status counters as the tab, and Approvals lists the approval queue, pending first. Both honour your access scope and show a note, not an empty list, when a store cannot be read. Executing stays on the Instructions tab. On `/approvals`, pending rows carry Approve and Reject buttons (dialog with an optional comment). The page shows a request's scope in full up to 17,408 bytes (a bound request is at most 16 KiB, so it is always shown whole). The scope of an `import_definition` or `save_definition_yaml` ticket opens with the tool and the definition's `approval_mode`, `plugin`, `action`, `definition_id` and `name` (or `parse_error: true` when the document could not be read), and ends with the byte length and SHA-256 of the document, so the digest identifies the exact bytes. The short scope cell shows only the START of that subject (the dispatch-relevant fields come first); open the request for the whole subject. An import always shows the `approval_mode` it will store: the document's, else for a signed document the one in its `yaml_source`, else `auto` (a signed document's `yaml_source` is read for `plugin`, `action` and `approval_mode` only; the id and name come from the document, and an omitted id is generated by the server at import); a YAML save shows the YAML's `approval_mode` when it states one, otherwise `auto` for a create (which stores `auto`) and none for an update (which keeps the stored value). A larger scope, which only an unbound request from a tool with no bound of its own can have, is shown clipped: the row is tagged "Scope clipped", the detail panel states the true size, Approve is withheld and Reject stays. Read the full scope with `GET /api/v1/approvals`, then approve with `POST /api/approvals/{id}/approve` from a signed-in session (an API token or an MCP client cannot approve). The older Approvals tab does the same. On `/executions`, selecting a row shows per-device results; a running execution updates live over SSE (a chip shows the stream state); and **Cancel execution** (dialog, shown when you may cancel and the execution is not finished) cancels it. Fleet-wide figures (today, all time, device success rate, average duration) appear for unconfined operators only and are hidden when the store cannot be read. The device success rate is successes divided by contacted devices over finished runs; devices that were never reached are not in it.
 
 **Workflows page.** `/workflows` is a page in the sidebar under Instructions (its workflow actions are described below): the workflow definitions (name, description, step count; selecting one lists its steps with each step's failure policy) and the recurring schedules. Schedules run a single instruction on the cadence the scheduler really applies (once, every N minutes, daily, weekly or monthly; time of day, weekday and day of month are stored but not used) and are not linked to workflows. A schedule you did not create shows only whether it targets all devices or a subset.
 

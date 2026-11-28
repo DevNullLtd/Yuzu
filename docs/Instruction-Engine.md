@@ -184,7 +184,7 @@ spec:
         - count
   readablePayload: "Inspect service '${serviceName}'"
   gather:
-    ttlSeconds: 300                      # agent must respond within this window
+    ttlSeconds: 300                      # response window; at least 660 s is applied
   response:
     retentionDays: 90
   approval:
@@ -797,6 +797,8 @@ spec:
 ```
 
 **Aggregate status computation:**
+
+The table below is the original design. The server does not apply `minSuccessPercent` or the `failed`, `partial` and `timed_out` run statuses: a finished run is `succeeded` only when every intended device answered successfully, otherwise `completed` (or `cancelled`). A silent device is `timed_out` per device. See [Execution lifecycle](user-manual/instructions.md#10-execution-lifecycle).
 
 | Condition | Status |
 |---|---|

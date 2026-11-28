@@ -892,6 +892,96 @@ TEST_CASE("CommandOutboxDelivery[pg]: a genuine successful dispatch (sent>0) com
     CHECK(still->agents_targeted == 4);
 }
 
+// #2673: attempt one saved a complete list but did not finish the occurrence; the re-drive
+// could neither announce itself nor save its own list. The run must not read `succeeded`.
+TEST_CASE("CommandOutboxDelivery[pg]: a re-drive whose device list was not saved cannot let the "
+          "run read succeeded",
+          "[command_outbox][pg][delivery][coverage]") {
+    DeliveryPg fx;
+    yuzu::server::pg::PgPool tracker_pool{{.conninfo = fx.dsn(), .size = 2}};
+    REQUIRE(tracker_pool.valid());
+    ExecutionTracker tracker{tracker_pool};
+    REQUIRE(tracker.is_open());
+    const auto sql = [&](const std::string& statement) {
+        yuzu::server::pg::PgConn conn{PQconnectdb(fx.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        yuzu::server::pg::PgResult r =
+            yuzu::server::pg::exec_params(conn.get(), statement.c_str(), std::vector<std::string>{});
+        INFO(PQresultErrorMessage(r.get()));
+        REQUIRE(r.status() == PGRES_COMMAND_OK);
+    };
+
+    Execution exec;
+    exec.definition_id = "power_health.report";
+    exec.status = "running";
+    exec.dispatched_by = "svc-scheduler";
+    exec.expects_targets = true;
+    auto exec_id = tracker.create_execution(exec);
+    REQUIRE(exec_id.has_value());
+    // Attempt one: announced and saved.
+    REQUIRE(tracker.mark_targets_expected(*exec_id));
+    REQUIRE(tracker.record_dispatch_targets(
+        *exec_id, {{"a", yuzu::server::TargetDisposition::Contacted}}, true));
+
+    auto req = fx.req("occ-unsaved", "cmd-unsaved");
+    req.execution_id = *exec_id;
+    REQUIRE(fx.store().claim_and_enqueue(req, fx.lock(), fx.epoch()) ==
+            OutboxEnqueueOutcome::Enqueued);
+
+    DispatchProbe probe;
+    probe.next.sent = 1;
+    probe.next.targets_record_failed = true;
+
+    CommandOutboxDelivery::Deps d;
+    d.outbox = &fx.store();
+    d.dispatch_seq_fn = fx.seq_fn();
+    d.leader = &fx.elector();
+    d.execution_tracker = &tracker;
+    d.dispatch_fn = [&probe](const std::string&, const std::string&,
+                             const std::vector<std::string>&, const std::string&,
+                             const std::unordered_map<std::string, std::string>&,
+                             const std::string&, const DispatchCaller&,
+                             const std::string& command_id) {
+        probe.calls++;
+        auto out = probe.next;
+        out.command_id = command_id;
+        return out;
+    };
+    d.resolve_caller = [](const std::string& principal) {
+        DispatchCaller c;
+        c.principal = principal;
+        return c;
+    };
+    d.arming_check = [](const std::string&, const std::string&, const std::string&,
+                        const std::unordered_map<std::string, std::string>&) { return true; };
+    CommandOutboxDelivery loop{std::move(d)};
+
+    // While the fact cannot be stored, the occurrence stays pending and the run unfinishable.
+    sql("CREATE FUNCTION public.yuzu_test_refuse() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN "
+        "RAISE EXCEPTION 'refused'; END $$");
+    sql("CREATE TRIGGER yuzu_test_refuse BEFORE UPDATE ON execution_tracker.executions "
+        "FOR EACH ROW WHEN (NEW.targets_incomplete AND NOT OLD.targets_incomplete) "
+        "EXECUTE FUNCTION public.yuzu_test_refuse()");
+    loop.tick();
+    CHECK(probe.calls == 1);
+    CHECK(fx.raw_state("occ-unsaved") == "pending");
+    CHECK(tracker.get_execution(*exec_id)->agents_targeted == 0);
+
+    sql("DROP TRIGGER yuzu_test_refuse ON execution_tracker.executions");
+    loop.tick();
+    CHECK(probe.calls == 2);
+    CHECK(fx.raw_state("occ-unsaved") == "sent");
+
+    yuzu::server::AgentExecStatus reply;
+    reply.agent_id = "a";
+    reply.status = "success";
+    reply.completed_at = 1;
+    REQUIRE(tracker.update_agent_status(*exec_id, reply));
+    const auto done = tracker.get_execution(*exec_id);
+    REQUIRE(done.has_value());
+    CHECK(done->status == "completed");
+}
+
 // #4982 round 6 (Kimi K1/Codex C2, round-6 adversarial review): the real
 // call-site atomicity proof the test above cannot provide (see the #4982
 // round-6 correction on its own comment). This forces the SECOND statement

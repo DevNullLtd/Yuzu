@@ -58,6 +58,15 @@ namespace yuzu::server::software_sync {
 /// behind.
 inline constexpr int kMaxLiveRuns = 3;
 
+/// What the execution record needs to know about a run beyond the devices that are asked
+/// (#2673). Skipped-because-fresh devices need nothing and are deliberately not listed.
+struct RunTargets {
+    bool connected_only{false};        ///< a scope or fleet selector chose the devices
+    std::vector<std::string> offline;  ///< selected but not connected here
+    std::vector<std::string> too_old;  ///< selected but unable to run the sync
+    bool partial_list{false};          ///< the selected devices may not all be listed
+};
+
 /// The seams a run needs. The server wires them; a test fakes them.
 struct Env {
     /// Selector -> the caller's candidate ids (already narrowed to their visible set) and
@@ -69,7 +78,8 @@ struct Env {
     /// and `execution_id` the tracker row the replies are recorded against (empty = untracked).
     /// A throw out of this seam is handled: see `Runner::run`.
     std::function<DispatchResult(const auth::Session&, const std::vector<std::string>&,
-                                 std::int64_t delay_max_s, const std::string& execution_id)>
+                                 std::int64_t delay_max_s, const std::string& execution_id,
+                                 const RunTargets& run)>
         dispatch;
     /// Cheap: does the caller hold an unfiltered Execution:Execute? No fleet read. Decides the
     /// run key's caller class and the fleet-administrator half of the whole-fleet rule.
@@ -406,7 +416,10 @@ private:
 
         DispatchResult sent;
         try {
-            sent = env_.dispatch(session, plan.targets, delay_max_s, execution_id);
+            sent = env_.dispatch(
+                session, plan.targets, delay_max_s, execution_id,
+                RunTargets{sel.arm == DispatchArm::Broadcast || sel.arm == DispatchArm::Scope,
+                           plan.offline, plan.too_old, resolved.partial_list});
         } catch (...) {
             // Any throw, not only std::exception: one that skipped this branch would unwind through
             // the Reservation's defaults, releasing the ledger entry with no audit row and the
