@@ -1326,9 +1326,7 @@
     "capability_rows": [
       "server/core/src/capability_decls/plugin_action_catalogue_b.hpp"
     ],
-    "changelog": [
-      "changelog.d/3925-users-enabled-string.changed.md"
-    ],
+    "changelog": [],
     "definitions": [
       "content/definitions/users.yaml"
     ],

@@ -71,7 +71,7 @@ STAGING=""
 BUNDLE_ROOT=""                                # $STAGING/yuzu-agents -> /opt/yuzu-agents
 
 # ── Defaults / config ─────────────────────────────────────────────────────
-VERSION="${YUZU_VERSION:-0.15.0}"
+VERSION="${YUZU_VERSION:-0.16.0}"
 IMAGE_NAME="yuzu-agent-bundle-chisel"
 PUSH=0; MULTIARCH=0; RUN_TEST=1; KEEP_STAGING=0; VERIFY_ONLY=0; SIGNER_REPO=""
 STAGING_OWNED=0
@@ -273,10 +273,10 @@ ok "SHA256SUMS signature verified (signer $SIGNER_REPO, $TAG)"
 # (spellings seen on published releases, e.g. for 0.13.0-rc6):
 #   .deb  yuzu-agent_0.13.0.rc6_amd64.deb   ('~' served as '.', before 0.14.0-rc3)
 #         yuzu-agent_0.14.0-rc3_amd64.deb   (0.14.0-rc3 and later; '~' also tried)
-#         yuzu-agent_0.15.0_amd64.deb       (stable)
-#   .rpm  yuzu-agent-0.13.0-0.1.rc6.x86_64.rpm / yuzu-agent-0.15.0-1.x86_64.rpm
-#   .pkg  YuzuAgent-0.13.0_rc6-macos-arm64.pkg / YuzuAgent-0.15.0-macos-arm64.pkg
-#   .exe  YuzuAgentSetup-0.13.0_rc6.exe / YuzuAgentSetup-0.15.0.exe
+#         yuzu-agent_0.16.0_amd64.deb       (stable)
+#   .rpm  yuzu-agent-0.13.0-0.1.rc6.x86_64.rpm / yuzu-agent-0.16.0-1.x86_64.rpm
+#   .pkg  YuzuAgent-0.13.0_rc6-macos-arm64.pkg / YuzuAgent-0.16.0-macos-arm64.pkg
+#   .exe  YuzuAgentSetup-0.13.0_rc6.exe / YuzuAgentSetup-0.16.0.exe
 # Exactly one candidate must exist; none or several is a hard stop that names
 # them (done in the parent shell: a die inside $(...) would only end the subshell).
 VER_BASE="${VERSION%%-*}"; VER_PRE=""

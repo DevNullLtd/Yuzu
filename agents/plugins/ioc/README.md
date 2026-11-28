@@ -144,5 +144,4 @@ port|22|false|No listening service on this port
 - Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_d.hpp`
 - Tests: `tests/unit/test_ioc_domain_cap.cpp` · `tests/unit/test_ioc_parsers.cpp`
 - Privilege row: `docs/agent-privilege-model.md` (no row yet)
-- Changelog: `changelog.d/7710-ioc-hosts-exact-match.fixed.md` · `changelog.d/8164-ioc-domain-cap.fixed.md`
 <!-- END GENERATED -->
