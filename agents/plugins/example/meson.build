@@ -1,4 +1,4 @@
-shared_library(
+example_plugin_lib = shared_library(
   'example',
   files('src/example_plugin.cpp'),
   name_prefix: '',          # Strip 'lib' prefix → example.so / example.dll
@@ -6,3 +6,5 @@ shared_library(
   install: true,
   install_dir: get_option('libdir') / 'yuzu' / 'plugins',
 )
+# deploy_dlls (root meson.build) waits for every library in this list (#8926).
+yuzu_plugin_libs += example_plugin_lib

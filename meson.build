@@ -544,6 +544,11 @@ subdir('proto')
 subdir('sdk')
 
 # ── Agent ─────────────────────────────────────────────────────────────────────
+# Every agents/plugins/<dir>/meson.build appends its library here, so the
+# Windows deploy_dlls target below runs only after all of them are linked
+# (#8926). tests/test_deploy_dlls_plugin_depends_lint.py checks each plugin
+# appends.
+yuzu_plugin_libs = []
 if build_agent
   subdir('agents/core')
   # build_examples gates ONLY the four plugins below: the three demo plugins
@@ -925,10 +930,14 @@ if host_machine.system() == 'windows'
     message(_deploy_run.stderr().strip())
   endif
 
-  # Run at build time so rebuilt plugins are always copied to plugins/
+  # Run at build time so rebuilt plugins are always copied to plugins/.
+  # depends: makes ninja finish linking every plugin first. Without it the
+  # copy could run while the linker still held a plugin DLL open, and the
+  # build failed with WinError 32 on whichever DLLs were still linking (#8926).
   custom_target('deploy_dlls',
     command: [_python3, _deploy_script] + _deploy_args,
     output: '.dlls_deployed',
+    depends: yuzu_plugin_libs,
     build_always_stale: true,
     build_by_default: true,
   )

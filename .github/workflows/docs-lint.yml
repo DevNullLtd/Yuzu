@@ -465,6 +465,13 @@ jobs:
       - name: Agent installer plugin coverage lint
         run: python3 -I tests/test_agent_installer_plugin_coverage_lint.py
 
+      # Every plugin the root meson.build builds appends its library to
+      # yuzu_plugin_libs, and the Windows deploy_dlls target depends on that
+      # list, so it never copies a plugin DLL that is still being linked
+      # (#8926). Mutation-tests itself. Stdlib only.
+      - name: deploy_dlls plugin depends lint
+        run: python3 -I tests/test_deploy_dlls_plugin_depends_lint.py
+
       # Gateway scrape (#5695): every shipped Prometheus config, and every
       # compose stack that runs a Prometheus next to a gateway, scrapes the
       # gateway's metrics port. Stdlib only.
