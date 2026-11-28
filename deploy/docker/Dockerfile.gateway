@@ -55,7 +55,7 @@
 # result. Re-resolve and review the digest on every bump, and set the same OTP
 # in scripts/ci/image-vuln-gate.sh's GRYPE_REQUIRED_COMPONENTS (a test checks
 # they agree).
-FROM hexpm/erlang:28.5.0.8-alpine-3.23.8@sha256:1fc35219ea9db671006cfd87d2aa645bc80268a49d90a93c592abdb49edc8e26 AS deps
+FROM hexpm/erlang:28.5-alpine-3.23.4@sha256:77e27750739a891ae545489134917a38a4e1210f54d532408c7b4085bc8accce AS deps
 
 # BuildKit sets TARGETARCH from --platform (and from the host when it is not
 # given). Keep the allowed set in step with the marker line above.
