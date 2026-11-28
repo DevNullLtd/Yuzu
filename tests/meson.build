@@ -3889,6 +3889,16 @@ test('agent installer plugin coverage lint',
   timeout: 30,
 )
 
+# The Windows deploy_dlls target depends on every plugin library, so it never
+# copies a plugin DLL the linker still holds open (#8926). Every plugin the
+# root meson.build builds must append its library to yuzu_plugin_libs.
+test('deploy_dlls plugin depends lint',
+  _python3_test,
+  args: [files('test_deploy_dlls_plugin_depends_lint.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
 # The Windows agent payloads (zip and installer) ship the Visual C++ runtime
 # app-local, and release.yml checks every shipped binary's DLL imports against
 # each payload before ISCC runs. Behavioural over synthetic PE images (stdlib),
