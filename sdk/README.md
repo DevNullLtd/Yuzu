@@ -74,8 +74,12 @@ guide in `docs/plugin-author-guide.md` (if present). In short:
 3. Add a `meson.build` that produces a shared library. A plugin built in
    this tree also assigns it to a variable and appends it with
    `yuzu_plugin_libs += <variable>`, so the Windows build waits for it before
-   copying plugin DLLs (#8926). A plugin built outside this tree skips the
-   append, because that list exists only in the root `meson.build`.
+   copying plugin DLLs (#8926). Both lines sit outside any `if` or `foreach`
+   block; a plugin built only on some operating systems puts that condition
+   on its `subdir()` call in the root `meson.build` instead
+   (`docs/user-manual/agent-plugins.md`, step 3). A plugin built outside this
+   tree skips the append, because that list exists only in the root
+   `meson.build`.
 4. Register the plugin directory with `subdir('agents/plugins/<name>')`
    in the root `meson.build` (or distribute your plugin independently and
    drop it into the agent's plugin directory at runtime).

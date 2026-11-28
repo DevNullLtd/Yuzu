@@ -247,7 +247,11 @@ class DeployDllsPluginDepends(unittest.TestCase):
                 self.assertIn(old, self.meson, f"mutation anchor for {name!r} not found")
                 mutated = self.meson.replace(old, new, 1)
                 if name == "init moved after the plugin subdirs":
+                    self.assertIn("# ── Server", mutated, "second anchor for the moved init not found")
                     mutated = mutated.replace("# ── Server", "yuzu_plugin_libs = []\n# ── Server", 1)
+                    # Without the re-added init this would only test "init dropped".
+                    self.assertTrue(any("comes after the first plugin subdir" in m for m in problems(mutated, reader)),
+                                    "the moved init was not reported as coming after the first plugin subdir")
                 self.assertNotEqual(problems(mutated, reader), [], f"{name!r} was not caught")
 
     def test_plugin_mutations_are_caught(self):
