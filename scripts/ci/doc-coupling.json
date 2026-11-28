@@ -314,6 +314,21 @@
         "docs/user-manual/server-admin.md",
         "docs/user-manual/ha-postgres.md"
       ]
+    },
+    {
+      "id": "release-process",
+      "why": "how a release is tagged, published and QA'd, and how changelog fragments are folded (#119)",
+      "code": [
+        ".github/workflows/release.yml",
+        ".github/workflows/pre-release.yml",
+        "scripts/release-preflight.sh",
+        "scripts/assemble-changelog.py",
+        "scripts/check-compose-versions.sh",
+        ".claude/skills/release/SKILL.md"
+      ],
+      "docs": [
+        "docs/branch-strategy.md"
+      ]
     }
   ]
 }
